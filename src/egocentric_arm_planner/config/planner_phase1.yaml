@@ -1,0 +1,80 @@
+robot_description_param: /robot_description
+urdf_path: ""
+
+base_frame: base_link
+ee_frame: EE_link
+
+joint_names:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - wrist_joint1
+  - wrist_joint2
+  - wrist_joint3
+
+sensors:
+  - id: 0
+    name: link2_sensor1
+    frame: link2_sensor1_tof_link
+  - id: 1
+    name: link2_sensor2
+    frame: link2_sensor2_tof_link
+  - id: 2
+    name: link3_sensor1
+    frame: link3_sensor1_tof_link
+  - id: 3
+    name: link3_sensor2
+    frame: link3_sensor2_tof_link
+  - id: 4
+    name: link4_sensor1
+    frame: link4_sensor1_tof_link
+  - id: 5
+    name: link4_sensor2
+    frame: link4_sensor2_tof_link
+  - id: 6
+    name: ee_sensor1
+    frame: EE_sensor1_tof_link
+  - id: 7
+    name: ee_sensor2
+    frame: EE_sensor2_tof_link
+
+ik:
+  position_weight: 1.0
+  orientation_weight: 0.5
+  damping: 0.001
+  step_size: 0.5
+  position_tolerance: 0.01
+  orientation_tolerance: 0.2
+  max_iterations: 100
+
+task_generator:
+  T_plan: 2.0
+  trajectory_dt: 0.02
+
+  enable_time_scaling: true
+  nominal_max_joint_velocity: 0.8
+
+  min_plan_duration: 0.5
+  max_plan_duration: 5.0
+
+  reject_large_joint_jump: true
+  max_joint_jump_inf_norm: 3.14
+
+intervention:
+  T_cmd: 0.5
+  hold_duration: 0.5
+  command_dt: 0.02
+
+receding_horizon:
+  planning_rate: 30.0
+
+topics:
+  joint_states: /joint_states
+  target_pose: /care_planner/ee_target_pose
+  task_trajectory: /care_planner/task_trajectory
+  command_trajectory: /care_planner/command_trajectory
+
+debug:
+  publish_task_trajectory: true
+  overrun_warn_ratio: 1.0
