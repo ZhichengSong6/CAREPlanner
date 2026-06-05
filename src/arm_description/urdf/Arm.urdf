@@ -43,7 +43,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/base_link.STL" />
+          filename="package://arm_description/meshes/base_link.STL" />
       </geometry>
       <material
         name="">
@@ -57,7 +57,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/base_link.STL" />
+          filename="package://arm_description/meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -83,7 +83,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link1.STL" />
+          filename="package://arm_description/meshes/link1.STL" />
       </geometry>
       <material
         name="">
@@ -97,7 +97,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link1.STL" />
+          filename="package://arm_description/meshes/link1.STL" />
       </geometry>
     </collision>
   </link>
@@ -141,7 +141,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2.STL" />
+          filename="package://arm_description/meshes/link2.STL" />
       </geometry>
       <material
         name="">
@@ -155,7 +155,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2.STL" />
+          filename="package://arm_description/meshes/link2.STL" />
       </geometry>
     </collision>
   </link>
@@ -199,7 +199,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_link.STL" />
       </geometry>
       <material
         name="">
@@ -213,7 +213,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -252,7 +252,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -266,7 +266,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -305,7 +305,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -319,7 +319,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor1_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -358,7 +358,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_link.STL" />
       </geometry>
       <material
         name="">
@@ -372,7 +372,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -411,7 +411,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -425,7 +425,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -464,7 +464,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -478,7 +478,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link2_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link2_sensor2_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -517,7 +517,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3.STL" />
+          filename="package://arm_description/meshes/link3.STL" />
       </geometry>
       <material
         name="">
@@ -531,7 +531,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3.STL" />
+          filename="package://arm_description/meshes/link3.STL" />
       </geometry>
     </collision>
   </link>
@@ -575,7 +575,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_link.STL" />
       </geometry>
       <material
         name="">
@@ -589,7 +589,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -628,7 +628,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -642,7 +642,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -681,7 +681,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -695,7 +695,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor1_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -734,7 +734,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_link.STL" />
       </geometry>
       <material
         name="">
@@ -748,7 +748,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -787,7 +787,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -801,7 +801,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -840,7 +840,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -854,7 +854,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link3_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link3_sensor2_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -893,7 +893,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4.STL" />
+          filename="package://arm_description/meshes/link4.STL" />
       </geometry>
       <material
         name="">
@@ -907,7 +907,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4.STL" />
+          filename="package://arm_description/meshes/link4.STL" />
       </geometry>
     </collision>
   </link>
@@ -951,7 +951,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_link.STL" />
       </geometry>
       <material
         name="">
@@ -965,7 +965,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1004,7 +1004,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -1018,7 +1018,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1057,7 +1057,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -1071,7 +1071,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor1_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1110,7 +1110,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_link.STL" />
       </geometry>
       <material
         name="">
@@ -1124,7 +1124,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1163,7 +1163,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -1177,7 +1177,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1216,7 +1216,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -1230,7 +1230,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/link4_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/link4_sensor2_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1269,7 +1269,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link1.STL" />
+          filename="package://arm_description/meshes/wrist_link1.STL" />
       </geometry>
       <material
         name="">
@@ -1283,7 +1283,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link1.STL" />
+          filename="package://arm_description/meshes/wrist_link1.STL" />
       </geometry>
     </collision>
   </link>
@@ -1327,7 +1327,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link2.STL" />
+          filename="package://arm_description/meshes/wrist_link2.STL" />
       </geometry>
       <material
         name="">
@@ -1341,7 +1341,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link2.STL" />
+          filename="package://arm_description/meshes/wrist_link2.STL" />
       </geometry>
     </collision>
   </link>
@@ -1385,7 +1385,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link3.STL" />
+          filename="package://arm_description/meshes/wrist_link3.STL" />
       </geometry>
       <material
         name="">
@@ -1399,7 +1399,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/wrist_link3.STL" />
+          filename="package://arm_description/meshes/wrist_link3.STL" />
       </geometry>
     </collision>
   </link>
@@ -1443,7 +1443,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_link.STL" />
       </geometry>
       <material
         name="">
@@ -1457,7 +1457,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1496,7 +1496,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -1510,7 +1510,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_camera_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1549,7 +1549,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -1563,7 +1563,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor1_tof_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor1_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1602,7 +1602,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_link.STL" />
       </geometry>
       <material
         name="">
@@ -1616,7 +1616,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1655,7 +1655,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_camera_link.STL" />
       </geometry>
       <material
         name="">
@@ -1669,7 +1669,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_camera_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_camera_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1708,7 +1708,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_tof_link.STL" />
       </geometry>
       <material
         name="">
@@ -1722,7 +1722,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_sensor2_tof_link.STL" />
+          filename="package://arm_description/meshes/EE_sensor2_tof_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -1761,7 +1761,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_link.STL" />
+          filename="package://arm_description/meshes/EE_link.STL" />
       </geometry>
       <material
         name="">
@@ -1775,7 +1775,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://arm_sim_node/urdf/meshes/EE_link.STL" />
+          filename="package://arm_description/meshes/EE_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -2547,7 +2547,7 @@
 
   <!-- ================================================================ -->
   <!-- Kinematic Gazebo rendering mode                                  -->
-  <!-- The arm state is supplied by arm_sim_node via                     -->
+  <!-- The arm state is supplied by arm_description via                     -->
   <!-- /gazebo/set_model_configuration, not by Gazebo dynamics.          -->
   <!-- Disable gravity so unactuated joints do not sag between syncs.    -->
   <!-- ================================================================ -->

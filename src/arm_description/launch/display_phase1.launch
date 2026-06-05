@@ -1,13 +1,45 @@
 <launch>
-  <include file="$(find arm_description)/launch/load_robot_description.launch" />
+  <arg name="robot_urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
 
-  <node pkg="joint_state_publisher_gui"
+  <arg name="use_gui"
+       default="true" />
+
+  <arg name="use_rviz"
+       default="true" />
+
+  <arg name="rviz_config"
+       default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
+
+  <!-- Load URDF into /robot_description -->
+  <include file="$(find arm_description)/launch/load_robot_description.launch">
+    <arg name="robot_urdf" value="$(arg robot_urdf)" />
+  </include>
+
+  <!-- Publish /joint_states manually for Phase I visualization -->
+  <node if="$(arg use_gui)"
+        pkg="joint_state_publisher_gui"
         type="joint_state_publisher_gui"
         name="joint_state_publisher_gui"
         output="screen" />
 
+  <node unless="$(arg use_gui)"
+        pkg="joint_state_publisher"
+        type="joint_state_publisher"
+        name="joint_state_publisher"
+        output="screen" />
+
+  <!-- Publish /tf from /joint_states and /robot_description -->
   <node pkg="robot_state_publisher"
         type="robot_state_publisher"
         name="robot_state_publisher"
+        output="screen" />
+
+  <!-- Load saved RViz config -->
+  <node if="$(arg use_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="rviz"
+        args="-d $(arg rviz_config)"
         output="screen" />
 </launch>

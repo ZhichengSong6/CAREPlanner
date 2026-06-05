@@ -2,7 +2,7 @@
 <package format="2">
   <name>arm_description</name>
   <version>0.0.1</version>
-  <description>Robot description files for CARE-Planner arm experiments.</description>
+  <description>Robot description, visualization, and simulation resources for CARE-Planner arm experiments.</description>
 
   <maintainer email="songzhicheng66@gmail.com">zhicheng</maintainer>
   <license>MIT</license>
@@ -11,6 +11,7 @@
 
   <exec_depend>robot_state_publisher</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
+  <exec_depend>joint_state_publisher_gui</exec_depend>
   <exec_depend>rviz</exec_depend>
   <exec_depend>xacro</exec_depend>
 </package>
