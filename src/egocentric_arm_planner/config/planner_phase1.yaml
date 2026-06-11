@@ -51,30 +51,79 @@ ik:
 task_generator:
   T_plan: 2.0
   trajectory_dt: 0.02
-
+  use_quintic: true
   enable_time_scaling: true
-  nominal_max_joint_velocity: 0.8
 
-  min_plan_duration: 0.5
+  min_plan_duration: 0.05
   max_plan_duration: 5.0
 
+  nominal_max_joint_velocity: 2.0
+  joint_velocity_limits:
+    joint1: 2.0
+    joint2: 2.0
+    joint3: 2.0
+    joint4: 2.0
+    wrist_joint1: 2.5
+    wrist_joint2: 2.5
+    wrist_joint3: 2.5
+
+  nominal_max_joint_acceleration: 10.0
+  joint_acceleration_limits:
+    joint1: 8.0
+    joint2: 8.0
+    joint3: 10.0
+    joint4: 10.0
+    wrist_joint1: 15.0
+    wrist_joint2: 15.0
+    wrist_joint3: 15.0
+
+  enforce_velocity_acceleration_limits: true
+  duration_limit_check_iterations: 6
+  duration_limit_check_margin: 1.02
+
   reject_large_joint_jump: true
-  max_joint_jump_inf_norm: 3.14
+  max_joint_jump_inf_norm: 3.0
 
 intervention:
-  T_cmd: 0.5
+  T_cmd: 2.0
   hold_duration: 0.5
   command_dt: 0.02
 
 receding_horizon:
-  planning_rate: 30.0
+  planning_rate: 20.0
 
 topics:
-  joint_states: /joint_states
+  joint_states: /care_arm/joint_states
   target_pose: /care_planner/ee_target_pose
   task_trajectory: /care_planner/task_trajectory
-  command_trajectory: /care_planner/command_trajectory
+  command_trajectory: /care_planner/command_trajectory_candidate
 
 debug:
   publish_task_trajectory: true
   overrun_warn_ratio: 1.0
+
+visualization:
+  marker_topic: /care_planner/debug/markers
+  path_line_width: 0.015
+  command_line_width: 0.03
+  target_axis_length: 0.12
+  target_axis_width: 0.01
+  target_sphere_radius: 0.035
+
+execution:
+  rate: 100.0
+  joint_states: /care_arm/joint_states
+  input_trajectory: /care_planner/command_trajectory_candidate
+  output_velocity_command: /care_arm/arm_group_velocity_controller/command
+  reference_state: /care_planner/execution/reference_state
+  control_dt: 0.05
+  max_start_error: 0.3
+  max_tracking_error: 0.8
+  hold_when_no_trajectory: true
+  hold_when_tracking_error_large: true
+  reject_large_start_error: true
+  hold_initial_zero_pose: true
+  hold_last_reference_when_no_trajectory: true
+  reference_timeout: 0.15
+  position_feedback_gain: 2.5
+  max_command_velocity: 2.0

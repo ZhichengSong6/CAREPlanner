@@ -5,6 +5,6 @@ find_package(catkin REQUIRED)
 
 catkin_package()
 
-install(DIRECTORY urdf meshes launch config rviz
+install(DIRECTORY urdf meshes launch config rviz worlds
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

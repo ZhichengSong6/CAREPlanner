@@ -330,4 +330,85 @@ JointTrajectory JointTrajectory::makeQuinticZeroVelocityAcceleration(
   return traj;
 }
 
+
+JointTrajectory JointTrajectory::makeQuinticBoundaryVelocityAcceleration(
+    const Eigen::VectorXd& q0,
+    const Eigen::VectorXd& dq0,
+    const Eigen::VectorXd& ddq0,
+    const Eigen::VectorXd& q1,
+    const Eigen::VectorXd& dq1,
+    const Eigen::VectorXd& ddq1,
+    double duration,
+    double dt) {
+  if (q0.size() != q1.size() ||
+      q0.size() != dq0.size() ||
+      q0.size() != ddq0.size() ||
+      q0.size() != dq1.size() ||
+      q0.size() != ddq1.size()) {
+    throw std::runtime_error(
+        "[JointTrajectory] size mismatch in makeQuinticBoundaryVelocityAcceleration.");
+  }
+
+  if (duration <= 0.0 || dt <= 0.0) {
+    throw std::runtime_error(
+        "[JointTrajectory] invalid duration or dt in makeQuinticBoundaryVelocityAcceleration.");
+  }
+
+  const int dof = static_cast<int>(q0.size());
+  JointTrajectory traj(dof);
+
+  const double T = duration;
+  const double T2 = T * T;
+  const double T3 = T2 * T;
+  const double T4 = T3 * T;
+  const double T5 = T4 * T;
+
+  Eigen::Matrix3d M;
+  M << T3,        T4,         T5,
+       3.0 * T2,  4.0 * T3,   5.0 * T4,
+       6.0 * T,   12.0 * T2,  20.0 * T3;
+
+  Eigen::VectorXd c0 = q0;
+  Eigen::VectorXd c1 = dq0;
+  Eigen::VectorXd c2 = 0.5 * ddq0;
+  Eigen::VectorXd c3(dof);
+  Eigen::VectorXd c4(dof);
+  Eigen::VectorXd c5(dof);
+
+  for (int j = 0; j < dof; ++j) {
+    Eigen::Vector3d rhs;
+    rhs << q1[j] - (c0[j] + c1[j] * T + c2[j] * T2),
+           dq1[j] - (c1[j] + 2.0 * c2[j] * T),
+           ddq1[j] - (2.0 * c2[j]);
+
+    const Eigen::Vector3d sol = M.colPivHouseholderQr().solve(rhs);
+    c3[j] = sol[0];
+    c4[j] = sol[1];
+    c5[j] = sol[2];
+  }
+
+  const int steps = std::max(1, static_cast<int>(std::ceil(duration / dt)));
+
+  for (int i = 0; i <= steps; ++i) {
+    const double t = std::min(i * dt, duration);
+    const double t2 = t * t;
+    const double t3 = t2 * t;
+    const double t4 = t3 * t;
+    const double t5 = t4 * t;
+
+    const Eigen::VectorXd q =
+        c0 + c1 * t + c2 * t2 + c3 * t3 + c4 * t4 + c5 * t5;
+
+    const Eigen::VectorXd dq =
+        c1 + 2.0 * c2 * t + 3.0 * c3 * t2 + 4.0 * c4 * t3 + 5.0 * c5 * t4;
+
+    const Eigen::VectorXd ddq =
+        2.0 * c2 + 6.0 * c3 * t + 12.0 * c4 * t2 + 20.0 * c5 * t3;
+
+    traj.addPoint(t, q, dq, ddq);
+  }
+
+  return traj;
+}
+
 }  // namespace arm_trajectory

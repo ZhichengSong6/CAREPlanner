@@ -23,19 +23,19 @@
 
   <link
     name="base_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.00110280922060463 -1.98703837603586E-05 0.0390910140862879"
+        xyz="0.00044547 -8.0265E-06 0.037874"
         rpy="0 0 0" />
       <mass
-        value="0.766851050223606" />
+        value="1.8984" />
       <inertia
-        ixx="0.00181952459266476"
-        ixy="4.6709925751517E-07"
-        ixz="2.90512573822122E-05"
-        iyy="0.00175770181428764"
-        iyz="-1.79295513788847E-07"
-        izz="0.00301277451685566" />
+        ixx="0.0028587"
+        ixy="4.671E-07"
+        ixz="2.9051E-05"
+        iyy="0.0027968"
+        iyz="-1.793E-07"
+        izz="0.0047243" />
     </inertial>
     <visual>
       <origin
@@ -63,19 +63,19 @@
   </link>
   <link
     name="link1">
-    <inertial>
+        <inertial>
       <origin
-        xyz="3.99351013802084E-05 2.96986005835023E-07 0.0979878098842334"
+        xyz="0.0010429 6.7528E-07 0.11689"
         rpy="0 0 0" />
       <mass
-        value="2.22318567608356" />
+        value="3.7184" />
       <inertia
-        ixx="0.0105769901062"
-        ixy="-1.03095907575644E-06"
-        ixz="9.30832684723888E-05"
-        iyy="0.0112071774977816"
-        iyz="-1.49157928808864E-08"
-        izz="0.00659269034666982" />
+        ixx="0.012546"
+        ixy="-1.0309E-06"
+        ixz="9.3083E-05"
+        iyy="0.012764"
+        iyz="-1.4827E-08"
+        izz="0.0081494" />
     </inertial>
     <visual>
       <origin
@@ -116,24 +116,25 @@
     <limit
       lower="-3.14"
       upper="3.14"
-      effort="100"
-      velocity="100" />
+      effort="170"
+      velocity="20.106193" />
+    <dynamics damping="2.00" friction="0.01" />
   </joint>
   <link
     name="link2">
-    <inertial>
+        <inertial>
       <origin
-        xyz="7.02671045918066E-11 0.0426351402886548 -0.0482569721337471"
+        xyz="7.0267E-11 0.042635 -0.048257"
         rpy="0 0 0" />
       <mass
-        value="1.25469347638256" />
+        value="1.2547" />
       <inertia
-        ixx="0.00681707376598388"
-        ixy="-9.55906063032647E-12"
-        ixz="5.05760325058508E-11"
-        iyy="0.00391273673603705"
-        iyz="0.000445604816093975"
-        izz="0.0049573253595571" />
+        ixx="0.0068171"
+        ixy="-9.5591E-12"
+        ixz="5.0576E-11"
+        iyy="0.0039127"
+        iyz="0.0004456"
+        izz="0.0049573" />
     </inertial>
     <visual>
       <origin
@@ -174,14 +175,15 @@
     <limit
       lower="-2.3"
       upper="2.3"
-      effort="100"
-      velocity="100" />
+      effort="300"
+      velocity="11.100294" />
+    <dynamics damping="2.00" friction="0.01" />
   </joint>
   <link
     name="link2_sensor1_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.000228568543839791 7.19703164022628E-07 0.0112564931324916"
+        xyz="-0.000228568543839791 7.19703164023171E-07 0.0112564931324916"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776281" />
@@ -190,8 +192,8 @@
         ixy="3.04829332274897E-08"
         ixz="1.61957363513343E-08"
         iyy="4.26727737514081E-06"
-        iyz="1.00050856908896E-11"
-        izz="6.1259453751771E-06" />
+        iyz="1.00050856908872E-11"
+        izz="6.12594537517709E-06" />
     </inertial>
     <visual>
       <origin
@@ -232,18 +234,18 @@
   </joint>
   <link
     name="link2_sensor1_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0110000000000001 -1.69742692124331E-15 -0.0795000000000007"
+        xyz="-1.69829428298129E-15 -0.0110000000000001 -0.0795000000000007"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-1.93870456067121E-27"
-        ixz="-5.33929441248023E-25"
+        ixy="1.93870456067121E-27"
+        ixz="-6.76824914093002E-25"
         iyy="3.27363771981099E-10"
-        iyz="-6.76824924443896E-25"
+        iyz="5.33929441248022E-25"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -285,18 +287,18 @@
   </joint>
   <link
     name="link2_sensor1_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.011 -1.76681586028238E-15 -0.0795000000000007"
+        xyz="-1.76594849854439E-15 0.011 -0.0795000000000007"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-1.93870456067121E-27"
-        ixz="-5.33929441248023E-25"
+        ixy="1.93870456067121E-27"
+        ixz="-6.76824914093002E-25"
         iyy="3.27363771981099E-10"
-        iyz="-6.76824924443896E-25"
+        iyz="5.33929441248022E-25"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -338,18 +340,18 @@
   </joint>
   <link
     name="link2_sensor2_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.000228568543839958 7.19703164025031E-07 0.0112564931324908"
+        xyz="-0.000228568543839958 7.19703164025624E-07 0.0112564931324908"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776282" />
       <inertia
         ixx="4.32261598928483E-06"
-        ixy="3.04829332274879E-08"
+        ixy="3.0482933227488E-08"
         ixz="1.61957363513346E-08"
         iyy="4.26727737514082E-06"
-        iyz="1.00050856903382E-11"
+        iyz="1.00050856903349E-11"
         izz="6.12594537517711E-06" />
     </inertial>
     <visual>
@@ -391,18 +393,18 @@
   </joint>
   <link
     name="link2_sensor2_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0110000000000002 -6.41847686111419E-17 -0.0794999999999999"
+        xyz="-6.93889390390723E-17 -0.011 -0.0795000000000007"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="8.43471116152968E-27"
-        ixz="-5.81651271751732E-25"
+        ixy="-8.43471116152968E-27"
+        ixz="6.78108932832103E-25"
         iyy="3.27363771981099E-10"
-        iyz="6.78108932832102E-25"
+        iyz="5.81651271751732E-25"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -444,18 +446,18 @@
   </joint>
   <link
     name="link2_sensor2_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.0109999999999999 -7.19910242530375E-17 -0.0794999999999999"
+        xyz="-7.54604712049911E-17 0.0110000000000001 -0.0795000000000007"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="1.40959977432119E-26"
-        ixz="-5.706961220746E-25"
+        ixy="-1.40959977432119E-26"
+        ixz="6.72731604947771E-25"
         iyy="3.27363771981099E-10"
-        iyz="6.72731604947771E-25"
+        iyz="5.706961220746E-25"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -497,19 +499,19 @@
   </joint>
   <link
     name="link3">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0382053785934682 2.69362486658608E-05 -0.116767542432942"
+        xyz="0.014308 1.0088E-05 -0.066624"
         rpy="0 0 0" />
       <mass
-        value="0.582589401925533" />
+        value="1.5556" />
       <inertia
-        ixx="0.00217499498948574"
-        ixy="-9.02828549174016E-08"
-        ixz="0.000251445351988843"
-        iyy="0.00207203135682847"
-        iyz="2.44720534552963E-07"
-        izz="0.000663505488104311" />
+        ixx="0.0027664"
+        ixy="-9.0283E-08"
+        ixz="0.00025145"
+        iyy="0.0026634"
+        iyz="2.4472E-07"
+        izz="0.0015422" />
     </inertial>
     <visual>
       <origin
@@ -550,14 +552,15 @@
     <limit
       lower="-3.14"
       upper="3.14"
-      effort="100"
-      velocity="100" />
+      effort="148"
+      velocity="11.728613" />
+    <dynamics damping="2.00" friction="0.01" />
   </joint>
   <link
     name="link3_sensor1_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.000228568543840069 -7.19703164013025E-07 0.0112564931324908"
+        xyz="0.000228568543840069 -7.1970316401329E-07 0.0112564931324908"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776282" />
@@ -565,8 +568,8 @@
         ixx="4.32261598928483E-06"
         ixy="3.04829332274915E-08"
         ixz="-1.61957363513331E-08"
-        iyy="4.26727737514081E-06"
-        iyz="-1.00050856909277E-11"
+        iyy="4.26727737514082E-06"
+        iyz="-1.00050856909267E-11"
         izz="6.1259453751771E-06" />
     </inertial>
     <visual>
@@ -608,18 +611,18 @@
   </joint>
   <link
     name="link3_sensor1_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0109999999999992 0.0110000000000008 -0.000500000000002679"
+        xyz="0.0110000000000008 -0.0109999999999992 -0.000500000000002748"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-5.61705979896003E-36"
-        ixz="-1.81923992016045E-24"
+        ixy="5.6169011014011E-36"
+        ixz="3.53135936562297E-25"
         iyy="3.27363771981099E-10"
-        iyz="2.95134985728526E-26"
+        iyz="1.04944450342308E-26"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -661,18 +664,18 @@
   </joint>
   <link
     name="link3_sensor1_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.0110000000000008 -0.0109999999999992 -0.00050000000000272"
+        xyz="-0.0109999999999992 0.0110000000000008 -0.000500000000002651"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-7.22194249150602E-36"
-        ixz="-1.81923992016045E-24"
+        ixy="7.22177231451008E-36"
+        ixz="3.53135936562297E-25"
         iyy="3.27363771981099E-10"
-        iyz="2.95134985728527E-26"
+        iyz="1.04944450342311E-26"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -714,9 +717,9 @@
   </joint>
   <link
     name="link3_sensor2_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.000228568543840019 7.19703164009378E-07 0.0112564931324908"
+        xyz="-0.00022856854384002 7.19703164009378E-07 0.0112564931324908"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776282" />
@@ -725,7 +728,7 @@
         ixy="3.04829332274916E-08"
         ixz="1.61957363513339E-08"
         iyy="4.26727737514082E-06"
-        iyz="1.00050856902153E-11"
+        iyz="1.00050856902166E-11"
         izz="6.1259453751771E-06" />
     </inertial>
     <visual>
@@ -767,18 +770,18 @@
   </joint>
   <link
     name="link3_sensor2_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.011 0.0110000000000002 -0.0005"
+        xyz="0.0110000000000002 -0.011 -0.000500000000000004"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-5.61715111214638E-36"
-        ixz="-4.65284445336328E-26"
+        ixy="5.61710469932095E-36"
+        ixz="-5.30529265693358E-27"
         iyy="3.27363771981099E-10"
-        iyz="-6.84538804295522E-27"
+        iyz="4.63635670976881E-26"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -820,18 +823,18 @@
   </joint>
   <link
     name="link3_sensor2_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.011 -0.011 -0.000500000000000004"
+        xyz="-0.011 0.011 -0.0005"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-7.22210268131449E-36"
-        ixz="-4.65284445336328E-26"
+        ixy="7.22209070680012E-36"
+        ixz="-5.30529265693358E-27"
         iyy="3.27363771981099E-10"
-        iyz="-6.84538804295522E-27"
+        iyz="4.63635670976881E-26"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -873,19 +876,19 @@
   </joint>
   <link
     name="link4">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-1.96484668744606E-05 -0.0695934964300845 -0.0527490114772609"
+        xyz="-5.3868E-06 -0.056922 -0.04264"
         rpy="0 0 0" />
       <mass
-        value="0.499691951248306" />
+        value="1.8227" />
       <inertia
-        ixx="0.00118224707570711"
-        ixy="-1.42437858818239E-07"
-        ixz="-1.88226425968712E-07"
-        iyy="0.000347696574337866"
-        iyz="0.000112751754317425"
-        izz="0.00134960905730777" />
+        ixx="0.0018802"
+        ixy="-1.4244E-07"
+        ixz="-1.8823E-07"
+        iyy="0.0010714"
+        iyz="0.00011275"
+        izz="0.0023349" />
     </inertial>
     <visual>
       <origin
@@ -926,12 +929,13 @@
     <limit
       lower="-2.65"
       upper="2.65"
-      effort="100"
-      velocity="100" />
+      effort="148"
+      velocity="11.728613" />
+    <dynamics damping="2.00" friction="0.01" />
   </joint>
   <link
     name="link4_sensor1_link">
-    <inertial>
+        <inertial>
       <origin
         xyz="0.000228568543840008 -7.19703163953866E-07 0.0112564931324908"
         rpy="0 0 0" />
@@ -939,10 +943,10 @@
         value="0.0280853097776281" />
       <inertia
         ixx="4.32261598928481E-06"
-        ixy="3.04829332274935E-08"
-        ixz="-1.61957363513329E-08"
-        iyy="4.26727737514082E-06"
-        iyz="-1.00050856922343E-11"
+        ixy="3.04829332274933E-08"
+        ixz="-1.61957363513334E-08"
+        iyy="4.26727737514081E-06"
+        iyz="-1.00050856919769E-11"
         izz="6.12594537517709E-06" />
     </inertial>
     <visual>
@@ -984,18 +988,18 @@
   </joint>
   <link
     name="link4_sensor1_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0110000000000053 0.0110000000000006 -0.000499999999999931"
+        xyz="0.0110000000000006 -0.0110000000000053 -0.000499999999999924"
         rpy="0 0 0" />
       <mass
         value="6.36172512351933E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-7.36270178218522E-31"
-        ixz="-7.50047434365883E-28"
+        ixy="7.36270178402193E-31"
+        ixz="1.22964181563149E-25"
         iyy="3.27363771981099E-10"
-        iyz="1.22964181563149E-25"
+        iyz="7.50047434365149E-28"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -1037,18 +1041,18 @@
   </joint>
   <link
     name="link4_sensor1_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.0109999999999942 -0.0109999999999999 -0.00050000000000007"
+        xyz="-0.0109999999999999 0.0109999999999942 -0.000500000000000063"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-8.56242774233129E-31"
-        ixz="9.72098268996497E-28"
+        ixy="8.56242774233129E-31"
+        ixz="5.18684159067175E-26"
         iyy="3.27363771981099E-10"
-        iyz="5.18684159067175E-26"
+        iyz="-9.72098268996497E-28"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -1090,9 +1094,9 @@
   </joint>
   <link
     name="link4_sensor2_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.000228568543839791 7.19703161042133E-07 0.0112564931324909"
+        xyz="-0.000228568543839791 7.19703161041699E-07 0.0112564931324909"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776282" />
@@ -1101,7 +1105,7 @@
         ixy="3.04829332274894E-08"
         ixz="1.61957363513335E-08"
         iyy="4.26727737514083E-06"
-        iyz="1.00050856908473E-11"
+        iyz="1.00050856908493E-11"
         izz="6.12594537517712E-06" />
     </inertial>
     <visual>
@@ -1143,18 +1147,18 @@
   </joint>
   <link
     name="link4_sensor2_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0109999999999998 0.011 -0.000499999999999994"
+        xyz="0.011 -0.0109999999999998 -0.000499999999999994"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="-1.05181454022198E-30"
-        ixz="-3.64035083444701E-26"
+        ixy="1.05181454020871E-30"
+        ixz="-7.45581236687767E-27"
         iyy="3.27363771981099E-10"
-        iyz="-7.45581236687719E-27"
+        iyz="3.64035083444664E-26"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -1196,18 +1200,18 @@
   </joint>
   <link
     name="link4_sensor2_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.011 -0.011 -0.000500000000000028"
+        xyz="-0.011 0.011 -0.000500000000000028"
         rpy="0 0 0" />
       <mass
         value="6.36172512351933E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="7.06687894273882E-31"
-        ixz="7.01585039963243E-26"
+        ixy="-7.06687894272806E-31"
+        ixz="1.15931951675418E-27"
         iyy="3.27363771981099E-10"
-        iyz="1.15931951675464E-27"
+        iyz="-7.01585039963281E-26"
         izz="6.44124668756332E-10" />
     </inertial>
     <visual>
@@ -1249,19 +1253,19 @@
   </joint>
   <link
     name="wrist_link1">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.00352707839199187 -5.046664839529E-05 0.0556606367218427"
+        xyz="-0.00051403 -1.6186E-05 0.051476"
         rpy="0 0 0" />
       <mass
-        value="0.165249310681186" />
+        value="0.51524" />
       <inertia
-        ixx="0.000101827092950677"
-        ixy="-6.96700678035003E-08"
-        ixz="2.67501088034374E-07"
-        iyy="0.00010977530285432"
-        iyz="-2.71303548325022E-08"
-        izz="8.59339042614574E-05" />
+        ixx="0.00023417"
+        ixy="-6.967E-08"
+        ixz="2.675E-07"
+        iyy="0.00021631"
+        iyz="-2.713E-08"
+        izz="0.00019246" />
     </inertial>
     <visual>
       <origin
@@ -1302,24 +1306,25 @@
     <limit
       lower="-3.14"
       upper="3.14"
-      effort="100"
-      velocity="100" />
+      effort="30"
+      velocity="9.215338" />
+    <dynamics damping="0.2" friction="0.01" />
   </joint>
   <link
     name="wrist_link2">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0032749201170947 3.6174834796121E-05 -0.0352410752787541"
+        xyz="-0.0011208 8.8611E-06 -0.035437"
         rpy="0 0 0" />
       <mass
-        value="0.113563263335891" />
+        value="0.46355" />
       <inertia
-        ixx="8.22056606936563E-05"
-        ixy="4.11957711935237E-08"
-        ixz="1.81514767243925E-07"
-        iyy="6.24860697352306E-05"
-        iyz="-1.06157282031961E-06"
-        izz="5.9966239536844E-05" />
+        ixx="0.00021454"
+        ixy="4.1197E-08"
+        ixz="1.8151E-07"
+        iyy="0.00016902"
+        iyz="-1.0616E-06"
+        izz="0.0001665" />
     </inertial>
     <visual>
       <origin
@@ -1360,24 +1365,25 @@
     <limit
       lower="-3.14"
       upper="3.14"
-      effort="100"
-      velocity="100" />
+      effort="30"
+      velocity="9.215338" />
+    <dynamics damping="0.2" friction="0.01" />
   </joint>
   <link
     name="wrist_link3">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.000122260474742749 -0.033008042147523 -0.0093146869027906"
+        xyz="0.00012226 -0.033008 -0.0093147"
         rpy="0 0 0" />
       <mass
-        value="0.0627633465287199" />
+        value="0.062763" />
       <inertia
-        ixx="4.2581565184529E-05"
-        ixy="1.38030805624568E-06"
-        ixz="3.79394638543889E-11"
-        iyy="3.50631826362204E-05"
-        iyz="-1.11183612133598E-05"
-        izz="4.62054718437767E-05" />
+        ixx="4.2582E-05"
+        ixy="1.3803E-06"
+        ixz="3.7939E-11"
+        iyy="3.5063E-05"
+        iyz="-1.1118E-05"
+        izz="4.6205E-05" />
     </inertial>
     <visual>
       <origin
@@ -1418,24 +1424,25 @@
     <limit
       lower="-1.2"
       upper="1.2"
-      effort="100"
-      velocity="100" />
+      effort="30"
+      velocity="9.215338" />
+    <dynamics damping="0.2" friction="0.01" />
   </joint>
   <link
     name="EE_sensor1_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.00022856854384002 7.19703162606089E-07 0.0112564931324906"
+        xyz="-0.00022857 7.197E-07 0.011256"
         rpy="0 0 0" />
       <mass
-        value="0.0280853097776282" />
+        value="0.028085" />
       <inertia
-        ixx="4.32261598928482E-06"
-        ixy="3.04829332274869E-08"
-        ixz="1.6195736351333E-08"
-        iyy="4.26727737514081E-06"
-        iyz="1.00050856919219E-11"
-        izz="6.1259453751771E-06" />
+        ixx="4.3226E-06"
+        ixy="3.0483E-08"
+        ixz="1.6196E-08"
+        iyy="4.2673E-06"
+        iyz="1.0005E-11"
+        izz="6.1259E-06" />
     </inertial>
     <visual>
       <origin
@@ -1476,18 +1483,18 @@
   </joint>
   <link
     name="EE_sensor1_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0110000000009206 0.0109999999999828 -0.00049999997474548"
+        xyz="0.0109999999999995 -0.0109999999999999 -0.000500000000000611"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="1.0339757656787E-26"
-        ixz="-8.53954676984747E-26"
+        ixy="-1.03397576567871E-26"
+        ixz="-2.12272920930763E-27"
         iyy="3.27363771981099E-10"
-        iyz="-2.12272920930759E-27"
+        iyz="8.53954676984791E-26"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -1529,18 +1536,18 @@
   </joint>
   <link
     name="EE_sensor1_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.0109999999990793 -0.011000000000017 -0.000499999974745702"
+        xyz="-0.0110000000000003 0.0110000000000001 -0.000500000000000833"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
       <inertia
         ixx="3.27363771981099E-10"
-        ixy="1.02185886217505E-26"
-        ixz="2.27283124901765E-26"
+        ixy="-1.02185886217505E-26"
+        ixz="1.28243293401181E-27"
         iyy="3.27363771981099E-10"
-        iyz="1.28243293401167E-27"
+        iyz="-2.27283124901736E-26"
         izz="6.44124668756333E-10" />
     </inertial>
     <visual>
@@ -1582,18 +1589,18 @@
   </joint>
   <link
     name="EE_sensor2_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.000228568553391706 7.19703178335965E-07 0.0112564931558856"
+        xyz="-0.000228568553391706 7.19703178311602E-07 0.0112564931558857"
         rpy="0 0 0" />
       <mass
         value="0.0280853097776281" />
       <inertia
         ixx="4.32261598928481E-06"
         ixy="3.0482933227487E-08"
-        ixz="1.61957363513331E-08"
-        iyy="4.2672773751408E-06"
-        iyz="1.00050856914545E-11"
+        ixz="1.61957363513332E-08"
+        iyy="4.26727737514081E-06"
+        iyz="1.00050856914479E-11"
         izz="6.12594537517709E-06" />
     </inertial>
     <visual>
@@ -1635,18 +1642,18 @@
   </joint>
   <link
     name="EE_sensor2_camera_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="0.0109999999904482 0.0110000000000138 -0.000499999976604992"
+        xyz="0.0109999999999995 -0.0110000000000002 -0.000500000000000389"
         rpy="0 0 0" />
       <mass
         value="6.36172512351907E-05" />
       <inertia
         ixx="3.27363771981085E-10"
-        ixy="5.95705361328952E-26"
-        ixz="-1.09859925104699E-25"
+        ixy="-5.95705361328951E-26"
+        ixz="-1.77715364821852E-26"
         iyy="3.27363771981085E-10"
-        iyz="-1.77715364812103E-26"
+        iyz="1.09859925104699E-25"
         izz="6.44124668756305E-10" />
     </inertial>
     <visual>
@@ -1688,18 +1695,18 @@
   </joint>
   <link
     name="EE_sensor2_tof_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-0.0110000000095517 -0.0109999999999862 -0.000499999976605103"
+        xyz="-0.0110000000000006 0.0109999999999997 -0.0005000000000005"
         rpy="0 0 0" />
       <mass
         value="6.36172512351907E-05" />
       <inertia
         ixx="3.27363771981085E-10"
-        ixy="5.95705361328952E-26"
-        ixz="-1.09859925104699E-25"
+        ixy="-5.95705361328951E-26"
+        ixz="-1.77715364821851E-26"
         iyy="3.27363771981085E-10"
-        iyz="-1.77715364812103E-26"
+        iyz="1.09859925104699E-25"
         izz="6.44124668756305E-10" />
     </inertial>
     <visual>
@@ -1741,9 +1748,9 @@
   </joint>
   <link
     name="EE_link">
-    <inertial>
+        <inertial>
       <origin
-        xyz="-9.88108095342215E-13 2.01575405637501E-11 -0.000499999974748588"
+        xyz="-9.88108095342448E-13 2.01575093387276E-11 -0.000499999974748588"
         rpy="0 0 0" />
       <mass
         value="6.36172512351934E-05" />
@@ -2542,14 +2549,102 @@
 
 
   <!-- ================================================================ -->
-  <!-- Gazebo ros_control position-interface transmissions              -->
+  <!-- Gazebo ros_control plugin                                       -->
   <!-- ================================================================ -->
+  <gazebo>
+    <plugin name="gazebo_ros_control" filename="libgazebo_ros_control.so">
+      <robotNamespace>/care_arm</robotNamespace>
+      <robotParam>/robot_description</robotParam>
+    </plugin>
+  </gazebo>
 
   <!-- ================================================================ -->
-  <!-- Kinematic Gazebo rendering mode                                  -->
-  <!-- The arm state is supplied by arm_description via                     -->
-  <!-- /gazebo/set_model_configuration, not by Gazebo dynamics.          -->
-  <!-- Disable gravity so unactuated joints do not sag between syncs.    -->
+  <!-- ros_control velocity-interface transmissions                     -->
+  <!-- These transmissions expose the 7 actuated joints to ros_control velocity controllers. -->
+  <!-- ================================================================ -->
+
+  <transmission name="joint1_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="joint1">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="joint1_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="joint2_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="joint2">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="joint2_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="joint3_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="joint3">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="joint3_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="joint4_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="joint4">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="joint4_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="wrist_joint1_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="wrist_joint1">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="wrist_joint1_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="wrist_joint2_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="wrist_joint2">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="wrist_joint2_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <transmission name="wrist_joint3_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="wrist_joint3">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="wrist_joint3_motor">
+      <hardwareInterface>hardware_interface/VelocityJointInterface</hardwareInterface>
+      <mechanicalReduction>1</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <!-- ================================================================ -->
+  <!-- Gazebo visual/sensor links gravity settings                      -->
+  <!-- In M15 we use ros_control VelocityJointInterface for the 7 arm    -->
+  <!-- joints. These gravity tags are kept from the previous visualization -->
+  <!-- setup so the auxiliary sensor links do not sag during simulation. -->
   <!-- ================================================================ -->
   <gazebo reference="base_link">
     <gravity>false</gravity>

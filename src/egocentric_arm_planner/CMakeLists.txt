@@ -9,6 +9,10 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
   geometry_msgs
   trajectory_msgs
+  visualization_msgs
+  interactive_markers
+  tf2_ros
+  tf2_geometry_msgs
   arm_model
   arm_trajectory
 )
@@ -24,6 +28,10 @@ catkin_package(
     sensor_msgs
     geometry_msgs
     trajectory_msgs
+    visualization_msgs
+    interactive_markers
+    tf2_ros
+    tf2_geometry_msgs
     arm_model
     arm_trajectory
   DEPENDS EIGEN3
@@ -40,6 +48,8 @@ add_library(egocentric_arm_planner
   src/dummy_trajectory_evaluator.cpp
   src/intervention_manager.cpp
   src/receding_horizon_planner.cpp
+  src/trajectory_visualizer.cpp
+  src/trajectory_execution_manager.cpp
 )
 
 add_dependencies(egocentric_arm_planner
@@ -60,5 +70,43 @@ add_dependencies(receding_horizon_planner_node
 
 target_link_libraries(receding_horizon_planner_node
   egocentric_arm_planner
+  ${catkin_LIBRARIES}
+)
+
+add_executable(trajectory_visualizer_node
+  src/trajectory_visualizer_node.cpp
+)
+
+add_dependencies(trajectory_visualizer_node
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_visualizer_node
+  egocentric_arm_planner
+  ${catkin_LIBRARIES}
+)
+
+add_executable(trajectory_execution_manager_node
+  src/trajectory_execution_manager_node.cpp
+)
+
+add_dependencies(trajectory_execution_manager_node
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_execution_manager_node
+  egocentric_arm_planner
+  ${catkin_LIBRARIES}
+)
+
+add_executable(ee_interactive_marker_node
+  src/ee_interactive_marker_node.cpp
+)
+
+add_dependencies(ee_interactive_marker_node
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
 )

@@ -30,6 +30,12 @@ public:
                          const geometry_msgs::PoseStamped& target_pose_msg,
                          arm_trajectory::JointTrajectory& tau_task);
 
+  PlannerStatus generate(const Eigen::VectorXd& q_current,
+                         const Eigen::VectorXd& dq_current,
+                         const Eigen::VectorXd& ddq_current,
+                         const geometry_msgs::PoseStamped& target_pose_msg,
+                         arm_trajectory::JointTrajectory& tau_task);
+
   const TaskTrajectoryGeneratorConfig& config() const;
 
   Eigen::VectorXd lastGoalQ() const;
@@ -40,7 +46,18 @@ private:
   bool loadConfig(const ros::NodeHandle& nh);
 
   double computeTrajectoryDuration(const Eigen::VectorXd& q_current,
-                                   const Eigen::VectorXd& q_goal) const;
+                                   const Eigen::VectorXd& dq_start,
+                                   const Eigen::VectorXd& q_goal,
+                                   const Eigen::VectorXd& dq_goal) const;
+
+  double estimateJointDuration(double q0,
+                               double dq0,
+                               double q1,
+                               double dq1,
+                               double velocity_limit,
+                               double acceleration_limit) const;
+
+  Eigen::VectorXd clampAccelerationToLimits(const Eigen::VectorXd& ddq) const;
 
 private:
   bool initialized_ = false;

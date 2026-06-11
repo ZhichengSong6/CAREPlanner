@@ -1,0 +1,41 @@
+<launch>
+  <arg name="world_file"
+       default="$(find arm_description)/worlds/maixsense_empty.world" />
+
+  <arg name="robot_urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+
+  <arg name="model_name"
+       default="care_arm" />
+
+  <arg name="paused"
+       default="false" />
+
+  <arg name="use_sim_time"
+       default="true" />
+
+  <arg name="gui"
+       default="true" />
+
+  <arg name="verbose"
+       default="false" />
+
+  <include file="$(find arm_description)/launch/gazebo_maixsense_world.launch">
+    <arg name="world_file" value="$(arg world_file)" />
+    <arg name="paused" value="$(arg paused)" />
+    <arg name="use_sim_time" value="$(arg use_sim_time)" />
+    <arg name="gui" value="$(arg gui)" />
+    <arg name="verbose" value="$(arg verbose)" />
+  </include>
+
+  <include file="$(find arm_description)/launch/spawn_arm.launch">
+    <arg name="robot_urdf" value="$(arg robot_urdf)" />
+    <arg name="model_name" value="$(arg model_name)" />
+    <arg name="x" value="0.0" />
+    <arg name="y" value="0.0" />
+    <arg name="z" value="0.0" />
+    <arg name="roll" value="0.0" />
+    <arg name="pitch" value="0.0" />
+    <arg name="yaw" value="0.0" />
+  </include>
+</launch>

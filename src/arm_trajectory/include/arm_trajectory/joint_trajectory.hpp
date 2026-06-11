@@ -62,6 +62,16 @@ public:
       double duration,
       double dt);
 
+  static JointTrajectory makeQuinticBoundaryVelocityAcceleration(
+      const Eigen::VectorXd& q0,
+      const Eigen::VectorXd& dq0,
+      const Eigen::VectorXd& ddq0,
+      const Eigen::VectorXd& q1,
+      const Eigen::VectorXd& dq1,
+      const Eigen::VectorXd& ddq1,
+      double duration,
+      double dt);
+
 private:
   bool checkVectorSize(const Eigen::VectorXd& q,
                        const Eigen::VectorXd& dq,

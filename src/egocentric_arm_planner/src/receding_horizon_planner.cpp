@@ -188,9 +188,31 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   const Eigen::VectorXd q_current = robot_model_->getCurrentQ();
   const Eigen::VectorXd dq_current = robot_model_->getCurrentDq();
 
+  Eigen::VectorXd ddq_current = Eigen::VectorXd::Zero(robot_model_->nv());
+  const ros::Time current_stamp = joint_state.header.stamp.isZero()
+                                      ? ros::Time::now()
+                                      : joint_state.header.stamp;
+
+  if (has_previous_dq_for_ddq_ &&
+      previous_dq_for_ddq_.size() == dq_current.size()) {
+    const double dt = (current_stamp - previous_dq_stamp_).toSec();
+    if (dt > 1e-5) {
+      ddq_current = (dq_current - previous_dq_for_ddq_) / dt;
+      latest_ddq_estimate_ = ddq_current;
+      has_ddq_estimate_ = true;
+    } else if (has_ddq_estimate_ &&
+               latest_ddq_estimate_.size() == dq_current.size()) {
+      ddq_current = latest_ddq_estimate_;
+    }
+  }
+
+  previous_dq_for_ddq_ = dq_current;
+  previous_dq_stamp_ = current_stamp;
+  has_previous_dq_for_ddq_ = true;
+
   arm_trajectory::JointTrajectory tau_task;
   const PlannerStatus gen_status =
-      task_generator_.generate(q_current, dq_current, target_pose, tau_task);
+      task_generator_.generate(q_current, dq_current, ddq_current, target_pose, tau_task);
 
   if (gen_status != PlannerStatus::SUCCESS) {
     ROS_WARN_STREAM_THROTTLE(

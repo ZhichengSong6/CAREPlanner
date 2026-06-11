@@ -1,0 +1,53 @@
+care_arm:
+  gazebo_ros_control:
+    pid_gains:
+      joint1:
+        p: 5.0
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      joint2:
+        p: 5.0
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      joint3:
+        p: 5.0
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      joint4:
+        p: 5.0
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      wrist_joint1:
+        p: 0.2
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      wrist_joint2:
+        p: 0.2
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+      wrist_joint3:
+        p: 0.2
+        i: 0.0
+        d: 0.0
+        i_clamp: 0.0
+
+  joint_state_controller:
+    type: joint_state_controller/JointStateController
+    publish_rate: 100
+
+  arm_group_velocity_controller:
+    type: velocity_controllers/JointGroupVelocityController
+    joints:
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - wrist_joint1
+      - wrist_joint2
+      - wrist_joint3

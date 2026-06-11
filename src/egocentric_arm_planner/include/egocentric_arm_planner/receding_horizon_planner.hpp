@@ -78,6 +78,12 @@ private:
 
   bool publish_task_trajectory_ = true;
 
+  bool has_previous_dq_for_ddq_ = false;
+  bool has_ddq_estimate_ = false;
+  ros::Time previous_dq_stamp_;
+  Eigen::VectorXd previous_dq_for_ddq_;
+  Eigen::VectorXd latest_ddq_estimate_;
+
   double overrun_warn_ratio_ = 1.0;
 };
 

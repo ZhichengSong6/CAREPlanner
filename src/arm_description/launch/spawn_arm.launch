@@ -1,0 +1,42 @@
+<launch>
+  <arg name="robot_urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+
+  <arg name="model_name"
+       default="care_arm" />
+
+  <arg name="x"
+       default="0.0" />
+  <arg name="y"
+       default="0.0" />
+  <arg name="z"
+       default="0.0" />
+
+  <arg name="roll"
+       default="0.0" />
+  <arg name="pitch"
+       default="0.0" />
+  <arg name="yaw"
+       default="0.0" />
+
+  <!-- Load Arm.urdf into /robot_description -->
+  <include file="$(find arm_description)/launch/load_robot_description.launch">
+    <arg name="robot_urdf" value="$(arg robot_urdf)" />
+  </include>
+
+  <!-- Spawn URDF model into Gazebo.
+       M14 only spawns the model. It does not start controllers. -->
+  <node pkg="gazebo_ros"
+        type="spawn_model"
+        name="spawn_care_arm"
+        output="screen"
+        args="-urdf
+              -param robot_description
+              -model $(arg model_name)
+              -x $(arg x)
+              -y $(arg y)
+              -z $(arg z)
+              -R $(arg roll)
+              -P $(arg pitch)
+              -Y $(arg yaw)" />
+</launch>

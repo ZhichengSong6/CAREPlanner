@@ -2,6 +2,7 @@
 
 #include <string>
 #include <limits>
+#include <vector>
 
 namespace egocentric_arm_planner {
 
@@ -131,10 +132,22 @@ struct TaskTrajectoryGeneratorConfig {
   double trajectory_dt = 0.02;
 
   bool enable_time_scaling = true;
+
+  // Planner-level velocity / acceleration limits used for trajectory timing.
+  // These are intentionally lower than URDF peak motor limits.
   double nominal_max_joint_velocity = 0.5;
+  double nominal_max_joint_acceleration = 3.0;
+  std::vector<double> joint_velocity_limits;
+  std::vector<double> joint_acceleration_limits;
 
   double min_plan_duration = 0.5;
   double max_plan_duration = 5.0;
+
+  // After a quintic trajectory is generated, sample it and enlarge duration
+  // if any sampled dq/ddq exceeds the configured limits.
+  bool enforce_velocity_acceleration_limits = true;
+  int duration_limit_check_iterations = 6;
+  double duration_limit_check_margin = 1.05;
 
   bool reject_large_joint_jump = true;
   double max_joint_jump_inf_norm = 3.14;
