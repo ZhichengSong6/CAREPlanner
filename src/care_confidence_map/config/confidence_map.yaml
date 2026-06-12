@@ -1,0 +1,49 @@
+confidence_map:
+  frame: base_link
+
+  x_min: -0.90
+  x_max:  0.90
+  y_min: -0.90
+  y_max:  0.90
+  z_min:  0.0
+  z_max:  1.10
+
+  resolution: 0.05
+
+  update_rate: 30.0
+  publish_rate: 10.0
+
+  # Temporal memory of observed space.
+  # If a voxel is not currently visible, confidence decays as:
+  # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
+  temporal_decay_time: 2.0
+
+  marker_topic: /care_planner/confidence_map/markers
+  pointcloud_topic: /care_planner/confidence_map/points
+  fov_marker_topic: /care_planner/confidence_map/fov_markers
+  
+  marker_topic: /care_planner/confidence_map/markers
+  pointcloud_topic: /care_planner/confidence_map/points
+  fov_marker_topic: /care_planner/confidence_map/fov_markers
+  query_service: /care_planner/confidence_map/query
+
+sensor_model:
+  forward_axis: z
+
+  tof_min_range: 0.05
+  tof_max_range: 0.75
+
+  horizontal_fov_deg: 55.0
+  vertical_fov_deg: 72.0
+
+  local_resolution: 0.05
+
+  sensors:
+    - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
+    - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
+    - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
+    - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
+    - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
+    - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
+    - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
+    - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}

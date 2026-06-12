@@ -1,0 +1,5 @@
+geometry_msgs/Point[] points
+---
+float32[] confidence
+float32[] current_visibility
+uint8[] inside_map

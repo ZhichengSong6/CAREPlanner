@@ -1,0 +1,11 @@
+<launch>
+  <arg name="config_file"
+       default="$(find care_confidence_map)/config/confidence_map.yaml" />
+
+  <node pkg="care_confidence_map"
+        type="confidence_map_node"
+        name="confidence_map_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+  </node>
+</launch>

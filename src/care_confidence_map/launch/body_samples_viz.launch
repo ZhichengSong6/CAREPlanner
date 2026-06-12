@@ -1,0 +1,24 @@
+<launch>
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+
+  <arg name="marker_topic"
+       default="/care_planner/body_samples/markers" />
+
+  <arg name="publish_rate" default="10.0" />
+  <arg name="show_non_risk" default="true" />
+  <arg name="alpha" default="0.35" />
+  <arg name="scale_multiplier" default="1.0" />
+
+  <node pkg="care_confidence_map"
+        type="body_sample_marker_publisher.py"
+        name="body_sample_marker_publisher"
+        output="screen">
+    <param name="body_samples_file" value="$(arg body_samples_file)" />
+    <param name="marker_topic" value="$(arg marker_topic)" />
+    <param name="publish_rate" value="$(arg publish_rate)" />
+    <param name="show_non_risk" value="$(arg show_non_risk)" />
+    <param name="alpha" value="$(arg alpha)" />
+    <param name="scale_multiplier" value="$(arg scale_multiplier)" />
+  </node>
+</launch>
