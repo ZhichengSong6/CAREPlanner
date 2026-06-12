@@ -6,7 +6,6 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /MarkerArray3
       Splitter Ratio: 0.5
     Tree Height: 1079
   - Class: rviz/Selection
@@ -26,7 +25,7 @@ Panels:
   - Class: rviz/Time
     Name: Time
     SyncMode: 0
-    SyncSource: ""
+    SyncSource: PointCloud2
 Preferences:
   PromptSaveOnExit: true
 Toolbars:
@@ -307,7 +306,9 @@ Visualization Manager:
       Marker Topic: /care_planner/confidence_map/fov_markers
       Name: MarkerArray
       Namespaces:
-        {}
+        sensor_fov: true
+        sensor_label: true
+        sensor_origin: true
       Queue Size: 100
       Value: true
     - Alpha: 1
@@ -340,10 +341,10 @@ Visualization Manager:
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Marker Topic: /care_planner/body_samples/markers
+      Marker Topic: /care_planner/body_samples/world_markers
       Name: MarkerArray
       Namespaces:
-        body_risk_samples: true
+        {}
       Queue Size: 100
       Value: true
   Enabled: true
@@ -374,7 +375,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 1.3751983642578125
+      Distance: 4.2711567878723145
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -390,9 +391,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.3503973186016083
+      Pitch: 0.385397344827652
       Target Frame: <Fixed Frame>
-      Yaw: 6.093578338623047
+      Yaw: 5.633579254150391
     Saved: ~
 Window Geometry:
   Displays:

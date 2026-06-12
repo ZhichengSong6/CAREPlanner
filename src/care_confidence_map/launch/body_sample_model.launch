@@ -1,0 +1,36 @@
+<launch>
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+
+  <arg name="map_frame" default="base_link" />
+
+  <node pkg="care_confidence_map"
+        type="body_sample_model_node"
+        name="body_sample_model_node"
+        output="screen">
+
+    <param name="body_sample_model/body_samples_file"
+           value="$(arg body_samples_file)" />
+
+    <param name="body_sample_model/map_frame"
+           value="$(arg map_frame)" />
+
+    <param name="body_sample_model/marker_topic"
+           value="/care_planner/body_samples/world_markers" />
+
+    <param name="body_sample_model/publish_rate"
+           value="10.0" />
+
+    <param name="body_sample_model/show_non_risk_samples"
+           value="true" />
+
+    <param name="body_sample_model/show_text_labels"
+           value="true" />
+
+    <param name="body_sample_model/text_scale"
+           value="0.035" />
+
+    <param name="body_sample_model/marker_alpha"
+           value="0.45" />
+  </node>
+</launch>

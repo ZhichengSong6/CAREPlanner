@@ -1,0 +1,40 @@
+<launch>
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+
+  <arg name="map_frame" default="base_link" />
+
+  <arg name="confidence_query_service"
+       default="/care_planner/confidence_map/query" />
+
+  <node pkg="care_confidence_map"
+        type="body_observability_node"
+        name="body_observability_node"
+        output="screen">
+
+    <param name="body_observability/body_samples_file"
+           value="$(arg body_samples_file)" />
+
+    <param name="body_observability/map_frame"
+           value="$(arg map_frame)" />
+
+    <param name="body_observability/confidence_query_service"
+           value="$(arg confidence_query_service)" />
+
+    <param name="body_observability/publish_rate"
+           value="10.0" />
+
+    <param name="body_observability/query_timeout"
+           value="0.05" />
+
+    <param name="body_observability/use_risk_samples_only"
+           value="true" />
+
+    <param name="body_observability/publish_markers"
+           value="true" />
+
+    <param name="body_observability/marker_alpha"
+           value="0.75" />
+
+  </node>
+</launch>
