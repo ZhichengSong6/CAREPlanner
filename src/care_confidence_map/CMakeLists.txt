@@ -7,6 +7,7 @@ find_package(catkin REQUIRED COMPONENTS
   roscpp
   rospy
   std_msgs
+  std_srvs
   sensor_msgs
   geometry_msgs
   trajectory_msgs
@@ -41,6 +42,7 @@ catkin_package(
     roscpp
     rospy
     std_msgs
+    std_srvs
     sensor_msgs
     geometry_msgs
     trajectory_msgs
@@ -58,10 +60,6 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${YAML_CPP_INCLUDE_DIRS}
 )
-
-# ============================================================
-# Libraries
-# ============================================================
 
 add_library(body_sample_model
   src/body_sample_model.cpp
@@ -93,10 +91,6 @@ target_link_libraries(trajectory_risk_evaluator
   pinocchio::pinocchio
 )
 
-# ============================================================
-# Nodes
-# ============================================================
-
 add_executable(confidence_map_node
   src/confidence_map_node.cpp
 )
@@ -107,7 +101,9 @@ add_dependencies(confidence_map_node
 )
 
 target_link_libraries(confidence_map_node
+  body_sample_model
   ${catkin_LIBRARIES}
+  yaml-cpp
 )
 
 add_executable(body_sample_model_node
@@ -157,20 +153,12 @@ target_link_libraries(trajectory_risk_node
   pinocchio::pinocchio
 )
 
-# ============================================================
-# Python tools
-# ============================================================
-
 catkin_install_python(PROGRAMS
   scripts/test_query_confidence.py
   scripts/generate_body_samples.py
   scripts/body_sample_marker_publisher.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
-
-# ============================================================
-# Install
-# ============================================================
 
 install(TARGETS
   body_sample_model

@@ -3,6 +3,9 @@
 #include <XmlRpcValue.h>
 
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/body_sample_model.hpp>
+
+#include <std_srvs/Trigger.h>
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -20,6 +23,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -44,6 +48,13 @@ struct GridPoint
 struct LocalVisiblePoint
 {
   tf2::Vector3 p_sensor;
+};
+
+struct CurrentBodyPriorSphere
+{
+  std::string link_name;
+  tf2::Vector3 center_map;
+  double radius = 0.0;
 };
 
 class ConfidenceMapNode
@@ -71,11 +82,21 @@ public:
       return false;
     }
 
+    if (!loadCurrentBodyPriorParams())
+    {
+      ROS_ERROR("[confidence_map_node] Failed to load current_body_prior params.");
+      return false;
+    }
+
     generateGlobalGrid();
     generateSensorLocalVisiblePoints();
 
     fov_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(fov_marker_topic_, 1, true);
+
+    current_body_prior_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(
+            current_body_prior_marker_topic_, 1, true);
 
     pointcloud_pub_ =
         nh_.advertise<sensor_msgs::PointCloud2>(pointcloud_topic_, 1, true);
@@ -83,6 +104,11 @@ public:
     query_service_ =
         nh_.advertiseService(query_service_name_,
                              &ConfidenceMapNode::handleQueryConfidence,
+                             this);
+
+    refresh_body_prior_service_ =
+        nh_.advertiseService(refresh_body_prior_service_name_,
+                             &ConfidenceMapNode::handleRefreshBodyPrior,
                              this);
 
     const double update_period = 1.0 / std::max(0.1, update_rate_);
@@ -97,6 +123,14 @@ public:
         nh_.createTimer(ros::Duration(publish_period),
                         &ConfidenceMapNode::publishTimerCallback,
                         this);
+
+    if (current_body_prior_enabled_ && current_body_prior_refresh_on_startup_)
+    {
+      std::string refresh_msg;
+      refreshCurrentBodyPrior(ros::Time::now(), "startup", &refresh_msg);
+      ROS_INFO_STREAM("[confidence_map_node] startup current-body prior refresh: "
+                      << refresh_msg);
+    }
 
     printSummary();
     return true;
@@ -182,6 +216,80 @@ private:
                        << nx_ << " x " << ny_ << " x " << nz_);
       return false;
     }
+
+    return true;
+  }
+
+  bool loadCurrentBodyPriorParams()
+  {
+    ros::NodeHandle& nh = pnh_;
+
+    nh.param("current_body_prior/enabled",
+             current_body_prior_enabled_,
+             true);
+
+    nh.param("current_body_prior/refresh_on_startup",
+             current_body_prior_refresh_on_startup_,
+             true);
+
+    nh.param("current_body_prior/risk_samples_only",
+             current_body_prior_risk_samples_only_,
+             false);
+
+    nh.param("current_body_prior/inflation_radius",
+             current_body_prior_inflation_radius_,
+             0.10);
+
+    nh.param("current_body_prior/tf_timeout",
+             current_body_prior_tf_timeout_,
+             0.05);
+
+    nh.param<std::string>(
+        "current_body_prior/body_samples_file",
+        current_body_prior_body_samples_file_,
+        "");
+
+    nh.param<std::string>(
+        "current_body_prior/refresh_service",
+        refresh_body_prior_service_name_,
+        "/care_planner/confidence_map/refresh_body_prior");
+
+    nh.param<std::string>(
+        "current_body_prior/marker_topic",
+        current_body_prior_marker_topic_,
+        "/care_planner/confidence_map/current_body_prior_markers");
+
+    if (!current_body_prior_enabled_)
+    {
+      return true;
+    }
+
+    if (current_body_prior_inflation_radius_ < 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid current_body_prior/inflation_radius: "
+                       << current_body_prior_inflation_radius_);
+      return false;
+    }
+
+    if (current_body_prior_body_samples_file_.empty())
+    {
+      ROS_ERROR("[confidence_map_node] current_body_prior/body_samples_file is empty.");
+      return false;
+    }
+
+    std::string error_msg;
+    if (!current_body_sample_model_.loadFromYaml(
+            current_body_prior_body_samples_file_, &error_msg))
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Failed to load body samples for current_body_prior: "
+                       << error_msg);
+      return false;
+    }
+
+    ROS_INFO_STREAM("[confidence_map_node] Loaded "
+                    << current_body_sample_model_.size()
+                    << " body samples for current_body_prior from "
+                    << current_body_prior_body_samples_file_);
 
     return true;
   }
@@ -332,6 +440,185 @@ private:
 
     ROS_INFO_STREAM("[confidence_map_node] Generated global confidence grid with "
                     << grid_points_.size() << " points.");
+  }
+
+  int gridLinearIndex(int ix, int iy, int iz) const
+  {
+    return ix * ny_ * nz_ + iy * nz_ + iz;
+  }
+
+  void markSphereAsKnownClear(
+      const tf2::Vector3& center_map,
+      double radius,
+      const ros::Time& stamp,
+      int* updated_cells)
+  {
+    if (updated_cells == nullptr)
+    {
+      return;
+    }
+
+    const double r = std::max(0.0, radius);
+    const double r2 = r * r;
+
+    int ix_min = static_cast<int>(
+        std::floor((center_map.x() - r - x_min_) / resolution_));
+    int ix_max = static_cast<int>(
+        std::ceil((center_map.x() + r - x_min_) / resolution_));
+    int iy_min = static_cast<int>(
+        std::floor((center_map.y() - r - y_min_) / resolution_));
+    int iy_max = static_cast<int>(
+        std::ceil((center_map.y() + r - y_min_) / resolution_));
+    int iz_min = static_cast<int>(
+        std::floor((center_map.z() - r - z_min_) / resolution_));
+    int iz_max = static_cast<int>(
+        std::ceil((center_map.z() + r - z_min_) / resolution_));
+
+    ix_min = std::max(0, ix_min);
+    iy_min = std::max(0, iy_min);
+    iz_min = std::max(0, iz_min);
+    ix_max = std::min(nx_ - 1, ix_max);
+    iy_max = std::min(ny_ - 1, iy_max);
+    iz_max = std::min(nz_ - 1, iz_max);
+
+    const double stamp_sec = stamp.toSec();
+
+    for (int ix = ix_min; ix <= ix_max; ++ix)
+    {
+      const double x = x_min_ + static_cast<double>(ix) * resolution_;
+      for (int iy = iy_min; iy <= iy_max; ++iy)
+      {
+        const double y = y_min_ + static_cast<double>(iy) * resolution_;
+        for (int iz = iz_min; iz <= iz_max; ++iz)
+        {
+          const double z = z_min_ + static_cast<double>(iz) * resolution_;
+          const double dx = x - center_map.x();
+          const double dy = y - center_map.y();
+          const double dz = z - center_map.z();
+
+          if (dx * dx + dy * dy + dz * dz > r2)
+          {
+            continue;
+          }
+
+          GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
+          gp.last_seen_time = stamp_sec;
+          gp.confidence = 1.0f;
+
+          // This is a robot-body known-clear prior, not a live sensor ray.
+          // Do not set current_visibility=1 here.
+          gp.current_visibility = 0.0f;
+
+          *updated_cells += 1;
+        }
+      }
+    }
+  }
+
+  bool refreshCurrentBodyPrior(
+      const ros::Time& now,
+      const std::string& reason,
+      std::string* message)
+  {
+    last_body_prior_spheres_.clear();
+    last_body_prior_refresh_time_ = now;
+    last_body_prior_updated_cells_ = 0;
+    last_body_prior_transformed_samples_ = 0;
+    last_body_prior_skipped_samples_ = 0;
+
+    if (!current_body_prior_enabled_)
+    {
+      if (message)
+      {
+        *message = "current_body_prior disabled";
+      }
+      return true;
+    }
+
+    if (current_body_sample_model_.size() == 0)
+    {
+      if (message)
+      {
+        *message = "no body samples loaded";
+      }
+      return false;
+    }
+
+    const ros::Duration timeout(
+        std::max(0.0, current_body_prior_tf_timeout_));
+
+    for (const auto& sample : current_body_sample_model_.samples())
+    {
+      if (current_body_prior_risk_samples_only_ && !sample.include_for_risk)
+      {
+        continue;
+      }
+
+      geometry_msgs::TransformStamped tf_msg;
+      try
+      {
+        tf_msg = tf_buffer_.lookupTransform(
+            map_frame_,
+            sample.frame_name,
+            ros::Time(0),
+            timeout);
+      }
+      catch (const tf2::TransformException& ex)
+      {
+        ++last_body_prior_skipped_samples_;
+        ROS_WARN_THROTTLE(
+            2.0,
+            "[confidence_map_node] current_body_prior missing TF %s -> %s: %s",
+            map_frame_.c_str(),
+            sample.frame_name.c_str(),
+            ex.what());
+        continue;
+      }
+
+      const tf2::Transform T_map_link = transformMsgToTf2(tf_msg);
+      const tf2::Vector3 center_map = T_map_link * sample.center_link;
+      const double radius =
+          sample.radius + current_body_prior_inflation_radius_;
+
+      markSphereAsKnownClear(
+          center_map, radius, now, &last_body_prior_updated_cells_);
+
+      CurrentBodyPriorSphere sphere;
+      sphere.link_name = sample.link_name;
+      sphere.center_map = center_map;
+      sphere.radius = radius;
+      last_body_prior_spheres_.push_back(sphere);
+
+      ++last_body_prior_transformed_samples_;
+    }
+
+    std::ostringstream oss;
+    oss << "reason=" << reason
+        << ", transformed_samples=" << last_body_prior_transformed_samples_
+        << ", skipped_samples=" << last_body_prior_skipped_samples_
+        << ", updated_cells=" << last_body_prior_updated_cells_
+        << ", inflation_radius=" << current_body_prior_inflation_radius_;
+
+    if (message)
+    {
+      *message = oss.str();
+    }
+
+    if (last_body_prior_transformed_samples_ <= 0)
+    {
+      ROS_WARN_STREAM("[confidence_map_node] current_body_prior refresh failed: "
+                      << oss.str());
+      return false;
+    }
+
+    ROS_INFO_STREAM_THROTTLE(
+        1.0,
+        "[confidence_map_node] current_body_prior refreshed: "
+            << oss.str());
+
+    publishCurrentBodyPriorMarkers();
+
+    return true;
   }
 
   void generateSensorLocalVisiblePoints()
@@ -498,6 +785,19 @@ private:
       res.inside_map.push_back(1);
     }
 
+    return true;
+  }
+
+  bool handleRefreshBodyPrior(
+      std_srvs::Trigger::Request&,
+      std_srvs::Trigger::Response& res)
+  {
+    std::string message;
+    const bool ok = refreshCurrentBodyPrior(
+        ros::Time::now(), "service", &message);
+
+    res.success = ok;
+    res.message = message;
     return true;
   }
 
@@ -830,6 +1130,107 @@ private:
     return marker;
   }
 
+  visualization_msgs::Marker makeCurrentBodyPriorSphereMarker(
+      const CurrentBodyPriorSphere& sphere,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "current_body_prior_spheres";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position.x = sphere.center_map.x();
+    marker.pose.position.y = sphere.center_map.y();
+    marker.pose.position.z = sphere.center_map.z();
+    marker.pose.orientation.w = 1.0;
+
+    marker.scale.x = 2.0 * sphere.radius;
+    marker.scale.y = 2.0 * sphere.radius;
+    marker.scale.z = 2.0 * sphere.radius;
+
+    marker.color.r = 0.2f;
+    marker.color.g = 1.0f;
+    marker.color.b = 0.2f;
+    marker.color.a = 0.12f;
+
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeCurrentBodyPriorTextMarker(int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "current_body_prior_label";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position.x = 0.45;
+    marker.pose.position.y = 0.45;
+    marker.pose.position.z = 1.15;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = 0.04;
+
+    marker.color.r = 0.7f;
+    marker.color.g = 1.0f;
+    marker.color.b = 0.7f;
+    marker.color.a = 1.0f;
+
+    std::ostringstream oss;
+    oss << "current body prior"
+        << "\nbody samples + " << current_body_prior_inflation_radius_ << " m"
+        << "\nconfidence=1, visibility=0"
+        << "\nsamples=" << last_body_prior_transformed_samples_
+        << ", cells=" << last_body_prior_updated_cells_;
+
+    marker.text = oss.str();
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::MarkerArray makeCurrentBodyPriorMarkerArray() const
+  {
+    visualization_msgs::MarkerArray array;
+
+    visualization_msgs::Marker delete_marker;
+    delete_marker.header.frame_id = map_frame_;
+    delete_marker.header.stamp = ros::Time::now();
+    delete_marker.action = visualization_msgs::Marker::DELETEALL;
+    array.markers.push_back(delete_marker);
+
+    if (!current_body_prior_enabled_)
+    {
+      return array;
+    }
+
+    int marker_id = 0;
+    for (const auto& sphere : last_body_prior_spheres_)
+    {
+      array.markers.push_back(
+          makeCurrentBodyPriorSphereMarker(sphere, marker_id++));
+    }
+
+    array.markers.push_back(makeCurrentBodyPriorTextMarker(marker_id++));
+    return array;
+  }
+
+  void publishCurrentBodyPriorMarkers() const
+  {
+    if (!current_body_prior_marker_pub_)
+    {
+      return;
+    }
+    current_body_prior_marker_pub_.publish(
+        makeCurrentBodyPriorMarkerArray());
+  }
+
   bool getSensorTransforms(
       std::vector<tf2::Transform>& T_map_sensors,
       visualization_msgs::MarkerArray* marker_array)
@@ -903,6 +1304,7 @@ private:
     getSensorTransforms(T_map_sensors_unused, &marker_array);
 
     fov_marker_pub_.publish(marker_array);
+    publishCurrentBodyPriorMarkers();
 
     sensor_msgs::PointCloud2 cloud = makeGridPointCloudMsg();
     pointcloud_pub_.publish(cloud);
@@ -937,6 +1339,18 @@ private:
     ROS_INFO_STREAM("fov_marker_topic: " << fov_marker_topic_);
 
     ROS_INFO_STREAM("");
+    ROS_INFO_STREAM("current_body_prior:");
+    ROS_INFO_STREAM("  enabled: " << current_body_prior_enabled_);
+    ROS_INFO_STREAM("  body_samples_file: " << current_body_prior_body_samples_file_);
+    ROS_INFO_STREAM("  inflation_radius: " << current_body_prior_inflation_radius_);
+    ROS_INFO_STREAM("  refresh_on_startup: " << current_body_prior_refresh_on_startup_);
+    ROS_INFO_STREAM("  risk_samples_only: " << current_body_prior_risk_samples_only_);
+    ROS_INFO_STREAM("  refresh_service: " << refresh_body_prior_service_name_);
+    ROS_INFO_STREAM("  marker_topic: " << current_body_prior_marker_topic_);
+    ROS_INFO_STREAM("  last_transformed_samples: " << last_body_prior_transformed_samples_);
+    ROS_INFO_STREAM("  last_updated_cells: " << last_body_prior_updated_cells_);
+
+    ROS_INFO_STREAM("");
     ROS_INFO_STREAM("sensor model:");
     ROS_INFO_STREAM("  forward_axis: " << forward_axis_);
     ROS_INFO_STREAM("  range: [" << tof_min_range_ << ", " << tof_max_range_ << "]");
@@ -966,8 +1380,10 @@ private:
   tf2_ros::TransformListener tf_listener_;
 
   ros::Publisher fov_marker_pub_;
+  ros::Publisher current_body_prior_marker_pub_;
   ros::Publisher pointcloud_pub_;
   ros::ServiceServer query_service_;
+  ros::ServiceServer refresh_body_prior_service_;
 
   ros::Timer update_timer_;
   ros::Timer publish_timer_;
@@ -994,6 +1410,23 @@ private:
   std::string pointcloud_topic_;
   std::string fov_marker_topic_;
   std::string query_service_name_;
+
+  bool current_body_prior_enabled_ = true;
+  bool current_body_prior_refresh_on_startup_ = true;
+  bool current_body_prior_risk_samples_only_ = false;
+  double current_body_prior_inflation_radius_ = 0.10;
+  double current_body_prior_tf_timeout_ = 0.05;
+  std::string current_body_prior_body_samples_file_;
+  std::string refresh_body_prior_service_name_ =
+      "/care_planner/confidence_map/refresh_body_prior";
+  std::string current_body_prior_marker_topic_ =
+      "/care_planner/confidence_map/current_body_prior_markers";
+  care_confidence_map::BodySampleModel current_body_sample_model_;
+  std::vector<CurrentBodyPriorSphere> last_body_prior_spheres_;
+  ros::Time last_body_prior_refresh_time_;
+  int last_body_prior_updated_cells_ = 0;
+  int last_body_prior_transformed_samples_ = 0;
+  int last_body_prior_skipped_samples_ = 0;
 
   std::string forward_axis_;
   tf2::Vector3 forward_dir_;

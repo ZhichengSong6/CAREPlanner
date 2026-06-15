@@ -1,6 +1,8 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
 #include <care_confidence_map/QueryConfidence.h>
 
+#include <std_srvs/Trigger.h>
+
 #include <ros/ros.h>
 
 #include <std_msgs/Float32.h>
@@ -52,6 +54,10 @@ public:
         nh_.serviceClient<care_confidence_map::QueryConfidence>(
             confidence_query_service_);
 
+    refresh_body_prior_client_ =
+        nh_.serviceClient<std_srvs::Trigger>(
+            refresh_body_prior_service_);
+
     trajectory_sub_ =
         nh_.subscribe(
             input_trajectory_topic_,
@@ -99,6 +105,10 @@ public:
         nh_.advertise<visualization_msgs::MarkerArray>(
             "/care_planner/trajectory_risk/worst_timestep_markers", 1, true);
 
+    attribution_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(
+            "/care_planner/trajectory_risk/attribution_markers", 1, true);
+
     eval_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
             "/care_planner/trajectory_risk/eval_time_ms", 1, true);
@@ -126,6 +136,22 @@ public:
     timing_summary_pub_ =
         nh_.advertise<std_msgs::String>(
             "/care_planner/trajectory_risk/timing_summary", 1, true);
+
+    attribution_summary_pub_ =
+        nh_.advertise<std_msgs::String>(
+            "/care_planner/trajectory_risk/attribution_summary", 1, true);
+
+    timestep_attribution_pub_ =
+        nh_.advertise<std_msgs::String>(
+            "/care_planner/trajectory_risk/timestep_attribution", 1, true);
+
+    link_attribution_pub_ =
+        nh_.advertise<std_msgs::String>(
+            "/care_planner/trajectory_risk/link_attribution", 1, true);
+
+    topk_sample_attribution_pub_ =
+        nh_.advertise<std_msgs::String>(
+            "/care_planner/trajectory_risk/topk_sample_attribution", 1, true);
 
     eval_timer_ =
         nh_.createTimer(
@@ -200,9 +226,74 @@ private:
     double fk_time_ms = 0.0;
     double query_time_ms = 0.0;
     double risk_compute_time_ms = 0.0;
+    double attribution_time_ms = 0.0;
     double marker_time_ms = 0.0;
     double total_time_ms = 0.0;
     bool published_markers = false;
+  };
+
+  struct LinkAttributionStats
+  {
+    std::string link_name = "none";
+
+    int sample_count = 0;
+    int inside_count = 0;
+    int outside_count = 0;
+    int visible_count = 0;
+
+    double confidence_sum = 0.0;
+    double mean_confidence = 0.0;
+    double min_confidence = 0.0;
+    double visible_ratio = 0.0;
+    double gap = 1.0;
+  };
+
+  struct SampleAttributionItem
+  {
+    int eval_timestep = -1;
+    int original_timestep = -1;
+
+    std::string link_name = "none";
+    int sample_index_in_link = -1;
+    int source_collision_index = -1;
+
+    double confidence = 0.0;
+    double gap = 1.0;
+    double current_visibility = 0.0;
+    bool inside = false;
+
+    Eigen::Vector3d center_base = Eigen::Vector3d::Zero();
+    double radius = 0.01;
+  };
+
+  struct AttributionResult
+  {
+    bool success = false;
+    std::string message = "not evaluated";
+
+    double trajectory_gap = 1.0;
+
+    int worst_eval_timestep = -1;
+    int worst_original_timestep = -1;
+    double worst_timestep_gap = 1.0;
+    double worst_timestep_mean_confidence = 0.0;
+    double worst_timestep_visible_ratio = 0.0;
+
+    std::string worst_link_over_trajectory = "none";
+    double worst_link_gap_over_trajectory = 1.0;
+    double worst_link_mean_confidence_over_trajectory = 0.0;
+    double worst_link_visible_ratio_over_trajectory = 0.0;
+
+    std::string worst_link_at_worst_timestep = "none";
+    double worst_link_gap_at_worst_timestep = 1.0;
+    double worst_link_mean_confidence_at_worst_timestep = 0.0;
+    double worst_link_visible_ratio_at_worst_timestep = 0.0;
+
+    std::vector<LinkAttributionStats> link_stats_over_trajectory;
+    std::vector<LinkAttributionStats> link_stats_at_worst_timestep;
+
+    std::vector<SampleAttributionItem> topk_low_confidence_samples;
+    std::vector<SampleAttributionItem> worst_timestep_worst_link_samples;
   };
 
   void loadParams()
@@ -232,6 +323,21 @@ private:
         confidence_query_service_,
         "/care_planner/confidence_map/query");
 
+    pnh_.param<std::string>(
+        "trajectory_risk/refresh_body_prior_service",
+        refresh_body_prior_service_,
+        "/care_planner/confidence_map/refresh_body_prior");
+
+    pnh_.param(
+        "trajectory_risk/refresh_body_prior_before_query",
+        refresh_body_prior_before_query_,
+        true);
+
+    pnh_.param(
+        "trajectory_risk/refresh_body_prior_timeout",
+        refresh_body_prior_timeout_,
+        0.10);
+
     pnh_.param(
         "trajectory_risk/eval_rate",
         eval_rate_,
@@ -258,6 +364,11 @@ private:
         0.85);
 
     pnh_.param(
+        "trajectory_risk/attribution_marker_alpha",
+        attribution_marker_alpha_,
+        0.90);
+
+    pnh_.param(
         "trajectory_risk/marker_publish_rate",
         marker_publish_rate_,
         2.0);
@@ -273,6 +384,16 @@ private:
         true);
 
     pnh_.param(
+        "trajectory_risk/show_attribution_markers",
+        show_attribution_markers_,
+        true);
+
+    pnh_.param(
+        "trajectory_risk/top_k_samples",
+        top_k_samples_,
+        20);
+
+    pnh_.param(
         "trajectory_risk/evaluate_stale_trajectory",
         evaluate_stale_trajectory_,
         true);
@@ -281,6 +402,18 @@ private:
         "trajectory_risk/stale_trajectory_timeout",
         stale_trajectory_timeout_,
         1.0);
+
+    ignored_risk_links_.clear();
+    if (!pnh_.getParam("trajectory_risk/ignored_risk_links",
+                       ignored_risk_links_))
+    {
+      ROS_WARN_STREAM("[trajectory_risk_node] "
+                      "trajectory_risk/ignored_risk_links is not set. "
+                      "No links will be ignored.");
+    }
+
+    ROS_INFO_STREAM("[trajectory_risk_node] ignored_risk_links: "
+                    << ignoredRiskLinksToString());
   }
 
   double wallMs(const ros::WallTime& start, const ros::WallTime& end) const
@@ -309,6 +442,30 @@ private:
     std_msgs::Int32 msg;
     msg.data = value;
     return msg;
+  }
+
+  bool isIgnoredRiskLink(const std::string& link_name) const
+  {
+    return std::find(
+               ignored_risk_links_.begin(),
+               ignored_risk_links_.end(),
+               link_name) != ignored_risk_links_.end();
+  }
+
+  std::string ignoredRiskLinksToString() const
+  {
+    std::ostringstream oss;
+
+    for (std::size_t i = 0; i < ignored_risk_links_.size(); ++i)
+    {
+      if (i > 0)
+      {
+        oss << ",";
+      }
+      oss << ignored_risk_links_[i];
+    }
+
+    return oss.str();
   }
 
   std::vector<int> makeDownsampleIndices(int input_size) const
@@ -480,6 +637,50 @@ private:
     return true;
   }
 
+  bool refreshBodyPriorBeforeQuery()
+  {
+    if (!refresh_body_prior_before_query_)
+    {
+      return true;
+    }
+
+    if (!refresh_body_prior_client_.waitForExistence(
+            ros::Duration(refresh_body_prior_timeout_)))
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "[trajectory_risk_node] Waiting for refresh body prior service: %s",
+          refresh_body_prior_service_.c_str());
+      return false;
+    }
+
+    std_srvs::Trigger srv;
+    if (!refresh_body_prior_client_.call(srv))
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "[trajectory_risk_node] Failed to call refresh body prior service: %s",
+          refresh_body_prior_service_.c_str());
+      return false;
+    }
+
+    if (!srv.response.success)
+    {
+      ROS_WARN_THROTTLE(
+          2.0,
+          "[trajectory_risk_node] Refresh body prior service returned failure: %s",
+          srv.response.message.c_str());
+      return false;
+    }
+
+    ROS_INFO_THROTTLE(
+        2.0,
+        "[trajectory_risk_node] Refreshed current-body confidence prior before trajectory query: %s",
+        srv.response.message.c_str());
+
+    return true;
+  }
+
   bool queryTrajectoryConfidence(
       const care_confidence_map::TrajectorySampleResult& sample_result,
       care_confidence_map::QueryConfidence* srv)
@@ -558,6 +759,7 @@ private:
     {
       TimestepStats& ts =
           result.timestep_stats[static_cast<std::size_t>(k)];
+
       ts.timestep_index = k;
 
       if (k < static_cast<int>(eval_to_original_index.size()))
@@ -582,7 +784,7 @@ private:
       double timestep_min_confidence =
           std::numeric_limits<double>::infinity();
 
-      ts.total_count = static_cast<int>(frame.samples.size());
+      ts.total_count = 0;
 
       for (const auto& sample : frame.samples)
       {
@@ -595,6 +797,14 @@ private:
         const double visible =
             static_cast<double>(
                 srv.response.current_visibility[flat_index]);
+
+        if (isIgnoredRiskLink(sample.link_name))
+        {
+          flat_index += 1;
+          continue;
+        }
+
+        ts.total_count += 1;
 
         if (!inside)
         {
@@ -668,9 +878,16 @@ private:
         ts.min_confidence = 0.0;
         ts.visible_ratio = 0.0;
         ts.worst_confidence = 0.0;
+        ts.worst_link = "none";
       }
 
-      ts.risk = std::max(0.0, std::min(1.0, 1.0 - ts.mean_confidence));
+      if (!std::isfinite(ts.min_confidence))
+      {
+        ts.min_confidence = 0.0;
+      }
+
+      ts.risk =
+          std::max(0.0, std::min(1.0, 1.0 - ts.mean_confidence));
 
       if (ts.risk > result.score || result.worst_risk_timestep < 0)
       {
@@ -703,6 +920,7 @@ private:
       result.worst_confidence = 0.0;
       result.score = 1.0;
       result.worst_timestep_risk = 1.0;
+      result.worst_link = "none";
     }
 
     if (!std::isfinite(result.min_confidence))
@@ -711,6 +929,301 @@ private:
     }
 
     return result;
+  }
+
+  LinkAttributionStats finalizeLinkAttributionStats(
+      const LinkAttributionStats& in) const
+  {
+    LinkAttributionStats out = in;
+
+    if (out.inside_count > 0)
+    {
+      out.mean_confidence =
+          out.confidence_sum / static_cast<double>(out.inside_count);
+
+      out.visible_ratio =
+          static_cast<double>(out.visible_count) /
+          static_cast<double>(out.inside_count);
+
+      out.gap =
+          std::max(0.0, std::min(1.0, 1.0 - out.mean_confidence));
+
+      if (!std::isfinite(out.min_confidence))
+      {
+        out.min_confidence = 0.0;
+      }
+    }
+    else
+    {
+      out.mean_confidence = 0.0;
+      out.min_confidence = 0.0;
+      out.visible_ratio = 0.0;
+      out.gap = 1.0;
+    }
+
+    return out;
+  }
+
+  void updateLinkAttributionStats(
+      const std::string& link_name,
+      bool inside,
+      double confidence,
+      double current_visibility,
+      std::map<std::string, LinkAttributionStats>* stats_map) const
+  {
+    LinkAttributionStats& stats = (*stats_map)[link_name];
+
+    if (stats.link_name == "none")
+    {
+      stats.link_name = link_name;
+      stats.min_confidence = std::numeric_limits<double>::infinity();
+    }
+
+    stats.sample_count += 1;
+
+    if (!inside)
+    {
+      stats.outside_count += 1;
+      return;
+    }
+
+    stats.inside_count += 1;
+    stats.confidence_sum += confidence;
+
+    if (current_visibility > 0.5)
+    {
+      stats.visible_count += 1;
+    }
+
+    if (confidence < stats.min_confidence)
+    {
+      stats.min_confidence = confidence;
+    }
+  }
+
+  std::vector<LinkAttributionStats> finalizeAndSortLinkStats(
+      const std::map<std::string, LinkAttributionStats>& stats_map) const
+  {
+    std::vector<LinkAttributionStats> out;
+    out.reserve(stats_map.size());
+
+    for (const auto& kv : stats_map)
+    {
+      out.push_back(finalizeLinkAttributionStats(kv.second));
+    }
+
+    std::sort(
+        out.begin(),
+        out.end(),
+        [](const LinkAttributionStats& a,
+           const LinkAttributionStats& b)
+        {
+          if (std::fabs(a.gap - b.gap) > 1e-9)
+          {
+            return a.gap > b.gap;
+          }
+          return a.link_name < b.link_name;
+        });
+
+    return out;
+  }
+
+  static bool sampleAttributionLess(
+      const SampleAttributionItem& a,
+      const SampleAttributionItem& b)
+  {
+    if (std::fabs(a.gap - b.gap) > 1e-9)
+    {
+      return a.gap > b.gap;
+    }
+
+    if (std::fabs(a.confidence - b.confidence) > 1e-9)
+    {
+      return a.confidence < b.confidence;
+    }
+
+    if (a.eval_timestep != b.eval_timestep)
+    {
+      return a.eval_timestep < b.eval_timestep;
+    }
+
+    if (a.link_name != b.link_name)
+    {
+      return a.link_name < b.link_name;
+    }
+
+    return a.sample_index_in_link < b.sample_index_in_link;
+  }
+
+  AttributionResult computeAttributionResult(
+      const care_confidence_map::TrajectorySampleResult& sample_result,
+      const care_confidence_map::QueryConfidence& srv,
+      const RiskResult& risk_result) const
+  {
+    AttributionResult attr;
+
+    if (!sample_result.success || !risk_result.success)
+    {
+      attr.success = false;
+      attr.message = "sample_result or risk_result is not successful";
+      return attr;
+    }
+
+    attr.success = true;
+    attr.message = "OK";
+
+    attr.trajectory_gap = risk_result.score;
+
+    attr.worst_eval_timestep = risk_result.worst_risk_timestep;
+    attr.worst_original_timestep = risk_result.worst_risk_original_timestep;
+    attr.worst_timestep_gap = risk_result.worst_timestep_risk;
+
+    if (risk_result.worst_risk_timestep >= 0 &&
+        risk_result.worst_risk_timestep <
+            static_cast<int>(risk_result.timestep_stats.size()))
+    {
+      const TimestepStats& ts =
+          risk_result.timestep_stats[
+              static_cast<std::size_t>(risk_result.worst_risk_timestep)];
+
+      attr.worst_timestep_mean_confidence = ts.mean_confidence;
+      attr.worst_timestep_visible_ratio = ts.visible_ratio;
+    }
+
+    std::map<std::string, LinkAttributionStats> link_stats_all;
+    std::map<std::string, LinkAttributionStats> link_stats_worst_timestep;
+
+    std::vector<SampleAttributionItem> all_sample_items;
+    all_sample_items.reserve(
+        static_cast<std::size_t>(sample_result.total_samples));
+
+    std::size_t flat_index = 0;
+
+    for (const auto& frame : sample_result.frames)
+    {
+      int original_timestep = -1;
+      if (frame.timestep_index >= 0 &&
+          frame.timestep_index <
+              static_cast<int>(risk_result.eval_to_original_index.size()))
+      {
+        original_timestep =
+            risk_result.eval_to_original_index[
+                static_cast<std::size_t>(frame.timestep_index)];
+      }
+
+      for (const auto& sample : frame.samples)
+      {
+        const bool inside =
+            (srv.response.inside_map[flat_index] != 0);
+
+        const double confidence =
+            static_cast<double>(srv.response.confidence[flat_index]);
+
+        const double current_visibility =
+            static_cast<double>(
+                srv.response.current_visibility[flat_index]);
+
+        if (isIgnoredRiskLink(sample.link_name))
+        {
+          flat_index += 1;
+          continue;
+        }
+
+        updateLinkAttributionStats(
+            sample.link_name,
+            inside,
+            confidence,
+            current_visibility,
+            &link_stats_all);
+
+        if (frame.timestep_index == risk_result.worst_risk_timestep)
+        {
+          updateLinkAttributionStats(
+              sample.link_name,
+              inside,
+              confidence,
+              current_visibility,
+              &link_stats_worst_timestep);
+        }
+
+        SampleAttributionItem item;
+        item.eval_timestep = frame.timestep_index;
+        item.original_timestep = original_timestep;
+        item.link_name = sample.link_name;
+        item.sample_index_in_link = sample.sample_index_in_link;
+        item.source_collision_index = sample.source_collision_index;
+        item.confidence = inside ? confidence : 0.0;
+        item.gap =
+            inside
+                ? std::max(0.0, std::min(1.0, 1.0 - confidence))
+                : 1.0;
+        item.current_visibility = current_visibility;
+        item.inside = inside;
+        item.center_base = sample.center_base;
+        item.radius = sample.radius;
+
+        all_sample_items.push_back(item);
+
+        flat_index += 1;
+      }
+    }
+
+    attr.link_stats_over_trajectory =
+        finalizeAndSortLinkStats(link_stats_all);
+
+    attr.link_stats_at_worst_timestep =
+        finalizeAndSortLinkStats(link_stats_worst_timestep);
+
+    if (!attr.link_stats_over_trajectory.empty())
+    {
+      const LinkAttributionStats& worst =
+          attr.link_stats_over_trajectory.front();
+
+      attr.worst_link_over_trajectory = worst.link_name;
+      attr.worst_link_gap_over_trajectory = worst.gap;
+      attr.worst_link_mean_confidence_over_trajectory =
+          worst.mean_confidence;
+      attr.worst_link_visible_ratio_over_trajectory =
+          worst.visible_ratio;
+    }
+
+    if (!attr.link_stats_at_worst_timestep.empty())
+    {
+      const LinkAttributionStats& worst =
+          attr.link_stats_at_worst_timestep.front();
+
+      attr.worst_link_at_worst_timestep = worst.link_name;
+      attr.worst_link_gap_at_worst_timestep = worst.gap;
+      attr.worst_link_mean_confidence_at_worst_timestep =
+          worst.mean_confidence;
+      attr.worst_link_visible_ratio_at_worst_timestep =
+          worst.visible_ratio;
+    }
+
+    std::sort(
+        all_sample_items.begin(),
+        all_sample_items.end(),
+        sampleAttributionLess);
+
+    const int top_k =
+        std::max(0,
+                 std::min(top_k_samples_,
+                          static_cast<int>(all_sample_items.size())));
+
+    attr.topk_low_confidence_samples.assign(
+        all_sample_items.begin(),
+        all_sample_items.begin() + top_k);
+
+    for (const auto& item : all_sample_items)
+    {
+      if (item.eval_timestep == attr.worst_eval_timestep &&
+          item.link_name == attr.worst_link_at_worst_timestep)
+      {
+        attr.worst_timestep_worst_link_samples.push_back(item);
+      }
+    }
+
+    return attr;
   }
 
   visualization_msgs::Marker makeDeleteAllMarker(const std::string& ns) const
@@ -790,6 +1303,99 @@ private:
     return marker;
   }
 
+  visualization_msgs::Marker makeAttributionSampleMarker(
+      const SampleAttributionItem& item,
+      const std::string& ns_prefix,
+      int marker_id,
+      bool is_topk_marker) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+
+    marker.ns =
+        ns_prefix +
+        "/t" +
+        std::to_string(item.eval_timestep) +
+        "/" +
+        item.link_name;
+
+    marker.id = marker_id;
+
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position = toPointMsg(item.center_base);
+    marker.pose.orientation.w = 1.0;
+
+    const double scale_multiplier = is_topk_marker ? 3.0 : 2.5;
+    marker.scale.x = scale_multiplier * item.radius;
+    marker.scale.y = scale_multiplier * item.radius;
+    marker.scale.z = scale_multiplier * item.radius;
+
+    if (is_topk_marker)
+    {
+      marker.color.r = 1.0f;
+      marker.color.g = 0.0f;
+      marker.color.b = 0.0f;
+      marker.color.a = static_cast<float>(attribution_marker_alpha_);
+    }
+    else
+    {
+      marker.color.r = 1.0f;
+      marker.color.g = 0.8f;
+      marker.color.b = 0.0f;
+      marker.color.a = static_cast<float>(attribution_marker_alpha_);
+    }
+
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeAttributionTextMarker(
+      const AttributionResult& attr,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+
+    marker.ns = "trajectory_risk/attribution_text";
+    marker.id = marker_id;
+
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position.x = 0.0;
+    marker.pose.position.y = 0.0;
+    marker.pose.position.z = 1.25;
+    marker.pose.orientation.w = 1.0;
+
+    marker.scale.z = 0.045;
+
+    marker.color.r = 1.0f;
+    marker.color.g = 1.0f;
+    marker.color.b = 1.0f;
+    marker.color.a = 1.0f;
+
+    std::ostringstream oss;
+    oss << "U_gap attribution"
+        << "\ntrajectory_gap = " << attr.trajectory_gap
+        << "\nignored links = " << ignoredRiskLinksToString()
+        << "\nworst eval timestep = " << attr.worst_eval_timestep
+        << "\nworst original timestep = " << attr.worst_original_timestep
+        << "\nworst link over trajectory = " << attr.worst_link_over_trajectory
+        << "\nworst link at worst timestep = " << attr.worst_link_at_worst_timestep
+        << "\ntop-K samples = " << attr.topk_low_confidence_samples.size();
+
+    marker.text = oss.str();
+
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
   visualization_msgs::Marker makeWorstTimestepTextMarker(
       const RiskResult& result,
       int marker_id) const
@@ -819,6 +1425,7 @@ private:
 
     std::ostringstream oss;
     oss << "Trajectory risk = " << result.score
+        << "\nIgnored links = " << ignoredRiskLinksToString()
         << "\nWorst eval timestep = " << result.worst_risk_timestep
         << "\nWorst original timestep = "
         << result.worst_risk_original_timestep
@@ -841,6 +1448,7 @@ private:
         << ", message=" << result.message
         << ", score=" << result.score
         << ", rule=max_timestep(1-mean_confidence)"
+        << ", ignored_risk_links=" << ignoredRiskLinksToString()
         << ", mean_confidence=" << result.mean_confidence
         << ", min_confidence=" << result.min_confidence
         << ", visible_ratio=" << result.visible_ratio
@@ -848,9 +1456,9 @@ private:
         << ", eval_num_timesteps=" << result.eval_num_timesteps
         << ", max_eval_timesteps=" << max_eval_timesteps_
         << ", samples_per_timestep=" << result.samples_per_timestep
-        << ", total_samples=" << result.total_samples
-        << ", inside=" << result.inside_count
-        << ", outside=" << result.outside_count
+        << ", total_samples_queried=" << result.total_samples
+        << ", risk_inside=" << result.inside_count
+        << ", risk_outside=" << result.outside_count
         << ", worst_risk_timestep=" << result.worst_risk_timestep
         << ", worst_risk_original_timestep="
         << result.worst_risk_original_timestep
@@ -883,9 +1491,9 @@ private:
           << ", mean=" << ts.mean_confidence
           << ", min=" << ts.min_confidence
           << ", visible_ratio=" << ts.visible_ratio
-          << ", inside=" << ts.inside_count
-          << ", outside=" << ts.outside_count
-          << ", total=" << ts.total_count
+          << ", risk_inside=" << ts.inside_count
+          << ", risk_outside=" << ts.outside_count
+          << ", risk_total=" << ts.total_count
           << ", worst_link=" << ts.worst_link
           << ", worst_conf=" << ts.worst_confidence
           << ", worst_sample_index_in_link="
@@ -910,6 +1518,7 @@ private:
         << ", worst_timestep_risk=" << result.worst_timestep_risk
         << ", trajectory_score=" << result.score
         << ", rule=max_timestep(1-mean_confidence)"
+        << ", ignored_risk_links=" << ignoredRiskLinksToString()
         << ", worst_sample_timestep=" << result.worst_sample_timestep
         << ", worst_sample_original_timestep="
         << result.worst_sample_original_timestep
@@ -931,9 +1540,9 @@ private:
       oss << ", timestep_mean_confidence=" << ts.mean_confidence
           << ", timestep_min_confidence=" << ts.min_confidence
           << ", timestep_visible_ratio=" << ts.visible_ratio
-          << ", timestep_inside=" << ts.inside_count
-          << ", timestep_outside=" << ts.outside_count
-          << ", timestep_total=" << ts.total_count
+          << ", timestep_risk_inside=" << ts.inside_count
+          << ", timestep_risk_outside=" << ts.outside_count
+          << ", timestep_risk_total=" << ts.total_count
           << ", timestep_worst_link=" << ts.worst_link
           << ", timestep_worst_confidence=" << ts.worst_confidence;
     }
@@ -954,6 +1563,7 @@ private:
         << ", fk_ms=" << timing.fk_time_ms
         << ", query_ms=" << timing.query_time_ms
         << ", risk_compute_ms=" << timing.risk_compute_time_ms
+        << ", attribution_ms=" << timing.attribution_time_ms
         << ", marker_ms=" << timing.marker_time_ms
         << ", convert_ms=" << timing.convert_time_ms
         << ", input_age_ms=" << timing.input_age_ms
@@ -961,8 +1571,174 @@ private:
         << ", target_period_ms=" << (1000.0 / std::max(0.1, eval_rate_))
         << ", input_num_timesteps=" << result.input_num_timesteps
         << ", eval_num_timesteps=" << result.eval_num_timesteps
-        << ", total_samples=" << result.total_samples
+        << ", total_samples_queried=" << result.total_samples
+        << ", risk_inside=" << result.inside_count
         << ", markers_published=" << timing.published_markers;
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    return msg;
+  }
+
+  std_msgs::String makeAttributionSummaryMsg(
+      const AttributionResult& attr) const
+  {
+    std::ostringstream oss;
+
+    oss << "trajectory_attribution: "
+        << "success=" << attr.success
+        << ", message=" << attr.message
+        << ", ignored_risk_links=" << ignoredRiskLinksToString()
+        << ", trajectory_gap=" << attr.trajectory_gap
+        << ", worst_eval_timestep=" << attr.worst_eval_timestep
+        << ", worst_original_timestep=" << attr.worst_original_timestep
+        << ", worst_timestep_gap=" << attr.worst_timestep_gap
+        << ", worst_timestep_mean_confidence="
+        << attr.worst_timestep_mean_confidence
+        << ", worst_timestep_visible_ratio="
+        << attr.worst_timestep_visible_ratio
+        << ", worst_link_over_trajectory="
+        << attr.worst_link_over_trajectory
+        << ", worst_link_gap_over_trajectory="
+        << attr.worst_link_gap_over_trajectory
+        << ", worst_link_mean_confidence_over_trajectory="
+        << attr.worst_link_mean_confidence_over_trajectory
+        << ", worst_link_visible_ratio_over_trajectory="
+        << attr.worst_link_visible_ratio_over_trajectory
+        << ", worst_link_at_worst_timestep="
+        << attr.worst_link_at_worst_timestep
+        << ", worst_link_gap_at_worst_timestep="
+        << attr.worst_link_gap_at_worst_timestep
+        << ", worst_link_mean_confidence_at_worst_timestep="
+        << attr.worst_link_mean_confidence_at_worst_timestep
+        << ", worst_link_visible_ratio_at_worst_timestep="
+        << attr.worst_link_visible_ratio_at_worst_timestep
+        << ", topk_sample_count="
+        << attr.topk_low_confidence_samples.size()
+        << ", worst_timestep_worst_link_sample_count="
+        << attr.worst_timestep_worst_link_samples.size();
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    return msg;
+  }
+
+  std_msgs::String makeTimestepAttributionMsg(
+      const RiskResult& result) const
+  {
+    std::ostringstream oss;
+
+    oss << "trajectory_timestep_attribution:";
+
+    for (const auto& ts : result.timestep_stats)
+    {
+      const double timestep_gap =
+          std::max(0.0, std::min(1.0, 1.0 - ts.mean_confidence));
+
+      oss << "\n  eval_t=" << ts.timestep_index
+          << ", original_t=" << ts.original_timestep_index
+          << ", gap=" << timestep_gap
+          << ", mean_confidence=" << ts.mean_confidence
+          << ", min_confidence=" << ts.min_confidence
+          << ", visible_ratio=" << ts.visible_ratio
+          << ", risk_inside=" << ts.inside_count
+          << ", risk_outside=" << ts.outside_count
+          << ", risk_total=" << ts.total_count
+          << ", worst_link=" << ts.worst_link
+          << ", worst_confidence=" << ts.worst_confidence;
+    }
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    return msg;
+  }
+
+  std_msgs::String makeLinkAttributionMsg(
+      const AttributionResult& attr) const
+  {
+    std::ostringstream oss;
+
+    oss << "trajectory_link_attribution:"
+        << "\n  ignored_risk_links=" << ignoredRiskLinksToString();
+
+    oss << "\n  over_trajectory:";
+
+    for (const auto& link : attr.link_stats_over_trajectory)
+    {
+      oss << "\n    " << link.link_name
+          << ": gap=" << link.gap
+          << ", mean_confidence=" << link.mean_confidence
+          << ", min_confidence=" << link.min_confidence
+          << ", visible_ratio=" << link.visible_ratio
+          << ", inside=" << link.inside_count
+          << ", outside=" << link.outside_count
+          << ", total=" << link.sample_count;
+    }
+
+    oss << "\n  at_worst_timestep:";
+
+    for (const auto& link : attr.link_stats_at_worst_timestep)
+    {
+      oss << "\n    " << link.link_name
+          << ": gap=" << link.gap
+          << ", mean_confidence=" << link.mean_confidence
+          << ", min_confidence=" << link.min_confidence
+          << ", visible_ratio=" << link.visible_ratio
+          << ", inside=" << link.inside_count
+          << ", outside=" << link.outside_count
+          << ", total=" << link.sample_count;
+    }
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    return msg;
+  }
+
+  std_msgs::String makeTopKSampleAttributionMsg(
+      const AttributionResult& attr) const
+  {
+    std::ostringstream oss;
+
+    oss << "trajectory_topk_sample_attribution:"
+        << "\n  ignored_risk_links=" << ignoredRiskLinksToString()
+        << "\n  top_k=" << attr.topk_low_confidence_samples.size()
+        << "\n  samples:";
+
+    int rank = 0;
+    for (const auto& item : attr.topk_low_confidence_samples)
+    {
+      oss << "\n    #" << rank
+          << ": eval_t=" << item.eval_timestep
+          << ", original_t=" << item.original_timestep
+          << ", link=" << item.link_name
+          << ", sample_index_in_link=" << item.sample_index_in_link
+          << ", source_collision_index=" << item.source_collision_index
+          << ", confidence=" << item.confidence
+          << ", gap=" << item.gap
+          << ", current_visibility=" << item.current_visibility
+          << ", inside=" << item.inside;
+      rank += 1;
+    }
+
+    oss << "\n  worst_timestep_worst_link="
+        << attr.worst_link_at_worst_timestep
+        << "\n  worst_timestep_worst_link_samples=";
+
+    rank = 0;
+    for (const auto& item : attr.worst_timestep_worst_link_samples)
+    {
+      oss << "\n    #" << rank
+          << ": eval_t=" << item.eval_timestep
+          << ", original_t=" << item.original_timestep
+          << ", link=" << item.link_name
+          << ", sample_index_in_link=" << item.sample_index_in_link
+          << ", source_collision_index=" << item.source_collision_index
+          << ", confidence=" << item.confidence
+          << ", gap=" << item.gap
+          << ", current_visibility=" << item.current_visibility
+          << ", inside=" << item.inside;
+      rank += 1;
+    }
 
     std_msgs::String msg;
     msg.data = oss.str();
@@ -992,6 +1768,16 @@ private:
     marker_time_pub_.publish(makeFloatMsg(timing.marker_time_ms));
     input_age_pub_.publish(makeFloatMsg(timing.input_age_ms));
     timing_summary_pub_.publish(makeTimingSummaryMsg(result, timing));
+  }
+
+  void publishAttribution(
+      const AttributionResult& attr,
+      const RiskResult& result)
+  {
+    attribution_summary_pub_.publish(makeAttributionSummaryMsg(attr));
+    timestep_attribution_pub_.publish(makeTimestepAttributionMsg(result));
+    link_attribution_pub_.publish(makeLinkAttributionMsg(attr));
+    topk_sample_attribution_pub_.publish(makeTopKSampleAttributionMsg(attr));
   }
 
   bool shouldPublishMarkers()
@@ -1115,6 +1901,47 @@ private:
     worst_timestep_marker_pub_.publish(array);
   }
 
+  void publishAttributionMarkers(
+      const AttributionResult& attr)
+  {
+    visualization_msgs::MarkerArray array;
+    array.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/attribution"));
+
+    if (!show_attribution_markers_ || !attr.success)
+    {
+      attribution_marker_pub_.publish(array);
+      return;
+    }
+
+    int marker_id = 1;
+
+    for (const auto& item : attr.topk_low_confidence_samples)
+    {
+      array.markers.push_back(
+          makeAttributionSampleMarker(
+              item,
+              "trajectory_risk/attribution/topk",
+              marker_id++,
+              true));
+    }
+
+    for (const auto& item : attr.worst_timestep_worst_link_samples)
+    {
+      array.markers.push_back(
+          makeAttributionSampleMarker(
+              item,
+              "trajectory_risk/attribution/worst_timestep_worst_link",
+              marker_id++,
+              false));
+    }
+
+    array.markers.push_back(
+        makeAttributionTextMarker(attr, marker_id++));
+
+    attribution_marker_pub_.publish(array);
+  }
+
   void publishEmptyOutputsWithError(const std::string& message)
   {
     RiskResult result;
@@ -1122,6 +1949,11 @@ private:
     result.message = message;
 
     publishRiskStats(result);
+
+    AttributionResult attr;
+    attr.success = false;
+    attr.message = message;
+    publishAttribution(attr, result);
 
     visualization_msgs::MarkerArray full_delete;
     full_delete.markers.push_back(
@@ -1132,6 +1964,11 @@ private:
     worst_delete.markers.push_back(
         makeDeleteAllMarker("trajectory_risk/worst_timestep"));
     worst_timestep_marker_pub_.publish(worst_delete);
+
+    visualization_msgs::MarkerArray attr_delete;
+    attr_delete.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/attribution"));
+    attribution_marker_pub_.publish(attr_delete);
   }
 
   bool getLatestTrajectory(
@@ -1230,6 +2067,17 @@ private:
       return;
     }
 
+    if (!refreshBodyPriorBeforeQuery())
+    {
+      const std::string msg =
+          "Failed to refresh current-body confidence prior before trajectory query.";
+      ROS_WARN_STREAM_THROTTLE(
+          2.0,
+          "[trajectory_risk_node] " << msg);
+      publishEmptyOutputsWithError(msg);
+      return;
+    }
+
     care_confidence_map::QueryConfidence srv;
 
     const ros::WallTime query_start = ros::WallTime::now();
@@ -1260,7 +2108,20 @@ private:
     const ros::WallTime risk_end = ros::WallTime::now();
     timing.risk_compute_time_ms = wallMs(risk_start, risk_end);
 
+    const ros::WallTime attribution_start = ros::WallTime::now();
+
+    const AttributionResult attribution =
+        computeAttributionResult(
+            sample_result,
+            srv,
+            result);
+
+    const ros::WallTime attribution_end = ros::WallTime::now();
+    timing.attribution_time_ms =
+        wallMs(attribution_start, attribution_end);
+
     publishRiskStats(result);
+    publishAttribution(attribution, result);
 
     const ros::WallTime marker_start = ros::WallTime::now();
 
@@ -1269,6 +2130,7 @@ private:
       timing.published_markers = true;
       publishFullTrajectoryMarkers(sample_result, srv);
       publishWorstTimestepMarkers(sample_result, srv, result);
+      publishAttributionMarkers(attribution);
     }
 
     const ros::WallTime marker_end = ros::WallTime::now();
@@ -1281,17 +2143,22 @@ private:
 
     ROS_INFO_THROTTLE(
         1.0,
-        "[trajectory_risk_node] risk=%.3f, total_ms=%.2f, fk_ms=%.2f, query_ms=%.2f, marker_ms=%.2f, input_steps=%d, eval_steps=%d, samples=%d, worst_original_t=%d, worst_link=%s",
+        "[trajectory_risk_node] risk=%.3f, total_ms=%.2f, fk_ms=%.2f, query_ms=%.2f, attr_ms=%.2f, marker_ms=%.2f, input_steps=%d, eval_steps=%d, queried_samples=%d, risk_inside=%d, ignored_links=%s, worst_original_t=%d, worst_link=%s, attr_worst_link=%s, topk=%zu",
         result.score,
         timing.total_time_ms,
         timing.fk_time_ms,
         timing.query_time_ms,
+        timing.attribution_time_ms,
         timing.marker_time_ms,
         result.input_num_timesteps,
         result.eval_num_timesteps,
         result.total_samples,
+        result.inside_count,
+        ignoredRiskLinksToString().c_str(),
         result.worst_risk_original_timestep,
-        result.worst_link.c_str());
+        result.worst_link.c_str(),
+        attribution.worst_link_at_worst_timestep.c_str(),
+        attribution.topk_low_confidence_samples.size());
   }
 
   void printSummary() const
@@ -1304,16 +2171,27 @@ private:
     ROS_INFO_STREAM("input_trajectory_topic: " << input_trajectory_topic_);
     ROS_INFO_STREAM("confidence_query_service: "
                     << confidence_query_service_);
+    ROS_INFO_STREAM("refresh_body_prior_service: "
+                    << refresh_body_prior_service_);
+    ROS_INFO_STREAM("refresh_body_prior_before_query: "
+                    << refresh_body_prior_before_query_);
+    ROS_INFO_STREAM("refresh_body_prior_timeout: "
+                    << refresh_body_prior_timeout_);
     ROS_INFO_STREAM("eval_rate: " << eval_rate_);
     ROS_INFO_STREAM("max_eval_timesteps: " << max_eval_timesteps_);
     ROS_INFO_STREAM("query_timeout: " << query_timeout_);
     ROS_INFO_STREAM("marker_publish_rate: " << marker_publish_rate_);
     ROS_INFO_STREAM("marker_alpha: " << marker_alpha_);
     ROS_INFO_STREAM("worst_marker_alpha: " << worst_marker_alpha_);
+    ROS_INFO_STREAM("attribution_marker_alpha: " << attribution_marker_alpha_);
     ROS_INFO_STREAM("show_full_trajectory_markers: "
                     << show_full_trajectory_markers_);
     ROS_INFO_STREAM("show_worst_timestep_markers: "
                     << show_worst_timestep_markers_);
+    ROS_INFO_STREAM("show_attribution_markers: "
+                    << show_attribution_markers_);
+    ROS_INFO_STREAM("top_k_samples: " << top_k_samples_);
+    ROS_INFO_STREAM("ignored_risk_links: " << ignoredRiskLinksToString());
     ROS_INFO_STREAM("evaluate_stale_trajectory: "
                     << evaluate_stale_trajectory_);
     ROS_INFO_STREAM("stale_trajectory_timeout: "
@@ -1327,11 +2205,12 @@ private:
     }
     ROS_INFO_STREAM("subscribed input:");
     ROS_INFO_STREAM("  " << input_trajectory_topic_);
-    ROS_INFO_STREAM("published timing topics:");
-    ROS_INFO_STREAM("  /care_planner/trajectory_risk/timing_summary");
-    ROS_INFO_STREAM("  /care_planner/trajectory_risk/eval_time_ms");
-    ROS_INFO_STREAM("  /care_planner/trajectory_risk/fk_time_ms");
-    ROS_INFO_STREAM("  /care_planner/trajectory_risk/query_time_ms");
+    ROS_INFO_STREAM("published attribution topics:");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/attribution_summary");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/timestep_attribution");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/link_attribution");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/topk_sample_attribution");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/attribution_markers");
     ROS_INFO_STREAM("==========================================");
   }
 
@@ -1341,6 +2220,7 @@ private:
 
   ros::Subscriber trajectory_sub_;
   ros::ServiceClient confidence_query_client_;
+  ros::ServiceClient refresh_body_prior_client_;
 
   ros::Publisher score_pub_;
   ros::Publisher mean_confidence_pub_;
@@ -1352,6 +2232,7 @@ private:
   ros::Publisher worst_timestep_summary_pub_;
   ros::Publisher full_trajectory_marker_pub_;
   ros::Publisher worst_timestep_marker_pub_;
+  ros::Publisher attribution_marker_pub_;
 
   ros::Publisher eval_time_pub_;
   ros::Publisher fk_time_pub_;
@@ -1360,6 +2241,11 @@ private:
   ros::Publisher marker_time_pub_;
   ros::Publisher input_age_pub_;
   ros::Publisher timing_summary_pub_;
+
+  ros::Publisher attribution_summary_pub_;
+  ros::Publisher timestep_attribution_pub_;
+  ros::Publisher link_attribution_pub_;
+  ros::Publisher topk_sample_attribution_pub_;
 
   ros::Timer eval_timer_;
 
@@ -1379,18 +2265,27 @@ private:
       "/care_planner/task_trajectory";
   std::string confidence_query_service_ =
       "/care_planner/confidence_map/query";
+  std::string refresh_body_prior_service_ =
+      "/care_planner/confidence_map/refresh_body_prior";
 
   double eval_rate_ = 20.0;
   int max_eval_timesteps_ = 12;
 
   double query_timeout_ = 0.10;
+  double refresh_body_prior_timeout_ = 0.10;
   double marker_alpha_ = 0.45;
   double worst_marker_alpha_ = 0.85;
+  double attribution_marker_alpha_ = 0.90;
   double marker_publish_rate_ = 2.0;
   double stale_trajectory_timeout_ = 1.0;
 
+  int top_k_samples_ = 20;
+  std::vector<std::string> ignored_risk_links_;
+
+  bool refresh_body_prior_before_query_ = true;
   bool show_full_trajectory_markers_ = false;
   bool show_worst_timestep_markers_ = true;
+  bool show_attribution_markers_ = true;
   bool evaluate_stale_trajectory_ = true;
 };
 

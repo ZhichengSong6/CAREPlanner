@@ -13,19 +13,37 @@ confidence_map:
   update_rate: 30.0
   publish_rate: 10.0
 
-  # Temporal memory of observed space.
+  # Temporal memory of observed / known-clear space.
   # If a voxel is not currently visible, confidence decays as:
   # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
+  # Set to a very large value for practical no-decay debugging.
   temporal_decay_time: 2.0
 
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
-  
-  marker_topic: /care_planner/confidence_map/markers
-  pointcloud_topic: /care_planner/confidence_map/points
-  fov_marker_topic: /care_planner/confidence_map/fov_markers
   query_service: /care_planner/confidence_map/query
+
+current_body_prior:
+  enabled: true
+
+  # This file is set by confidence_map.launch so that $(find ...) works.
+  body_samples_file: ""
+
+  # Use current TF + body_samples. Each sample sphere is inflated by this radius.
+  inflation_radius: 0.10
+
+  # If true, also refresh once at node startup. Even if TF is not ready at startup,
+  # trajectory_risk_node will call the refresh service before every trajectory query.
+  refresh_on_startup: true
+
+  # false = include all body samples, including base if present.
+  # true  = only include samples marked include_for_risk in body_samples.yaml.
+  risk_samples_only: false
+
+  tf_timeout: 0.05
+  refresh_service: /care_planner/confidence_map/refresh_body_prior
+  marker_topic: /care_planner/confidence_map/current_body_prior_markers
 
 sensor_model:
   forward_axis: z

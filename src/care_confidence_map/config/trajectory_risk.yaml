@@ -1,0 +1,8 @@
+trajectory_risk:
+  ignored_risk_links:
+    - base_link
+    - link1
+
+  refresh_body_prior_before_query: true
+  refresh_body_prior_service: /care_planner/confidence_map/refresh_body_prior
+  refresh_body_prior_timeout: 0.10

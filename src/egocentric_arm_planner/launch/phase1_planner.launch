@@ -10,6 +10,14 @@
   <arg name="ee_frame" default="EE_link" />
 
   <!-- ========================= -->
+  <!-- Optional execution manager -->
+  <!-- ========================= -->
+
+  <!-- Default true: normal behavior, planner publishes command and execution manager tracks it.
+       Set false when testing risk / attribution without moving the robot. -->
+  <arg name="use_execution_manager" default="true" />
+
+  <!-- ========================= -->
   <!-- Optional interactive marker -->
   <!-- ========================= -->
 
@@ -40,16 +48,18 @@
   <!-- Execution manager node     -->
   <!-- ========================= -->
 
-  <node pkg="egocentric_arm_planner"
-        type="trajectory_execution_manager_node"
-        name="trajectory_execution_manager_node"
-        output="screen">
+  <group if="$(arg use_execution_manager)">
+    <node pkg="egocentric_arm_planner"
+          type="trajectory_execution_manager_node"
+          name="trajectory_execution_manager_node"
+          output="screen">
 
-    <rosparam command="load" file="$(arg config_file)" />
+      <rosparam command="load" file="$(arg config_file)" />
 
-    <param name="base_frame" value="$(arg base_frame)" />
-    <param name="ee_frame" value="$(arg ee_frame)" />
-  </node>
+      <param name="base_frame" value="$(arg base_frame)" />
+      <param name="ee_frame" value="$(arg ee_frame)" />
+    </node>
+  </group>
 
   <!-- ========================= -->
   <!-- Trajectory visualizer node -->

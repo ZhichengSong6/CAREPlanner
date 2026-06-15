@@ -2,10 +2,15 @@
   <arg name="config_file"
        default="$(find care_confidence_map)/config/confidence_map.yaml" />
 
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+
   <node pkg="care_confidence_map"
         type="confidence_map_node"
         name="confidence_map_node"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="current_body_prior/body_samples_file"
+           value="$(arg body_samples_file)" />
   </node>
 </launch>
