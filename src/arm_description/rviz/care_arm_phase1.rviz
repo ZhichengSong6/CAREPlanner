@@ -341,7 +341,7 @@ Visualization Manager:
       Value: true
     - Class: rviz/MarkerArray
       Enabled: true
-      Marker Topic: /care_planner/body_samples/world_markers
+      Marker Topic: /care_planner/trajectory_risk/full_trajectory_markers
       Name: MarkerArray
       Namespaces:
         {}

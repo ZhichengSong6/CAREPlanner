@@ -9,6 +9,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
   sensor_msgs
   geometry_msgs
+  trajectory_msgs
   visualization_msgs
   tf2
   tf2_ros
@@ -19,6 +20,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(yaml-cpp REQUIRED)
+find_package(pinocchio REQUIRED)
 
 add_service_files(
   FILES
@@ -32,13 +34,16 @@ generate_messages(
 
 catkin_package(
   INCLUDE_DIRS include
-  LIBRARIES body_sample_model
+  LIBRARIES
+    body_sample_model
+    trajectory_risk_evaluator
   CATKIN_DEPENDS
     roscpp
     rospy
     std_msgs
     sensor_msgs
     geometry_msgs
+    trajectory_msgs
     visualization_msgs
     tf2
     tf2_ros
@@ -55,7 +60,7 @@ include_directories(
 )
 
 # ============================================================
-# Library: BodySampleModel
+# Libraries
 # ============================================================
 
 add_library(body_sample_model
@@ -72,8 +77,24 @@ target_link_libraries(body_sample_model
   yaml-cpp
 )
 
+add_library(trajectory_risk_evaluator
+  src/trajectory_risk_evaluator.cpp
+)
+
+add_dependencies(trajectory_risk_evaluator
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_risk_evaluator
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+  pinocchio::pinocchio
+)
+
 # ============================================================
-# Node: confidence_map_node
+# Nodes
 # ============================================================
 
 add_executable(confidence_map_node
@@ -88,12 +109,6 @@ add_dependencies(confidence_map_node
 target_link_libraries(confidence_map_node
   ${catkin_LIBRARIES}
 )
-
-# ============================================================
-# Node: body_sample_model_node
-#   Loads body_samples.yaml and publishes transformed markers
-#   in base_link frame.
-# ============================================================
 
 add_executable(body_sample_model_node
   src/body_sample_model_node.cpp
@@ -110,13 +125,6 @@ target_link_libraries(body_sample_model_node
   yaml-cpp
 )
 
-# ============================================================
-# Node: body_observability_node
-#   Loads body_samples.yaml, transforms samples into base_link,
-#   calls QueryConfidence service, and publishes current-pose
-#   whole-body observability score.
-# ============================================================
-
 add_executable(body_observability_node
   src/body_observability_node.cpp
 )
@@ -132,8 +140,25 @@ target_link_libraries(body_observability_node
   yaml-cpp
 )
 
+add_executable(trajectory_risk_node
+  src/trajectory_risk_node.cpp
+)
+
+add_dependencies(trajectory_risk_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_risk_node
+  trajectory_risk_evaluator
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+  pinocchio::pinocchio
+)
+
 # ============================================================
-# Python scripts
+# Python tools
 # ============================================================
 
 catkin_install_python(PROGRAMS
@@ -149,9 +174,11 @@ catkin_install_python(PROGRAMS
 
 install(TARGETS
   body_sample_model
+  trajectory_risk_evaluator
   confidence_map_node
   body_sample_model_node
   body_observability_node
+  trajectory_risk_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

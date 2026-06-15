@@ -1,0 +1,83 @@
+<launch>
+  <arg name="robot_urdf_file"
+       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+
+  <arg name="base_frame"
+       default="base_link" />
+
+  <arg name="input_trajectory_topic"
+       default="/care_planner/task_trajectory" />
+
+  <arg name="confidence_query_service"
+       default="/care_planner/confidence_map/query" />
+
+  <arg name="eval_rate"
+       default="20.0" />
+
+  <arg name="max_eval_timesteps"
+       default="12" />
+
+  <arg name="marker_publish_rate"
+       default="2.0" />
+
+  <arg name="show_full_trajectory_markers"
+       default="true" />
+
+  <arg name="show_worst_timestep_markers"
+       default="true" />
+
+  <node pkg="care_confidence_map"
+        type="trajectory_risk_node"
+        name="trajectory_risk_node"
+        output="screen">
+
+    <param name="trajectory_risk/robot_urdf_file"
+           value="$(arg robot_urdf_file)" />
+
+    <param name="trajectory_risk/body_samples_file"
+           value="$(arg body_samples_file)" />
+
+    <param name="trajectory_risk/base_frame"
+           value="$(arg base_frame)" />
+
+    <param name="trajectory_risk/input_trajectory_topic"
+           value="$(arg input_trajectory_topic)" />
+
+    <param name="trajectory_risk/confidence_query_service"
+           value="$(arg confidence_query_service)" />
+
+    <param name="trajectory_risk/eval_rate"
+           value="$(arg eval_rate)" />
+
+    <param name="trajectory_risk/max_eval_timesteps"
+           value="$(arg max_eval_timesteps)" />
+
+    <param name="trajectory_risk/query_timeout"
+           value="0.10" />
+
+    <param name="trajectory_risk/marker_alpha"
+           value="0.45" />
+
+    <param name="trajectory_risk/worst_marker_alpha"
+           value="0.85" />
+
+    <param name="trajectory_risk/marker_publish_rate"
+           value="$(arg marker_publish_rate)" />
+
+    <param name="trajectory_risk/show_full_trajectory_markers"
+           value="$(arg show_full_trajectory_markers)" />
+
+    <param name="trajectory_risk/show_worst_timestep_markers"
+           value="$(arg show_worst_timestep_markers)" />
+
+    <param name="trajectory_risk/evaluate_stale_trajectory"
+           value="true" />
+
+    <param name="trajectory_risk/stale_trajectory_timeout"
+           value="1.0" />
+
+  </node>
+</launch>

@@ -2,7 +2,7 @@
 <package format="2">
   <name>care_confidence_map</name>
   <version>0.0.1</version>
-  <description>Confidence-aware local mapping module for CAREPlanner.</description>
+  <description>Confidence-aware local mapping and whole-body trajectory risk evaluation module for CAREPlanner.</description>
 
   <maintainer email="you@example.com">zhicheng</maintainer>
   <license>MIT</license>
@@ -15,11 +15,15 @@
   <build_depend>yaml-cpp</build_depend>
   <exec_depend>yaml-cpp</exec_depend>
 
+  <build_depend>pinocchio</build_depend>
+  <exec_depend>pinocchio</exec_depend>
+
   <depend>roscpp</depend>
   <depend>rospy</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>trajectory_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>tf2</depend>
   <depend>tf2_ros</depend>
