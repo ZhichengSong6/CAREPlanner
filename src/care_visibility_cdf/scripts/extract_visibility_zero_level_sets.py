@@ -209,7 +209,6 @@ def refine_q_to_zero_level(point_np: np.ndarray, q_init_np: np.ndarray, all_chai
                            target_sensor: int = -1):
     point = torch_tensor(point_np, device)
     q = torch_tensor(q_init_np, device).clone().detach().requires_grad_(True)
-    optimizer = torch.optim.Adam([q], lr=args.lr)
 
     with torch.no_grad():
         g_initial, _, _, _ = visibility_objective_batch(
@@ -224,29 +223,17 @@ def refine_q_to_zero_level(point_np: np.ndarray, q_init_np: np.ndarray, all_chai
             target_sensor,
         )
 
-    best_q = q.detach().clone()
-    best_abs_g = torch.abs(g_initial).detach().clone()
-
-    for _ in range(args.max_iter):
-        optimizer.zero_grad()
-        g, _, _, _ = visibility_objective_batch(
-            point,
-            q,
-            all_chain_specs,
-            args.horizontal_fov_deg,
-            args.vertical_fov_deg,
-            args.z_min,
-            args.z_max,
-            args.delta,
-            target_sensor,
+    if args.zero_level_optimizer == "lbfgs":
+        optimizer = torch.optim.LBFGS(
+            [q],
+            lr=args.lbfgs_lr,
+            max_iter=args.max_iter,
+            line_search_fn="strong_wolfe",
         )
-        loss = torch.mean(g * g)
-        loss.backward()
-        optimizer.step()
-        clamp_q_(q, q_min, q_max)
 
-        with torch.no_grad():
-            g_after, _, _, _ = visibility_objective_batch(
+        def closure():
+            optimizer.zero_grad()
+            g, _, _, _ = visibility_objective_batch(
                 point,
                 q,
                 all_chain_specs,
@@ -257,10 +244,51 @@ def refine_q_to_zero_level(point_np: np.ndarray, q_init_np: np.ndarray, all_chai
                 args.delta,
                 target_sensor,
             )
-            abs_g = torch.abs(g_after)
-            improve = abs_g < best_abs_g
-            best_abs_g[improve] = abs_g[improve]
-            best_q[improve] = q.detach()[improve]
+            loss = torch.sum(g * g)
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        best_q = q.detach()
+    else:
+        optimizer = torch.optim.Adam([q], lr=args.lr)
+        best_q = q.detach().clone()
+        best_abs_g = torch.abs(g_initial).detach().clone()
+
+        for _ in range(args.max_iter):
+            optimizer.zero_grad()
+            g, _, _, _ = visibility_objective_batch(
+                point,
+                q,
+                all_chain_specs,
+                args.horizontal_fov_deg,
+                args.vertical_fov_deg,
+                args.z_min,
+                args.z_max,
+                args.delta,
+                target_sensor,
+            )
+            loss = torch.mean(g * g)
+            loss.backward()
+            optimizer.step()
+            clamp_q_(q, q_min, q_max)
+
+            with torch.no_grad():
+                g_after, _, _, _ = visibility_objective_batch(
+                    point,
+                    q,
+                    all_chain_specs,
+                    args.horizontal_fov_deg,
+                    args.vertical_fov_deg,
+                    args.z_min,
+                    args.z_max,
+                    args.delta,
+                    target_sensor,
+                )
+                abs_g = torch.abs(g_after)
+                improve = abs_g < best_abs_g
+                best_abs_g[improve] = abs_g[improve]
+                best_q[improve] = q.detach()[improve]
 
     with torch.no_grad():
         g, sensor_margins, active_sensor, active_planes = visibility_objective_batch(
@@ -275,7 +303,8 @@ def refine_q_to_zero_level(point_np: np.ndarray, q_init_np: np.ndarray, all_chai
             target_sensor,
         )
         abs_g = torch.abs(g)
-        keep = abs_g <= args.epsilon
+        boundary_mask = ((best_q > q_min.unsqueeze(0)) & (best_q < q_max.unsqueeze(0))).all(dim=1)
+        keep = (abs_g <= args.epsilon) & boundary_mask
         keep_indices = torch.nonzero(keep, as_tuple=False).flatten()
         return (
             best_q[keep].detach().cpu().numpy(),
@@ -442,6 +471,8 @@ def main():
     parser.add_argument("--p-seed", type=int, default=0)
     parser.add_argument("--q-init-per-p", type=int, default=2048)
     parser.add_argument("--optimize-top-k", type=int, default=128)
+    parser.add_argument("--optimize-all-initial", action="store_true",
+                        help="Optimize all q_init samples. This matches the CDF L-BFGS data-generation style.")
     parser.add_argument("--target-q0-per-p", type=int, default=32)
     parser.add_argument("--extract-per-sensor", action="store_true",
                         help="Also extract per-sensor zero-level sets Q0_s(p).")
@@ -450,6 +481,8 @@ def main():
     parser.add_argument("--epsilon", type=float, default=0.01)
     parser.add_argument("--max-iter", type=int, default=50)
     parser.add_argument("--lr", type=float, default=0.03)
+    parser.add_argument("--zero-level-optimizer", choices=["adam", "lbfgs"], default="adam")
+    parser.add_argument("--lbfgs-lr", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--progress-every", type=int, default=10)
@@ -553,7 +586,11 @@ def main():
     print(f"device:          {device}")
     print(f"p_count:         {len(p_indices)}")
     print(f"q_init_per_p:    {args.q_init_per_p}")
-    print(f"optimize_top_k:  {args.optimize_top_k}")
+    print(f"zero_optimizer:  {args.zero_level_optimizer}")
+    if args.zero_level_optimizer == "lbfgs":
+        print(f"lbfgs_lr:        {args.lbfgs_lr}")
+    print(f"optimize_all:    {args.optimize_all_initial}")
+    print(f"optimize_top_k:  {'all' if args.optimize_all_initial else args.optimize_top_k}")
     print(f"target_q0_per_p: {args.target_q0_per_p}")
     print(f"epsilon:         {args.epsilon}")
     print(f"extract_per_sensor: {args.extract_per_sensor}")
@@ -583,9 +620,12 @@ def main():
                 args.delta,
             )
             abs_g_init = torch.abs(g_init).detach().cpu().numpy()
-        top_k = min(args.optimize_top_k, len(q_init))
-        init_indices_unsorted = np.argpartition(abs_g_init, top_k - 1)[:top_k]
-        init_indices = init_indices_unsorted[np.argsort(abs_g_init[init_indices_unsorted])]
+        if args.optimize_all_initial:
+            init_indices = np.arange(len(q_init), dtype=np.int64)
+        else:
+            top_k = min(args.optimize_top_k, len(q_init))
+            init_indices_unsorted = np.argpartition(abs_g_init, top_k - 1)[:top_k]
+            init_indices = init_indices_unsorted[np.argsort(abs_g_init[init_indices_unsorted])]
         q_candidates = q_init[init_indices]
 
         (
@@ -673,9 +713,12 @@ def main():
 
             for sensor_idx in range(num_sensors):
                 g_sensor_init = all_sensor_margins_init[:, sensor_idx] - args.delta
-                top_k_sensor = min(args.per_sensor_optimize_top_k, len(q_init))
-                sensor_init_unsorted = np.argpartition(np.abs(g_sensor_init), top_k_sensor - 1)[:top_k_sensor]
-                sensor_init_indices = sensor_init_unsorted[np.argsort(np.abs(g_sensor_init[sensor_init_unsorted]))]
+                if args.optimize_all_initial:
+                    sensor_init_indices = np.arange(len(q_init), dtype=np.int64)
+                else:
+                    top_k_sensor = min(args.per_sensor_optimize_top_k, len(q_init))
+                    sensor_init_unsorted = np.argpartition(np.abs(g_sensor_init), top_k_sensor - 1)[:top_k_sensor]
+                    sensor_init_indices = sensor_init_unsorted[np.argsort(np.abs(g_sensor_init[sensor_init_unsorted]))]
                 sensor_candidates = q_init[sensor_init_indices]
 
                 (
@@ -813,6 +856,9 @@ def main():
         "epsilon": np.asarray(args.epsilon, dtype=np.float32),
         "q_init_per_p": np.asarray(args.q_init_per_p, dtype=np.int32),
         "optimize_top_k": np.asarray(args.optimize_top_k, dtype=np.int32),
+        "optimize_all_initial": np.asarray(args.optimize_all_initial, dtype=np.bool_),
+        "zero_level_optimizer": np.asarray(args.zero_level_optimizer),
+        "lbfgs_lr": np.asarray(args.lbfgs_lr, dtype=np.float32),
         "target_q0_per_p": np.asarray(args.target_q0_per_p, dtype=np.int32),
         "extract_per_sensor": np.asarray(args.extract_per_sensor, dtype=np.bool_),
         "per_sensor_optimize_top_k": np.asarray(args.per_sensor_optimize_top_k, dtype=np.int32),
