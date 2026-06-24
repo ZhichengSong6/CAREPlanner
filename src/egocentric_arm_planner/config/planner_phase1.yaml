@@ -109,6 +109,7 @@ visualization:
   target_axis_length: 0.12
   target_axis_width: 0.01
   target_sphere_radius: 0.035
+  publish_rate: 10.0
 
 execution:
   rate: 100.0

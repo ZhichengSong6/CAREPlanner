@@ -31,7 +31,7 @@
   <!-- ========================= -->
 
   <arg name="eval_rate" default="20.0" />
-  <arg name="max_eval_timesteps" default="12" />
+  <arg name="max_eval_timesteps" default="50" />
   <arg name="query_timeout" default="0.10" />
 
   <!-- Marker publish rate is throttled separately from risk eval rate. -->
@@ -41,11 +41,18 @@
   <arg name="worst_marker_alpha" default="0.85" />
   <arg name="attribution_marker_alpha" default="0.90" />
 
-  <arg name="show_full_trajectory_markers" default="false" />
+  <arg name="show_full_trajectory_markers" default="true" />
   <arg name="show_worst_timestep_markers" default="true" />
   <arg name="show_attribution_markers" default="true" />
 
   <arg name="top_k_samples" default="20" />
+
+  <arg name="risk_frontier_threshold" default="0.30" />
+  <arg name="risk_frontier_window_steps" default="5" />
+  <arg name="safe_prefix_margin_steps" default="2" />
+  <arg name="frontier_confidence_threshold" default="0.50" />
+  <arg name="frontier_gap_threshold" default="0.50" />
+  <arg name="frontier_radius_margin" default="0.05" />
 
   <arg name="evaluate_stale_trajectory" default="true" />
   <arg name="stale_trajectory_timeout" default="1.0" />
@@ -109,6 +116,24 @@
 
     <param name="trajectory_risk/top_k_samples"
            value="$(arg top_k_samples)" />
+
+    <param name="trajectory_risk/risk_frontier_threshold"
+        value="$(arg risk_frontier_threshold)" />
+
+    <param name="trajectory_risk/risk_frontier_window_steps"
+        value="$(arg risk_frontier_window_steps)" />
+
+    <param name="trajectory_risk/safe_prefix_margin_steps"
+        value="$(arg safe_prefix_margin_steps)" />
+
+    <param name="trajectory_risk/frontier_confidence_threshold"
+        value="$(arg frontier_confidence_threshold)" />
+
+    <param name="trajectory_risk/frontier_gap_threshold"
+        value="$(arg frontier_gap_threshold)" />
+
+    <param name="trajectory_risk/frontier_radius_margin"
+        value="$(arg frontier_radius_margin)" />
 
     <param name="trajectory_risk/evaluate_stale_trajectory"
            value="$(arg evaluate_stale_trajectory)" />

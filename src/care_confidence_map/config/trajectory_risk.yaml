@@ -6,3 +6,23 @@ trajectory_risk:
   refresh_body_prior_before_query: true
   refresh_body_prior_service: /care_planner/confidence_map/refresh_body_prior
   refresh_body_prior_timeout: 0.10
+
+  # Kept as debug for mean-risk frontier. Active sensing now uses
+  # sample-temporal frontier detection instead.
+  risk_frontier_threshold: 0.30
+
+  # Primary temporal frontier group:
+  # first_bad_eval_timestep ... first_bad_eval_timestep + 5
+  primary_frontier_window_steps: 5
+
+  # Backward-compatible name; can keep this too.
+  risk_frontier_window_steps: 5
+
+  safe_prefix_margin_steps: 2
+
+  frontier_confidence_threshold: 0.50
+  frontier_gap_threshold: 0.50
+  frontier_radius_margin: 0.05
+
+  enable_secondary_frontier_group: true
+  secondary_frontier_max_reported_samples: 200

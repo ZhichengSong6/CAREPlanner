@@ -109,6 +109,14 @@ public:
         nh_.advertise<visualization_msgs::MarkerArray>(
             "/care_planner/trajectory_risk/attribution_markers", 1, true);
 
+    primary_frontier_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(
+            "/care_planner/trajectory_risk/primary_frontier_markers", 1, true);
+
+    secondary_frontier_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(
+            "/care_planner/trajectory_risk/secondary_frontier_markers", 1, true);
+
     eval_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
             "/care_planner/trajectory_risk/eval_time_ms", 1, true);
@@ -152,6 +160,10 @@ public:
     topk_sample_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
             "/care_planner/trajectory_risk/topk_sample_attribution", 1, true);
+
+    risk_frontier_attribution_pub_ =
+        nh_.advertise<std_msgs::String>(
+            "/care_planner/trajectory_risk/risk_frontier_attribution", 1, true);
 
     eval_timer_ =
         nh_.createTimer(
@@ -292,8 +304,43 @@ private:
     std::vector<LinkAttributionStats> link_stats_over_trajectory;
     std::vector<LinkAttributionStats> link_stats_at_worst_timestep;
 
+    bool has_risk_frontier = false;
+    int first_risky_eval_timestep = -1;
+    int first_risky_original_timestep = -1;
+    int safe_prefix_end_eval_timestep = -1;
+    int safe_prefix_end_original_timestep = -1;
+    int risk_frontier_window_start_eval = -1;
+    int risk_frontier_window_end_eval = -1;
+    int risk_frontier_window_start_original = -1;
+    int risk_frontier_window_end_original = -1;
+    double risk_frontier_threshold = 0.0;
+    double risk_frontier_mean_gap = 0.0;
+    double risk_frontier_total_weight = 0.0;
+    Eigen::Vector3d risk_frontier_centroid_base = Eigen::Vector3d::Zero();
+    double risk_frontier_radius = 0.0;
+
     std::vector<SampleAttributionItem> topk_low_confidence_samples;
     std::vector<SampleAttributionItem> worst_timestep_worst_link_samples;
+
+    // Primary temporal frontier group: earliest time window where any
+    // considered body/collision sample enters low-confidence space.
+    // This is the required active-sensing target group.
+    std::vector<SampleAttributionItem> risk_frontier_samples;
+    std::vector<LinkAttributionStats> risk_frontier_link_stats;
+
+    // Secondary temporal frontier group: all low-confidence samples after
+    // the primary window. This is an optional long-horizon bonus.
+    bool has_secondary_frontier = false;
+    Eigen::Vector3d secondary_frontier_centroid_base = Eigen::Vector3d::Zero();
+    double secondary_frontier_radius = 0.0;
+    double secondary_frontier_mean_gap = 0.0;
+    double secondary_frontier_total_weight = 0.0;
+    int secondary_frontier_window_start_eval = -1;
+    int secondary_frontier_window_end_eval = -1;
+    int secondary_frontier_window_start_original = -1;
+    int secondary_frontier_window_end_original = -1;
+    std::vector<SampleAttributionItem> secondary_frontier_samples;
+    std::vector<LinkAttributionStats> secondary_frontier_link_stats;
   };
 
   void loadParams()
@@ -392,6 +439,36 @@ private:
         "trajectory_risk/top_k_samples",
         top_k_samples_,
         20);
+
+    pnh_.param(
+        "trajectory_risk/risk_frontier_threshold",
+        risk_frontier_threshold_,
+        0.30);
+
+    pnh_.param(
+        "trajectory_risk/risk_frontier_window_steps",
+        risk_frontier_window_steps_,
+        5);
+
+    pnh_.param(
+        "trajectory_risk/safe_prefix_margin_steps",
+        safe_prefix_margin_steps_,
+        2);
+
+    pnh_.param(
+        "trajectory_risk/frontier_confidence_threshold",
+        frontier_confidence_threshold_,
+        0.50);
+
+    pnh_.param(
+        "trajectory_risk/frontier_gap_threshold",
+        frontier_gap_threshold_,
+        0.50);
+
+    pnh_.param(
+        "trajectory_risk/frontier_radius_margin",
+        frontier_radius_margin_,
+        0.05);
 
     pnh_.param(
         "trajectory_risk/evaluate_stale_trajectory",
@@ -1055,6 +1132,242 @@ private:
     return a.sample_index_in_link < b.sample_index_in_link;
   }
 
+  bool isRiskFrontierSample(const SampleAttributionItem& item) const
+  {
+    if (!item.inside)
+    {
+      return false;
+    }
+
+    if (item.confidence > frontier_confidence_threshold_)
+    {
+      return false;
+    }
+
+    if (item.gap < frontier_gap_threshold_)
+    {
+      return false;
+    }
+
+    return true;
+  }
+
+  int originalIndexForEvalTimestep(
+      const RiskResult& risk_result,
+      int eval_timestep) const
+  {
+    if (eval_timestep < 0 ||
+        eval_timestep >=
+            static_cast<int>(risk_result.eval_to_original_index.size()))
+    {
+      return -1;
+    }
+
+    return risk_result.eval_to_original_index[
+        static_cast<std::size_t>(eval_timestep)];
+  }
+
+  void computeRiskFrontierAttribution(
+      const RiskResult& risk_result,
+      const std::vector<SampleAttributionItem>& all_sample_items,
+      AttributionResult* attr) const
+  {
+    if (!attr)
+    {
+      return;
+    }
+
+    attr->risk_frontier_threshold = risk_frontier_threshold_;
+
+    const int num_eval_timesteps =
+        static_cast<int>(risk_result.timestep_stats.size());
+
+    if (num_eval_timesteps <= 0)
+    {
+      attr->has_risk_frontier = false;
+      return;
+    }
+
+    // Sample-temporal frontier detection:
+    // Find the earliest eval timestep where any considered body/collision
+    // sample sphere becomes low-confidence. This is more sensitive than
+    // whole-body mean timestep risk and is the correct trigger for active sensing.
+    std::vector<std::vector<SampleAttributionItem>> bad_samples_by_timestep(
+        static_cast<std::size_t>(num_eval_timesteps));
+
+    for (const auto& item : all_sample_items)
+    {
+      if (item.eval_timestep < 0 || item.eval_timestep >= num_eval_timesteps)
+      {
+        continue;
+      }
+
+      if (!isRiskFrontierSample(item))
+      {
+        continue;
+      }
+
+      bad_samples_by_timestep[static_cast<std::size_t>(item.eval_timestep)].push_back(item);
+    }
+
+    int first_bad_eval_timestep = -1;
+    for (int t = 0; t < num_eval_timesteps; ++t)
+    {
+      if (!bad_samples_by_timestep[static_cast<std::size_t>(t)].empty())
+      {
+        first_bad_eval_timestep = t;
+        break;
+      }
+    }
+
+    if (first_bad_eval_timestep < 0)
+    {
+      attr->has_risk_frontier = false;
+      return;
+    }
+
+    const int primary_window_start = first_bad_eval_timestep;
+    const int primary_window_end =
+        std::min(num_eval_timesteps - 1,
+                 first_bad_eval_timestep +
+                     std::max(0, risk_frontier_window_steps_));
+
+    const int safe_prefix_eval =
+        std::max(0,
+                 first_bad_eval_timestep -
+                     std::max(0, safe_prefix_margin_steps_));
+
+    attr->has_risk_frontier = true;
+    attr->first_risky_eval_timestep = first_bad_eval_timestep;
+    attr->first_risky_original_timestep =
+        originalIndexForEvalTimestep(risk_result, first_bad_eval_timestep);
+    attr->safe_prefix_end_eval_timestep = safe_prefix_eval;
+    attr->safe_prefix_end_original_timestep =
+        originalIndexForEvalTimestep(risk_result, safe_prefix_eval);
+
+    attr->risk_frontier_window_start_eval = primary_window_start;
+    attr->risk_frontier_window_end_eval = primary_window_end;
+    attr->risk_frontier_window_start_original =
+        originalIndexForEvalTimestep(risk_result, primary_window_start);
+    attr->risk_frontier_window_end_original =
+        originalIndexForEvalTimestep(risk_result, primary_window_end);
+
+    for (int t = primary_window_start; t <= primary_window_end; ++t)
+    {
+      const auto& samples = bad_samples_by_timestep[static_cast<std::size_t>(t)];
+      attr->risk_frontier_samples.insert(
+          attr->risk_frontier_samples.end(), samples.begin(), samples.end());
+    }
+
+    if (primary_window_end + 1 < num_eval_timesteps)
+    {
+      attr->secondary_frontier_window_start_eval = primary_window_end + 1;
+      attr->secondary_frontier_window_end_eval = num_eval_timesteps - 1;
+      attr->secondary_frontier_window_start_original =
+          originalIndexForEvalTimestep(
+              risk_result, attr->secondary_frontier_window_start_eval);
+      attr->secondary_frontier_window_end_original =
+          originalIndexForEvalTimestep(
+              risk_result, attr->secondary_frontier_window_end_eval);
+
+      for (int t = primary_window_end + 1; t < num_eval_timesteps; ++t)
+      {
+        const auto& samples = bad_samples_by_timestep[static_cast<std::size_t>(t)];
+        attr->secondary_frontier_samples.insert(
+            attr->secondary_frontier_samples.end(), samples.begin(), samples.end());
+      }
+    }
+
+    auto summarizeGroup =
+        [this](const std::vector<SampleAttributionItem>& samples,
+               Eigen::Vector3d* centroid,
+               double* radius,
+               double* mean_gap,
+               double* total_weight,
+               std::vector<LinkAttributionStats>* link_stats)
+    {
+      if (!centroid || !radius || !mean_gap || !total_weight || !link_stats)
+      {
+        return;
+      }
+
+      *centroid = Eigen::Vector3d::Zero();
+      *radius = 0.0;
+      *mean_gap = 0.0;
+      *total_weight = 0.0;
+      link_stats->clear();
+
+      std::map<std::string, LinkAttributionStats> stats_map;
+      Eigen::Vector3d weighted_sum = Eigen::Vector3d::Zero();
+      double weight_sum = 0.0;
+      double gap_sum = 0.0;
+
+      for (const auto& item : samples)
+      {
+        updateLinkAttributionStats(
+            item.link_name,
+            item.inside,
+            item.confidence,
+            item.current_visibility,
+            &stats_map);
+
+        const double w = std::max(1e-6, item.gap);
+        weighted_sum += w * item.center_base;
+        weight_sum += w;
+        gap_sum += item.gap;
+      }
+
+      *link_stats = finalizeAndSortLinkStats(stats_map);
+
+      if (samples.empty() || weight_sum <= 0.0)
+      {
+        return;
+      }
+
+      *centroid = weighted_sum / weight_sum;
+      *total_weight = weight_sum;
+      *mean_gap = gap_sum / static_cast<double>(samples.size());
+
+      double r = 0.0;
+      for (const auto& item : samples)
+      {
+        r = std::max(
+            r,
+            (item.center_base - *centroid).norm() + item.radius);
+      }
+
+      *radius = r + frontier_radius_margin_;
+    };
+
+    summarizeGroup(
+        attr->risk_frontier_samples,
+        &attr->risk_frontier_centroid_base,
+        &attr->risk_frontier_radius,
+        &attr->risk_frontier_mean_gap,
+        &attr->risk_frontier_total_weight,
+        &attr->risk_frontier_link_stats);
+
+    summarizeGroup(
+        attr->secondary_frontier_samples,
+        &attr->secondary_frontier_centroid_base,
+        &attr->secondary_frontier_radius,
+        &attr->secondary_frontier_mean_gap,
+        &attr->secondary_frontier_total_weight,
+        &attr->secondary_frontier_link_stats);
+
+    attr->has_secondary_frontier = !attr->secondary_frontier_samples.empty();
+
+    std::sort(
+        attr->risk_frontier_samples.begin(),
+        attr->risk_frontier_samples.end(),
+        sampleAttributionLess);
+
+    std::sort(
+        attr->secondary_frontier_samples.begin(),
+        attr->secondary_frontier_samples.end(),
+        sampleAttributionLess);
+  }
+
   AttributionResult computeAttributionResult(
       const care_confidence_map::TrajectorySampleResult& sample_result,
       const care_confidence_map::QueryConfidence& srv,
@@ -1167,6 +1480,11 @@ private:
         flat_index += 1;
       }
     }
+
+    computeRiskFrontierAttribution(
+        risk_result,
+        all_sample_items,
+        &attr);
 
     attr.link_stats_over_trajectory =
         finalizeAndSortLinkStats(link_stats_all);
@@ -1349,6 +1667,105 @@ private:
       marker.color.a = static_cast<float>(attribution_marker_alpha_);
     }
 
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeColoredFrontierSampleMarker(
+      const SampleAttributionItem& item,
+      const std::string& ns_prefix,
+      int marker_id,
+      float r,
+      float g,
+      float b,
+      float alpha,
+      double scale_multiplier) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns =
+        ns_prefix +
+        "/t" +
+        std::to_string(item.eval_timestep) +
+        "/" +
+        item.link_name;
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position = toPointMsg(item.center_base);
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = scale_multiplier * item.radius;
+    marker.scale.y = scale_multiplier * item.radius;
+    marker.scale.z = scale_multiplier * item.radius;
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = alpha;
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeFrontierSummarySphereMarker(
+      const Eigen::Vector3d& centroid,
+      double radius,
+      const std::string& ns,
+      int marker_id,
+      float r,
+      float g,
+      float b,
+      float alpha) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = ns;
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position = toPointMsg(centroid);
+    marker.pose.orientation.w = 1.0;
+    const double diameter = 2.0 * std::max(0.02, radius);
+    marker.scale.x = diameter;
+    marker.scale.y = diameter;
+    marker.scale.z = diameter;
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = alpha;
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeFrontierGroupTextMarker(
+      const Eigen::Vector3d& centroid,
+      double radius,
+      const std::string& ns,
+      int marker_id,
+      const std::string& text,
+      float r,
+      float g,
+      float b) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = ns;
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position = toPointMsg(centroid);
+    marker.pose.position.z += std::max(0.05, radius + 0.04);
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = 0.035;
+    marker.color.r = r;
+    marker.color.g = g;
+    marker.color.b = b;
+    marker.color.a = 1.0f;
+    marker.text = text;
     marker.lifetime = ros::Duration(0.0);
     return marker;
   }
@@ -1616,7 +2033,26 @@ private:
         << ", topk_sample_count="
         << attr.topk_low_confidence_samples.size()
         << ", worst_timestep_worst_link_sample_count="
-        << attr.worst_timestep_worst_link_samples.size();
+        << attr.worst_timestep_worst_link_samples.size()
+        << ", has_risk_frontier=" << attr.has_risk_frontier
+        << ", first_risky_eval_timestep="
+        << attr.first_risky_eval_timestep
+        << ", first_risky_original_timestep="
+        << attr.first_risky_original_timestep
+        << ", safe_prefix_end_eval_timestep="
+        << attr.safe_prefix_end_eval_timestep
+        << ", safe_prefix_end_original_timestep="
+        << attr.safe_prefix_end_original_timestep
+        << ", risk_frontier_window_eval=["
+        << attr.risk_frontier_window_start_eval << ","
+        << attr.risk_frontier_window_end_eval << "]"
+        << ", risk_frontier_window_original=["
+        << attr.risk_frontier_window_start_original << ","
+        << attr.risk_frontier_window_end_original << "]"
+        << ", risk_frontier_sample_count="
+        << attr.risk_frontier_samples.size()
+        << ", risk_frontier_radius="
+        << attr.risk_frontier_radius;
 
     std_msgs::String msg;
     msg.data = oss.str();
@@ -1694,6 +2130,103 @@ private:
     return msg;
   }
 
+  std_msgs::String makeRiskFrontierAttributionMsg(
+      const AttributionResult& attr) const
+  {
+    std::ostringstream oss;
+
+    oss << "trajectory_risk_frontier_attribution:"
+        << "\n  ignored_risk_links=" << ignoredRiskLinksToString()
+        << "\n  has_risk_frontier=" << attr.has_risk_frontier
+        << "\n  risk_frontier_threshold=" << attr.risk_frontier_threshold
+        << "\n  first_risky_eval_timestep="
+        << attr.first_risky_eval_timestep
+        << "\n  first_risky_original_timestep="
+        << attr.first_risky_original_timestep
+        << "\n  safe_prefix_end_eval_timestep="
+        << attr.safe_prefix_end_eval_timestep
+        << "\n  safe_prefix_end_original_timestep="
+        << attr.safe_prefix_end_original_timestep
+        << "\n  risk_frontier_window_eval=["
+        << attr.risk_frontier_window_start_eval << ","
+        << attr.risk_frontier_window_end_eval << "]"
+        << "\n  risk_frontier_window_original=["
+        << attr.risk_frontier_window_start_original << ","
+        << attr.risk_frontier_window_end_original << "]"
+        << "\n  target_centroid_base=["
+        << attr.risk_frontier_centroid_base.x() << ","
+        << attr.risk_frontier_centroid_base.y() << ","
+        << attr.risk_frontier_centroid_base.z() << "]"
+        << "\n  target_radius=" << attr.risk_frontier_radius
+        << "\n  mean_gap=" << attr.risk_frontier_mean_gap
+        << "\n  total_weight=" << attr.risk_frontier_total_weight
+        << "\n  sample_count=" << attr.risk_frontier_samples.size()
+        << "\n  detection_mode=sample_temporal"
+        << "\n  primary_group:"
+        << "\n    role=required_immediate_active_sensing_target"
+        << "\n    eval_window=[" << attr.risk_frontier_window_start_eval
+        << "," << attr.risk_frontier_window_end_eval << "]"
+        << "\n    original_window=[" << attr.risk_frontier_window_start_original
+        << "," << attr.risk_frontier_window_end_original << "]"
+        << "\n    centroid_base=["
+        << attr.risk_frontier_centroid_base.x() << ","
+        << attr.risk_frontier_centroid_base.y() << ","
+        << attr.risk_frontier_centroid_base.z() << "]"
+        << "\n    radius=" << attr.risk_frontier_radius
+        << "\n    sample_count=" << attr.risk_frontier_samples.size()
+        << "\n  secondary_group:"
+        << "\n    role=optional_long_horizon_bonus"
+        << "\n    has_secondary=" << attr.has_secondary_frontier
+        << "\n    eval_window=[" << attr.secondary_frontier_window_start_eval
+        << "," << attr.secondary_frontier_window_end_eval << "]"
+        << "\n    original_window=[" << attr.secondary_frontier_window_start_original
+        << "," << attr.secondary_frontier_window_end_original << "]"
+        << "\n    centroid_base=["
+        << attr.secondary_frontier_centroid_base.x() << ","
+        << attr.secondary_frontier_centroid_base.y() << ","
+        << attr.secondary_frontier_centroid_base.z() << "]"
+        << "\n    radius=" << attr.secondary_frontier_radius
+        << "\n    sample_count=" << attr.secondary_frontier_samples.size()
+        << "\n  link_groups:";
+
+    for (const auto& link : attr.risk_frontier_link_stats)
+    {
+      oss << "\n    " << link.link_name
+          << ": gap=" << link.gap
+          << ", mean_confidence=" << link.mean_confidence
+          << ", min_confidence=" << link.min_confidence
+          << ", visible_ratio=" << link.visible_ratio
+          << ", inside=" << link.inside_count
+          << ", outside=" << link.outside_count
+          << ", total=" << link.sample_count;
+    }
+
+    oss << "\n  samples:";
+    int rank = 0;
+    for (const auto& item : attr.risk_frontier_samples)
+    {
+      oss << "\n    #" << rank
+          << ": eval_t=" << item.eval_timestep
+          << ", original_t=" << item.original_timestep
+          << ", link=" << item.link_name
+          << ", sample_index_in_link=" << item.sample_index_in_link
+          << ", source_collision_index=" << item.source_collision_index
+          << ", confidence=" << item.confidence
+          << ", gap=" << item.gap
+          << ", current_visibility=" << item.current_visibility
+          << ", inside=" << item.inside
+          << ", position_base=["
+          << item.center_base.x() << ","
+          << item.center_base.y() << ","
+          << item.center_base.z() << "]";
+      rank += 1;
+    }
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    return msg;
+  }
+
   std_msgs::String makeTopKSampleAttributionMsg(
       const AttributionResult& attr) const
   {
@@ -1716,7 +2249,11 @@ private:
           << ", confidence=" << item.confidence
           << ", gap=" << item.gap
           << ", current_visibility=" << item.current_visibility
-          << ", inside=" << item.inside;
+          << ", inside=" << item.inside
+          << ", position_base=["
+          << item.center_base.x() << ","
+          << item.center_base.y() << ","
+          << item.center_base.z() << "]";
       rank += 1;
     }
 
@@ -1736,7 +2273,11 @@ private:
           << ", confidence=" << item.confidence
           << ", gap=" << item.gap
           << ", current_visibility=" << item.current_visibility
-          << ", inside=" << item.inside;
+          << ", inside=" << item.inside
+          << ", position_base=["
+          << item.center_base.x() << ","
+          << item.center_base.y() << ","
+          << item.center_base.z() << "]";
       rank += 1;
     }
 
@@ -1778,6 +2319,8 @@ private:
     timestep_attribution_pub_.publish(makeTimestepAttributionMsg(result));
     link_attribution_pub_.publish(makeLinkAttributionMsg(attr));
     topk_sample_attribution_pub_.publish(makeTopKSampleAttributionMsg(attr));
+    risk_frontier_attribution_pub_.publish(
+        makeRiskFrontierAttributionMsg(attr));
   }
 
   bool shouldPublishMarkers()
@@ -1901,6 +2444,71 @@ private:
     worst_timestep_marker_pub_.publish(array);
   }
 
+  visualization_msgs::Marker makeRiskFrontierTargetMarker(
+      const AttributionResult& attr,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "trajectory_risk/attribution/risk_frontier_target";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position = toPointMsg(attr.risk_frontier_centroid_base);
+    marker.pose.orientation.w = 1.0;
+
+    const double diameter =
+        2.0 * std::max(0.02, attr.risk_frontier_radius);
+    marker.scale.x = diameter;
+    marker.scale.y = diameter;
+    marker.scale.z = diameter;
+
+    marker.color.r = 0.0f;
+    marker.color.g = 0.85f;
+    marker.color.b = 1.0f;
+    marker.color.a = 0.35f;
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeRiskFrontierTextMarker(
+      const AttributionResult& attr,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = base_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "trajectory_risk/attribution/risk_frontier_text";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.position = toPointMsg(attr.risk_frontier_centroid_base);
+    marker.pose.position.z +=
+        std::max(0.05, attr.risk_frontier_radius + 0.04);
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = 0.035;
+
+    marker.color.r = 0.0f;
+    marker.color.g = 0.95f;
+    marker.color.b = 1.0f;
+    marker.color.a = 1.0f;
+
+    std::ostringstream oss;
+    oss << "risk frontier"
+        << "\nfirst eval t = " << attr.first_risky_eval_timestep
+        << " / original t = " << attr.first_risky_original_timestep
+        << "\nsafe prefix eval t = "
+        << attr.safe_prefix_end_eval_timestep
+        << "\nsamples = " << attr.risk_frontier_samples.size()
+        << " / radius = " << attr.risk_frontier_radius;
+    marker.text = oss.str();
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
   void publishAttributionMarkers(
       const AttributionResult& attr)
   {
@@ -1916,6 +2524,8 @@ private:
 
     int marker_id = 1;
 
+    // Global explanation only: top-K and worst-timestep/worst-link samples.
+    // Primary/secondary temporal frontier groups are published on separate topics.
     for (const auto& item : attr.topk_low_confidence_samples)
     {
       array.markers.push_back(
@@ -1940,6 +2550,136 @@ private:
         makeAttributionTextMarker(attr, marker_id++));
 
     attribution_marker_pub_.publish(array);
+  }
+
+  void publishPrimaryFrontierMarkers(
+      const AttributionResult& attr)
+  {
+    visualization_msgs::MarkerArray array;
+    array.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/primary_frontier"));
+
+    if (!show_attribution_markers_ || !attr.success ||
+        !attr.has_risk_frontier || attr.risk_frontier_samples.empty())
+    {
+      primary_frontier_marker_pub_.publish(array);
+      return;
+    }
+
+    int marker_id = 1;
+
+    for (const auto& item : attr.risk_frontier_samples)
+    {
+      array.markers.push_back(
+          makeColoredFrontierSampleMarker(
+              item,
+              "trajectory_risk/primary_frontier/samples",
+              marker_id++,
+              0.0f,
+              0.95f,
+              1.0f,
+              static_cast<float>(attribution_marker_alpha_),
+              2.7));
+    }
+
+    // Summary sphere only: centroid + bounding radius of primary samples.
+    // It is not the actual sensing target used for scoring.
+    array.markers.push_back(
+        makeFrontierSummarySphereMarker(
+            attr.risk_frontier_centroid_base,
+            attr.risk_frontier_radius,
+            "trajectory_risk/primary_frontier/summary_sphere",
+            marker_id++,
+            0.0f,
+            0.85f,
+            1.0f,
+            0.22f));
+
+    std::ostringstream oss;
+    oss << "primary temporal frontier"
+        << "\nfirst eval t = " << attr.first_risky_eval_timestep
+        << " / original t = " << attr.first_risky_original_timestep
+        << "\nsafe prefix eval t = " << attr.safe_prefix_end_eval_timestep
+        << "\nwindow = [" << attr.risk_frontier_window_start_eval
+        << "," << attr.risk_frontier_window_end_eval << "]"
+        << "\nsamples = " << attr.risk_frontier_samples.size()
+        << " / radius = " << attr.risk_frontier_radius;
+
+    array.markers.push_back(
+        makeFrontierGroupTextMarker(
+            attr.risk_frontier_centroid_base,
+            attr.risk_frontier_radius,
+            "trajectory_risk/primary_frontier/text",
+            marker_id++,
+            oss.str(),
+            0.0f,
+            0.95f,
+            1.0f));
+
+    primary_frontier_marker_pub_.publish(array);
+  }
+
+  void publishSecondaryFrontierMarkers(
+      const AttributionResult& attr)
+  {
+    visualization_msgs::MarkerArray array;
+    array.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/secondary_frontier"));
+
+    if (!show_attribution_markers_ || !attr.success ||
+        !attr.has_secondary_frontier || attr.secondary_frontier_samples.empty())
+    {
+      secondary_frontier_marker_pub_.publish(array);
+      return;
+    }
+
+    int marker_id = 1;
+
+    for (const auto& item : attr.secondary_frontier_samples)
+    {
+      array.markers.push_back(
+          makeColoredFrontierSampleMarker(
+              item,
+              "trajectory_risk/secondary_frontier/samples",
+              marker_id++,
+              0.55f,
+              0.35f,
+              1.0f,
+              static_cast<float>(0.65 * attribution_marker_alpha_),
+              2.3));
+    }
+
+    array.markers.push_back(
+        makeFrontierSummarySphereMarker(
+            attr.secondary_frontier_centroid_base,
+            attr.secondary_frontier_radius,
+            "trajectory_risk/secondary_frontier/summary_sphere",
+            marker_id++,
+            0.55f,
+            0.35f,
+            1.0f,
+            0.14f));
+
+    std::ostringstream oss;
+    oss << "secondary temporal frontier"
+        << "\nwindow = [" << attr.secondary_frontier_window_start_eval
+        << "," << attr.secondary_frontier_window_end_eval << "]"
+        << "\nsamples = " << attr.secondary_frontier_samples.size()
+        << " / radius = " << attr.secondary_frontier_radius
+        << "\noptional long-horizon bonus";
+
+    array.markers.push_back(
+        makeFrontierGroupTextMarker(
+            attr.secondary_frontier_centroid_base,
+            attr.secondary_frontier_radius,
+            "trajectory_risk/secondary_frontier/text",
+            marker_id++,
+            oss.str(),
+            0.55f,
+            0.35f,
+            1.0f));
+
+    secondary_frontier_marker_pub_.publish(array);
   }
 
   void publishEmptyOutputsWithError(const std::string& message)
@@ -1969,6 +2709,16 @@ private:
     attr_delete.markers.push_back(
         makeDeleteAllMarker("trajectory_risk/attribution"));
     attribution_marker_pub_.publish(attr_delete);
+
+    visualization_msgs::MarkerArray primary_delete;
+    primary_delete.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/primary_frontier"));
+    primary_frontier_marker_pub_.publish(primary_delete);
+
+    visualization_msgs::MarkerArray secondary_delete;
+    secondary_delete.markers.push_back(
+        makeDeleteAllMarker("trajectory_risk/secondary_frontier"));
+    secondary_frontier_marker_pub_.publish(secondary_delete);
   }
 
   bool getLatestTrajectory(
@@ -2131,6 +2881,8 @@ private:
       publishFullTrajectoryMarkers(sample_result, srv);
       publishWorstTimestepMarkers(sample_result, srv, result);
       publishAttributionMarkers(attribution);
+      publishPrimaryFrontierMarkers(attribution);
+      publishSecondaryFrontierMarkers(attribution);
     }
 
     const ros::WallTime marker_end = ros::WallTime::now();
@@ -2191,6 +2943,18 @@ private:
     ROS_INFO_STREAM("show_attribution_markers: "
                     << show_attribution_markers_);
     ROS_INFO_STREAM("top_k_samples: " << top_k_samples_);
+    ROS_INFO_STREAM("risk_frontier_threshold: "
+                    << risk_frontier_threshold_);
+    ROS_INFO_STREAM("risk_frontier_window_steps: "
+                    << risk_frontier_window_steps_);
+    ROS_INFO_STREAM("safe_prefix_margin_steps: "
+                    << safe_prefix_margin_steps_);
+    ROS_INFO_STREAM("frontier_confidence_threshold: "
+                    << frontier_confidence_threshold_);
+    ROS_INFO_STREAM("frontier_gap_threshold: "
+                    << frontier_gap_threshold_);
+    ROS_INFO_STREAM("frontier_radius_margin: "
+                    << frontier_radius_margin_);
     ROS_INFO_STREAM("ignored_risk_links: " << ignoredRiskLinksToString());
     ROS_INFO_STREAM("evaluate_stale_trajectory: "
                     << evaluate_stale_trajectory_);
@@ -2210,7 +2974,10 @@ private:
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/timestep_attribution");
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/link_attribution");
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/topk_sample_attribution");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/risk_frontier_attribution");
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/attribution_markers");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/primary_frontier_markers");
+    ROS_INFO_STREAM("  /care_planner/trajectory_risk/secondary_frontier_markers");
     ROS_INFO_STREAM("==========================================");
   }
 
@@ -2233,6 +3000,8 @@ private:
   ros::Publisher full_trajectory_marker_pub_;
   ros::Publisher worst_timestep_marker_pub_;
   ros::Publisher attribution_marker_pub_;
+  ros::Publisher primary_frontier_marker_pub_;
+  ros::Publisher secondary_frontier_marker_pub_;
 
   ros::Publisher eval_time_pub_;
   ros::Publisher fk_time_pub_;
@@ -2246,6 +3015,7 @@ private:
   ros::Publisher timestep_attribution_pub_;
   ros::Publisher link_attribution_pub_;
   ros::Publisher topk_sample_attribution_pub_;
+  ros::Publisher risk_frontier_attribution_pub_;
 
   ros::Timer eval_timer_;
 
@@ -2280,6 +3050,12 @@ private:
   double stale_trajectory_timeout_ = 1.0;
 
   int top_k_samples_ = 20;
+  int risk_frontier_window_steps_ = 5;
+  int safe_prefix_margin_steps_ = 2;
+  double risk_frontier_threshold_ = 0.30;
+  double frontier_confidence_threshold_ = 0.50;
+  double frontier_gap_threshold_ = 0.50;
+  double frontier_radius_margin_ = 0.05;
   std::vector<std::string> ignored_risk_links_;
 
   bool refresh_body_prior_before_query_ = true;

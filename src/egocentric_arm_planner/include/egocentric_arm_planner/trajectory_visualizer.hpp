@@ -30,6 +30,7 @@ private:
   void targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg);
   void taskTrajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void commandTrajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void publishTimerCallback(const ros::TimerEvent& event);
 
   void publishMarkers();
 
@@ -65,6 +66,7 @@ private:
   ros::Subscriber command_traj_sub_;
 
   ros::Publisher marker_pub_;
+  ros::Timer publish_timer_;
 
   std::shared_ptr<arm_model::RobotModel> robot_model_;
 
@@ -73,6 +75,7 @@ private:
   bool has_target_pose_ = false;
   bool has_task_traj_ = false;
   bool has_command_traj_ = false;
+  bool marker_dirty_ = false;
 
   geometry_msgs::PoseStamped latest_target_pose_;
   trajectory_msgs::JointTrajectory latest_task_traj_;
@@ -88,6 +91,7 @@ private:
   double target_axis_length_ = 0.12;
   double target_axis_width_ = 0.01;
   double target_sphere_radius_ = 0.035;
+  double visualization_publish_rate_ = 10.0;
 };
 
 }  // namespace egocentric_arm_planner

@@ -196,7 +196,7 @@ private:
     {
         visualization_msgs::InteractiveMarker int_marker;
         int_marker.header.frame_id = base_frame_;
-        int_marker.header.stamp = ros::Time::now();
+        int_marker.header.stamp = ros::Time(0);
         int_marker.name = "ee_target_marker";
         int_marker.description = "EE Target: drag, then click green box to send goal";
         int_marker.scale = marker_scale_ * 4.0;
@@ -240,52 +240,72 @@ private:
 
     void add6DofControls(visualization_msgs::InteractiveMarker& int_marker)
     {
-        visualization_msgs::InteractiveMarkerControl control;
+        // Use freshly-created controls for every axis.  Reusing the same
+        // InteractiveMarkerControl object is legal, but RViz's interactive
+        // marker display is much more robust if every control is explicit,
+        // normalized, and has FIXED orientation mode.
+        auto addAxisControls = [&](const std::string& axis_name,
+                                   double qx,
+                                   double qy,
+                                   double qz,
+                                   double qw)
+        {
+            visualization_msgs::InteractiveMarkerControl rotate_control;
+            rotate_control.name = "rotate_" + axis_name;
+            rotate_control.orientation.x = qx;
+            rotate_control.orientation.y = qy;
+            rotate_control.orientation.z = qz;
+            rotate_control.orientation.w = qw;
+            normalizeControlQuaternion(rotate_control);
+            rotate_control.orientation_mode =
+                visualization_msgs::InteractiveMarkerControl::FIXED;
+            rotate_control.interaction_mode =
+                visualization_msgs::InteractiveMarkerControl::ROTATE_AXIS;
+            int_marker.controls.push_back(rotate_control);
 
-        // X axis
-        control.orientation.w = 0.70710678;
-        control.orientation.x = 0.70710678;
-        control.orientation.y = 0.0;
-        control.orientation.z = 0.0;
-        control.name = "rotate_x";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::ROTATE_AXIS;
-        int_marker.controls.push_back(control);
+            visualization_msgs::InteractiveMarkerControl move_control;
+            move_control.name = "move_" + axis_name;
+            move_control.orientation.x = qx;
+            move_control.orientation.y = qy;
+            move_control.orientation.z = qz;
+            move_control.orientation.w = qw;
+            normalizeControlQuaternion(move_control);
+            move_control.orientation_mode =
+                visualization_msgs::InteractiveMarkerControl::FIXED;
+            move_control.interaction_mode =
+                visualization_msgs::InteractiveMarkerControl::MOVE_AXIS;
+            int_marker.controls.push_back(move_control);
+        };
 
-        control.name = "move_x";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
+        // Same axis definitions as the standard ROS interactive marker 6-DoF
+        // tutorial, normalized before insertion.
+        addAxisControls("x", 1.0, 0.0, 0.0, 1.0);
+        addAxisControls("y", 0.0, 1.0, 0.0, 1.0);
+        addAxisControls("z", 0.0, 0.0, 1.0, 1.0);
+    }
 
-        // Y axis
-        control.orientation.w = 0.70710678;
-        control.orientation.x = 0.0;
-        control.orientation.y = 0.70710678;
-        control.orientation.z = 0.0;
-        control.name = "rotate_y";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::ROTATE_AXIS;
-        int_marker.controls.push_back(control);
+    static void normalizeControlQuaternion(
+        visualization_msgs::InteractiveMarkerControl& control)
+    {
+        const double x = control.orientation.x;
+        const double y = control.orientation.y;
+        const double z = control.orientation.z;
+        const double w = control.orientation.w;
+        const double norm = std::sqrt(x * x + y * y + z * z + w * w);
 
-        control.name = "move_y";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
+        if (norm < 1e-9)
+        {
+            control.orientation.x = 0.0;
+            control.orientation.y = 0.0;
+            control.orientation.z = 0.0;
+            control.orientation.w = 1.0;
+            return;
+        }
 
-        // Z axis
-        control.orientation.w = 0.70710678;
-        control.orientation.x = 0.0;
-        control.orientation.y = 0.0;
-        control.orientation.z = 0.70710678;
-        control.name = "rotate_z";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::ROTATE_AXIS;
-        int_marker.controls.push_back(control);
-
-        control.name = "move_z";
-        control.interaction_mode =
-            visualization_msgs::InteractiveMarkerControl::MOVE_AXIS;
-        int_marker.controls.push_back(control);
+        control.orientation.x /= norm;
+        control.orientation.y /= norm;
+        control.orientation.z /= norm;
+        control.orientation.w /= norm;
     }
 
     void processFeedback(

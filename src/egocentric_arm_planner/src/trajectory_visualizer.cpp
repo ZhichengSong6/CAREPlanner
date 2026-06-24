@@ -43,6 +43,15 @@ bool TrajectoryVisualizer::initialize(const ros::NodeHandle& nh,
                      target_sphere_radius_,
                      target_sphere_radius_);
 
+  pnh_.param<double>("visualization/publish_rate",
+                     visualization_publish_rate_,
+                     visualization_publish_rate_);
+
+  if (visualization_publish_rate_ <= 0.0) {
+    ROS_WARN("[TrajectoryVisualizer] visualization/publish_rate <= 0. Using 10 Hz.");
+    visualization_publish_rate_ = 10.0;
+  }
+
   robot_model_ = std::make_shared<arm_model::RobotModel>();
   if (!robot_model_->initializeFromRosParam(pnh_)) {
     ROS_ERROR("[TrajectoryVisualizer] Failed to initialize RobotModel.");
@@ -72,11 +81,18 @@ bool TrajectoryVisualizer::initialize(const ros::NodeHandle& nh,
       1,
       true);
 
+  publish_timer_ = nh_.createTimer(
+      ros::Duration(1.0 / visualization_publish_rate_),
+      &TrajectoryVisualizer::publishTimerCallback,
+      this);
+
   ROS_INFO("[TrajectoryVisualizer] Initialized.");
   ROS_INFO_STREAM("[TrajectoryVisualizer] target_pose_topic = " << target_pose_topic_);
   ROS_INFO_STREAM("[TrajectoryVisualizer] task_trajectory_topic = " << task_trajectory_topic_);
   ROS_INFO_STREAM("[TrajectoryVisualizer] command_trajectory_topic = " << command_trajectory_topic_);
   ROS_INFO_STREAM("[TrajectoryVisualizer] marker_topic = " << marker_topic_);
+  ROS_INFO_STREAM("[TrajectoryVisualizer] visualization_publish_rate = "
+                  << visualization_publish_rate_);
 
   return true;
 }
@@ -91,9 +107,8 @@ void TrajectoryVisualizer::targetPoseCallback(
     std::lock_guard<std::mutex> lock(data_mutex_);
     latest_target_pose_ = *msg;
     has_target_pose_ = true;
+    marker_dirty_ = true;
   }
-
-  publishMarkers();
 }
 
 void TrajectoryVisualizer::taskTrajectoryCallback(
@@ -106,9 +121,8 @@ void TrajectoryVisualizer::taskTrajectoryCallback(
     std::lock_guard<std::mutex> lock(data_mutex_);
     latest_task_traj_ = *msg;
     has_task_traj_ = true;
+    marker_dirty_ = true;
   }
-
-  publishMarkers();
 }
 
 void TrajectoryVisualizer::commandTrajectoryCallback(
@@ -121,9 +135,22 @@ void TrajectoryVisualizer::commandTrajectoryCallback(
     std::lock_guard<std::mutex> lock(data_mutex_);
     latest_command_traj_ = *msg;
     has_command_traj_ = true;
+    marker_dirty_ = true;
+  }
+}
+
+
+void TrajectoryVisualizer::publishTimerCallback(const ros::TimerEvent&) {
+  bool should_publish = false;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    should_publish = marker_dirty_;
+    marker_dirty_ = false;
   }
 
-  publishMarkers();
+  if (should_publish) {
+    publishMarkers();
+  }
 }
 
 void TrajectoryVisualizer::publishMarkers() {
@@ -156,8 +183,11 @@ void TrajectoryVisualizer::publishMarkers() {
   }
 
   visualization_msgs::MarkerArray marker_array;
-  marker_array.markers.push_back(makeDeleteAllMarker());
 
+  // Do not publish DELETEALL on every update. RViz can become unstable when a
+  // high-rate MarkerArray repeatedly deletes and recreates markers while the
+  // user is interacting with an InteractiveMarker. All markers below use stable
+  // ns/id pairs, so ADD is enough to replace the previous marker contents.
   if (has_target) {
     appendTargetMarkers(target_pose, marker_array);
   }

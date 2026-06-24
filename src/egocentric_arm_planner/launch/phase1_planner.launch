@@ -22,6 +22,7 @@
   <!-- ========================= -->
 
   <arg name="use_interactive_marker" default="true" />
+  <arg name="use_trajectory_visualizer" default="true" />
   <arg name="interactive_marker_server_name" default="ee_interactive_marker" />
   <arg name="interactive_marker_scale" default="0.08" />
 
@@ -65,16 +66,18 @@
   <!-- Trajectory visualizer node -->
   <!-- ========================= -->
 
-  <node pkg="egocentric_arm_planner"
-        type="trajectory_visualizer_node"
-        name="trajectory_visualizer_node"
-        output="screen">
+  <group if="$(arg use_trajectory_visualizer)">
+    <node pkg="egocentric_arm_planner"
+          type="trajectory_visualizer_node"
+          name="trajectory_visualizer_node"
+          output="screen">
 
-    <rosparam command="load" file="$(arg config_file)" />
+      <rosparam command="load" file="$(arg config_file)" />
 
-    <param name="base_frame" value="$(arg base_frame)" />
-    <param name="ee_frame" value="$(arg ee_frame)" />
-  </node>
+      <param name="base_frame" value="$(arg base_frame)" />
+      <param name="ee_frame" value="$(arg ee_frame)" />
+    </node>
+  </group>
 
   <!-- ========================= -->
   <!-- EE interactive marker node -->
