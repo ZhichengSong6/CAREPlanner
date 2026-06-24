@@ -339,7 +339,7 @@ def q_row_to_map(joint_names: List[str], q_row: np.ndarray) -> Dict[str, float]:
     return {name: float(value) for name, value in zip(joint_names, q_row)}
 
 
-def prepare_occlusion_context(args, sensor_frames: List[str]):
+def prepare_occlusion_context(args, sensor_frames: List[str], joint_names: List[str], device):
     if not args.occlusion_urdf:
         return None
 
@@ -351,18 +351,227 @@ def prepare_occlusion_context(args, sensor_frames: List[str]):
             "Expected box/cylinder/sphere collision geometry."
         )
 
-    return {
+    ignore_links = set(args.ignore_links)
+    primitives = [primitive for primitive in primitives if primitive["link"] not in ignore_links]
+
+    collision_chains = [
+        find_chain_joints(occlusion_robot, args.base_frame, primitive["link"])
+        for primitive in primitives
+    ]
+    sensor_chains = [
+        find_chain_joints(occlusion_robot, args.base_frame, frame)
+        for frame in sensor_frames
+    ]
+
+    use_torch = args.occlusion_backend == "torch" or (
+        args.occlusion_backend == "auto" and device.type == "cuda"
+    )
+
+    context = {
         "robot": occlusion_robot,
         "primitives": primitives,
-        "collision_chains": [
-            find_chain_joints(occlusion_robot, args.base_frame, primitive["link"])
-            for primitive in primitives
-        ],
-        "sensor_chains": [
-            find_chain_joints(occlusion_robot, args.base_frame, frame)
-            for frame in sensor_frames
-        ],
+        "collision_chains": collision_chains,
+        "sensor_chains": sensor_chains,
+        "backend": "torch" if use_torch else "cpu",
     }
+    if use_torch:
+        context["collision_chain_specs"] = [
+            prepare_chain_specs(occlusion_robot, args.base_frame, [primitive["link"]], joint_names, device)[0]
+            for primitive in primitives
+        ]
+        context["sensor_chain_specs"] = prepare_chain_specs(
+            occlusion_robot, args.base_frame, sensor_frames, joint_names, device
+        )
+        context["primitive_specs"] = [
+            make_torch_primitive_spec(primitive, device)
+            for primitive in primitives
+        ]
+    return context
+
+
+def make_torch_primitive_spec(primitive, device):
+    geom = primitive["geometry"]
+    spec = {
+        "type": primitive["type"],
+        "origin": torch_tensor(primitive["origin"], device),
+    }
+    if primitive["type"] == "box":
+        spec["half_size"] = torch_tensor(0.5 * np.asarray(geom.size, dtype=np.float32), device)
+    elif primitive["type"] == "cylinder":
+        spec["radius"] = float(geom.radius)
+        spec["half_length"] = 0.5 * float(geom.length)
+    elif primitive["type"] == "sphere":
+        spec["radius"] = float(geom.radius)
+    return spec
+
+
+def transform_points_inverse_batch(transform: torch.Tensor, points: torch.Tensor):
+    rot = transform[:, :3, :3]
+    trans = transform[:, :3, 3]
+    return torch.bmm(rot.transpose(1, 2), (points - trans).unsqueeze(-1)).squeeze(-1)
+
+
+def segment_box_hit_batch(local_start: torch.Tensor, local_end: torch.Tensor,
+                          half_size: torch.Tensor, ignore_start_inside: bool):
+    direction = local_end - local_start
+    eps = 1e-12
+    parallel = torch.abs(direction) < eps
+    outside_parallel = parallel & ((local_start < -half_size.unsqueeze(0)) | (local_start > half_size.unsqueeze(0)))
+
+    safe_direction = torch.where(parallel, torch.ones_like(direction), direction)
+    t1 = (-half_size.unsqueeze(0) - local_start) / safe_direction
+    t2 = ( half_size.unsqueeze(0) - local_start) / safe_direction
+    t_near = torch.minimum(t1, t2)
+    t_far = torch.maximum(t1, t2)
+    t_near = torch.where(parallel, torch.full_like(t_near, -torch.inf), t_near)
+    t_far = torch.where(parallel, torch.full_like(t_far, torch.inf), t_far)
+
+    t_min = torch.maximum(torch.max(t_near, dim=1).values, torch.zeros(local_start.shape[0], device=local_start.device))
+    t_max = torch.minimum(torch.min(t_far, dim=1).values, torch.ones(local_start.shape[0], device=local_start.device))
+    hit = (t_min <= t_max) & (~torch.any(outside_parallel, dim=1))
+
+    if ignore_start_inside:
+        inside = torch.all((local_start >= -half_size.unsqueeze(0)) & (local_start <= half_size.unsqueeze(0)), dim=1)
+        hit = hit & (~inside)
+
+    return hit, t_min
+
+
+def segment_sphere_hit_batch(local_start: torch.Tensor, local_end: torch.Tensor,
+                             radius: float, ignore_start_inside: bool):
+    direction = local_end - local_start
+    a = torch.sum(direction * direction, dim=1)
+    b = 2.0 * torch.sum(local_start * direction, dim=1)
+    c = torch.sum(local_start * local_start, dim=1) - radius * radius
+    disc = b * b - 4.0 * a * c
+    valid = (a > 1e-12) & (disc >= 0.0)
+    sqrt_disc = torch.sqrt(torch.clamp(disc, min=0.0))
+    denom = 2.0 * torch.where(a > 1e-12, a, torch.ones_like(a))
+    t_a = (-b - sqrt_disc) / denom
+    t_b = (-b + sqrt_disc) / denom
+    inf = torch.full_like(t_a, torch.inf)
+    t_candidates = torch.stack([
+        torch.where((0.0 <= t_a) & (t_a <= 1.0), t_a, inf),
+        torch.where((0.0 <= t_b) & (t_b <= 1.0), t_b, inf),
+    ], dim=1)
+    t = torch.min(t_candidates, dim=1).values
+    hit = valid & torch.isfinite(t)
+    if ignore_start_inside:
+        inside = torch.sum(local_start * local_start, dim=1) <= radius * radius
+        hit = hit & (~inside)
+    return hit, t
+
+
+def segment_cylinder_hit_batch(local_start: torch.Tensor, local_end: torch.Tensor,
+                               radius: float, half_length: float, ignore_start_inside: bool):
+    direction = local_end - local_start
+    px, py, pz = local_start[:, 0], local_start[:, 1], local_start[:, 2]
+    dx, dy, dz = direction[:, 0], direction[:, 1], direction[:, 2]
+    inf = torch.full_like(px, torch.inf)
+    candidates = []
+
+    a = dx * dx + dy * dy
+    b = 2.0 * (px * dx + py * dy)
+    c = px * px + py * py - radius * radius
+    disc = b * b - 4.0 * a * c
+    side_valid = (a > 1e-12) & (disc >= 0.0)
+    sqrt_disc = torch.sqrt(torch.clamp(disc, min=0.0))
+    denom = 2.0 * torch.where(a > 1e-12, a, torch.ones_like(a))
+    for t_side in [(-b - sqrt_disc) / denom, (-b + sqrt_disc) / denom]:
+        z = pz + t_side * dz
+        ok = side_valid & (0.0 <= t_side) & (t_side <= 1.0) & (-half_length <= z) & (z <= half_length)
+        candidates.append(torch.where(ok, t_side, inf))
+
+    cap_valid = torch.abs(dz) > 1e-12
+    for z_cap in [-half_length, half_length]:
+        t_cap = (z_cap - pz) / torch.where(cap_valid, dz, torch.ones_like(dz))
+        x = px + t_cap * dx
+        y = py + t_cap * dy
+        ok = cap_valid & (0.0 <= t_cap) & (t_cap <= 1.0) & (x * x + y * y <= radius * radius)
+        candidates.append(torch.where(ok, t_cap, inf))
+
+    t = torch.min(torch.stack(candidates, dim=1), dim=1).values
+    hit = torch.isfinite(t)
+    if ignore_start_inside:
+        inside = (px * px + py * py <= radius * radius) & (torch.abs(pz) <= half_length)
+        hit = hit & (~inside)
+    return hit, t
+
+
+def compute_q0_occlusion_torch(point: np.ndarray, q_rows: np.ndarray, sensor_indices: np.ndarray,
+                               occlusion_context, args, device):
+    count = len(q_rows)
+    occluded = torch.zeros((count,), dtype=torch.bool, device=device)
+    if occlusion_context is None or count == 0:
+        return occluded.detach().cpu().numpy()
+
+    valid_sensor = sensor_indices >= 0
+    if not np.all(valid_sensor):
+        occluded[torch_tensor(~valid_sensor, device, dtype=torch.bool)] = True
+    if not np.any(valid_sensor):
+        return occluded.detach().cpu().numpy()
+
+    q = torch_tensor(q_rows, device)
+    sensor_indices_t = torch.as_tensor(sensor_indices, device=device, dtype=torch.long)
+    point_t = torch_tensor(point, device).reshape(1, 3).expand(count, 3)
+
+    sensor_transforms = batch_eye(count, device).to(dtype=q.dtype)
+    for sensor_idx, chain_specs in enumerate(occlusion_context["sensor_chain_specs"]):
+        mask = sensor_indices_t == sensor_idx
+        if torch.any(mask):
+            sensor_transforms[mask] = fk_sensor_batch(chain_specs, q[mask])
+
+    sensor_origin = sensor_transforms[:, :3, 3]
+    vec = point_t - sensor_origin
+    length = torch.linalg.norm(vec, dim=1)
+    valid_ray = length >= args.min_ray_length
+    direction = vec / torch.clamp(length.unsqueeze(1), min=args.min_ray_length)
+    start = sensor_origin + args.ray_start_offset * direction
+    end = point_t - args.point_end_offset * direction
+    segment = end - start
+    segment_len = torch.linalg.norm(segment, dim=1)
+    valid_ray = valid_ray & (segment_len >= args.min_ray_length)
+
+    for primitive_spec, chain_specs in zip(
+        occlusion_context["primitive_specs"],
+        occlusion_context["collision_chain_specs"],
+    ):
+        link_transform = fk_sensor_batch(chain_specs, q)
+        origin = primitive_spec["origin"].unsqueeze(0).expand(count, -1, -1)
+        collision_transform = torch.bmm(link_transform, origin)
+        local_start = transform_points_inverse_batch(collision_transform, start)
+        local_end = transform_points_inverse_batch(collision_transform, end)
+
+        if primitive_spec["type"] == "box":
+            hit, t = segment_box_hit_batch(
+                local_start,
+                local_end,
+                primitive_spec["half_size"],
+                args.ignore_start_inside,
+            )
+        elif primitive_spec["type"] == "cylinder":
+            hit, t = segment_cylinder_hit_batch(
+                local_start,
+                local_end,
+                primitive_spec["radius"],
+                primitive_spec["half_length"],
+                args.ignore_start_inside,
+            )
+        elif primitive_spec["type"] == "sphere":
+            hit, t = segment_sphere_hit_batch(
+                local_start,
+                local_end,
+                primitive_spec["radius"],
+                args.ignore_start_inside,
+            )
+        else:
+            continue
+
+        distance = torch.clamp(t, 0.0, 1.0) * segment_len + args.ray_start_offset
+        hit = hit & valid_ray & (distance >= args.min_hit_distance)
+        occluded = occluded | hit
+
+    return occluded.detach().cpu().numpy()
 
 
 def compute_q0_occlusion(point: np.ndarray, q_rows: np.ndarray, sensor_indices: np.ndarray,
@@ -494,6 +703,8 @@ def main():
     parser.add_argument("--delta", type=float, default=None)
     parser.add_argument("--occlusion-urdf", default="",
                         help="Optional simplified collision URDF for self-occlusion checking.")
+    parser.add_argument("--occlusion-backend", choices=["auto", "cpu", "torch"], default="auto",
+                        help="Self-occlusion backend. auto uses torch on CUDA and CPU otherwise.")
     parser.add_argument("--keep-occluded-q0", action="store_true",
                         help="Record occlusion fields but do not filter occluded q0 candidates.")
     parser.add_argument("--ray-start-offset", type=float, default=0.03)
@@ -531,7 +742,7 @@ def main():
     q_min = torch_tensor(q_min_np, device)
     q_max = torch_tensor(q_max_np, device)
     all_chain_specs = prepare_chain_specs(robot, args.base_frame, sensor_frames, joint_names, device)
-    occlusion_context = prepare_occlusion_context(args, sensor_frames)
+    occlusion_context = prepare_occlusion_context(args, sensor_frames, joint_names, device)
 
     if args.p_count > 0:
         p_indices = p_rng.choice(len(grid_points), size=min(args.p_count, len(grid_points)), replace=False)
@@ -598,6 +809,7 @@ def main():
         print(f"per_sensor_top_k:   {args.per_sensor_optimize_top_k}")
         print(f"per_sensor_k:       {args.per_sensor_target_q0_per_p}")
     print(f"occlusion_urdf:  {args.occlusion_urdf if args.occlusion_urdf else '<none>'}")
+    print(f"occlusion_backend: {occlusion_context['backend'] if occlusion_context is not None else '<none>'}")
     print(f"keep_occluded:   {args.keep_occluded_q0}")
     print(f"max_iter:        {args.max_iter}")
     print(f"lr:              {args.lr}")
@@ -648,9 +860,14 @@ def main():
         )
 
         if len(q0) > 0:
-            occluded = compute_q0_occlusion(
-                point, q0, active_sensor0, joint_names, occlusion_context, args
-            )
+            if occlusion_context is not None and occlusion_context["backend"] == "torch":
+                occluded = compute_q0_occlusion_torch(
+                    point, q0, active_sensor0, occlusion_context, args, device
+                )
+            else:
+                occluded = compute_q0_occlusion(
+                    point, q0, active_sensor0, joint_names, occlusion_context, args
+                )
             num_q0_before_occlusion[out_idx] = len(q0)
             num_q0_occluded_candidates[out_idx] = int(np.count_nonzero(occluded))
             if occlusion_context is not None and not args.keep_occluded_q0:
@@ -744,14 +961,25 @@ def main():
                 if len(sq0) == 0:
                     continue
 
-                soccluded = compute_q0_occlusion(
-                    point,
-                    sq0,
-                    np.full((len(sq0),), sensor_idx, dtype=np.int16),
-                    joint_names,
-                    occlusion_context,
-                    args,
-                )
+                ssensor_indices = np.full((len(sq0),), sensor_idx, dtype=np.int16)
+                if occlusion_context is not None and occlusion_context["backend"] == "torch":
+                    soccluded = compute_q0_occlusion_torch(
+                        point,
+                        sq0,
+                        ssensor_indices,
+                        occlusion_context,
+                        args,
+                        device,
+                    )
+                else:
+                    soccluded = compute_q0_occlusion(
+                        point,
+                        sq0,
+                        ssensor_indices,
+                        joint_names,
+                        occlusion_context,
+                        args,
+                    )
                 num_sensor_q0_before_occlusion[out_idx, sensor_idx] = len(sq0)
                 num_sensor_q0_occluded_candidates[out_idx, sensor_idx] = int(np.count_nonzero(soccluded))
                 if occlusion_context is not None and not args.keep_occluded_q0:
@@ -864,6 +1092,7 @@ def main():
         "per_sensor_optimize_top_k": np.asarray(args.per_sensor_optimize_top_k, dtype=np.int32),
         "per_sensor_target_q0_per_p": np.asarray(args.per_sensor_target_q0_per_p, dtype=np.int32),
         "occlusion_urdf": np.asarray(args.occlusion_urdf),
+        "occlusion_backend": np.asarray(occlusion_context["backend"] if occlusion_context is not None else "none"),
         "keep_occluded_q0": np.asarray(args.keep_occluded_q0, dtype=np.bool_),
         "raw_has_occlusion_labels": np.asarray(
             bool(raw["has_occlusion_labels"]) if "has_occlusion_labels" in raw else False,
