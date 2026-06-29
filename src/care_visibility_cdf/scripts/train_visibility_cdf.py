@@ -456,16 +456,25 @@ class OnlineVisibilityCDFSampler:
         self.rng = np.random.default_rng(args.seed)
 
         q0 = np.load(args.q0, allow_pickle=True)
-        required = ["grid_points", "q0_templates", "q0_g", "num_q0"]
+        # Strict Yiming-analog single-output mode:
+        #   Yiming: one scalar output, but label distance is min over per-link Q0_l(p).
+        #   Ours:   one scalar output, but label distance is min over per-sensor Q0_s(p).
+        # We therefore train [p,q] -> scalar using sensor_q0_templates, not q0_templates.
+        required = ["grid_points", "sensor_q0_templates", "sensor_q0_g", "num_sensor_q0"]
         missing = [key for key in required if key not in q0]
         if missing:
-            raise RuntimeError(f"q0 file missing required keys: {missing}")
+            raise RuntimeError(f"q0 file missing required keys for sensor-min single-output training: {missing}")
 
         self.q0 = q0
         self.grid_points = q0["grid_points"].astype(np.float32)
-        self.q0_templates = q0["q0_templates"].astype(np.float32)
-        self.q0_g = q0["q0_g"]
-        self.num_q0 = q0["num_q0"].astype(np.int64)
+        self.sensor_q0_templates = q0["sensor_q0_templates"].astype(np.float32)  # [P, S, K, 7]
+        self.sensor_q0_g = q0["sensor_q0_g"].astype(np.float32)                  # [P, S, K]
+        self.num_sensor_q0 = q0["num_sensor_q0"].astype(np.int64)                # [P, S]
+        self.sensor_q0_valid_with_occlusion = (
+            q0["sensor_q0_valid_with_occlusion"].astype(np.bool_)
+            if "sensor_q0_valid_with_occlusion" in q0
+            else None
+        )
         self.joint_names = args.joint_names or names_from_npz(q0, "joint_names", DEFAULT_JOINT_NAMES)
         self.sensor_frames = args.sensor_frames or names_from_npz(q0, "sensor_frames", DEFAULT_SENSOR_FRAMES)
 
@@ -475,10 +484,16 @@ class OnlineVisibilityCDFSampler:
         args.z_max = scalar_from_npz(q0, "z_max", 0.70) if args.z_max is None else args.z_max
         args.delta = scalar_from_npz(q0, "delta", 0.01) if args.delta is None else args.delta
 
-        valid_mask = q0["valid_mask_with_occlusion"].astype(np.bool_) if "valid_mask_with_occlusion" in q0 else q0["valid_mask"].astype(np.bool_)
-        self.valid_rows = np.where(valid_mask & (self.num_q0 > 0))[0].astype(np.int64)
+        if "valid_mask_with_occlusion" in q0:
+            valid_mask = q0["valid_mask_with_occlusion"].astype(np.bool_)
+        elif "valid_mask" in q0:
+            valid_mask = q0["valid_mask"].astype(np.bool_)
+        else:
+            valid_mask = np.ones((self.grid_points.shape[0],), dtype=np.bool_)
+        has_any_sensor_q0 = np.any(self.num_sensor_q0 > 0, axis=1)
+        self.valid_rows = np.where(valid_mask & has_any_sensor_q0)[0].astype(np.int64)
         if len(self.valid_rows) == 0:
-            raise RuntimeError("No valid Q0 rows found.")
+            raise RuntimeError("No valid per-sensor Q0 rows found.")
 
         if args.val_points > 0:
             perm = np.random.default_rng(args.seed + 17).permutation(self.valid_rows)
@@ -501,16 +516,30 @@ class OnlineVisibilityCDFSampler:
         self.occlusion_context = prepare_torch_occlusion_context(args, self.sensor_frames, self.joint_names, device)
 
     def select_valid_q0(self, row):
-        k = int(self.num_q0[row])
-        if k <= 0:
+        """Return concatenated valid per-sensor Q0_s(p) for one p row.
+
+        This is the visibility analog of Yiming's per-link decomposition:
+            unsigned_distance(p,q) = min_s min_{q0 in Q0_s(p)} ||q - q0||.
+        The network output remains a single scalar.
+        """
+        q0_sets = []
+        num_sensors = self.num_sensor_q0.shape[1]
+        for s in range(num_sensors):
+            k = int(self.num_sensor_q0[row, s])
+            if k <= 0:
+                continue
+            finite = (
+                np.isfinite(self.sensor_q0_g[row, s, :k])
+                & np.isfinite(self.sensor_q0_templates[row, s, :k]).all(axis=1)
+            )
+            if self.sensor_q0_valid_with_occlusion is not None:
+                finite = finite & self.sensor_q0_valid_with_occlusion[row, s, :k]
+            idx = np.where(finite)[0]
+            if len(idx) > 0:
+                q0_sets.append(self.sensor_q0_templates[row, s, idx])
+        if not q0_sets:
             return None
-        finite = np.isfinite(self.q0_g[row, :k]) & np.isfinite(self.q0_templates[row, :k]).all(axis=1)
-        if "q0_valid_with_occlusion" in self.q0:
-            finite = finite & self.q0["q0_valid_with_occlusion"][row, :k].astype(np.bool_)
-        idx = np.where(finite)[0]
-        if len(idx) == 0:
-            return None
-        return self.q0_templates[row, idx]
+        return np.concatenate(q0_sets, axis=0).astype(np.float32)
 
     @torch.no_grad()
     def visibility_label_batch(self, point_np, q_batch_np):
@@ -606,7 +635,9 @@ def eval_online(model, sampler, args):
     sign_ok = 0
     false_visible = 0
     false_invisible = 0
-    near = {0.25: [0, 0.0], 0.5: [0, 0.0], 1.0: [0, 0.0]}
+    visible_count = 0
+    invisible_count = 0
+    near = {0.1: [0, 0.0], 0.25: [0, 0.0], 0.5: [0, 0.0], 1.0: [0, 0.0], 2.0: [0, 0.0]}
 
     for _ in range(args.val_batches):
         batch = sampler.sample_batch(args.batch_x, args.batch_q, split="val")
@@ -615,6 +646,8 @@ def eval_online(model, sampler, args):
         pred = model(batch["x"])
         err = pred - y
         total += len(y)
+        visible_count += torch.count_nonzero(visible).item()
+        invisible_count += torch.count_nonzero(~visible).item()
         se += torch.sum(err ** 2).item()
         ae += torch.sum(torch.abs(err)).item()
         pred_visible = pred >= 0.0
@@ -635,6 +668,9 @@ def eval_online(model, sampler, args):
         "rmse": math.sqrt(se / max(total, 1)),
         "mae": ae / max(total, 1),
         "sign_acc": sign_ok / max(total, 1),
+        "visible_count": visible_count,
+        "invisible_count": invisible_count,
+        "visible_ratio": visible_count / max(total, 1),
         "false_visible_rate": false_visible / max(total, 1),
         "false_invisible_rate": false_invisible / max(total, 1),
     }
@@ -642,6 +678,63 @@ def eval_online(model, sampler, args):
         out[f"near_{band:g}_count"] = count
         out[f"near_{band:g}_mae"] = err_sum / count if count > 0 else float("nan")
     return out
+
+
+def summarize_sampled_batches(sampler, args, split="val", num_batches=None):
+    if num_batches is None:
+        num_batches = args.diagnose_batches
+    total = 0
+    visible_count = 0
+    y_abs_values = []
+    near_counts = {0.1: 0, 0.25: 0, 0.5: 0, 1.0: 0, 2.0: 0}
+
+    t0 = time.time()
+    for _ in range(num_batches):
+        batch = sampler.sample_batch(args.batch_x, args.batch_q, split=split)
+        y = batch["y"].detach().cpu().numpy()
+        visible = batch["visible"].detach().cpu().numpy().astype(bool)
+        abs_y = np.abs(y)
+        total += y.shape[0]
+        visible_count += int(np.count_nonzero(visible))
+        y_abs_values.append(abs_y)
+        for band in near_counts:
+            near_counts[band] += int(np.count_nonzero(abs_y <= band))
+
+    y_abs = np.concatenate(y_abs_values, axis=0) if y_abs_values else np.zeros((0,), dtype=np.float32)
+    out = {
+        "split": split,
+        "num_batches": int(num_batches),
+        "total_samples": int(total),
+        "visible_count": int(visible_count),
+        "invisible_count": int(total - visible_count),
+        "visible_ratio": float(visible_count / max(total, 1)),
+        "elapsed_sec": float(time.time() - t0),
+    }
+    for band, count in near_counts.items():
+        out[f"near_{band:g}_count"] = int(count)
+        out[f"near_{band:g}_ratio"] = float(count / max(total, 1))
+    if y_abs.size > 0:
+        out["abs_y_percentiles"] = {
+            str(p): float(v)
+            for p, v in zip([0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100],
+                            np.percentile(y_abs, [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]))
+        }
+    return out
+
+
+def print_sampling_diagnostics(stats):
+    print("")
+    print(f"=== Online Sampling Diagnostics ({stats['split']}) ===")
+    print(f"batches:       {stats['num_batches']}")
+    print(f"samples:       {stats['total_samples']}")
+    print(f"visible:       {stats['visible_count']} / {stats['total_samples']} = {stats['visible_ratio']:.6f}")
+    print(f"invisible:     {stats['invisible_count']} / {stats['total_samples']} = {1.0 - stats['visible_ratio']:.6f}")
+    for band in [0.1, 0.25, 0.5, 1.0, 2.0]:
+        print(f"|cdf| <= {band:g}: count={stats[f'near_{band:g}_count']} ratio={stats[f'near_{band:g}_ratio']:.8f}")
+    if "abs_y_percentiles" in stats:
+        p = stats["abs_y_percentiles"]
+        print("abs(cdf) percentiles:", ", ".join([f"p{k}={p[k]:.4f}" for k in ["0", "1", "5", "10", "25", "50", "75", "90", "95", "99", "100"]]))
+    print(f"diagnose_elapsed: {stats['elapsed_sec']:.2f}s")
 
 
 def save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sampler, path):
@@ -665,7 +758,7 @@ def save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sample
             "target_clip": args.target_clip,
             "metric": args.metric,
         },
-        "training_mode": "online_yiming_style_torch_occlusion",
+        "training_mode": "online_yiming_style_sensor_min_single_output_torch_occlusion",
         "q0_path": args.q0,
         "urdf": args.urdf,
         "occlusion_urdf": args.occlusion_urdf,
@@ -725,6 +818,8 @@ def main():
     parser.add_argument("--loss-grad-weight", type=float, default=0.0)
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--save-every", type=int, default=50)
+    parser.add_argument("--diagnose-only", action="store_true", help="Only sample online batches and report near-boundary/visibility statistics, then exit.")
+    parser.add_argument("--diagnose-batches", type=int, default=20, help="Number of online batches used for diagnose-only and pre-training diagnostics.")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -753,7 +848,7 @@ def main():
         "train_q0_rows": int(len(sampler.train_rows)),
         "val_q0_rows": int(len(sampler.val_rows)),
         "samples_per_step": int(args.batch_x * args.batch_q),
-        "training_mode": "online_yiming_style_torch_occlusion",
+        "training_mode": "online_yiming_style_sensor_min_single_output_torch_occlusion",
         "loss_formula": "cdf*MSE, with optional eikonal/tension/grad terms disabled by default",
     })
     with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -773,6 +868,15 @@ def main():
     print(f"model:         MLP input=10 hidden={args.hidden_dim} layers={args.num_layers} activation={args.activation}")
     print(f"loss weights:  cdf={weights['cdf']} eikonal={weights['eikonal']} tension={weights['tension']} grad={weights['grad']}")
     print(f"target_clip:   {args.target_clip}")
+    print("label_mode:    single_output_sensor_min (Yiming per-link analog: min over per-sensor Q0_s)")
+
+    diag_stats = summarize_sampled_batches(sampler, args, split="val", num_batches=args.diagnose_batches)
+    print_sampling_diagnostics(diag_stats)
+    with open(os.path.join(args.output_dir, "sampling_diagnostics.json"), "w", encoding="utf-8") as f:
+        json.dump(diag_stats, f, indent=2)
+    if args.diagnose_only:
+        print("diagnose_only: exit before training")
+        return
 
     best_val = float("inf")
     global_step = 0
@@ -809,7 +913,8 @@ def main():
                 f"train_total={train_log['total']:.6f} train_mse={train_log['mse']:.6f} "
                 f"grad_cos={train_log['grad_cos']:.4f} "
                 f"val_mse={val_log['mse']:.6f} val_mae={val_log['mae']:.6f} "
-                f"sign_acc={val_log['sign_acc']:.4f} near0.5_count={val_log['near_0.5_count']} "
+                f"sign_acc={val_log['sign_acc']:.4f} visible_ratio={val_log['visible_ratio']:.4f} "
+                f"near0.5_count={val_log['near_0.5_count']} near0.5_ratio={val_log['near_0.5_count']/max(args.val_batches*args.batch_x*args.batch_q,1):.8f} "
                 f"near0.5_mae={val_log['near_0.5_mae']:.6f} elapsed={time.time() - t0:.1f}s"
             )
 
