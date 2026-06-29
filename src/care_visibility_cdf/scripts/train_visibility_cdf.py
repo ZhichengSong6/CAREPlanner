@@ -13,7 +13,6 @@ import torch
 import torch.nn as nn
 from urdf_parser_py.urdf import URDF
 
-
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.append(SCRIPT_DIR)
@@ -40,7 +39,6 @@ class MLP(nn.Module):
         super().__init__()
         if num_layers < 2:
             raise ValueError("num_layers must be >= 2")
-
         if activation == "relu":
             act = nn.ReLU
         elif activation == "softplus":
@@ -49,13 +47,11 @@ class MLP(nn.Module):
             act = nn.SiLU
         else:
             raise ValueError(f"Unsupported activation: {activation}")
-
         layers = [nn.Linear(input_dim, hidden_dim), act()]
         for _ in range(num_layers - 2):
             layers += [nn.Linear(hidden_dim, hidden_dim), act()]
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.net = nn.Sequential(*layers)
-
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -135,7 +131,6 @@ def batch_revolute_transform(axis, q):
     c = torch.cos(q)
     s = torch.sin(q)
     one_minus_c = 1.0 - c
-
     rot = torch.zeros((batch_size, 3, 3), device=device, dtype=dtype)
     rot[:, 0, 0] = c + x * x * one_minus_c
     rot[:, 0, 1] = x * y * one_minus_c - z * s
@@ -146,7 +141,6 @@ def batch_revolute_transform(axis, q):
     rot[:, 2, 0] = z * x * one_minus_c - y * s
     rot[:, 2, 1] = z * y * one_minus_c + x * s
     rot[:, 2, 2] = c + z * z * one_minus_c
-
     transform = batch_eye(batch_size, device, dtype)
     transform[:, :3, :3] = rot
     return transform
@@ -175,9 +169,12 @@ def fk_batch(chain_specs, q_batch):
     return transform
 
 
-def visibility_margins_batch(point, q_batch, sensor_chain_specs, h_fov, v_fov, z_min, z_max, delta):
+def visibility_margins_points_batch(points, q_batch, sensor_chain_specs, h_fov, v_fov, z_min, z_max, delta):
+    # points: [B,3], q_batch: [B,7]
+    points = points.to(device=q_batch.device, dtype=q_batch.dtype).reshape(-1, 3)
     batch_size = q_batch.shape[0]
-    point = point.to(device=q_batch.device, dtype=q_batch.dtype).reshape(1, 3).expand(batch_size, 3)
+    if points.shape[0] != batch_size:
+        raise ValueError(f"points batch {points.shape[0]} != q batch {batch_size}")
 
     ax = math.tan(math.radians(h_fov) * 0.5)
     ay = math.tan(math.radians(v_fov) * 0.5)
@@ -189,7 +186,7 @@ def visibility_margins_batch(point, q_batch, sensor_chain_specs, h_fov, v_fov, z
         tf = fk_batch(specs, q_batch)
         rot = tf[:, :3, :3]
         trans = tf[:, :3, 3]
-        p_sensor = torch.bmm(rot.transpose(1, 2), (point - trans).unsqueeze(-1)).squeeze(-1)
+        p_sensor = torch.bmm(rot.transpose(1, 2), (points - trans).unsqueeze(-1)).squeeze(-1)
         x = p_sensor[:, 0]
         y = p_sensor[:, 1]
         z = p_sensor[:, 2]
@@ -223,7 +220,6 @@ def segment_box_hit(local_start, local_end, half_size, ignore_start_inside):
     t_min = torch.zeros(local_start.shape[0], device=local_start.device, dtype=local_start.dtype)
     t_max = torch.ones_like(t_min)
     valid = torch.ones_like(t_min, dtype=torch.bool)
-
     for axis in range(3):
         da = d[:, axis]
         p0 = local_start[:, axis]
@@ -237,7 +233,6 @@ def segment_box_hit(local_start, local_end, half_size, ignore_start_inside):
         tb = torch.maximum(t1, t2)
         t_min = torch.where(parallel, t_min, torch.maximum(t_min, ta))
         t_max = torch.where(parallel, t_max, torch.minimum(t_max, tb))
-
     hit = valid & (t_min <= t_max) & (t_min >= 0.0) & (t_min <= 1.0)
     if ignore_start_inside:
         hit = hit & (~inside_start)
@@ -266,10 +261,8 @@ def segment_cylinder_hit(local_start, local_end, radius, half_length, ignore_sta
     x0, y0, z0 = local_start[:, 0], local_start[:, 1], local_start[:, 2]
     dx, dy, dz = d[:, 0], d[:, 1], d[:, 2]
     r2 = radius * radius
-
     inside_start = (x0 * x0 + y0 * y0 <= r2) & (torch.abs(z0) <= half_length)
     hit = torch.zeros_like(x0, dtype=torch.bool)
-
     a = dx * dx + dy * dy
     b = 2.0 * (x0 * dx + y0 * dy)
     c = x0 * x0 + y0 * y0 - r2
@@ -280,7 +273,6 @@ def segment_cylinder_hit(local_start, local_end, radius, half_length, ignore_sta
     for t in [(-b - sqrt_disc) / denom, (-b + sqrt_disc) / denom]:
         z = z0 + t * dz
         hit = hit | (valid_side & (t >= 0.0) & (t <= 1.0) & (z >= -half_length) & (z <= half_length))
-
     valid_cap = torch.abs(dz) > 1e-12
     safe_dz = torch.where(valid_cap, dz, torch.ones_like(dz))
     for z_cap in [-half_length, half_length]:
@@ -288,7 +280,6 @@ def segment_cylinder_hit(local_start, local_end, radius, half_length, ignore_sta
         x = x0 + t * dx
         y = y0 + t * dy
         hit = hit | (valid_cap & (t >= 0.0) & (t <= 1.0) & (x * x + y * y <= r2))
-
     if ignore_start_inside:
         hit = hit & (~inside_start)
     return hit
@@ -301,7 +292,6 @@ def prepare_torch_occlusion_context(args, sensor_frames, joint_names, device):
     primitives = load_collision_primitives(robot)
     if not primitives:
         raise RuntimeError(f"No supported collision primitives found in {args.occlusion_urdf}.")
-
     sensor_specs = prepare_chain_specs(robot, args.base_frame, sensor_frames, joint_names, device)
     link_specs = [
         prepare_chain_specs(robot, args.base_frame, [primitive["link"]], joint_names, device)[0]
@@ -317,58 +307,45 @@ def prepare_torch_occlusion_context(args, sensor_frames, joint_names, device):
 
 
 @torch.no_grad()
-def torch_sensor_occlusion(point, q_batch, context, args):
+def torch_sensor_occlusion_points(points, q_batch, context, args):
     batch_size = q_batch.shape[0]
     num_sensors = len(context["sensor_specs"])
     device = q_batch.device
-    point = point.to(device=device, dtype=q_batch.dtype).reshape(1, 3).expand(batch_size, 3)
+    points = points.to(device=device, dtype=q_batch.dtype).reshape(batch_size, 3)
     sensor_occluded = torch.zeros((batch_size, num_sensors), device=device, dtype=torch.bool)
 
     for sensor_idx, specs in enumerate(context["sensor_specs"]):
         sensor_tf = fk_batch(specs, q_batch)
         origin = sensor_tf[:, :3, 3]
-        vec = point - origin
+        vec = points - origin
         length = torch.linalg.norm(vec, dim=1)
         valid_ray = length >= args.min_ray_length
         direction = vec / torch.clamp(length, min=1e-12).unsqueeze(1)
         start = origin + args.ray_start_offset * direction
-        end = point - args.point_end_offset * direction
+        end = points - args.point_end_offset * direction
         segment_len = torch.linalg.norm(end - start, dim=1)
         valid_ray = valid_ray & (segment_len >= args.min_ray_length)
 
         hit_any = torch.zeros((batch_size,), device=device, dtype=torch.bool)
-        for primitive, link_specs, col_origin in zip(
-            context["primitives"],
-            context["link_specs"],
-            context["collision_origins"],
-        ):
+        for primitive, link_specs, col_origin in zip(context["primitives"], context["link_specs"], context["collision_origins"]):
             if primitive["link"] in args.ignore_links:
                 continue
             link_tf = fk_batch(link_specs, q_batch)
             col_tf = torch.bmm(link_tf, col_origin.to(dtype=q_batch.dtype).unsqueeze(0).expand(batch_size, -1, -1))
             local_start = transform_points_inv(col_tf, start)
             local_end = transform_points_inv(col_tf, end)
-
             geom = primitive["geometry"]
             if primitive["type"] == "box":
                 half_size = torch_tensor(0.5 * np.asarray(geom.size, dtype=np.float32), device, dtype=q_batch.dtype)
                 hit = segment_box_hit(local_start, local_end, half_size, args.ignore_start_inside)
             elif primitive["type"] == "cylinder":
-                hit = segment_cylinder_hit(
-                    local_start,
-                    local_end,
-                    float(geom.radius),
-                    0.5 * float(geom.length),
-                    args.ignore_start_inside,
-                )
+                hit = segment_cylinder_hit(local_start, local_end, float(geom.radius), 0.5 * float(geom.length), args.ignore_start_inside)
             elif primitive["type"] == "sphere":
                 hit = segment_sphere_hit(local_start, local_end, float(geom.radius), args.ignore_start_inside)
             else:
                 continue
             hit_any = hit_any | (valid_ray & hit)
-
         sensor_occluded[:, sensor_idx] = hit_any
-
     return sensor_occluded
 
 
@@ -379,26 +356,14 @@ def normalize_pq(p, q, p_min, p_max, q_min, q_max):
 
 
 def grad_wrt_q_physical(pred, x, q_scale):
-    grad_x = torch.autograd.grad(
-        pred.sum(),
-        x,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True,
-    )[0]
+    grad_x = torch.autograd.grad(pred.sum(), x, create_graph=True, retain_graph=True, only_inputs=True)[0]
     return grad_x[:, 3:] * q_scale.view(1, 7)
 
 
 def tension_loss_from_grad_q(grad_q, x, q_scale):
     cols = []
     for j in range(grad_q.shape[1]):
-        grad2_x = torch.autograd.grad(
-            grad_q[:, j].sum(),
-            x,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True,
-        )[0]
+        grad2_x = torch.autograd.grad(grad_q[:, j].sum(), x, create_graph=True, retain_graph=True, only_inputs=True)[0]
         cols.append(grad2_x[:, 3:] * q_scale.view(1, 7))
     hessian = torch.stack(cols, dim=2)
     return (hessian ** 2).mean()
@@ -408,17 +373,14 @@ def compute_losses(model, batch, q_scale, weights):
     x = batch["x"]
     if weights["eikonal"] > 0.0 or weights["tension"] > 0.0 or weights["grad"] > 0.0:
         x = x.detach().clone().requires_grad_(True)
-
     y = batch["y"]
     pred = model(x)
     mse = torch.mean((pred - y) ** 2)
-
     zero = pred.new_tensor(0.0)
     eikonal = zero
     tension = zero
     grad_loss = zero
     grad_cos = zero
-
     if weights["eikonal"] > 0.0 or weights["tension"] > 0.0 or weights["grad"] > 0.0:
         grad_q = grad_wrt_q_physical(pred, x, q_scale)
         grad_norm = torch.linalg.norm(grad_q, dim=1)
@@ -432,21 +394,8 @@ def compute_losses(model, batch, q_scale, weights):
             grad_loss = torch.mean(1.0 - grad_cos_each)
         if weights["tension"] > 0.0:
             tension = tension_loss_from_grad_q(grad_q, x, q_scale)
-
-    total = (
-        weights["cdf"] * mse
-        + weights["eikonal"] * eikonal
-        + weights["tension"] * tension
-        + weights["grad"] * grad_loss
-    )
-    return {
-        "total": total,
-        "mse": mse.detach(),
-        "eikonal": eikonal.detach(),
-        "tension": tension.detach(),
-        "grad": grad_loss.detach(),
-        "grad_cos": grad_cos.detach(),
-    }
+    total = weights["cdf"] * mse + weights["eikonal"] * eikonal + weights["tension"] * tension + weights["grad"] * grad_loss
+    return {"total": total, "mse": mse.detach(), "eikonal": eikonal.detach(), "tension": tension.detach(), "grad": grad_loss.detach(), "grad_cos": grad_cos.detach()}
 
 
 class OnlineVisibilityCDFSampler:
@@ -456,24 +405,19 @@ class OnlineVisibilityCDFSampler:
         self.rng = np.random.default_rng(args.seed)
 
         q0 = np.load(args.q0, allow_pickle=True)
-        # Strict Yiming-analog single-output mode:
-        #   Yiming: one scalar output, but label distance is min over per-link Q0_l(p).
-        #   Ours:   one scalar output, but label distance is min over per-sensor Q0_s(p).
-        # We therefore train [p,q] -> scalar using sensor_q0_templates, not q0_templates.
         required = ["grid_points", "sensor_q0_templates", "sensor_q0_g", "num_sensor_q0"]
         missing = [key for key in required if key not in q0]
         if missing:
-            raise RuntimeError(f"q0 file missing required keys for sensor-min single-output training: {missing}")
+            raise RuntimeError(f"q0 file missing required keys for sensor-min single-output mode: {missing}")
 
         self.q0 = q0
         self.grid_points = q0["grid_points"].astype(np.float32)
-        self.sensor_q0_templates = q0["sensor_q0_templates"].astype(np.float32)  # [P, S, K, 7]
-        self.sensor_q0_g = q0["sensor_q0_g"].astype(np.float32)                  # [P, S, K]
-        self.num_sensor_q0 = q0["num_sensor_q0"].astype(np.int64)                # [P, S]
+        self.sensor_q0_templates = q0["sensor_q0_templates"].astype(np.float32)
+        self.sensor_q0_g = q0["sensor_q0_g"].astype(np.float32)
+        self.num_sensor_q0 = q0["num_sensor_q0"].astype(np.int64)
         self.sensor_q0_valid_with_occlusion = (
             q0["sensor_q0_valid_with_occlusion"].astype(np.bool_)
-            if "sensor_q0_valid_with_occlusion" in q0
-            else None
+            if "sensor_q0_valid_with_occlusion" in q0 else None
         )
         self.joint_names = args.joint_names or names_from_npz(q0, "joint_names", DEFAULT_JOINT_NAMES)
         self.sensor_frames = args.sensor_frames or names_from_npz(q0, "sensor_frames", DEFAULT_SENSOR_FRAMES)
@@ -484,14 +428,9 @@ class OnlineVisibilityCDFSampler:
         args.z_max = scalar_from_npz(q0, "z_max", 0.70) if args.z_max is None else args.z_max
         args.delta = scalar_from_npz(q0, "delta", 0.01) if args.delta is None else args.delta
 
-        if "valid_mask_with_occlusion" in q0:
-            valid_mask = q0["valid_mask_with_occlusion"].astype(np.bool_)
-        elif "valid_mask" in q0:
-            valid_mask = q0["valid_mask"].astype(np.bool_)
-        else:
-            valid_mask = np.ones((self.grid_points.shape[0],), dtype=np.bool_)
-        has_any_sensor_q0 = np.any(self.num_sensor_q0 > 0, axis=1)
-        self.valid_rows = np.where(valid_mask & has_any_sensor_q0)[0].astype(np.int64)
+        valid_by_sensor = self.num_sensor_q0 > 0
+        self.num_flat_q0 = self.num_sensor_q0.sum(axis=1).astype(np.int64)
+        self.valid_rows = np.where(self.num_flat_q0 > 0)[0].astype(np.int64)
         if len(self.valid_rows) == 0:
             raise RuntimeError("No valid per-sensor Q0 rows found.")
 
@@ -515,38 +454,39 @@ class OnlineVisibilityCDFSampler:
         self.sensor_chain_specs = prepare_chain_specs(robot, args.base_frame, self.sensor_frames, self.joint_names, device)
         self.occlusion_context = prepare_torch_occlusion_context(args, self.sensor_frames, self.joint_names, device)
 
-    def select_valid_q0(self, row):
-        """Return concatenated valid per-sensor Q0_s(p) for one p row.
+        # Cache valid flattened Q0 per p. This is exactly min_s min_k Q0_s, only flattened for speed.
+        t0 = time.time()
+        self.flat_q0 = [None] * self.grid_points.shape[0]
+        self._build_flat_q0_cache()
+        print(f"flat Q0 cache built: rows={len(self.valid_rows)} elapsed={time.time() - t0:.2f}s")
 
-        This is the visibility analog of Yiming's per-link decomposition:
-            unsigned_distance(p,q) = min_s min_{q0 in Q0_s(p)} ||q - q0||.
-        The network output remains a single scalar.
-        """
-        q0_sets = []
-        num_sensors = self.num_sensor_q0.shape[1]
-        for s in range(num_sensors):
-            k = int(self.num_sensor_q0[row, s])
-            if k <= 0:
-                continue
-            finite = (
-                np.isfinite(self.sensor_q0_g[row, s, :k])
-                & np.isfinite(self.sensor_q0_templates[row, s, :k]).all(axis=1)
-            )
-            if self.sensor_q0_valid_with_occlusion is not None:
-                finite = finite & self.sensor_q0_valid_with_occlusion[row, s, :k]
-            idx = np.where(finite)[0]
-            if len(idx) > 0:
-                q0_sets.append(self.sensor_q0_templates[row, s, idx])
-        if not q0_sets:
+    def _build_flat_q0_cache(self):
+        for row in self.valid_rows:
+            parts = []
+            for s in range(self.num_sensor_q0.shape[1]):
+                k = int(self.num_sensor_q0[row, s])
+                if k <= 0:
+                    continue
+                mask = np.isfinite(self.sensor_q0_g[row, s, :k]) & np.isfinite(self.sensor_q0_templates[row, s, :k]).all(axis=1)
+                if self.sensor_q0_valid_with_occlusion is not None:
+                    mask = mask & self.sensor_q0_valid_with_occlusion[row, s, :k]
+                if np.any(mask):
+                    parts.append(self.sensor_q0_templates[row, s, :k][mask])
+            if parts:
+                self.flat_q0[row] = np.concatenate(parts, axis=0).astype(np.float32)
+
+    def select_valid_q0(self, row):
+        out = self.flat_q0[int(row)]
+        if out is None or len(out) == 0:
             return None
-        return np.concatenate(q0_sets, axis=0).astype(np.float32)
+        return out
 
     @torch.no_grad()
-    def visibility_label_batch(self, point_np, q_batch_np):
+    def visibility_label_points_batch(self, p_batch_np, q_batch_np):
         q_batch = torch_tensor(q_batch_np, self.device)
-        point = torch_tensor(point_np, self.device)
-        sensor_margins, _best_sensor, _best_margin, _g, visible_fov = visibility_margins_batch(
-            point,
+        points = torch_tensor(p_batch_np, self.device)
+        _sensor_margins, _best_sensor, _best_margin, _g, visible_fov = visibility_margins_points_batch(
+            points,
             q_batch,
             self.sensor_chain_specs,
             self.args.horizontal_fov_deg,
@@ -556,73 +496,93 @@ class OnlineVisibilityCDFSampler:
             self.args.delta,
         )
         if self.occlusion_context is not None:
-            sensor_occluded = torch_sensor_occlusion(point, q_batch, self.occlusion_context, self.args)
+            sensor_occluded = torch_sensor_occlusion_points(points, q_batch, self.occlusion_context, self.args)
             sensor_visible = visible_fov & (~sensor_occluded)
         else:
             sensor_visible = visible_fov
         visible = torch.any(sensor_visible, dim=1)
         return visible.detach().cpu().numpy().astype(np.bool_)
 
+    def sample_near_q0(self, q0_set, n):
+        idx = self.rng.integers(0, len(q0_set), size=n)
+        base = q0_set[idx].astype(np.float32)
+        noise = self.rng.normal(0.0, self.args.near_q_sigma, size=base.shape).astype(np.float32)
+        q = base + noise
+        q = np.minimum(np.maximum(q, self.q_min.reshape(1, 7)), self.q_max.reshape(1, 7))
+        return q.astype(np.float32)
+
+    def sample_q_mixed(self, q0_set, batch_q):
+        frac = float(self.args.boundary_sample_frac)
+        frac = max(0.0, min(1.0, frac))
+        n_near = int(round(batch_q * frac))
+        n_random = batch_q - n_near
+        chunks = []
+        if n_random > 0:
+            chunks.append(sample_q_batch(self.rng, self.joint_limits, self.joint_names, n_random).astype(np.float32))
+        if n_near > 0:
+            chunks.append(self.sample_near_q0(q0_set, n_near))
+        q = np.concatenate(chunks, axis=0) if len(chunks) > 1 else chunks[0]
+        self.rng.shuffle(q, axis=0)
+        return q.astype(np.float32)
+
+    @torch.no_grad()
+    def unsigned_and_grad_for_groups(self, rows, q_groups):
+        unsigned_groups = []
+        nearest_groups = []
+        for row, q_np in zip(rows, q_groups):
+            q0_np = self.select_valid_q0(int(row))
+            q_t = torch_tensor(q_np, self.device)
+            q0_t = torch_tensor(q0_np, self.device)
+            # [batch_q, K]
+            dist = torch.cdist(q_t, q0_t, p=2.0) if self.args.metric == "l2" else torch.sum(torch.abs(q_t[:, None, :] - q0_t[None, :, :]), dim=2)
+            dmin, idx = torch.min(dist, dim=1)
+            nearest = q0_t[idx]
+            unsigned_groups.append(dmin.detach().cpu().numpy().astype(np.float32))
+            nearest_groups.append(nearest.detach().cpu().numpy().astype(np.float32))
+        return np.concatenate(unsigned_groups, axis=0), np.concatenate(nearest_groups, axis=0)
+
     def sample_batch(self, batch_x, batch_q, split="train"):
         rows_pool = self.train_rows if split == "train" else self.val_rows
         rows = self.rng.choice(rows_pool, size=batch_x, replace=(len(rows_pool) < batch_x))
 
-        p_list = []
-        q_list = []
-        y_list = []
-        visible_list = []
-        grad_list = []
-
+        rows_used = []
+        p_groups = []
+        q_groups = []
         for row in rows:
             q0_set = self.select_valid_q0(int(row))
             if q0_set is None:
                 continue
-
             point = self.grid_points[int(row)]
-            q_batch_np = sample_q_batch(self.rng, self.joint_limits, self.joint_names, batch_q).astype(np.float32)
+            q_batch_np = self.sample_q_mixed(q0_set, batch_q)
             p_batch_np = np.repeat(point.reshape(1, 3), batch_q, axis=0).astype(np.float32)
+            rows_used.append(int(row))
+            p_groups.append(p_batch_np)
+            q_groups.append(q_batch_np)
 
-            if self.args.metric == "l1":
-                dist_all = np.sum(np.abs(q_batch_np[:, None, :] - q0_set[None, :, :]), axis=2)
-            else:
-                diff_all = q_batch_np[:, None, :] - q0_set[None, :, :]
-                dist_all = np.linalg.norm(diff_all, axis=2)
-            nearest_local = np.argmin(dist_all, axis=1)
-            unsigned = dist_all[np.arange(batch_q), nearest_local].astype(np.float32)
-            nearest_q0 = q0_set[nearest_local]
-
-            visible = self.visibility_label_batch(point, q_batch_np)
-            sign = np.where(visible, 1.0, -1.0).astype(np.float32)
-            y = sign * unsigned
-            if self.args.target_clip > 0.0:
-                y = np.clip(y, -self.args.target_clip, self.args.target_clip)
-
-            diff = q_batch_np - nearest_q0
-            norm = np.linalg.norm(diff, axis=1, keepdims=True)
-            norm = np.maximum(norm, 1e-6)
-            grad_q_gt = sign.reshape(-1, 1) * diff / norm
-
-            p_list.append(p_batch_np)
-            q_list.append(q_batch_np)
-            y_list.append(y.astype(np.float32))
-            visible_list.append(visible)
-            grad_list.append(grad_q_gt.astype(np.float32))
-
-        if not p_list:
+        if not p_groups:
             raise RuntimeError("Failed to sample a non-empty online batch.")
 
-        p = np.concatenate(p_list, axis=0)
-        q = np.concatenate(q_list, axis=0)
-        y = np.concatenate(y_list, axis=0)
-        visible = np.concatenate(visible_list, axis=0)
-        grad = np.concatenate(grad_list, axis=0)
-        x = normalize_pq(p, q, self.p_min, self.p_max, self.q_min, self.q_max)
+        p = np.concatenate(p_groups, axis=0)
+        q = np.concatenate(q_groups, axis=0)
+        unsigned, nearest_q0 = self.unsigned_and_grad_for_groups(rows_used, q_groups)
 
+        visible = self.visibility_label_points_batch(p, q)
+        sign = np.where(visible, 1.0, -1.0).astype(np.float32)
+        y = sign * unsigned
+        if self.args.target_clip > 0.0:
+            y = np.clip(y, -self.args.target_clip, self.args.target_clip)
+
+        diff = q - nearest_q0
+        norm = np.linalg.norm(diff, axis=1, keepdims=True)
+        norm = np.maximum(norm, 1e-6)
+        grad_q_gt = sign.reshape(-1, 1) * diff / norm
+
+        x = normalize_pq(p, q, self.p_min, self.p_max, self.q_min, self.q_max)
         return {
             "x": torch.from_numpy(x).to(self.device),
-            "y": torch.from_numpy(y).to(self.device),
+            "y": torch.from_numpy(y.astype(np.float32)).to(self.device),
             "visible": torch.from_numpy(visible).to(self.device),
-            "grad_q_gt": torch.from_numpy(grad).to(self.device),
+            "grad_q_gt": torch.from_numpy(grad_q_gt.astype(np.float32)).to(self.device),
         }
 
 
@@ -635,9 +595,10 @@ def eval_online(model, sampler, args):
     sign_ok = 0
     false_visible = 0
     false_invisible = 0
-    visible_count = 0
-    invisible_count = 0
     near = {0.1: [0, 0.0], 0.25: [0, 0.0], 0.5: [0, 0.0], 1.0: [0, 0.0], 2.0: [0, 0.0]}
+    visible_total = 0
+    pred_visible_total = 0
+    true_positive = 0
 
     for _ in range(args.val_batches):
         batch = sampler.sample_batch(args.batch_x, args.batch_q, split="val")
@@ -646,14 +607,15 @@ def eval_online(model, sampler, args):
         pred = model(batch["x"])
         err = pred - y
         total += len(y)
-        visible_count += torch.count_nonzero(visible).item()
-        invisible_count += torch.count_nonzero(~visible).item()
         se += torch.sum(err ** 2).item()
         ae += torch.sum(torch.abs(err)).item()
         pred_visible = pred >= 0.0
         sign_ok += torch.count_nonzero(pred_visible == visible).item()
         false_visible += torch.count_nonzero(pred_visible & (~visible)).item()
         false_invisible += torch.count_nonzero((~pred_visible) & visible).item()
+        visible_total += torch.count_nonzero(visible).item()
+        pred_visible_total += torch.count_nonzero(pred_visible).item()
+        true_positive += torch.count_nonzero(pred_visible & visible).item()
         abs_y = torch.abs(y)
         abs_err = torch.abs(err)
         for band in near:
@@ -668,73 +630,44 @@ def eval_online(model, sampler, args):
         "rmse": math.sqrt(se / max(total, 1)),
         "mae": ae / max(total, 1),
         "sign_acc": sign_ok / max(total, 1),
-        "visible_count": visible_count,
-        "invisible_count": invisible_count,
-        "visible_ratio": visible_count / max(total, 1),
+        "visible_ratio": visible_total / max(total, 1),
+        "pred_visible_ratio": pred_visible_total / max(total, 1),
+        "visible_recall": true_positive / max(visible_total, 1),
+        "visible_precision": true_positive / max(pred_visible_total, 1),
         "false_visible_rate": false_visible / max(total, 1),
         "false_invisible_rate": false_invisible / max(total, 1),
     }
     for band, (count, err_sum) in near.items():
         out[f"near_{band:g}_count"] = count
+        out[f"near_{band:g}_ratio"] = count / max(total, 1)
         out[f"near_{band:g}_mae"] = err_sum / count if count > 0 else float("nan")
     return out
 
 
-def summarize_sampled_batches(sampler, args, split="val", num_batches=None):
-    if num_batches is None:
-        num_batches = args.diagnose_batches
-    total = 0
-    visible_count = 0
-    y_abs_values = []
-    near_counts = {0.1: 0, 0.25: 0, 0.5: 0, 1.0: 0, 2.0: 0}
-
+def diagnose_online_sampling(sampler, args, split="val"):
+    print("\n=== Online Sampling Diagnostics ({}) ===".format(split))
     t0 = time.time()
-    for _ in range(num_batches):
+    ys = []
+    vis = []
+    for _ in range(args.diagnose_batches):
         batch = sampler.sample_batch(args.batch_x, args.batch_q, split=split)
-        y = batch["y"].detach().cpu().numpy()
-        visible = batch["visible"].detach().cpu().numpy().astype(bool)
-        abs_y = np.abs(y)
-        total += y.shape[0]
-        visible_count += int(np.count_nonzero(visible))
-        y_abs_values.append(abs_y)
-        for band in near_counts:
-            near_counts[band] += int(np.count_nonzero(abs_y <= band))
-
-    y_abs = np.concatenate(y_abs_values, axis=0) if y_abs_values else np.zeros((0,), dtype=np.float32)
-    out = {
-        "split": split,
-        "num_batches": int(num_batches),
-        "total_samples": int(total),
-        "visible_count": int(visible_count),
-        "invisible_count": int(total - visible_count),
-        "visible_ratio": float(visible_count / max(total, 1)),
-        "elapsed_sec": float(time.time() - t0),
-    }
-    for band, count in near_counts.items():
-        out[f"near_{band:g}_count"] = int(count)
-        out[f"near_{band:g}_ratio"] = float(count / max(total, 1))
-    if y_abs.size > 0:
-        out["abs_y_percentiles"] = {
-            str(p): float(v)
-            for p, v in zip([0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100],
-                            np.percentile(y_abs, [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]))
-        }
-    return out
-
-
-def print_sampling_diagnostics(stats):
-    print("")
-    print(f"=== Online Sampling Diagnostics ({stats['split']}) ===")
-    print(f"batches:       {stats['num_batches']}")
-    print(f"samples:       {stats['total_samples']}")
-    print(f"visible:       {stats['visible_count']} / {stats['total_samples']} = {stats['visible_ratio']:.6f}")
-    print(f"invisible:     {stats['invisible_count']} / {stats['total_samples']} = {1.0 - stats['visible_ratio']:.6f}")
+        ys.append(batch["y"].detach().cpu().numpy())
+        vis.append(batch["visible"].detach().cpu().numpy())
+    y = np.concatenate(ys, axis=0)
+    visible = np.concatenate(vis, axis=0).astype(bool)
+    abs_y = np.abs(y)
+    total = len(y)
+    print(f"batches:       {args.diagnose_batches}")
+    print(f"samples:       {total}")
+    print(f"visible:       {visible.sum()} / {total} = {visible.mean():.6f}")
+    print(f"invisible:     {(~visible).sum()} / {total} = {(~visible).mean():.6f}")
     for band in [0.1, 0.25, 0.5, 1.0, 2.0]:
-        print(f"|cdf| <= {band:g}: count={stats[f'near_{band:g}_count']} ratio={stats[f'near_{band:g}_ratio']:.8f}")
-    if "abs_y_percentiles" in stats:
-        p = stats["abs_y_percentiles"]
-        print("abs(cdf) percentiles:", ", ".join([f"p{k}={p[k]:.4f}" for k in ["0", "1", "5", "10", "25", "50", "75", "90", "95", "99", "100"]]))
-    print(f"diagnose_elapsed: {stats['elapsed_sec']:.2f}s")
+        c = int(np.sum(abs_y <= band))
+        print(f"|cdf| <= {band:g}: count={c} ratio={c/max(total,1):.8f}")
+    percentiles = [0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100]
+    vals = np.percentile(abs_y, percentiles)
+    print("abs(cdf) percentiles: " + ", ".join([f"p{p}={v:.4f}" for p, v in zip(percentiles, vals)]))
+    print(f"diagnose_elapsed: {time.time() - t0:.2f}s")
 
 
 def save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sampler, path):
@@ -744,34 +677,23 @@ def save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sample
         "best_val_mse": best_val,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "model_config": {
-            "input_dim": 10,
-            "hidden_dim": args.hidden_dim,
-            "num_layers": args.num_layers,
-            "activation": args.activation,
-        },
-        "normalization": {
-            "p_min": sampler.p_min.tolist(),
-            "p_max": sampler.p_max.tolist(),
-            "q_min": sampler.q_min.tolist(),
-            "q_max": sampler.q_max.tolist(),
-            "target_clip": args.target_clip,
-            "metric": args.metric,
-        },
-        "training_mode": "online_yiming_style_sensor_min_single_output_torch_occlusion",
+        "model_config": {"input_dim": 10, "output_dim": 1, "hidden_dim": args.hidden_dim, "num_layers": args.num_layers, "activation": args.activation},
+        "normalization": {"p_min": sampler.p_min.tolist(), "p_max": sampler.p_max.tolist(), "q_min": sampler.q_min.tolist(), "q_max": sampler.q_max.tolist(), "target_clip": args.target_clip, "metric": args.metric},
+        "training_mode": "single_output_sensor_min_yiming_analog_fast_mixed_sampling",
+        "label_formula": "sign_global(p,q) * min_sensor min_q0_in_Q0_sensor(p) ||q-q0||",
         "q0_path": args.q0,
         "urdf": args.urdf,
         "occlusion_urdf": args.occlusion_urdf,
         "batch_x": args.batch_x,
         "batch_q": args.batch_q,
+        "boundary_sample_frac": args.boundary_sample_frac,
+        "near_q_sigma": args.near_q_sigma,
     }
     torch.save(ckpt, path)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Train visibility CDF with Yiming-style online q sampling and batched torch self-occlusion."
-    )
+    parser = argparse.ArgumentParser(description="Train single-output visibility CDF with Yiming-analog per-sensor min labels and optional mixed near-Q0 sampling.")
     parser.add_argument("--urdf", required=True)
     parser.add_argument("--q0", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -818,10 +740,13 @@ def main():
     parser.add_argument("--loss-grad-weight", type=float, default=0.0)
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--save-every", type=int, default=50)
-    parser.add_argument("--diagnose-only", action="store_true", help="Only sample online batches and report near-boundary/visibility statistics, then exit.")
-    parser.add_argument("--diagnose-batches", type=int, default=20, help="Number of online batches used for diagnose-only and pre-training diagnostics.")
-    args = parser.parse_args()
 
+    parser.add_argument("--boundary-sample-frac", type=float, default=0.0, help="Fraction of q samples generated by perturbing valid per-sensor Q0. Use 0.3 for 70/30 random/near-boundary.")
+    parser.add_argument("--near-q-sigma", type=float, default=0.10, help="Std dev in radians for q = q0 + Gaussian noise.")
+    parser.add_argument("--diagnose-only", action="store_true")
+    parser.add_argument("--diagnose-batches", type=int, default=50)
+
+    args = parser.parse_args()
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -834,12 +759,7 @@ def main():
     q_min = torch.tensor(args.q_min, dtype=torch.float32, device=device)
     q_max = torch.tensor(args.q_max, dtype=torch.float32, device=device)
     q_scale = 2.0 / (q_max - q_min)
-    weights = {
-        "cdf": args.loss_cdf_weight,
-        "eikonal": args.loss_eikonal_weight,
-        "tension": args.loss_tension_weight,
-        "grad": args.loss_grad_weight,
-    }
+    weights = {"cdf": args.loss_cdf_weight, "eikonal": args.loss_eikonal_weight, "tension": args.loss_tension_weight, "grad": args.loss_grad_weight}
 
     config = vars(args).copy()
     config.update({
@@ -848,14 +768,13 @@ def main():
         "train_q0_rows": int(len(sampler.train_rows)),
         "val_q0_rows": int(len(sampler.val_rows)),
         "samples_per_step": int(args.batch_x * args.batch_q),
-        "training_mode": "online_yiming_style_sensor_min_single_output_torch_occlusion",
-        "loss_formula": "cdf*MSE, with optional eikonal/tension/grad terms disabled by default",
+        "training_mode": "single_output_sensor_min_yiming_analog_fast_mixed_sampling",
+        "label_formula": "sign_global(p,q) * min_sensor min_q0_in_Q0_sensor(p) ||q-q0||",
     })
     with open(os.path.join(args.output_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
-    print("")
-    print("=== Online Visibility CDF Training Config ===")
+    print("\n=== Online Visibility CDF Training Config ===")
     print(f"urdf:          {args.urdf}")
     print(f"q0:            {args.q0}")
     print(f"occlusion:     {args.occlusion_urdf if args.occlusion_urdf else '<none>'}")
@@ -865,15 +784,13 @@ def main():
     print(f"valid q0 rows: {len(sampler.valid_rows)} train={len(sampler.train_rows)} val={len(sampler.val_rows)}")
     print(f"online batch:  batch_x={args.batch_x}, batch_q={args.batch_q}, samples/step={args.batch_x * args.batch_q}")
     print(f"steps/epoch:   {args.steps_per_epoch}")
-    print(f"model:         MLP input=10 hidden={args.hidden_dim} layers={args.num_layers} activation={args.activation}")
+    print(f"model:         MLP input=10 output=1 hidden={args.hidden_dim} layers={args.num_layers} activation={args.activation}")
     print(f"loss weights:  cdf={weights['cdf']} eikonal={weights['eikonal']} tension={weights['tension']} grad={weights['grad']}")
     print(f"target_clip:   {args.target_clip}")
     print("label_mode:    single_output_sensor_min (Yiming per-link analog: min over per-sensor Q0_s)")
+    print(f"sampling:      random={1.0 - args.boundary_sample_frac:.3f}, near_q0={args.boundary_sample_frac:.3f}, near_q_sigma={args.near_q_sigma}")
 
-    diag_stats = summarize_sampled_batches(sampler, args, split="val", num_batches=args.diagnose_batches)
-    print_sampling_diagnostics(diag_stats)
-    with open(os.path.join(args.output_dir, "sampling_diagnostics.json"), "w", encoding="utf-8") as f:
-        json.dump(diag_stats, f, indent=2)
+    diagnose_online_sampling(sampler, args, split="val")
     if args.diagnose_only:
         print("diagnose_only: exit before training")
         return
@@ -887,23 +804,19 @@ def main():
         model.train()
         sums = {"total": 0.0, "mse": 0.0, "eikonal": 0.0, "tension": 0.0, "grad": 0.0, "grad_cos": 0.0}
         count = 0
-
         for _ in range(args.steps_per_epoch):
             batch = sampler.sample_batch(args.batch_x, args.batch_q, split="train")
             optimizer.zero_grad(set_to_none=True)
             losses = compute_losses(model, batch, q_scale, weights)
             losses["total"].backward()
             optimizer.step()
-
             bs = len(batch["y"])
             count += bs
             global_step += 1
             for key in sums:
                 sums[key] += losses[key].item() * bs
-
         train_log = {key: sums[key] / max(count, 1) for key in sums}
         do_eval = epoch == 1 or epoch % args.eval_every == 0 or epoch == args.epochs
-
         if do_eval:
             val_log = eval_online(model, sampler, args)
             scheduler.step(val_log["mse"])
@@ -911,24 +824,20 @@ def main():
             print(
                 f"[epoch {epoch:04d} step {global_step:07d}] "
                 f"train_total={train_log['total']:.6f} train_mse={train_log['mse']:.6f} "
-                f"grad_cos={train_log['grad_cos']:.4f} "
                 f"val_mse={val_log['mse']:.6f} val_mae={val_log['mae']:.6f} "
-                f"sign_acc={val_log['sign_acc']:.4f} visible_ratio={val_log['visible_ratio']:.4f} "
-                f"near0.5_count={val_log['near_0.5_count']} near0.5_ratio={val_log['near_0.5_count']/max(args.val_batches*args.batch_x*args.batch_q,1):.8f} "
-                f"near0.5_mae={val_log['near_0.5_mae']:.6f} elapsed={time.time() - t0:.1f}s"
+                f"sign_acc={val_log['sign_acc']:.4f} recall={val_log['visible_recall']:.4f} precision={val_log['visible_precision']:.4f} "
+                f"near0.5_count={val_log['near_0.5_count']} near0.5_ratio={val_log['near_0.5_ratio']:.6f} "
+                f"elapsed={time.time() - t0:.1f}s"
             )
-
             if val_log["mse"] < best_val:
                 best_val = val_log["mse"]
                 save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sampler, os.path.join(args.output_dir, "best.pt"))
-
         if epoch % args.save_every == 0 or epoch == args.epochs:
             save_checkpoint(args, model, optimizer, epoch, global_step, best_val, sampler, os.path.join(args.output_dir, f"epoch_{epoch:04d}.pt"))
 
     with open(os.path.join(args.output_dir, "history.json"), "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
-    print("")
-    print(f"best_val_mse: {best_val:.9f}")
+    print(f"\nbest_val_mse: {best_val:.9f}")
     print(f"saved:        {os.path.join(args.output_dir, 'best.pt')}")
 
 
