@@ -42,6 +42,9 @@ outputs/
 # CARE visibility CDF generated training data
 src/care_visibility_cdf/data/*.npz
 
+# CARE visibility CDF generated L4CasADi sources/libraries
+src/care_visibility_cdf/generated/
+
 # CARE visibility CDF temporary/runtime outputs
 src/care_visibility_cdf/tmp/
 src/care_visibility_cdf/slurm_logs/
