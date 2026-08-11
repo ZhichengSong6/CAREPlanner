@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
-"""ROS1 dry-run interface for frozen CARE visibility NCDF guidance.
+"""ROS1 Stage-I dry-run validation for CARE visibility NCDF guidance.
 
-This node is deliberately NON-ACTUATING.  It subscribes to the real CAREPlanner
-active-sensing target, current JointState, and nominal command trajectory, then
-computes the frozen direct normalized projected-ascent correction used by the
-offline L4CasADi tests.
+This node is deliberately NON-ACTUATING. It subscribes to the real CAREPlanner
+active-sensing target, current 7-DoF JointState, and nominal command trajectory,
+then applies the frozen direct normalized NCDF ascent used by the offline tests.
 
-It NEVER publishes to the planner command-trajectory topic and NEVER publishes
-robot velocity/position commands.  Outputs are debug-only topics.
+The learned field is the ONLY source used by the optimizer. After optimization,
+the conservative analytic FOV oracle is evaluated at q_nominal and q_corrected
+for diagnostics only:
 
-Runtime data flow
------------------
-/care_planner/active_sensing/target_point       geometry_msgs/PointStamped
-/care_arm/joint_states                          sensor_msgs/JointState
-/care_planner/command_trajectory_candidate      trajectory_msgs/JointTrajectory
-                                  |
-                                  v
-                    q_nominal at lookahead time
-                                  |
-                                  v
-                 frozen NCDF direct ascent (5 x 0.01 rad)
-                                  |
-                                  v
-              debug nominal/corrected JointState + metrics
+    learned: f(x*, q_nominal) -> f(x*, q_corrected)
+    oracle : g(x*, q_nominal) -> g(x*, q_corrected)
 
-The active-sensing target is required to be fresh.  Freshness uses local ROS
-receipt time rather than trusting the incoming header stamp, which keeps this
-node robust to zero or simulation-time stamps.
+Oracle g never changes the step direction, line search, stopping condition, or
+published correction. This keeps Stage I a genuine real-distribution validation
+of the learned NCDF gradient.
+
+Robot state/configuration is exactly 7-D:
+
+    q = [joint1, joint2, joint3, joint4,
+         wrist_joint1, wrist_joint2, wrist_joint3] in R^7.
+
+No GCDF mobile-base state dimensions are used here.
 """
 
 from __future__ import annotations
@@ -49,15 +44,14 @@ from std_msgs.msg import Bool, Float32, String
 from trajectory_msgs.msg import JointTrajectory
 
 
-# Resolve the source package explicitly.  catkin_install_python places the
-# runtime entry point in devel/lib, while the frozen model reconstruction and
-# L4CasADi helpers intentionally remain source-tree tools.
 PACKAGE_DIR = Path(rospkg.RosPack().get_path("care_visibility_cdf")).resolve()
 SCRIPT_DIR = PACKAGE_DIR / "scripts"
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from evaluate_direct_vs_projection_ascent import (  # noqa: E402
+    DEFAULT_SENSOR_FRAMES,
+    PinocchioFOVOracle,
     build_model_from_checkpoint,
     torch_load_checkpoint,
 )
@@ -96,7 +90,7 @@ class NcdfActiveSensingDryRunNode:
     def __init__(self) -> None:
         self._lock = threading.Lock()
 
-        # Topics / timing.
+        # ROS topics / timing.
         self.target_topic = rospy.get_param(
             "~target_topic", "/care_planner/active_sensing/target_point"
         )
@@ -106,7 +100,7 @@ class NcdfActiveSensingDryRunNode:
         self.command_trajectory_topic = rospy.get_param(
             "~command_trajectory_topic", "/care_planner/command_trajectory_candidate"
         )
-        self.base_frame = rospy.get_param("~base_frame", "base_link")
+        self.base_frame = str(rospy.get_param("~base_frame", "base_link"))
         self.update_rate = float(rospy.get_param("~update_rate", 20.0))
         self.target_timeout = float(rospy.get_param("~target_timeout", 0.20))
         self.joint_state_timeout = float(rospy.get_param("~joint_state_timeout", 0.20))
@@ -119,6 +113,14 @@ class NcdfActiveSensingDryRunNode:
         self.step_max = float(rospy.get_param("~step_max", 0.05))
         self.max_backtracks = int(rospy.get_param("~max_backtracks", 4))
         self.grad_eps = float(rospy.get_param("~grad_eps", 1e-10))
+
+        # Frozen conservative analytic FOV oracle. These are the same defaults
+        # used by the offline NCDF-vs-oracle evaluation.
+        self.horizontal_fov_deg = float(rospy.get_param("~oracle_horizontal_fov_deg", 50.0))
+        self.vertical_fov_deg = float(rospy.get_param("~oracle_vertical_fov_deg", 66.0))
+        self.oracle_z_min = float(rospy.get_param("~oracle_z_min", 0.20))
+        self.oracle_z_max = float(rospy.get_param("~oracle_z_max", 0.70))
+        self.oracle_delta = float(rospy.get_param("~oracle_delta", 0.01))
 
         self.device_name = str(rospy.get_param("~device", "cpu"))
         self.checkpoint_path = Path(
@@ -148,9 +150,9 @@ class NcdfActiveSensingDryRunNode:
         self._trajectory_received: Optional[rospy.Time] = None
 
         rospy.loginfo("[ncdf_dryrun] Loading frozen NCDF / L4CasADi interface...")
-        self._initialize_model()
+        self._initialize_model_and_oracle()
 
-        # Debug-only publishers.  There is intentionally no publisher for the
+        # Debug-only publishers. There is intentionally no publisher for the
         # planner command trajectory or any controller command topic.
         self.nominal_pub = rospy.Publisher(
             "~nominal_joint_state", JointState, queue_size=1
@@ -160,8 +162,21 @@ class NcdfActiveSensingDryRunNode:
         )
         self.active_pub = rospy.Publisher("~active", Bool, queue_size=1)
         self.delta_f_pub = rospy.Publisher("~delta_f", Float32, queue_size=1)
+        self.oracle_g_before_pub = rospy.Publisher(
+            "~oracle_g_before", Float32, queue_size=1
+        )
+        self.oracle_g_after_pub = rospy.Publisher(
+            "~oracle_g_after", Float32, queue_size=1
+        )
+        self.delta_g_pub = rospy.Publisher("~delta_g", Float32, queue_size=1)
+        self.oracle_agrees_pub = rospy.Publisher(
+            "~oracle_agrees", Bool, queue_size=1
+        )
         self.optimizer_time_pub = rospy.Publisher(
             "~optimizer_time_ms", Float32, queue_size=1
+        )
+        self.oracle_time_pub = rospy.Publisher(
+            "~oracle_time_ms", Float32, queue_size=1
         )
         self.summary_pub = rospy.Publisher("~summary", String, queue_size=1)
 
@@ -183,7 +198,11 @@ class NcdfActiveSensingDryRunNode:
         )
 
         rospy.logwarn(
-            "[ncdf_dryrun] DRY RUN ONLY: this node does not publish commands and cannot actuate the robot."
+            "[ncdf_dryrun] DRY RUN ONLY: no command trajectory or controller command is published."
+        )
+        rospy.loginfo(
+            "[ncdf_dryrun] 7-DoF state q=%s",
+            ",".join(self.joint_names),
         )
         rospy.loginfo(
             "[ncdf_dryrun] target=%s joint_state=%s trajectory=%s",
@@ -198,6 +217,14 @@ class NcdfActiveSensingDryRunNode:
             self.iterations,
             self.iter_step,
             self.step_max,
+        )
+        rospy.loginfo(
+            "[ncdf_dryrun] oracle diagnostic only: hFOV=%.1fdeg vFOV=%.1fdeg z=[%.2f,%.2f] delta=%.3f",
+            self.horizontal_fov_deg,
+            self.vertical_fov_deg,
+            self.oracle_z_min,
+            self.oracle_z_max,
+            self.oracle_delta,
         )
 
     def _validate_params(self) -> None:
@@ -215,16 +242,18 @@ class NcdfActiveSensingDryRunNode:
             raise ValueError("~iter_step and ~step_max must be positive")
         if len(self.joint_names) != 7 or len(set(self.joint_names)) != 7:
             raise ValueError("~joint_names must contain exactly 7 unique names")
-        if not self.checkpoint_path.is_file():
+        if self.oracle_z_min >= self.oracle_z_max:
+            raise ValueError("oracle z_min must be smaller than z_max")
+        if self.checkpoint_path.is_file() is False:
             raise FileNotFoundError(f"NCDF checkpoint not found: {self.checkpoint_path}")
-        if not self.urdf_path.is_file():
+        if self.urdf_path.is_file() is False:
             raise FileNotFoundError(f"URDF not found: {self.urdf_path}")
         if self.device_name not in ("cpu", "cuda"):
             raise ValueError("~device must be 'cpu' or 'cuda'")
         if self.device_name == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("~device=cuda requested but torch CUDA is unavailable")
 
-    def _initialize_model(self) -> None:
+    def _initialize_model_and_oracle(self) -> None:
         self.device = torch.device(self.device_name)
         self.q_min, self.q_max = read_joint_limits(self.urdf_path, self.joint_names)
 
@@ -237,10 +266,23 @@ class NcdfActiveSensingDryRunNode:
             model_name=self.model_name,
         )
 
-        # First external-function call can include initialization overhead; do
-        # it once before online timing starts.
+        # Warm up the L4CasADi external function before online timing starts.
         self.value_grad_fn(np.asarray([[0.0, 0.0, 0.5]]), np.zeros((1, 7)))
+
+        self.oracle = PinocchioFOVOracle(
+            urdf_path=str(self.urdf_path),
+            joint_names=list(self.joint_names),
+            sensor_frames=list(DEFAULT_SENSOR_FRAMES),
+            horizontal_fov_deg=self.horizontal_fov_deg,
+            vertical_fov_deg=self.vertical_fov_deg,
+            z_min=self.oracle_z_min,
+            z_max=self.oracle_z_max,
+            delta=self.oracle_delta,
+            base_frame=self.base_frame,
+        )
+
         rospy.loginfo("[ncdf_dryrun] Frozen NCDF ready on %s.", self.device_name)
+        rospy.loginfo("[ncdf_dryrun] Analytic FOV oracle ready for debug-only evaluation.")
 
     def _target_callback(self, msg: PointStamped) -> None:
         if msg is None:
@@ -279,7 +321,10 @@ class NcdfActiveSensingDryRunNode:
         index: Dict[str, int] = {name: i for i, name in enumerate(msg.name)}
         if any(name not in index for name in self.joint_names):
             return None
-        q = np.asarray([msg.position[index[name]] for name in self.joint_names], dtype=np.float64)
+        q = np.asarray(
+            [msg.position[index[name]] for name in self.joint_names],
+            dtype=np.float64,
+        )
         return q if np.all(np.isfinite(q)) else None
 
     def _trajectory_positions_in_order(
@@ -329,9 +374,8 @@ class NcdfActiveSensingDryRunNode:
         return (1.0 - ratio) * positions[lower] + ratio * positions[upper]
 
     def _direct_correct(self, x: np.ndarray, q_nominal: np.ndarray):
-        # The trust region is intentionally centered on q_nominal: this node is
-        # diagnosing a local correction to the task reference, not replacing
-        # the task planner with visibility-only planning.
+        # Stage-I diagnostic only: a local visibility-only configuration step.
+        # This is NOT the final action-space controller.
         lb = np.maximum(self.q_min, q_nominal - self.step_max)
         ub = np.minimum(self.q_max, q_nominal + self.step_max)
         q = np.clip(q_nominal.copy(), lb, ub)
@@ -370,6 +414,18 @@ class NcdfActiveSensingDryRunNode:
         elapsed_ms = 1000.0 * (time.perf_counter() - tic)
         f_final, _ = _value_grad(self.value_grad_fn, x, q)
         return q, f_initial, f_final, accepted, backtracks, elapsed_ms
+
+    def _oracle_g(self, x: np.ndarray, q: np.ndarray) -> float:
+        # Explicit 7-D configuration input. Oracle is evaluation-only.
+        x_t = torch.as_tensor(
+            x, dtype=torch.float32, device=self.device
+        ).reshape(1, 3)
+        q_t = torch.as_tensor(
+            q, dtype=torch.float32, device=self.device
+        ).reshape(1, 7)
+        raw_margin, _ = self.oracle.signed_fov_margins(x_t, q_t)
+        g = torch.max(raw_margin - self.oracle.delta, dim=-1).values
+        return float(g.reshape(()).detach().cpu())
 
     def _joint_state_msg(self, q: np.ndarray, stamp: rospy.Time) -> JointState:
         msg = JointState()
@@ -424,7 +480,7 @@ class NcdfActiveSensingDryRunNode:
             return
         q_nominal = self._sample_nominal_q(trajectory)
         if q_nominal is None:
-            self._publish_inactive("command trajectory cannot provide ordered nominal q")
+            self._publish_inactive("command trajectory cannot provide ordered 7-D nominal q")
             return
 
         x = np.asarray(
@@ -438,39 +494,59 @@ class NcdfActiveSensingDryRunNode:
             q_corrected, f0, f1, accepted, backtracks, elapsed_ms = self._direct_correct(
                 x, q_nominal
             )
-        except Exception as exc:  # keep ROS process alive for diagnostic use
+        except Exception as exc:
             self._publish_inactive(f"optimizer exception: {exc}")
             rospy.logerr_throttle(1.0, "[ncdf_dryrun] optimizer exception: %s", exc)
             return
 
+        # Stage-I oracle validation is deliberately post hoc. The oracle has no
+        # influence on q_corrected above.
+        try:
+            oracle_tic = time.perf_counter()
+            g0 = self._oracle_g(x, q_nominal)
+            g1 = self._oracle_g(x, q_corrected)
+            oracle_elapsed_ms = 1000.0 * (time.perf_counter() - oracle_tic)
+        except Exception as exc:
+            self._publish_inactive(f"oracle debug exception: {exc}")
+            rospy.logerr_throttle(1.0, "[ncdf_dryrun] oracle exception: %s", exc)
+            return
+
         delta_q = q_corrected - q_nominal
         delta_f = f1 - f0
+        delta_g = g1 - g0
         step_l2 = float(np.linalg.norm(delta_q))
         step_inf = float(np.max(np.abs(delta_q)))
         nominal_from_current_l2 = float(np.linalg.norm(q_nominal - q_current))
+        oracle_agrees = bool(delta_g >= -1e-8)
+        crossed_oracle_boundary = bool(g0 < 0.0 and g1 >= 0.0)
+        f_up_g_down = bool(delta_f > 1e-8 and delta_g < -1e-8)
 
         stamp = now
         self.nominal_pub.publish(self._joint_state_msg(q_nominal, stamp))
         self.corrected_pub.publish(self._joint_state_msg(q_corrected, stamp))
         self.active_pub.publish(Bool(data=True))
         self.delta_f_pub.publish(Float32(data=float(delta_f)))
+        self.oracle_g_before_pub.publish(Float32(data=float(g0)))
+        self.oracle_g_after_pub.publish(Float32(data=float(g1)))
+        self.delta_g_pub.publish(Float32(data=float(delta_g)))
+        self.oracle_agrees_pub.publish(Bool(data=oracle_agrees))
         self.optimizer_time_pub.publish(Float32(data=float(elapsed_ms)))
+        self.oracle_time_pub.publish(Float32(data=float(oracle_elapsed_ms)))
 
         summary = (
             f"x={_format_vec(x)} target_age={target_age:.3f}s "
             f"q_nominal_from_current_l2={nominal_from_current_l2:.4f} "
             f"f={f0:+.5f}->{f1:+.5f} df={delta_f:+.5f} "
+            f"g={g0:+.5f}->{g1:+.5f} dg={delta_g:+.5f} "
+            f"oracle_agree={int(oracle_agrees)} cross={int(crossed_oracle_boundary)} "
+            f"f_up_g_down={int(f_up_g_down)} "
             f"dq_l2={step_l2:.4f} dq_inf={step_inf:.4f} "
             f"accepted={accepted}/{self.iterations} backtracks={backtracks} "
-            f"time={elapsed_ms:.3f}ms dq={_format_vec(delta_q)}"
+            f"opt_time={elapsed_ms:.3f}ms oracle_time={oracle_elapsed_ms:.3f}ms "
+            f"dq={_format_vec(delta_q)}"
         )
         self.summary_pub.publish(String(data=summary))
-
-        rospy.loginfo_throttle(
-            0.5,
-            "[ncdf_dryrun] %s",
-            summary,
-        )
+        rospy.loginfo_throttle(0.5, "[ncdf_dryrun] %s", summary)
 
 
 def main() -> None:
