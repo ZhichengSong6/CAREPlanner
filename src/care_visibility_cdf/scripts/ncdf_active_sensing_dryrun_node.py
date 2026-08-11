@@ -22,17 +22,24 @@ Robot state/configuration is exactly 7-D:
          wrist_joint1, wrist_joint2, wrist_joint3] in R^7.
 
 No GCDF mobile-base state dimensions are used here.
+
+The built-in Stage-I logger stores only unique real-frontier cases. A case is
+considered new when either the frontier point changes by at least the configured
+Cartesian threshold or q_nominal changes by at least the configured 7-D L2
+threshold. Repeated 20-Hz evaluations of the same case are therefore not
+counted multiple times.
 """
 
 from __future__ import annotations
 
 import copy
+import csv
 import math
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import rospkg
@@ -84,6 +91,16 @@ def _value_grad(value_grad_fn, x: np.ndarray, q: np.ndarray) -> Tuple[float, np.
 
 def _format_vec(values: Sequence[float], precision: int = 4) -> str:
     return "[" + ", ".join(f"{float(v):+.{precision}f}" for v in values) + "]"
+
+
+def _oracle_cohort(g0: float) -> str:
+    if -0.03 < g0 < 0.0:
+        return "near"
+    if -0.10 < g0 <= -0.03:
+        return "middle"
+    if g0 <= -0.10:
+        return "far"
+    return "inside_or_boundary"
 
 
 class NcdfActiveSensingDryRunNode:
@@ -139,6 +156,22 @@ class NcdfActiveSensingDryRunNode:
         raw_joint_names = rospy.get_param("~joint_names", list(DEFAULT_JOINT_NAMES))
         self.joint_names = [str(name) for name in raw_joint_names]
 
+        # Stage-I unique-case logger.
+        self.enable_logger = bool(rospy.get_param("~enable_logger", True))
+        self.unique_target_threshold_m = float(
+            rospy.get_param("~unique_target_threshold_m", 0.01)
+        )
+        self.unique_q_threshold_rad = float(
+            rospy.get_param("~unique_q_threshold_rad", 0.02)
+        )
+        run_stamp = time.strftime("%Y%m%d_%H%M%S")
+        default_log_path = (
+            PACKAGE_DIR / "outputs" / f"ncdf_stage1_real_frontier_{run_stamp}.csv"
+        )
+        self.log_path = Path(
+            rospy.get_param("~log_path", str(default_log_path))
+        ).expanduser().resolve()
+
         self._validate_params()
 
         # Cached ROS inputs and local receipt times.
@@ -149,8 +182,17 @@ class NcdfActiveSensingDryRunNode:
         self._latest_trajectory: Optional[JointTrajectory] = None
         self._trajectory_received: Optional[rospy.Time] = None
 
+        # Logger state.
+        self._log_file = None
+        self._csv_writer = None
+        self._last_logged_x: Optional[np.ndarray] = None
+        self._last_logged_q_nominal: Optional[np.ndarray] = None
+        self._logged_results: List[Dict[str, float]] = []
+        self._case_id = 0
+
         rospy.loginfo("[ncdf_dryrun] Loading frozen NCDF / L4CasADi interface...")
         self._initialize_model_and_oracle()
+        self._initialize_logger()
 
         # Debug-only publishers. There is intentionally no publisher for the
         # planner command trajectory or any controller command topic.
@@ -196,6 +238,7 @@ class NcdfActiveSensingDryRunNode:
         self.timer = rospy.Timer(
             rospy.Duration.from_sec(1.0 / self.update_rate), self._timer_callback
         )
+        rospy.on_shutdown(self._on_shutdown)
 
         rospy.logwarn(
             "[ncdf_dryrun] DRY RUN ONLY: no command trajectory or controller command is published."
@@ -226,6 +269,13 @@ class NcdfActiveSensingDryRunNode:
             self.oracle_z_max,
             self.oracle_delta,
         )
+        if self.enable_logger:
+            rospy.loginfo(
+                "[stage1_logger] unique if dx>=%.3fm OR dq_nominal_l2>=%.3frad",
+                self.unique_target_threshold_m,
+                self.unique_q_threshold_rad,
+            )
+            rospy.loginfo("[stage1_logger] CSV: %s", self.log_path)
 
     def _validate_params(self) -> None:
         if self.update_rate <= 0.0:
@@ -244,9 +294,11 @@ class NcdfActiveSensingDryRunNode:
             raise ValueError("~joint_names must contain exactly 7 unique names")
         if self.oracle_z_min >= self.oracle_z_max:
             raise ValueError("oracle z_min must be smaller than z_max")
-        if self.checkpoint_path.is_file() is False:
+        if self.unique_target_threshold_m < 0.0 or self.unique_q_threshold_rad < 0.0:
+            raise ValueError("unique-case thresholds must be non-negative")
+        if not self.checkpoint_path.is_file():
             raise FileNotFoundError(f"NCDF checkpoint not found: {self.checkpoint_path}")
-        if self.urdf_path.is_file() is False:
+        if not self.urdf_path.is_file():
             raise FileNotFoundError(f"URDF not found: {self.urdf_path}")
         if self.device_name not in ("cpu", "cuda"):
             raise ValueError("~device must be 'cpu' or 'cuda'")
@@ -283,6 +335,52 @@ class NcdfActiveSensingDryRunNode:
 
         rospy.loginfo("[ncdf_dryrun] Frozen NCDF ready on %s.", self.device_name)
         rospy.loginfo("[ncdf_dryrun] Analytic FOV oracle ready for debug-only evaluation.")
+
+    def _initialize_logger(self) -> None:
+        if not self.enable_logger:
+            rospy.loginfo("[stage1_logger] disabled")
+            return
+
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_file = self.log_path.open("w", newline="", buffering=1)
+
+        fields = [
+            "case_id",
+            "ros_time",
+            "wall_time_unix",
+            "cohort",
+            "target_x",
+            "target_y",
+            "target_z",
+            "target_age_s",
+            "q_nominal_from_current_l2",
+        ]
+        fields += [f"q_current_{name}" for name in self.joint_names]
+        fields += [f"q_nominal_{name}" for name in self.joint_names]
+        fields += [f"q_corrected_{name}" for name in self.joint_names]
+        fields += [f"delta_q_{name}" for name in self.joint_names]
+        fields += [
+            "f_before",
+            "f_after",
+            "delta_f",
+            "g_before",
+            "g_after",
+            "delta_g",
+            "oracle_agree",
+            "crossed_oracle_boundary",
+            "f_up_g_down",
+            "delta_q_l2",
+            "delta_q_inf",
+            "accepted_steps",
+            "requested_steps",
+            "backtracks",
+            "optimizer_time_ms",
+            "oracle_time_ms",
+        ]
+
+        self._csv_writer = csv.DictWriter(self._log_file, fieldnames=fields)
+        self._csv_writer.writeheader()
+        self._log_file.flush()
 
     def _target_callback(self, msg: PointStamped) -> None:
         if msg is None:
@@ -427,6 +525,183 @@ class NcdfActiveSensingDryRunNode:
         g = torch.max(raw_margin - self.oracle.delta, dim=-1).values
         return float(g.reshape(()).detach().cpu())
 
+    def _is_unique_case(self, x: np.ndarray, q_nominal: np.ndarray) -> Tuple[bool, float, float]:
+        if self._last_logged_x is None or self._last_logged_q_nominal is None:
+            return True, math.inf, math.inf
+
+        dx = float(np.linalg.norm(x - self._last_logged_x))
+        dq = float(np.linalg.norm(q_nominal - self._last_logged_q_nominal))
+        unique = (
+            dx >= self.unique_target_threshold_m
+            or dq >= self.unique_q_threshold_rad
+        )
+        return unique, dx, dq
+
+    def _log_unique_case(
+        self,
+        *,
+        now: rospy.Time,
+        x: np.ndarray,
+        target_age: float,
+        q_current: np.ndarray,
+        q_nominal: np.ndarray,
+        q_corrected: np.ndarray,
+        f0: float,
+        f1: float,
+        g0: float,
+        g1: float,
+        accepted: int,
+        backtracks: int,
+        optimizer_time_ms: float,
+        oracle_time_ms: float,
+    ) -> None:
+        if not self.enable_logger or self._csv_writer is None:
+            return
+
+        is_unique, dx_from_last, dq_from_last = self._is_unique_case(x, q_nominal)
+        if not is_unique:
+            return
+
+        self._case_id += 1
+        delta_q = q_corrected - q_nominal
+        delta_f = float(f1 - f0)
+        delta_g = float(g1 - g0)
+        oracle_agree = bool(delta_g >= -1e-8)
+        crossed = bool(g0 < 0.0 and g1 >= 0.0)
+        f_up_g_down = bool(delta_f > 1e-8 and delta_g < -1e-8)
+        q_nominal_from_current_l2 = float(np.linalg.norm(q_nominal - q_current))
+
+        row = {
+            "case_id": self._case_id,
+            "ros_time": float(now.to_sec()),
+            "wall_time_unix": float(time.time()),
+            "cohort": _oracle_cohort(g0),
+            "target_x": float(x[0]),
+            "target_y": float(x[1]),
+            "target_z": float(x[2]),
+            "target_age_s": float(target_age),
+            "q_nominal_from_current_l2": q_nominal_from_current_l2,
+            "f_before": float(f0),
+            "f_after": float(f1),
+            "delta_f": delta_f,
+            "g_before": float(g0),
+            "g_after": float(g1),
+            "delta_g": delta_g,
+            "oracle_agree": int(oracle_agree),
+            "crossed_oracle_boundary": int(crossed),
+            "f_up_g_down": int(f_up_g_down),
+            "delta_q_l2": float(np.linalg.norm(delta_q)),
+            "delta_q_inf": float(np.max(np.abs(delta_q))),
+            "accepted_steps": int(accepted),
+            "requested_steps": int(self.iterations),
+            "backtracks": int(backtracks),
+            "optimizer_time_ms": float(optimizer_time_ms),
+            "oracle_time_ms": float(oracle_time_ms),
+        }
+
+        for i, name in enumerate(self.joint_names):
+            row[f"q_current_{name}"] = float(q_current[i])
+            row[f"q_nominal_{name}"] = float(q_nominal[i])
+            row[f"q_corrected_{name}"] = float(q_corrected[i])
+            row[f"delta_q_{name}"] = float(delta_q[i])
+
+        self._csv_writer.writerow(row)
+        self._log_file.flush()
+
+        self._last_logged_x = x.copy()
+        self._last_logged_q_nominal = q_nominal.copy()
+        self._logged_results.append(
+            {
+                "delta_f": delta_f,
+                "g_before": float(g0),
+                "g_after": float(g1),
+                "delta_g": delta_g,
+                "oracle_agree": float(oracle_agree),
+                "f_up_g_down": float(f_up_g_down),
+            }
+        )
+
+        if math.isinf(dx_from_last):
+            uniqueness_text = "first case"
+        else:
+            uniqueness_text = (
+                f"dx={dx_from_last:.3f}m dq_nom_l2={dq_from_last:.3f}rad"
+            )
+
+        rospy.logwarn(
+            "[stage1_logger] saved case %d (%s): cohort=%s g=%+.5f->%+.5f dg=%+.5f agree=%d f_up_g_down=%d",
+            self._case_id,
+            uniqueness_text,
+            _oracle_cohort(g0),
+            g0,
+            g1,
+            delta_g,
+            int(oracle_agree),
+            int(f_up_g_down),
+        )
+        self._print_running_logger_summary()
+
+    def _print_running_logger_summary(self) -> None:
+        if not self._logged_results:
+            return
+        dg = np.asarray([r["delta_g"] for r in self._logged_results], dtype=np.float64)
+        improve = dg > 1e-8
+        disagree = np.asarray(
+            [r["f_up_g_down"] for r in self._logged_results], dtype=np.float64
+        ) > 0.5
+        rospy.logwarn(
+            "[stage1_logger] N=%d oracle_improve=%.1f%% f_up_g_down=%.1f%% mean_dg=%+.5f median_dg=%+.5f",
+            len(dg),
+            100.0 * float(np.mean(improve)),
+            100.0 * float(np.mean(disagree)),
+            float(np.mean(dg)),
+            float(np.median(dg)),
+        )
+
+    def _print_final_logger_summary(self) -> None:
+        if not self.enable_logger:
+            return
+        if not self._logged_results:
+            rospy.logwarn("[stage1_logger] no unique cases were recorded")
+            return
+
+        rospy.logwarn("[stage1_logger] ===== final Stage-I summary =====")
+        self._print_running_logger_summary()
+
+        for cohort in ("near", "middle", "far", "inside_or_boundary"):
+            subset = [
+                r
+                for r in self._logged_results
+                if _oracle_cohort(float(r["g_before"])) == cohort
+            ]
+            if not subset:
+                continue
+            dg = np.asarray([r["delta_g"] for r in subset], dtype=np.float64)
+            disagree = np.asarray(
+                [r["f_up_g_down"] for r in subset], dtype=np.float64
+            ) > 0.5
+            rospy.logwarn(
+                "[stage1_logger] %-18s N=%d improve=%.1f%% disagree=%.1f%% mean_dg=%+.5f",
+                cohort,
+                len(subset),
+                100.0 * float(np.mean(dg > 1e-8)),
+                100.0 * float(np.mean(disagree)),
+                float(np.mean(dg)),
+            )
+        rospy.logwarn("[stage1_logger] CSV saved to: %s", self.log_path)
+
+    def _on_shutdown(self) -> None:
+        try:
+            self._print_final_logger_summary()
+        finally:
+            if self._log_file is not None:
+                try:
+                    self._log_file.flush()
+                    self._log_file.close()
+                except Exception:
+                    pass
+                self._log_file = None
+
     def _joint_state_msg(self, q: np.ndarray, stamp: rospy.Time) -> JointState:
         msg = JointState()
         msg.header.stamp = stamp
@@ -532,6 +807,23 @@ class NcdfActiveSensingDryRunNode:
         self.oracle_agrees_pub.publish(Bool(data=oracle_agrees))
         self.optimizer_time_pub.publish(Float32(data=float(elapsed_ms)))
         self.oracle_time_pub.publish(Float32(data=float(oracle_elapsed_ms)))
+
+        self._log_unique_case(
+            now=now,
+            x=x,
+            target_age=target_age,
+            q_current=q_current,
+            q_nominal=q_nominal,
+            q_corrected=q_corrected,
+            f0=f0,
+            f1=f1,
+            g0=g0,
+            g1=g1,
+            accepted=accepted,
+            backtracks=backtracks,
+            optimizer_time_ms=elapsed_ms,
+            oracle_time_ms=oracle_elapsed_ms,
+        )
 
         summary = (
             f"x={_format_vec(x)} target_age={target_age:.3f}s "
