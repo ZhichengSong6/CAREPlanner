@@ -1,22 +1,14 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(care_visibility_cdf)
 
+# The visibility-CDF package currently contains offline data-generation,
+# training, and evaluation tools.  These scripts are run directly from the
+# source tree and are not ROS runtime executables, so they do not need to be
+# installed into the catkin devel space.
+#
+# Keep this CMakeLists intentionally minimal.  When runtime nodes or scripts
+# (for example the planned L4CasADi NCDF interface) are added, install only
+# those explicit entry points here.
 find_package(catkin REQUIRED)
 
 catkin_package()
-
-catkin_install_python(PROGRAMS
-  scripts/validate_visibility_oracle.py
-  scripts/generate_visibility_raw_samples.py
-  scripts/check_visibility_raw_samples.py
-  scripts/extract_visibility_zero_level_sets.py
-  scripts/check_visibility_oracle_consistency.py
-  scripts/check_visibility_gradient.py
-  scripts/visualize_visibility_q0_rviz.py
-  scripts/check_visibility_self_occlusion.py
-  scripts/annotate_visibility_raw_self_occlusion.py
-  scripts/generate_visibility_cdf_labels.py
-  scripts/train_visibility_cdf.py
-  scripts/eval_visibility_cdf.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
