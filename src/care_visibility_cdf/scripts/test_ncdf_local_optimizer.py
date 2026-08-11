@@ -39,7 +39,8 @@ import torch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PACKAGE_DIR = SCRIPT_DIR.parent
-REPO_ROOT = PACKAGE_DIR.parent.parent
+SRC_DIR = PACKAGE_DIR.parent
+REPO_ROOT = SRC_DIR.parent
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -57,7 +58,7 @@ DEFAULT_CHECKPOINT = (
     / "exp1_yiming_k500_fov_signed"
     / "final.pt"
 )
-DEFAULT_URDF = REPO_ROOT / "arm_description" / "urdf" / "Arm.urdf"
+DEFAULT_URDF = SRC_DIR / "arm_description" / "urdf" / "Arm.urdf"
 DEFAULT_BUILD_DIR = PACKAGE_DIR / "generated" / "l4casadi_ncdf_optimizer"
 DEFAULT_JOINT_NAMES = (
     "joint1",
@@ -162,23 +163,15 @@ def read_joint_limits(urdf_path: Path, joint_names: Sequence[str]) -> Tuple[np.n
 
 def build_local_solver(l4c_model, step_max: float, vis_weight: float, task_weight: float,
                        max_iter: int, tol: float):
-    # NLP decision variable: optimized joint configuration q_opt (7x1).
     q_opt = cs.MX.sym("q_opt", 7, 1)
-
-    # Parameters are kept symbolic so one solver instance can be reused:
-    # p = [x(3), q_current(7), q_nominal(7)].
     p = cs.MX.sym("p", 17, 1)
     x = p[0:3]
     q_current = p[3:10]
     q_nominal = p[10:17]
 
-    # L4CasADi v2 preserves the exact 2-D input shape. YimingMLP expects
-    # [batch, 10], therefore use an explicit 1x10 row.
     z = cs.horzcat(x.T, q_opt.T)
     f = l4c_model(z)
 
-    # Normalize the nominal-deviation term by step_max so the task weight has a
-    # useful scale independent of the chosen trust-region radius.
     normalized_deviation = (q_opt - q_nominal) / step_max
     task_cost = 0.5 * task_weight * cs.sumsqr(normalized_deviation)
     objective = -vis_weight * f + task_cost
@@ -190,8 +183,6 @@ def build_local_solver(l4c_model, step_max: float, vis_weight: float, task_weigh
         "ipopt.sb": "yes",
         "ipopt.max_iter": int(max_iter),
         "ipopt.tol": float(tol),
-        # We generated/verified first derivatives. Limited-memory keeps this
-        # first integration independent of an exact NN Hessian.
         "ipopt.hessian_approximation": "limited-memory",
     }
     solver = cs.nlpsol("care_ncdf_local_solver", "ipopt", nlp, opts)
@@ -206,8 +197,6 @@ def solve_once(solver, f_fn, x: np.ndarray, q_current: np.ndarray,
     q_current = np.asarray(q_current, dtype=np.float64).reshape(7)
     q_nominal = np.asarray(q_nominal, dtype=np.float64).reshape(7)
 
-    # Intersection of the robot's physical joint limits and the local
-    # trust-region box around the measured state.
     lbx = np.maximum(q_min, q_current - step_max)
     ubx = np.minimum(q_max, q_current + step_max)
     if np.any(lbx > ubx):
@@ -309,7 +298,6 @@ def main() -> None:
         model_name=args.model_name,
     )
 
-    # Warm up the L4CasADi execution graph before timing solves.
     x_warm = np.asarray([[0.0, 0.0, 0.5]], dtype=np.float32)
     q_warm = np.zeros((1, 7), dtype=np.float32)
     value_grad_fn(x_warm, q_warm)
@@ -340,8 +328,6 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     results = []
     for trial in range(args.num_trials):
-        # Avoid sampling exactly on joint bounds so the local trust region has
-        # room in both directions whenever possible.
         span = q_max - q_min
         margin = np.minimum(0.1, 0.05 * span)
         lo = q_min + margin
