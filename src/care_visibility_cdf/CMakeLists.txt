@@ -1,14 +1,17 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(care_visibility_cdf)
 
-# The visibility-CDF package currently contains offline data-generation,
-# training, and evaluation tools.  These scripts are run directly from the
-# source tree and are not ROS runtime executables, so they do not need to be
-# installed into the catkin devel space.
-#
-# Keep this CMakeLists intentionally minimal.  When runtime nodes or scripts
-# (for example the planned L4CasADi NCDF interface) are added, install only
-# those explicit entry points here.
 find_package(catkin REQUIRED)
 
 catkin_package()
+
+# Runtime ROS entry point.  Offline training/evaluation helpers remain in the
+# source tree and are imported by this node through the package source path.
+catkin_install_python(PROGRAMS
+  scripts/ncdf_active_sensing_dryrun_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY launch
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
