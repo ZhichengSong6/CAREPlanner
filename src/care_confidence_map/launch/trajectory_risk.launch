@@ -23,6 +23,9 @@
   <arg name="input_trajectory_topic"
        default="/care_planner/task_trajectory" />
 
+  <arg name="active_sensing_target_topic"
+       default="/care_planner/active_sensing/target_point" />
+
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
 
@@ -80,6 +83,9 @@
 
     <param name="trajectory_risk/input_trajectory_topic"
            value="$(arg input_trajectory_topic)" />
+
+    <param name="trajectory_risk/active_sensing_target_topic"
+           value="$(arg active_sensing_target_topic)" />
 
     <param name="trajectory_risk/confidence_query_service"
            value="$(arg confidence_query_service)" />
