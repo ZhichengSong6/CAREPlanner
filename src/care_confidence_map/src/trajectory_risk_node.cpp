@@ -10,6 +10,7 @@
 #include <std_msgs/String.h>
 
 #include <geometry_msgs/Point.h>
+#include <geometry_msgs/PointStamped.h>
 #include <trajectory_msgs/JointTrajectory.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
@@ -116,6 +117,10 @@ public:
     secondary_frontier_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
             "/care_planner/trajectory_risk/secondary_frontier_markers", 1, true);
+
+    active_sensing_target_pub_ =
+        nh_.advertise<geometry_msgs::PointStamped>(
+            active_sensing_target_topic_, 1, false);
 
     eval_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
@@ -364,6 +369,11 @@ private:
         "trajectory_risk/input_trajectory_topic",
         input_trajectory_topic_,
         "/care_planner/task_trajectory");
+
+    pnh_.param<std::string>(
+        "trajectory_risk/active_sensing_target_topic",
+        active_sensing_target_topic_,
+        "/care_planner/active_sensing/target_point");
 
     pnh_.param<std::string>(
         "trajectory_risk/confidence_query_service",
@@ -2323,6 +2333,47 @@ private:
         makeRiskFrontierAttributionMsg(attr));
   }
 
+  void publishActiveSensingTarget(const AttributionResult& attr)
+  {
+    if (!attr.success || !attr.has_risk_frontier ||
+        attr.risk_frontier_samples.empty())
+    {
+      return;
+    }
+
+    const SampleAttributionItem* target = nullptr;
+    for (const auto& item : attr.risk_frontier_samples)
+    {
+      if (item.inside && item.current_visibility <= 0.5)
+      {
+        target = &item;
+        break;
+      }
+    }
+
+    if (!target)
+    {
+      return;
+    }
+
+    geometry_msgs::PointStamped msg;
+    msg.header.stamp = ros::Time::now();
+    msg.header.frame_id = base_frame_;
+    msg.point = toPointMsg(target->center_base);
+    active_sensing_target_pub_.publish(msg);
+
+    ROS_INFO_THROTTLE(
+        1.0,
+        "[trajectory_risk_node] active-sensing target: x=%.3f y=%.3f z=%.3f, confidence=%.3f, visibility=%.3f, link=%s, original_t=%d",
+        target->center_base.x(),
+        target->center_base.y(),
+        target->center_base.z(),
+        target->confidence,
+        target->current_visibility,
+        target->link_name.c_str(),
+        target->original_timestep);
+  }
+
   bool shouldPublishMarkers()
   {
     if (marker_publish_rate_ <= 0.0)
@@ -2872,6 +2923,7 @@ private:
 
     publishRiskStats(result);
     publishAttribution(attribution, result);
+    publishActiveSensingTarget(attribution);
 
     const ros::WallTime marker_start = ros::WallTime::now();
 
@@ -2921,6 +2973,8 @@ private:
     ROS_INFO_STREAM("body_samples_file: " << body_samples_file_);
     ROS_INFO_STREAM("base_frame: " << base_frame_);
     ROS_INFO_STREAM("input_trajectory_topic: " << input_trajectory_topic_);
+    ROS_INFO_STREAM("active_sensing_target_topic: "
+                    << active_sensing_target_topic_);
     ROS_INFO_STREAM("confidence_query_service: "
                     << confidence_query_service_);
     ROS_INFO_STREAM("refresh_body_prior_service: "
@@ -2969,6 +3023,8 @@ private:
     }
     ROS_INFO_STREAM("subscribed input:");
     ROS_INFO_STREAM("  " << input_trajectory_topic_);
+    ROS_INFO_STREAM("published active-sensing target:");
+    ROS_INFO_STREAM("  " << active_sensing_target_topic_);
     ROS_INFO_STREAM("published attribution topics:");
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/attribution_summary");
     ROS_INFO_STREAM("  /care_planner/trajectory_risk/timestep_attribution");
@@ -3002,6 +3058,7 @@ private:
   ros::Publisher attribution_marker_pub_;
   ros::Publisher primary_frontier_marker_pub_;
   ros::Publisher secondary_frontier_marker_pub_;
+  ros::Publisher active_sensing_target_pub_;
 
   ros::Publisher eval_time_pub_;
   ros::Publisher fk_time_pub_;
@@ -3033,6 +3090,8 @@ private:
   std::string base_frame_ = "base_link";
   std::string input_trajectory_topic_ =
       "/care_planner/task_trajectory";
+  std::string active_sensing_target_topic_ =
+      "/care_planner/active_sensing/target_point";
   std::string confidence_query_service_ =
       "/care_planner/confidence_map/query";
   std::string refresh_body_prior_service_ =
