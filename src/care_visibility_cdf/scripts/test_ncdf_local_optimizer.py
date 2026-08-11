@@ -163,6 +163,7 @@ def read_joint_limits(urdf_path: Path, joint_names: Sequence[str]) -> Tuple[np.n
 
 def build_local_solver(l4c_model, step_max: float, vis_weight: float, task_weight: float,
                        max_iter: int, tol: float):
+    # Solver graph: slices of p are valid symbolic expressions inside the NLP.
     q_opt = cs.MX.sym("q_opt", 7, 1)
     p = cs.MX.sym("p", 17, 1)
     x = p[0:3]
@@ -186,7 +187,20 @@ def build_local_solver(l4c_model, step_max: float, vis_weight: float, task_weigh
         "ipopt.hessian_approximation": "limited-memory",
     }
     solver = cs.nlpsol("care_ncdf_local_solver", "ipopt", nlp, opts)
-    f_fn = cs.Function("care_ncdf_local_f", [x, q_opt], [f])
+
+    # Evaluation/debug function must have *pure symbolic* Function inputs.
+    # A slice such as p[0:3] is an MX expression, not a legal Function input.
+    x_eval = cs.MX.sym("x_eval", 3, 1)
+    q_eval = cs.MX.sym("q_eval", 7, 1)
+    z_eval = cs.horzcat(x_eval.T, q_eval.T)
+    f_eval = l4c_model(z_eval)
+    f_fn = cs.Function(
+        "care_ncdf_local_f",
+        [x_eval, q_eval],
+        [f_eval],
+        ["x", "q"],
+        ["f"],
+    )
     return solver, f_fn
 
 
