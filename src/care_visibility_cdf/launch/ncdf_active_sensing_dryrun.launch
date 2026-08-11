@@ -1,0 +1,62 @@
+<launch>
+  <!-- Frozen NCDF active-sensing dry run. This node publishes debug only. -->
+
+  <arg name="checkpoint"
+       default="$(find care_visibility_cdf)/checkpoints/exp1_yiming_k500_fov_signed/final.pt" />
+  <arg name="urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <arg name="device" default="cpu" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="joint_state_topic" default="/care_arm/joint_states" />
+  <arg name="command_trajectory_topic"
+       default="/care_planner/command_trajectory_candidate" />
+
+  <arg name="update_rate" default="20.0" />
+  <arg name="target_timeout" default="0.20" />
+  <arg name="joint_state_timeout" default="0.20" />
+  <arg name="trajectory_timeout" default="0.20" />
+  <arg name="lookahead_time" default="0.05" />
+
+  <arg name="iterations" default="5" />
+  <arg name="iter_step" default="0.01" />
+  <arg name="step_max" default="0.05" />
+  <arg name="max_backtracks" default="4" />
+
+  <node pkg="care_visibility_cdf"
+        type="ncdf_active_sensing_dryrun_node.py"
+        name="ncdf_active_sensing_dryrun"
+        output="screen">
+
+    <param name="checkpoint" value="$(arg checkpoint)" />
+    <param name="urdf" value="$(arg urdf)" />
+    <param name="device" value="$(arg device)" />
+
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="target_topic" value="$(arg target_topic)" />
+    <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+    <param name="command_trajectory_topic" value="$(arg command_trajectory_topic)" />
+
+    <param name="update_rate" value="$(arg update_rate)" />
+    <param name="target_timeout" value="$(arg target_timeout)" />
+    <param name="joint_state_timeout" value="$(arg joint_state_timeout)" />
+    <param name="trajectory_timeout" value="$(arg trajectory_timeout)" />
+    <param name="lookahead_time" value="$(arg lookahead_time)" />
+
+    <param name="iterations" value="$(arg iterations)" />
+    <param name="iter_step" value="$(arg iter_step)" />
+    <param name="step_max" value="$(arg step_max)" />
+    <param name="max_backtracks" value="$(arg max_backtracks)" />
+
+    <rosparam param="joint_names">
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - wrist_joint1
+      - wrist_joint2
+      - wrist_joint3
+    </rosparam>
+  </node>
+</launch>
