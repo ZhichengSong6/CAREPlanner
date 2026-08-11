@@ -1,0 +1,78 @@
+<launch>
+  <!-- Stage-II 7D NCDF action-space QP dry run. Debug only; no actuation. -->
+
+  <arg name="checkpoint"
+       default="$(find care_visibility_cdf)/checkpoints/exp1_yiming_k500_fov_signed/final.pt" />
+  <arg name="urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <arg name="device" default="cpu" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="joint_state_topic" default="/care_arm/joint_states" />
+  <arg name="command_trajectory_topic"
+       default="/care_planner/command_trajectory_candidate" />
+
+  <arg name="update_rate" default="20.0" />
+  <arg name="target_timeout" default="0.20" />
+  <arg name="joint_state_timeout" default="0.20" />
+  <arg name="trajectory_timeout" default="0.20" />
+
+  <!-- Match the existing TrajectoryExecutionManager short-step backend. -->
+  <arg name="control_dt" default="0.05" />
+  <arg name="lookahead_time" default="0.05" />
+  <arg name="position_feedback_gain" default="2.5" />
+  <arg name="max_command_velocity" default="2.0" />
+
+  <!-- Default action correction gives ~0.01 rad L2 configuration perturbation
+       over one 0.05-s control step before constraints. -->
+  <arg name="visibility_velocity_gain" default="0.20" />
+
+  <node pkg="care_visibility_cdf"
+        type="ncdf_action_qp_dryrun_node.py"
+        name="ncdf_action_qp_dryrun"
+        output="screen">
+
+    <param name="checkpoint" value="$(arg checkpoint)" />
+    <param name="urdf" value="$(arg urdf)" />
+    <param name="device" value="$(arg device)" />
+
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="target_topic" value="$(arg target_topic)" />
+    <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+    <param name="command_trajectory_topic" value="$(arg command_trajectory_topic)" />
+
+    <param name="update_rate" value="$(arg update_rate)" />
+    <param name="target_timeout" value="$(arg target_timeout)" />
+    <param name="joint_state_timeout" value="$(arg joint_state_timeout)" />
+    <param name="trajectory_timeout" value="$(arg trajectory_timeout)" />
+
+    <param name="control_dt" value="$(arg control_dt)" />
+    <param name="lookahead_time" value="$(arg lookahead_time)" />
+    <param name="position_feedback_gain" value="$(arg position_feedback_gain)" />
+    <param name="max_command_velocity" value="$(arg max_command_velocity)" />
+    <param name="visibility_velocity_gain" value="$(arg visibility_velocity_gain)" />
+
+    <rosparam param="joint_names">
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - wrist_joint1
+      - wrist_joint2
+      - wrist_joint3
+    </rosparam>
+
+    <rosparam param="velocity_limits">
+      [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    </rosparam>
+
+    <rosparam param="correction_acceleration_limits">
+      [8.0, 8.0, 10.0, 10.0, 15.0, 15.0, 15.0]
+    </rosparam>
+
+    <rosparam param="tracking_weights">
+      [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    </rosparam>
+  </node>
+</launch>
