@@ -33,8 +33,24 @@ Makefile
 .DS_Store
 
 # large/generated data
+
 data/
 datasets/
 recordings/
 outputs/
-checkpoints/
+
+# CARE visibility CDF generated training data
+src/care_visibility_cdf/data/*.npz
+
+# CARE visibility CDF temporary/runtime outputs
+src/care_visibility_cdf/tmp/
+src/care_visibility_cdf/slurm_logs/
+
+# Old visibility-CDF experiments
+src/care_visibility_cdf/checkpoints/archive_old_experiments/
+
+# Large evaluation sample dumps
+src/care_visibility_cdf/checkpoints/**/**/*_samples.npz
+
+# W&B local runtime files
+wandb/

@@ -128,9 +128,52 @@ def fk_sensor_batch(chain_specs, q_batch: torch.Tensor):
 def visibility_g_batch(point: torch.Tensor, q_batch: torch.Tensor, all_chain_specs,
                        horizontal_fov_deg: float, vertical_fov_deg: float,
                        z_min: float, z_max: float, delta: float):
-    batch_size = q_batch.shape[0]
+    """
+    Visibility FOV margin batch evaluator.
+
+    Backward-compatible modes:
+
+    1. Single point mode:
+        point:   [3]
+        q_batch: [Bq, 7]
+
+        returns:
+            g:              [Bq]
+            sensor_margins: [Bq, S]
+            active_sensor:  [Bq]
+            active_planes:  [Bq, S]
+
+    2. Batched point mode:
+        point:   [Bx, 3]
+        q_batch: [Bq, 7]
+
+        returns:
+            g:              [Bx, Bq]
+            sensor_margins: [Bx, Bq, S]
+            active_sensor:  [Bx, Bq]
+            active_planes:  [Bx, Bq, S]
+
+    This keeps old zero-level data generation unchanged while allowing
+    signed CDF training to compute FOV signs for all sampled points at once.
+    """
+
     device = q_batch.device
-    point = point.to(device=device, dtype=q_batch.dtype).reshape(1, 3).expand(batch_size, 3)
+    dtype = q_batch.dtype
+    Bq = q_batch.shape[0]
+
+    point = point.to(device=device, dtype=dtype)
+
+    single_point = False
+    if point.ndim == 1:
+        point = point.reshape(1, 3)
+        single_point = True
+    elif point.ndim == 2:
+        if point.shape[1] != 3:
+            raise RuntimeError(f"Expected point shape [Bx,3], got {tuple(point.shape)}")
+    else:
+        raise RuntimeError(f"Expected point shape [3] or [Bx,3], got {tuple(point.shape)}")
+
+    Bx = point.shape[0]
 
     ax = math.tan(math.radians(horizontal_fov_deg) * 0.5)
     ay = math.tan(math.radians(vertical_fov_deg) * 0.5)
@@ -139,33 +182,59 @@ def visibility_g_batch(point: torch.Tensor, q_batch: torch.Tensor, all_chain_spe
 
     sensor_margins = []
     active_planes = []
+
     for chain_specs in all_chain_specs:
+        # transform: [Bq,4,4], sensor frame to world frame
         transform = fk_sensor_batch(chain_specs, q_batch)
-        rot = transform[:, :3, :3]
-        trans = transform[:, :3, 3]
-        point_sensor = torch.bmm(
-            rot.transpose(1, 2),
-            (point - trans).unsqueeze(-1),
-        ).squeeze(-1)
-        x = point_sensor[:, 0]
-        y = point_sensor[:, 1]
-        z = point_sensor[:, 2]
-        planes = torch.stack([
-            (x + z * ax) / nx,
-            (-x + z * ax) / nx,
-            (y + z * ay) / ny,
-            (-y + z * ay) / ny,
-            z - z_min,
-            z_max - z,
-        ], dim=1)
-        margin, plane_idx = torch.min(planes, dim=1)
+
+        rot = transform[:, :3, :3]      # [Bq,3,3]
+        trans = transform[:, :3, 3]     # [Bq,3]
+
+        # point_world - sensor_origin_world:
+        # [Bx,1,3] - [1,Bq,3] -> [Bx,Bq,3]
+        diff_world = point[:, None, :] - trans[None, :, :]
+
+        # Transform world vector into sensor frame:
+        # point_sensor[b,q,i] = sum_j rot[q,j,i] * diff_world[b,q,j]
+        # equivalent to R^T @ diff.
+        point_sensor = torch.einsum("qji,bqj->bqi", rot, diff_world)
+
+        x = point_sensor[:, :, 0]   # [Bx,Bq]
+        y = point_sensor[:, :, 1]
+        z = point_sensor[:, :, 2]
+
+        planes = torch.stack(
+            [
+                (x + z * ax) / nx,
+                (-x + z * ax) / nx,
+                (y + z * ay) / ny,
+                (-y + z * ay) / ny,
+                z - z_min,
+                z_max - z,
+            ],
+            dim=-1,
+        )  # [Bx,Bq,6]
+
+        margin, plane_idx = torch.min(planes, dim=-1)  # [Bx,Bq]
+
         sensor_margins.append(margin)
         active_planes.append(plane_idx)
 
-    sensor_margins = torch.stack(sensor_margins, dim=1)
-    active_planes = torch.stack(active_planes, dim=1)
-    best_margin, active_sensor = torch.max(sensor_margins, dim=1)
+    sensor_margins = torch.stack(sensor_margins, dim=-1)  # [Bx,Bq,S]
+    active_planes = torch.stack(active_planes, dim=-1)    # [Bx,Bq,S]
+
+    best_margin, active_sensor = torch.max(sensor_margins, dim=-1)  # [Bx,Bq]
     g = best_margin - delta
+
+    if single_point:
+        # Preserve old API for data generation.
+        return (
+            g.squeeze(0),                         # [Bq]
+            sensor_margins.squeeze(0),            # [Bq,S]
+            active_sensor.squeeze(0),             # [Bq]
+            active_planes.squeeze(0),             # [Bq,S]
+        )
+
     return g, sensor_margins, active_sensor, active_planes
 
 
