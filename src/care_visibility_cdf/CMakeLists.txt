@@ -10,6 +10,7 @@ catkin_package()
 catkin_install_python(PROGRAMS
   scripts/ncdf_active_sensing_dryrun_node.py
   scripts/ncdf_action_qp_dryrun_node.py
+  scripts/ncdf_action_qp_logger_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
