@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stage-II 7-DoF action-space NCDF dry run for CAREPlanner.
 
-This node is NON-ACTUATING. It mirrors the current short-step velocity backend,
-constructs the nominal velocity command at the executor's 0.05-s lookahead,
-and applies a one-step 7-D visibility action QP.
+This node is deliberately NON-ACTUATING.  It mirrors the current short-step
+velocity backend, reconstructs the nominal 7-D velocity action, and computes a
+one-step NCDF visibility action correction.
 
 State / action
 --------------
@@ -12,47 +12,54 @@ State / action
 
 There are no mobile-base state dimensions.
 
-Nominal action
---------------
+Nominal executor action
+-----------------------
 The current TrajectoryExecutionManager computes
 
     u_nom = qdot_ref + Kp * (q_ref - q_measured)
 
-and then clamps the command velocity. This node reproduces that calculation for
-debug only.
+and clamps velocity.  This node reproduces that action for diagnostics.
+
+Strict one-step rollout semantics
+---------------------------------
+The Stage-II learned gradient is evaluated at the state reached by the nominal
+action over one control interval:
+
+    q_nom_next = q_current + dt * u_nom
+    grad       = d f(x*, q_nom_next) / d q.
+
+The corrected action is
+
+    u_corr = u_nom + du,
+
+and its physical one-step state is
+
+    q_corr_next = q_current + dt * u_corr.
+
+All learned-field and oracle comparisons are therefore
+
+    q_nom_next  versus  q_corr_next,
+
+rather than adding a synthetic configuration perturbation to q_ref.
 
 Visibility QP
 -------------
-At q_ref, evaluate the frozen learned field and gradient
-
-    grad = d f(x*, q_ref) / d q
-    d    = grad / ||grad||.
-
-The optimization variable is the ACTION CORRECTION du in R^7:
+Using d = grad / ||grad||, solve
 
     min_du  0.5 * du^T W du - visibility_velocity_gain * d^T du
 
-subject to elementwise bounds from
+subject to elementwise bounds induced by
 
-  1) total command velocity limits,
-  2) one-control-cycle correction acceleration budget,
-  3) next-step joint limits for q_ref + control_dt * du.
+  1) total corrected-action velocity limits,
+  2) physical total-action acceleration limits relative to measured qdot,
+  3) next-step joint limits under q_current + dt * u_corr,
+  4) a separate learned-correction trust region on du.
 
-With diagonal W and box constraints this is a convex QP with an exact closed
-form: compute the unconstrained minimizer and clip each joint to its feasible
-interval. No numerical QP package is needed for this Stage-II one-step test.
+With diagonal W and box constraints this convex 7-D QP has an exact solution:
+compute the unconstrained minimizer and clip each joint to its feasible
+interval.  No external QP package is needed for this one-step Stage-II test.
 
-The default visibility_velocity_gain is 0.2 rad/s. With control_dt=0.05 s and
-a unit-norm direction, the unconstrained configuration perturbation has L2 norm
-0.01 rad, matching ONE Stage-I Direct step (not the five-step 0.05-rad Stage-I
-diagnostic budget).
-
-For validation only, the node also evaluates learned f and analytic oracle g at
-
-    q_nominal  = q_ref
-    q_action   = q_ref + control_dt * du.
-
-The oracle never participates in the QP.
+The analytic FOV oracle is evaluation-only and never affects the action.
 """
 
 from __future__ import annotations
@@ -160,7 +167,7 @@ class NcdfActionQPDryRunNode:
         self.joint_state_timeout = float(rospy.get_param("~joint_state_timeout", 0.20))
         self.trajectory_timeout = float(rospy.get_param("~trajectory_timeout", 0.20))
 
-        # Match the current execution backend exactly by default.
+        # Match the current execution backend by default.
         self.control_dt = float(rospy.get_param("~control_dt", 0.05))
         self.lookahead_time = float(rospy.get_param("~lookahead_time", self.control_dt))
         self.position_feedback_gain = float(
@@ -170,26 +177,40 @@ class NcdfActionQPDryRunNode:
             rospy.get_param("~max_command_velocity", 2.0)
         )
 
-        # Stage-II QP parameters.
+        # Stage-II objective and constraints.
         self.visibility_velocity_gain = float(
             rospy.get_param("~visibility_velocity_gain", 0.20)
         )
         self.grad_eps = float(rospy.get_param("~grad_eps", 1e-10))
+
         self.velocity_limits = _as_7_vector(
             "velocity_limits",
             rospy.get_param("~velocity_limits", None),
             DEFAULT_VELOCITY_LIMITS,
         )
-        # The actual executor also globally clamps to max_command_velocity.
+        # The real executor also has a global max-command-velocity clamp.
         self.velocity_limits = np.minimum(
             self.velocity_limits,
             np.full(7, self.max_command_velocity, dtype=np.float64),
         )
+
+        # Physical total-action acceleration limits:
+        # |u_corr - dq_measured| <= a_max * dt.
+        self.acceleration_limits = _as_7_vector(
+            "acceleration_limits",
+            rospy.get_param("~acceleration_limits", None),
+            DEFAULT_ACCELERATION_LIMITS,
+        )
+
+        # Separate trust region for the learned correction itself.  This keeps
+        # the old Stage-II conservative budget but does NOT replace the physical
+        # total-action acceleration constraint above.
         self.correction_acceleration_limits = _as_7_vector(
             "correction_acceleration_limits",
             rospy.get_param("~correction_acceleration_limits", None),
             DEFAULT_ACCELERATION_LIMITS,
         )
+
         self.tracking_weights = _as_7_vector(
             "tracking_weights",
             rospy.get_param("~tracking_weights", None),
@@ -236,7 +257,7 @@ class NcdfActionQPDryRunNode:
         rospy.loginfo("[ncdf_action_qp] Loading frozen NCDF / L4CasADi interface...")
         self._initialize_model_and_oracle()
 
-        # Debug-only outputs.
+        # Debug-only outputs.  No publisher targets the actual robot controller.
         self.active_pub = rospy.Publisher("~active", Bool, queue_size=1)
         self.gradient_pub = rospy.Publisher("~gradient_q", Float64MultiArray, queue_size=1)
         self.nominal_action_pub = rospy.Publisher(
@@ -301,8 +322,9 @@ class NcdfActionQPDryRunNode:
             self.position_feedback_gain,
         )
         rospy.loginfo(
-            "[ncdf_action_qp] velocity_limits=%s correction_accel=%s",
+            "[ncdf_action_qp] velocity=%s accel=%s correction_trust_accel=%s",
             _format_vec(self.velocity_limits),
+            _format_vec(self.acceleration_limits),
             _format_vec(self.correction_acceleration_limits),
         )
 
@@ -325,6 +347,8 @@ class NcdfActionQPDryRunNode:
             raise ValueError("visibility_velocity_gain must be non-negative")
         if np.any(self.velocity_limits <= 0.0):
             raise ValueError("velocity_limits must be positive")
+        if np.any(self.acceleration_limits <= 0.0):
+            raise ValueError("acceleration_limits must be positive")
         if np.any(self.correction_acceleration_limits <= 0.0):
             raise ValueError("correction_acceleration_limits must be positive")
         if np.any(self.tracking_weights <= 0.0):
@@ -396,6 +420,7 @@ class NcdfActionQPDryRunNode:
         index: Dict[str, int] = {name: i for i, name in enumerate(msg.name)}
         if any(name not in index for name in self.joint_names):
             return None
+
         q = np.zeros(7, dtype=np.float64)
         dq = np.zeros(7, dtype=np.float64)
         for i, name in enumerate(self.joint_names):
@@ -405,6 +430,7 @@ class NcdfActionQPDryRunNode:
             q[i] = float(msg.position[j])
             if j < len(msg.velocity):
                 dq[i] = float(msg.velocity[j])
+
         if not np.all(np.isfinite(q)) or not np.all(np.isfinite(dq)):
             return None
         return q, dq
@@ -414,6 +440,7 @@ class NcdfActionQPDryRunNode:
     ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
         if not msg.points or not msg.joint_names:
             return None
+
         index: Dict[str, int] = {name: i for i, name in enumerate(msg.joint_names)}
         if any(name not in index for name in self.joint_names):
             return None
@@ -468,6 +495,7 @@ class NcdfActionQPDryRunNode:
         ddq0, ddq1 = vec(p0, "accelerations", True), vec(p1, "accelerations", True)
         if any(v is None for v in (q0, q1, dq0, dq1, ddq0, ddq1)):
             return None
+
         return (
             (1.0 - s) * q0 + s * q1,
             (1.0 - s) * dq0 + s * dq1,
@@ -485,32 +513,45 @@ class NcdfActionQPDryRunNode:
         self,
         direction: np.ndarray,
         u_nominal: np.ndarray,
-        q_nominal: np.ndarray,
+        q_current: np.ndarray,
+        dq_current: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Return corrected action, du, lower_du, upper_du.
+        """Solve the diagonal 7-D action QP exactly by box projection."""
 
-        Exact solution for diagonal quadratic objective + box constraints.
-        """
         # Unconstrained minimizer of
-        # 0.5 * du^T W du - gain * direction^T du.
+        #   0.5 * du^T W du - gain * direction^T du.
         du_free = self.visibility_velocity_gain * direction / self.tracking_weights
 
-        # Total action velocity limits.
+        # 1) Total corrected-action velocity limits.
         lower = -self.velocity_limits - u_nominal
         upper = self.velocity_limits - u_nominal
 
-        # Conservative one-cycle budget for the additional visibility action.
+        # 2) Physical total-action acceleration limits relative to measured qdot:
+        # dq_current - a*dt <= u_nominal + du <= dq_current + a*dt.
+        physical_dv = self.acceleration_limits * self.control_dt
+        lower = np.maximum(lower, dq_current - physical_dv - u_nominal)
+        upper = np.minimum(upper, dq_current + physical_dv - u_nominal)
+
+        # 3) Joint limits for the actual one-step corrected rollout:
+        # q_min <= q_current + dt*(u_nominal + du) <= q_max.
+        lower = np.maximum(
+            lower,
+            (self.q_min - q_current) / self.control_dt - u_nominal,
+        )
+        upper = np.minimum(
+            upper,
+            (self.q_max - q_current) / self.control_dt - u_nominal,
+        )
+
+        # 4) Separate trust region for learned visibility correction du.
         correction_dv = self.correction_acceleration_limits * self.control_dt
         lower = np.maximum(lower, -correction_dv)
         upper = np.minimum(upper, correction_dv)
 
-        # Joint limits for the perturbation around the nominal next state.
-        lower = np.maximum(lower, (self.q_min - q_nominal) / self.control_dt)
-        upper = np.minimum(upper, (self.q_max - q_nominal) / self.control_dt)
-
         if np.any(lower > upper + 1e-12):
             raise RuntimeError(
-                "empty action-QP feasible interval: "
+                "empty action-QP feasible interval; nominal action may already be "
+                "incompatible with one-step physical bounds. "
                 f"lower={lower.tolist()} upper={upper.tolist()}"
             )
 
@@ -575,7 +616,7 @@ class NcdfActionQPDryRunNode:
         if sampled is None:
             self._publish_inactive("cannot sample nominal trajectory")
             return
-        q_ref, dq_ref, ddq_ref = sampled
+        q_ref, dq_ref, _ddq_ref = sampled
 
         x = np.asarray(
             [target.point.x, target.point.y, target.point.z], dtype=np.float64
@@ -586,9 +627,13 @@ class NcdfActionQPDryRunNode:
 
         u_nom_raw, u_nom = self._nominal_executor_action(q_current, q_ref, dq_ref)
 
+        # Physical nominal one-step rollout.  The learned gradient is evaluated
+        # at the state the nominal action would actually reach.
+        q_nom_next = q_current + self.control_dt * u_nom
+
         try:
             ncdf_tic = time.perf_counter()
-            f0, grad = _value_grad(self.value_grad_fn, x, q_ref)
+            f_nom, grad = _value_grad(self.value_grad_fn, x, q_nom_next)
             grad_norm = float(np.linalg.norm(grad))
             ncdf_ms = 1000.0 * (time.perf_counter() - ncdf_tic)
             if not np.isfinite(grad_norm) or grad_norm <= self.grad_eps:
@@ -598,16 +643,19 @@ class NcdfActionQPDryRunNode:
 
             qp_tic = time.perf_counter()
             u_corr, du, du_lower, du_upper = self._solve_action_qp(
-                direction, u_nom, q_ref
+                direction=direction,
+                u_nominal=u_nom,
+                q_current=q_current,
+                dq_current=dq_current,
             )
             qp_ms = 1000.0 * (time.perf_counter() - qp_tic)
 
-            q_action = np.clip(q_ref + self.control_dt * du, self.q_min, self.q_max)
-            f1, _ = _value_grad(self.value_grad_fn, x, q_action)
+            q_corr_next = q_current + self.control_dt * u_corr
+            f_corr, _ = _value_grad(self.value_grad_fn, x, q_corr_next)
 
             oracle_tic = time.perf_counter()
-            g0 = self._oracle_g(x, q_ref)
-            g1 = self._oracle_g(x, q_action)
+            g_nom = self._oracle_g(x, q_nom_next)
+            g_corr = self._oracle_g(x, q_corr_next)
             oracle_ms = 1000.0 * (time.perf_counter() - oracle_tic)
         except Exception as exc:
             self._publish_inactive(f"Stage-II computation failed: {exc}")
@@ -617,8 +665,17 @@ class NcdfActionQPDryRunNode:
         visibility_rate_nom = float(np.dot(grad, u_nom))
         visibility_rate_corr = float(np.dot(grad, u_corr))
         delta_visibility_rate = float(np.dot(grad, du))
-        delta_f = float(f1 - f0)
-        delta_g = float(g1 - g0)
+        delta_f = float(f_corr - f_nom)
+        delta_g = float(g_corr - g_nom)
+
+        # Physical acceleration diagnostics use the total corrected action.
+        nominal_accel = (u_nom - dq_current) / self.control_dt
+        corrected_accel = (u_corr - dq_current) / self.control_dt
+        accel_ratio = np.abs(corrected_accel) / self.acceleration_limits
+        max_accel_ratio = float(np.max(accel_ratio))
+        nominal_max_accel_ratio = float(
+            np.max(np.abs(nominal_accel) / self.acceleration_limits)
+        )
 
         tol = 1e-8
         lower_active = np.abs(du - du_lower) <= 1e-6
@@ -630,14 +687,15 @@ class NcdfActionQPDryRunNode:
         learned_improved = bool(delta_f > tol)
         oracle_improved = bool(delta_g > tol)
         f_up_g_down = bool(delta_f > tol and delta_g < -tol)
+        physical_accel_ok = bool(max_accel_ratio <= 1.0 + 1e-8)
 
         self.active_pub.publish(Bool(data=True))
         self.gradient_pub.publish(self._array_msg(grad))
         self.nominal_action_pub.publish(self._array_msg(u_nom))
         self.corrected_action_pub.publish(self._array_msg(u_corr))
         self.delta_action_pub.publish(self._array_msg(du))
-        self.predicted_nominal_state_pub.publish(self._joint_state(q_ref, now))
-        self.predicted_corrected_state_pub.publish(self._joint_state(q_action, now))
+        self.predicted_nominal_state_pub.publish(self._joint_state(q_nom_next, now))
+        self.predicted_corrected_state_pub.publish(self._joint_state(q_corr_next, now))
         self.visibility_rate_nominal_pub.publish(Float32(data=visibility_rate_nom))
         self.visibility_rate_corrected_pub.publish(Float32(data=visibility_rate_corr))
         self.delta_visibility_rate_pub.publish(Float32(data=delta_visibility_rate))
@@ -650,16 +708,20 @@ class NcdfActionQPDryRunNode:
         summary = (
             f"x={_format_vec(x)} "
             f"grad_norm={grad_norm:.4e} "
+            f"dq_meas={_format_vec(dq_current)} "
             f"u_nom={_format_vec(u_nom)} "
             f"du={_format_vec(du)} u_corr={_format_vec(u_corr)} "
             f"rate={visibility_rate_nom:+.5f}->{visibility_rate_corr:+.5f} "
             f"drate={delta_visibility_rate:+.5f} "
-            f"f={f0:+.5f}->{f1:+.5f} df={delta_f:+.5f} "
-            f"g={g0:+.5f}->{g1:+.5f} dg={delta_g:+.5f} "
+            f"f_next={f_nom:+.5f}->{f_corr:+.5f} df={delta_f:+.5f} "
+            f"g_next={g_nom:+.5f}->{g_corr:+.5f} dg={delta_g:+.5f} "
             f"learned_up={int(learned_improved)} oracle_up={int(oracle_improved)} "
             f"f_up_g_down={int(f_up_g_down)} active_bounds={num_active} "
+            f"accel_ok={int(physical_accel_ok)} "
+            f"accel_ratio={max_accel_ratio:.3f} "
+            f"nom_accel_ratio={nominal_max_accel_ratio:.3f} "
             f"nom_vel_clip={int(velocity_clipped_nominal)} "
-            f"qpert_l2={np.linalg.norm(q_action-q_ref):.5f} "
+            f"qpert_l2={np.linalg.norm(q_corr_next-q_nom_next):.5f} "
             f"ncdf={ncdf_ms:.3f}ms qp={qp_ms:.4f}ms oracle={oracle_ms:.3f}ms"
         )
         self.summary_pub.publish(String(data=summary))
