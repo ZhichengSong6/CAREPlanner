@@ -1,0 +1,87 @@
+<launch>
+  <!-- Stage-III short-horizon NCDF trajectory QP.
+       This node filters nominal command trajectories and publishes a corrected
+       trajectory. It never publishes directly to the low-level controller. -->
+
+  <arg name="checkpoint"
+       default="$(find care_visibility_cdf)/checkpoints/exp1_yiming_k500_fov_signed/final.pt" />
+  <arg name="urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <arg name="device" default="cpu" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="joint_state_topic" default="/care_arm/joint_states" />
+  <arg name="input_trajectory_topic"
+       default="/care_planner/command_trajectory_candidate" />
+  <arg name="output_trajectory_topic"
+       default="/care_planner/command_trajectory_stage3" />
+
+  <arg name="target_timeout" default="0.20" />
+  <arg name="joint_state_timeout" default="0.20" />
+
+  <arg name="horizon_duration" default="1.0" />
+  <arg name="num_intervals" default="10" />
+  <arg name="control_dt" default="0.05" />
+
+  <arg name="q_deviation_weight" default="20.0" />
+  <arg name="u_deviation_weight" default="1.0" />
+  <arg name="u_smooth_weight" default="5.0" />
+  <arg name="visibility_weight" default="1.0" />
+  <arg name="oracle_debug" default="true" />
+
+  <node pkg="care_visibility_cdf"
+        type="ncdf_stage3_trajectory_qp_node.py"
+        name="ncdf_stage3_trajectory_qp"
+        output="screen">
+
+    <param name="checkpoint" value="$(arg checkpoint)" />
+    <param name="urdf" value="$(arg urdf)" />
+    <param name="device" value="$(arg device)" />
+
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="target_topic" value="$(arg target_topic)" />
+    <param name="joint_state_topic" value="$(arg joint_state_topic)" />
+    <param name="input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="output_trajectory_topic" value="$(arg output_trajectory_topic)" />
+
+    <param name="target_timeout" value="$(arg target_timeout)" />
+    <param name="joint_state_timeout" value="$(arg joint_state_timeout)" />
+    <param name="horizon_duration" value="$(arg horizon_duration)" />
+    <param name="num_intervals" value="$(arg num_intervals)" />
+    <param name="control_dt" value="$(arg control_dt)" />
+
+    <param name="q_deviation_weight" value="$(arg q_deviation_weight)" />
+    <param name="u_deviation_weight" value="$(arg u_deviation_weight)" />
+    <param name="u_smooth_weight" value="$(arg u_smooth_weight)" />
+    <param name="visibility_weight" value="$(arg visibility_weight)" />
+    <param name="oracle_debug" value="$(arg oracle_debug)" />
+
+    <rosparam param="joint_names">
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - wrist_joint1
+      - wrist_joint2
+      - wrist_joint3
+    </rosparam>
+
+    <!-- Hard Stage-III deviation trust regions. -->
+    <rosparam param="q_trust">
+      [0.08, 0.08, 0.08, 0.08, 0.08, 0.08, 0.08]
+    </rosparam>
+
+    <rosparam param="du_trust">
+      [0.25, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+    </rosparam>
+
+    <rosparam param="velocity_limits">
+      [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    </rosparam>
+
+    <rosparam param="acceleration_limits">
+      [8.0, 8.0, 10.0, 10.0, 15.0, 15.0, 15.0]
+    </rosparam>
+  </node>
+</launch>
