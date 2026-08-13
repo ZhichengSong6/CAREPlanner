@@ -1,5 +1,7 @@
 <launch>
-  <!-- Stage-II 7D NCDF action-space QP dry run. Debug only; no actuation. -->
+  <!-- Stage-II/III 7D NCDF action-space QP.
+       SAFETY: execute defaults false. When execute=true, launch the planner with
+       use_execution_manager:=false so there is only one velocity-command publisher. -->
 
   <arg name="checkpoint"
        default="$(find care_visibility_cdf)/checkpoints/exp1_yiming_k500_fov_signed/final.pt" />
@@ -18,15 +20,16 @@
   <arg name="joint_state_timeout" default="0.20" />
   <arg name="trajectory_timeout" default="0.20" />
 
-  <!-- Match the existing TrajectoryExecutionManager short-step backend. -->
   <arg name="control_dt" default="0.05" />
   <arg name="lookahead_time" default="0.05" />
   <arg name="position_feedback_gain" default="2.5" />
   <arg name="max_command_velocity" default="2.0" />
-
-  <!-- Default action correction gives ~0.01 rad L2 configuration perturbation
-       over one 0.05-s control step before constraints. -->
   <arg name="visibility_velocity_gain" default="0.20" />
+
+  <!-- Closed-loop execution is opt-in. -->
+  <arg name="execute" default="false" />
+  <arg name="velocity_command_topic"
+       default="/care_arm/arm_group_velocity_controller/command" />
 
   <node pkg="care_visibility_cdf"
         type="ncdf_action_qp_dryrun_node.py"
@@ -53,6 +56,9 @@
     <param name="max_command_velocity" value="$(arg max_command_velocity)" />
     <param name="visibility_velocity_gain" value="$(arg visibility_velocity_gain)" />
 
+    <param name="execute" value="$(arg execute)" />
+    <param name="velocity_command_topic" value="$(arg velocity_command_topic)" />
+
     <rosparam param="joint_names">
       - joint1
       - joint2
@@ -65,6 +71,10 @@
 
     <rosparam param="velocity_limits">
       [2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    </rosparam>
+
+    <rosparam param="acceleration_limits">
+      [8.0, 8.0, 10.0, 10.0, 15.0, 15.0, 15.0]
     </rosparam>
 
     <rosparam param="correction_acceleration_limits">
