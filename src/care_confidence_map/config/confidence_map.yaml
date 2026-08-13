@@ -16,8 +16,9 @@ confidence_map:
   # Temporal memory of observed / known-clear space.
   # If a voxel is not currently visible, confidence decays as:
   # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
-  # Set to a very large value for practical no-decay debugging.
-  temporal_decay_time: 2.0
+  # 100 s is intentionally very slow for current active-sensing debugging,
+  # so previously observed space is effectively remembered over a normal run.
+  temporal_decay_time: 100.0
 
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
