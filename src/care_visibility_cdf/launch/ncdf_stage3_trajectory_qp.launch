@@ -25,6 +25,7 @@
   <arg name="control_dt" default="0.05" />
 
   <arg name="q_deviation_weight" default="20.0" />
+  <arg name="terminal_q_weight" default="20.0" />
   <arg name="u_deviation_weight" default="1.0" />
   <arg name="u_smooth_weight" default="5.0" />
   <arg name="visibility_weight" default="1.0" />
@@ -52,6 +53,7 @@
     <param name="control_dt" value="$(arg control_dt)" />
 
     <param name="q_deviation_weight" value="$(arg q_deviation_weight)" />
+    <param name="terminal_q_weight" value="$(arg terminal_q_weight)" />
     <param name="u_deviation_weight" value="$(arg u_deviation_weight)" />
     <param name="u_smooth_weight" value="$(arg u_smooth_weight)" />
     <param name="visibility_weight" value="$(arg visibility_weight)" />
