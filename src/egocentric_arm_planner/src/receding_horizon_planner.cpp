@@ -186,33 +186,70 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   }
 
   const Eigen::VectorXd q_current = robot_model_->getCurrentQ();
-  const Eigen::VectorXd dq_current = robot_model_->getCurrentDq();
+  const Eigen::VectorXd dq_measured = robot_model_->getCurrentDq();
+
+  // JointState velocity is a measured input, not a trusted command.  During
+  // Gazebo/controller startup we have observed isolated tens-of-rad/s spikes
+  // while the position barely moves.  Feeding those values directly into a
+  // quintic boundary condition creates large trajectory overshoot and can also
+  // make the downstream Stage-III first-step acceleration constraint infeasible.
+  //
+  // Keep normal measured velocities, clip mild over-limit values, and replace
+  // grossly non-physical measurements (>1.5x the configured planner limit) by
+  // zero for this planning cycle.  Position is left untouched.
+  Eigen::VectorXd dq_planning = dq_measured;
+  const auto& velocity_limits = task_generator_.config().joint_velocity_limits;
+  bool sanitized_velocity = false;
+  if (static_cast<int>(velocity_limits.size()) == dq_planning.size()) {
+    for (int i = 0; i < dq_planning.size(); ++i) {
+      const double limit = std::max(velocity_limits[static_cast<std::size_t>(i)], 1e-6);
+      const double raw = dq_planning[i];
+      if (!std::isfinite(raw) || std::abs(raw) > 1.5 * limit) {
+        dq_planning[i] = 0.0;
+        sanitized_velocity = true;
+      } else if (std::abs(raw) > limit) {
+        dq_planning[i] = std::max(-limit, std::min(limit, raw));
+        sanitized_velocity = true;
+      }
+    }
+  }
+
+  if (sanitized_velocity) {
+    ROS_WARN_STREAM_THROTTLE(
+        0.5,
+        "[RecedingHorizonPlanner] Sanitized JointState velocity before planning. "
+            << "raw=[" << dq_measured.transpose() << "], used=["
+            << dq_planning.transpose() << "]");
+  }
 
   Eigen::VectorXd ddq_current = Eigen::VectorXd::Zero(robot_model_->nv());
   const ros::Time current_stamp = joint_state.header.stamp.isZero()
                                       ? ros::Time::now()
                                       : joint_state.header.stamp;
 
+  // Estimate acceleration from the sanitized velocity history.  Otherwise a
+  // single bad JointState velocity sample would contaminate the next cycle's
+  // ddq estimate even after the velocity itself had returned to normal.
   if (has_previous_dq_for_ddq_ &&
-      previous_dq_for_ddq_.size() == dq_current.size()) {
+      previous_dq_for_ddq_.size() == dq_planning.size()) {
     const double dt = (current_stamp - previous_dq_stamp_).toSec();
     if (dt > 1e-5) {
-      ddq_current = (dq_current - previous_dq_for_ddq_) / dt;
+      ddq_current = (dq_planning - previous_dq_for_ddq_) / dt;
       latest_ddq_estimate_ = ddq_current;
       has_ddq_estimate_ = true;
     } else if (has_ddq_estimate_ &&
-               latest_ddq_estimate_.size() == dq_current.size()) {
+               latest_ddq_estimate_.size() == dq_planning.size()) {
       ddq_current = latest_ddq_estimate_;
     }
   }
 
-  previous_dq_for_ddq_ = dq_current;
+  previous_dq_for_ddq_ = dq_planning;
   previous_dq_stamp_ = current_stamp;
   has_previous_dq_for_ddq_ = true;
 
   arm_trajectory::JointTrajectory tau_task;
   const PlannerStatus gen_status =
-      task_generator_.generate(q_current, dq_current, ddq_current, target_pose, tau_task);
+      task_generator_.generate(q_current, dq_planning, ddq_current, target_pose, tau_task);
 
   if (gen_status != PlannerStatus::SUCCESS) {
     ROS_WARN_STREAM_THROTTLE(
@@ -220,6 +257,48 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
         "[RecedingHorizonPlanner] Task trajectory generation failed: "
             << plannerStatusToString(gen_status));
     return false;
+  }
+
+  // Fail closed if the generator reached its time-scaling iteration cap while
+  // the trajectory is still outside the configured dynamic limits.  Previously
+  // TaskTrajectoryGenerator warned and returned SUCCESS, allowing a visibly
+  // oscillatory/over-limit nominal trajectory to propagate to TEM and Stage III.
+  const auto& task_cfg = task_generator_.config();
+  if (task_cfg.enforce_velocity_acceleration_limits) {
+    const double check_dt = std::max(0.005, std::min(task_cfg.trajectory_dt, 0.02));
+    double worst_velocity_ratio = 0.0;
+    double worst_acceleration_ratio = 0.0;
+    Eigen::VectorXd q_s;
+    Eigen::VectorXd dq_s;
+    Eigen::VectorXd ddq_s;
+
+    for (double t = tau_task.startTime();
+         t <= tau_task.endTime() + 1e-9;
+         t += check_dt) {
+      if (!tau_task.sample(std::min(t, tau_task.endTime()), q_s, dq_s, ddq_s)) {
+        continue;
+      }
+      for (int i = 0; i < dq_s.size(); ++i) {
+        const double v_limit = std::max(
+            task_cfg.joint_velocity_limits[static_cast<std::size_t>(i)], 1e-6);
+        const double a_limit = std::max(
+            task_cfg.joint_acceleration_limits[static_cast<std::size_t>(i)], 1e-6);
+        worst_velocity_ratio = std::max(
+            worst_velocity_ratio, std::abs(dq_s[i]) / v_limit);
+        worst_acceleration_ratio = std::max(
+            worst_acceleration_ratio, std::abs(ddq_s[i]) / a_limit);
+      }
+    }
+
+    if (worst_velocity_ratio > 1.001 || worst_acceleration_ratio > 1.001) {
+      ROS_ERROR_STREAM_THROTTLE(
+          0.5,
+          "[RecedingHorizonPlanner] Rejecting dynamically invalid tau_task. "
+              << "worst_velocity_ratio=" << worst_velocity_ratio
+              << ", worst_acceleration_ratio=" << worst_acceleration_ratio
+              << ", duration=" << tau_task.duration());
+      return false;
+    }
   }
 
   EvaluationResult eval;
