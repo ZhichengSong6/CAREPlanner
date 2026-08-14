@@ -23,4 +23,9 @@
   <depend>arm_trajectory</depend>
 
   <depend>eigen</depend>
+
+  <!-- Runtime-only tools used by the Phase-A A/B diagnostic launch. -->
+  <exec_depend>rospy</exec_depend>
+  <exec_depend>rosnode</exec_depend>
+  <exec_depend>rosbag</exec_depend>
 </package>
