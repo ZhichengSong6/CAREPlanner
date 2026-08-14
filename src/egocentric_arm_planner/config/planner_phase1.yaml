@@ -69,13 +69,13 @@ task_generator:
 
   nominal_max_joint_acceleration: 10.0
   joint_acceleration_limits:
-    joint1: 8.0
-    joint2: 8.0
-    joint3: 10.0
-    joint4: 10.0
-    wrist_joint1: 15.0
-    wrist_joint2: 15.0
-    wrist_joint3: 15.0
+    joint1: 3.0
+    joint2: 3.0
+    joint3: 4.0
+    joint4: 4.0
+    wrist_joint1: 6.0
+    wrist_joint2: 6.0
+    wrist_joint3: 6.0
 
   enforce_velocity_acceleration_limits: true
   duration_limit_check_iterations: 6
@@ -128,13 +128,13 @@ mpc:
     wrist_joint3: 2.5
 
   joint_acceleration_limits:
-    joint1: 8.0
-    joint2: 8.0
-    joint3: 10.0
-    joint4: 10.0
-    wrist_joint1: 15.0
-    wrist_joint2: 15.0
-    wrist_joint3: 15.0
+    joint1: 3.0
+    joint2: 3.0
+    joint3: 4.0
+    joint4: 4.0
+    wrist_joint1: 6.0
+    wrist_joint2: 6.0
+    wrist_joint3: 6.0
 
   piqp:
     max_iterations: 100
