@@ -19,9 +19,9 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 
-# Match FRGraph's PIQP integration: use the vendored PIQP headers directly in
-# header-only template mode. Do not add_subdirectory(PIQP), compile PIQP's
-# src/*.cpp, define PIQP_WITH_TEMPLATE_INSTANTIATION, or link a PIQP library.
+# PIQP is used only by the standalone velocity_qp_mpc_node. Keep its include
+# path out of the legacy planner library so the ae080a9 planner/IK build path
+# remains unchanged.
 set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
   message(FATAL_ERROR
@@ -46,13 +46,14 @@ catkin_package(
   DEPENDS EIGEN3
 )
 
+# Legacy planner include path: intentionally identical to ae080a9.
 include_directories(
   include
-  ${PIQP_INCLUDE_DIR}
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
 
+# Legacy planner library: intentionally identical source list to ae080a9.
 add_library(egocentric_arm_planner
   src/task_trajectory_generator.cpp
   src/dummy_trajectory_evaluator.cpp
@@ -60,7 +61,6 @@ add_library(egocentric_arm_planner
   src/receding_horizon_planner.cpp
   src/trajectory_visualizer.cpp
   src/trajectory_execution_manager.cpp
-  src/velocity_qp_mpc.cpp
 )
 
 add_dependencies(egocentric_arm_planner
@@ -110,16 +110,23 @@ target_link_libraries(trajectory_execution_manager_node
   ${catkin_LIBRARIES}
 )
 
+# Standalone Phase-A MPC executable. Compile velocity_qp_mpc.cpp directly into
+# this executable and add PIQP only to this target. It does not link against the
+# legacy egocentric_arm_planner library.
 add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc_node.cpp
+  src/velocity_qp_mpc.cpp
 )
 
 add_dependencies(velocity_qp_mpc_node
   ${catkin_EXPORTED_TARGETS}
 )
 
+target_include_directories(velocity_qp_mpc_node PRIVATE
+  ${PIQP_INCLUDE_DIR}
+)
+
 target_link_libraries(velocity_qp_mpc_node
-  egocentric_arm_planner
   ${catkin_LIBRARIES}
 )
 
