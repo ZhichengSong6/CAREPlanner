@@ -1,0 +1,29 @@
+<launch>
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="use_interactive_marker" default="true" />
+  <arg name="use_trajectory_visualizer" default="true" />
+
+  <!-- Generate and visualize the nominal task reference, but explicitly disable
+       TrajectoryExecutionManager: Phase-A QP-MPC owns the low-level velocity
+       command topic and must be the only velocity publisher. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="$(arg use_interactive_marker)" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+  </include>
+
+  <node pkg="egocentric_arm_planner"
+        type="velocity_qp_mpc_node"
+        name="velocity_qp_mpc_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="ee_frame" value="$(arg ee_frame)" />
+  </node>
+</launch>

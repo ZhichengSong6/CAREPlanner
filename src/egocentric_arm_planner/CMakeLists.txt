@@ -19,6 +19,15 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 
+# Match FRGraph's PIQP integration: use the vendored PIQP headers directly in
+# header-only template mode. Do not add_subdirectory(PIQP), compile PIQP's
+# src/*.cpp, define PIQP_WITH_TEMPLATE_INSTANTIATION, or link a PIQP library.
+set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
+if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
+  message(FATAL_ERROR
+    "PIQP headers are missing. Run: git submodule update --init --recursive")
+endif()
+
 catkin_package(
   INCLUDE_DIRS include
   LIBRARIES egocentric_arm_planner
@@ -39,6 +48,7 @@ catkin_package(
 
 include_directories(
   include
+  ${PIQP_INCLUDE_DIR}
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
@@ -50,6 +60,7 @@ add_library(egocentric_arm_planner
   src/receding_horizon_planner.cpp
   src/trajectory_visualizer.cpp
   src/trajectory_execution_manager.cpp
+  src/velocity_qp_mpc.cpp
 )
 
 add_dependencies(egocentric_arm_planner
@@ -95,6 +106,19 @@ add_dependencies(trajectory_execution_manager_node
 )
 
 target_link_libraries(trajectory_execution_manager_node
+  egocentric_arm_planner
+  ${catkin_LIBRARIES}
+)
+
+add_executable(velocity_qp_mpc_node
+  src/velocity_qp_mpc_node.cpp
+)
+
+add_dependencies(velocity_qp_mpc_node
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(velocity_qp_mpc_node
   egocentric_arm_planner
   ${catkin_LIBRARIES}
 )

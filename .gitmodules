@@ -1,0 +1,4 @@
+[submodule "src/third_party/piqp"]
+	path = src/third_party/piqp
+	url = https://github.com/ac-frg/piqp.git
+	branch = main

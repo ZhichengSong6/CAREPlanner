@@ -89,8 +89,66 @@ intervention:
   hold_duration: 0.5
   command_dt: 0.02
 
+# Keep the proven ae080a9 planning path unchanged in Stage 1.
 receding_horizon:
   planning_rate: 20.0
+
+# Independent Phase-A C++ velocity QP-MPC. In Stage 1 this consumes the
+# original planner's command_trajectory_candidate without modifying how that
+# reference is generated. NCDF/CDF terms are intentionally absent.
+mpc:
+  rate: 20.0
+  horizon_duration: 1.0
+  num_intervals: 20
+
+  q_tracking_weight: 50.0
+  terminal_q_tracking_weight: 100.0
+  u_tracking_weight: 2.0
+  u_smooth_weight: 1.0
+
+  q_tracking_trust: 0.50
+  joint_position_margin: 0.01
+
+  joint_position_limits:
+    joint1: {lower: -3.14, upper: 3.14}
+    joint2: {lower: -2.30, upper: 2.30}
+    joint3: {lower: -3.14, upper: 3.14}
+    joint4: {lower: -2.65, upper: 2.65}
+    wrist_joint1: {lower: -3.14, upper: 3.14}
+    wrist_joint2: {lower: -3.14, upper: 3.14}
+    wrist_joint3: {lower: -1.20, upper: 1.20}
+
+  joint_velocity_limits:
+    joint1: 2.0
+    joint2: 2.0
+    joint3: 2.0
+    joint4: 2.0
+    wrist_joint1: 2.5
+    wrist_joint2: 2.5
+    wrist_joint3: 2.5
+
+  joint_acceleration_limits:
+    joint1: 8.0
+    joint2: 8.0
+    joint3: 10.0
+    joint4: 10.0
+    wrist_joint1: 15.0
+    wrist_joint2: 15.0
+    wrist_joint3: 15.0
+
+  piqp:
+    max_iterations: 100
+    eps_abs: 0.000001
+    eps_rel: 0.000001
+    verbose: false
+    compute_timings: true
+
+  joint_states: /care_arm/joint_states
+  reference_trajectory: /care_planner/command_trajectory_candidate
+  output_velocity_command: /care_arm/arm_group_velocity_controller/command
+  predicted_trajectory: /care_planner/mpc/predicted_trajectory
+  joint_state_timeout: 0.20
+  reference_timeout: 0.20
 
 topics:
   joint_states: /care_arm/joint_states
