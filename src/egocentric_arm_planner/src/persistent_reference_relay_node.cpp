@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
