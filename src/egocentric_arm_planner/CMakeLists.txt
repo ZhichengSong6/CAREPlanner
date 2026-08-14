@@ -110,6 +110,20 @@ target_link_libraries(trajectory_execution_manager_node
   ${catkin_LIBRARIES}
 )
 
+# Diagnostic Stage-2 relay. This stays outside the legacy planner library and
+# latches only the first successful nominal trajectory after each new target.
+add_executable(persistent_reference_relay_node
+  src/persistent_reference_relay_node.cpp
+)
+
+add_dependencies(persistent_reference_relay_node
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(persistent_reference_relay_node
+  ${catkin_LIBRARIES}
+)
+
 # Standalone Phase-A MPC executable. Compile velocity_qp_mpc.cpp directly into
 # this executable and add PIQP only to this target. It does not link against the
 # legacy egocentric_arm_planner library.
