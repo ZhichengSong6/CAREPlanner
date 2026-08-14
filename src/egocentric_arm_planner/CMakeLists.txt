@@ -140,6 +140,17 @@ target_include_directories(velocity_qp_mpc_node PRIVATE
   ${PIQP_INCLUDE_DIR}
 )
 
+# PIQP and Eigen are template-heavy. A default catkin build without an explicit
+# CMAKE_BUILD_TYPE leaves this target effectively unoptimized, which made this
+# 140-variable dense QP take ~0.23 s on the test machine. Optimize only the MPC
+# executable so the validated legacy planner/IK build remains untouched.
+target_compile_options(velocity_qp_mpc_node PRIVATE
+  -O3
+)
+target_compile_definitions(velocity_qp_mpc_node PRIVATE
+  NDEBUG
+)
+
 target_link_libraries(velocity_qp_mpc_node
   ${catkin_LIBRARIES}
 )
