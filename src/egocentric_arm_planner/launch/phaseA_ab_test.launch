@@ -1,0 +1,60 @@
+<launch>
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="use_interactive_marker" default="true" />
+  <arg name="use_trajectory_visualizer" default="true" />
+
+  <!-- A/B switch. false = planner stays alive; true = kill it automatically
+       immediately after the first persistent reference reaches the relay output. -->
+  <arg name="auto_kill_planner" default="false" />
+  <arg name="kill_delay" default="0.05" />
+
+  <!-- rosbag recording. The parent directory must already exist. -->
+  <arg name="record_bag" default="true" />
+  <arg name="bag_prefix" default="/tmp/careplanner_phaseA_ab" />
+
+  <include file="$(find egocentric_arm_planner)/launch/phaseA_qp_mpc.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_interactive_marker" value="$(arg use_interactive_marker)" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+  </include>
+
+  <node if="$(arg auto_kill_planner)"
+        pkg="egocentric_arm_planner"
+        type="auto_kill_planner_after_reference.py"
+        name="auto_kill_planner_after_reference"
+        output="screen">
+    <param name="reference_topic"
+           value="/care_planner/command_trajectory_persistent" />
+    <param name="planner_node"
+           value="/receding_horizon_planner_node" />
+    <param name="kill_delay" value="$(arg kill_delay)" />
+  </node>
+
+  <!-- Record both inputs and outputs plus TF and rosout so the two conditions
+       can be compared on one synchronized timeline. -->
+  <node if="$(arg record_bag)"
+        pkg="rosbag"
+        type="record"
+        name="phaseA_ab_rosbag"
+        output="screen"
+        args="-O $(arg bag_prefix)
+              /clock
+              /tf
+              /tf_static
+              /rosout
+              /care_arm/joint_states
+              /care_arm/arm_group_velocity_controller/command
+              /care_planner/ee_target_pose
+              /care_planner/task_trajectory
+              /care_planner/command_trajectory_candidate
+              /care_planner/command_trajectory_persistent
+              /care_planner/mpc/predicted_trajectory
+              /velocity_qp_mpc_node/solve_time_ms
+              /velocity_qp_mpc_node/summary
+              /care_planner/experiment/planner_killed" />
+</launch>
