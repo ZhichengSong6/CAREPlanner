@@ -166,3 +166,11 @@ add_dependencies(ee_interactive_marker_node
 target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
 )
+
+# Diagnostic helper used only by the Phase-A A/B experiment. Installing it via
+# catkin_install_python makes the script executable from roslaunch without
+# changing the validated legacy C++ planner library.
+catkin_install_python(PROGRAMS
+  scripts/auto_kill_planner_after_reference.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
