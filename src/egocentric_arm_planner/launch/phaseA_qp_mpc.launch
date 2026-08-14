@@ -6,9 +6,8 @@
   <arg name="use_interactive_marker" default="true" />
   <arg name="use_trajectory_visualizer" default="true" />
 
-  <!-- Generate and visualize the nominal task reference, but explicitly disable
-       TrajectoryExecutionManager: Phase-A QP-MPC owns the low-level velocity
-       command topic and must be the only velocity publisher. -->
+  <!-- Keep the proven ae080a9 planner/IK path unchanged. It still publishes
+       /care_planner/command_trajectory_candidate repeatedly. -->
   <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -18,6 +17,22 @@
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
 
+  <!-- Diagnostic Stage 2: on each new EE target, latch only the first
+       successfully generated nominal trajectory and publish its advancing suffix.
+       Later repeated replans from the legacy planner are deliberately ignored. -->
+  <node pkg="egocentric_arm_planner"
+        type="persistent_reference_relay_node"
+        name="persistent_reference_relay_node"
+        output="screen">
+    <param name="input_trajectory"
+           value="/care_planner/command_trajectory_candidate" />
+    <param name="target_pose"
+           value="/care_planner/ee_target_pose" />
+    <param name="output_trajectory"
+           value="/care_planner/command_trajectory_persistent" />
+    <param name="publish_rate" value="20.0" />
+  </node>
+
   <node pkg="egocentric_arm_planner"
         type="velocity_qp_mpc_node"
         name="velocity_qp_mpc_node"
@@ -25,5 +40,7 @@
     <rosparam command="load" file="$(arg config_file)" />
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
+    <param name="mpc/reference_trajectory"
+           value="/care_planner/command_trajectory_persistent" />
   </node>
 </launch>
