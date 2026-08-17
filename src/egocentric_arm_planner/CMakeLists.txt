@@ -20,8 +20,8 @@ find_package(catkin REQUIRED COMPONENTS
 find_package(Eigen3 REQUIRED)
 
 # PIQP is used only by the standalone velocity_qp_mpc_node. Keep its include
-# path out of the legacy planner library so the ae080a9 planner/IK build path
-# remains unchanged.
+# path out of the planner library so the validated planner/IK build path remains
+# isolated from the template-heavy PIQP headers.
 set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
   message(FATAL_ERROR
@@ -46,14 +46,12 @@ catkin_package(
   DEPENDS EIGEN3
 )
 
-# Legacy planner include path: intentionally identical to ae080a9.
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
 )
 
-# Legacy planner library: intentionally identical source list to ae080a9.
 add_library(egocentric_arm_planner
   src/task_trajectory_generator.cpp
   src/dummy_trajectory_evaluator.cpp
@@ -110,23 +108,9 @@ target_link_libraries(trajectory_execution_manager_node
   ${catkin_LIBRARIES}
 )
 
-# Diagnostic Stage-2 relay. This stays outside the legacy planner library and
-# latches only the first successful nominal trajectory after each new target.
-add_executable(persistent_reference_relay_node
-  src/persistent_reference_relay_node.cpp
-)
-
-add_dependencies(persistent_reference_relay_node
-  ${catkin_EXPORTED_TARGETS}
-)
-
-target_link_libraries(persistent_reference_relay_node
-  ${catkin_LIBRARIES}
-)
-
 # Standalone Phase-A MPC executable. Compile velocity_qp_mpc.cpp directly into
 # this executable and add PIQP only to this target. It does not link against the
-# legacy egocentric_arm_planner library.
+# egocentric_arm_planner library.
 add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc_node.cpp
   src/velocity_qp_mpc.cpp
@@ -140,10 +124,8 @@ target_include_directories(velocity_qp_mpc_node PRIVATE
   ${PIQP_INCLUDE_DIR}
 )
 
-# PIQP and Eigen are template-heavy. A default catkin build without an explicit
-# CMAKE_BUILD_TYPE leaves this target effectively unoptimized, which made this
-# 140-variable dense QP take ~0.23 s on the test machine. Optimize only the MPC
-# executable so the validated legacy planner/IK build remains untouched.
+# PIQP and Eigen are template-heavy. Optimize only the MPC executable so the
+# planner/IK build remains independent of this compilation choice.
 target_compile_options(velocity_qp_mpc_node PRIVATE
   -O3
 )
@@ -165,12 +147,4 @@ add_dependencies(ee_interactive_marker_node
 
 target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
-)
-
-# Diagnostic helper used only by the Phase-A A/B experiment. Installing it via
-# catkin_install_python makes the script executable from roslaunch without
-# changing the validated legacy C++ planner library.
-catkin_install_python(PROGRAMS
-  scripts/auto_kill_planner_after_reference.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
