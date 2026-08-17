@@ -36,6 +36,7 @@ private:
   void planningTimerCallback(const ros::TimerEvent& event);
 
   bool runOnePlanningStep();
+  bool publishPersistentCommand();
 
   bool convertToRosTrajectory(
       const arm_trajectory::JointTrajectory& traj,
@@ -65,9 +66,18 @@ private:
 
   bool has_joint_state_ = false;
   bool has_target_pose_ = false;
+  bool new_target_pending_ = false;
+  bool has_persistent_command_ = false;
 
   sensor_msgs::JointState latest_joint_state_;
   geometry_msgs::PoseStamped latest_target_pose_;
+
+  // The validated old planner path is executed exactly once for each new EE
+  // target. Only after generate/evaluate/intervention all succeed do we cache
+  // the resulting command trajectory. Subsequent timer ticks publish an
+  // advancing suffix of this same command instead of re-running IK.
+  arm_trajectory::JointTrajectory persistent_command_;
+  ros::Time persistent_command_start_time_;
 
   double planning_rate_ = 30.0;
 
