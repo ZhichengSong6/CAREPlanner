@@ -6,13 +6,14 @@
   <arg name="use_sim_time" default="true" />
   <arg name="gazebo_gui" default="true" />
 
-  <!-- RViz remains part of the normal simulation launch. It waits for the
-       first joint-state message, which means the robot has been spawned and
-       gazebo_ros_control / the joint-state controller are operational, then
-       gives TF/rendering a short settling interval before creating the RViz
-       render context. Keep RViz on its default OpenGL path: forcing the 2.1
-       compatibility renderer did not prevent the observed NVIDIA/OGRE SIGSEGV
-       and in testing caused an immediate crash during initialization. -->
+  <!-- RViz remains part of the normal simulation startup from the user's
+       perspective, but it is intentionally detached from roslaunch after the
+       simulation/control stack becomes ready. The short-lived wrapper waits
+       for the first joint-state message, gives TF/rendering a brief settling
+       interval, then starts RViz in a new session with setsid. This more closely
+       matches the separately launched RViz configuration that has been more
+       stable on this system while keeping a single user-facing launch command.
+       RViz stays on its default OpenGL path. -->
   <arg name="use_rviz" default="true" />
   <arg name="rviz_ready_timeout" default="30.0" />
   <arg name="rviz_post_ready_delay" default="0.5" />
@@ -61,11 +62,14 @@
     <remap from="joint_states" to="/care_arm/joint_states" />
   </node>
 
+  <!-- roslaunch only manages this short-lived wrapper. After readiness, setsid
+       forks RViz into its own session and the wrapper exits cleanly. RViz output
+       is kept in a dedicated log because it no longer shares roslaunch stdout. -->
   <node if="$(arg use_rviz)"
         pkg="rviz"
         type="rviz"
         name="rviz"
         args="-d $(arg rviz_config)"
-        launch-prefix="bash -c 'timeout $(arg rviz_ready_timeout)s rostopic echo -n 1 /care_arm/joint_states &gt;/dev/null 2&gt;&amp;1 || true; sleep $(arg rviz_post_ready_delay); exec &quot;$0&quot; &quot;$@&quot;' "
+        launch-prefix="bash -c 'timeout $(arg rviz_ready_timeout)s rostopic echo -n 1 /care_arm/joint_states &gt;/dev/null 2&gt;&amp;1 || true; sleep $(arg rviz_post_ready_delay); setsid -f &quot;$0&quot; &quot;$@&quot; &gt;&quot;$HOME/.ros/careplanner_rviz_detached.log&quot; 2&gt;&amp;1 &lt;/dev/null; exit 0' "
         output="screen" />
 </launch>
