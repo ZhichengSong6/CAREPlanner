@@ -7,15 +7,6 @@
        default="$(find arm_description)/urdf/Arm.urdf" />
   <arg name="device" default="cpu" />
 
-  <!-- The catkin relay script is generated with the Python executable used when
-       the workspace was configured (typically /usr/bin/python3 on ROS Noetic).
-       The NCDF runtime needs PyTorch, which may live in a separate conda env.
-       launch-prefix lets this node alone run under that Python without changing
-       the interpreter used by the rest of the ROS/C++ workspace. Override with:
-         python_executable:=$CONDA_PREFIX/bin/python
-       after activating the desired environment. -->
-  <arg name="python_executable" default="python3" />
-
   <arg name="base_frame" default="base_link" />
   <arg name="target_topic"
        default="/care_planner/active_sensing/target_point" />
@@ -35,8 +26,7 @@
   <node pkg="care_visibility_cdf"
         type="ncdf_horizon_observer_node.py"
         name="ncdf_horizon_observer"
-        output="screen"
-        launch-prefix="$(arg python_executable)">
+        output="screen">
 
     <param name="checkpoint" value="$(arg checkpoint)" />
     <param name="urdf" value="$(arg urdf)" />
