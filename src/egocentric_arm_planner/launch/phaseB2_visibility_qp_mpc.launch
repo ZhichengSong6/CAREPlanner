@@ -1,0 +1,57 @@
+<launch>
+  <!--
+    Phase B.2: Phase-A velocity QP-MPC + first-order learned visibility cost.
+
+    The NCDF horizon observer is intentionally NOT launched here because it runs
+    in the dedicated ncdf_l4c conda environment. Start it separately with:
+      python src/care_visibility_cdf/scripts/ncdf_horizon_observer_node.py _device:=cpu
+
+    lambda_vis=0.0 is the exact Phase-A objective and is the recommended first
+    A/B sanity run. Positive lambda_vis enables the linear visibility term.
+  -->
+
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="use_interactive_marker" default="true" />
+  <arg name="use_trajectory_visualizer" default="true" />
+
+  <arg name="lambda_vis" default="0.10" />
+  <arg name="visibility_timeout" default="0.15" />
+  <arg name="gradient_norm_clip" default="0.0" />
+  <arg name="visibility_active_topic"
+       default="/ncdf_horizon_observer/active" />
+  <arg name="visibility_gradient_topic"
+       default="/ncdf_horizon_observer/gradient_q" />
+
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="$(arg use_interactive_marker)" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+  </include>
+
+  <node pkg="egocentric_arm_planner"
+        type="velocity_qp_mpc_node"
+        name="velocity_qp_mpc_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="ee_frame" value="$(arg ee_frame)" />
+    <param name="mpc/reference_trajectory"
+           value="/care_planner/command_trajectory_candidate" />
+
+    <param name="mpc/visibility/enabled" value="true" />
+    <param name="mpc/visibility/weight" value="$(arg lambda_vis)" />
+    <param name="mpc/visibility/timeout" value="$(arg visibility_timeout)" />
+    <param name="mpc/visibility/gradient_norm_clip"
+           value="$(arg gradient_norm_clip)" />
+    <param name="mpc/visibility/active_topic"
+           value="$(arg visibility_active_topic)" />
+    <param name="mpc/visibility/gradient_topic"
+           value="$(arg visibility_gradient_topic)" />
+  </node>
+</launch>
