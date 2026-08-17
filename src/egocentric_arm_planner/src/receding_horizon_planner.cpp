@@ -97,6 +97,7 @@ bool RecedingHorizonPlanner::initialize(const ros::NodeHandle& nh,
   ROS_INFO_STREAM("[RecedingHorizonPlanner] target_pose_topic = " << target_pose_topic_);
   ROS_INFO_STREAM("[RecedingHorizonPlanner] task_trajectory_topic = " << task_trajectory_topic_);
   ROS_INFO_STREAM("[RecedingHorizonPlanner] command_trajectory_topic = " << command_trajectory_topic_);
+  ROS_INFO("[RecedingHorizonPlanner] One-shot nominal planning enabled: each new EE target is planned once, then an advancing cached suffix is published.");
   ROS_WARN("[RecedingHorizonPlanner] Phase I node only publishes trajectory messages. It does NOT directly control Gazebo or robot states.");
 
   return true;
@@ -122,6 +123,19 @@ void RecedingHorizonPlanner::targetPoseCallback(
   std::lock_guard<std::mutex> lock(data_mutex_);
   latest_target_pose_ = *msg;
   has_target_pose_ = true;
+  new_target_pending_ = true;
+
+  // A new high-level target invalidates the old nominal command immediately.
+  // The next planning timer tick performs exactly one validated old-style
+  // planning attempt from the latest measured state.
+  has_persistent_command_ = false;
+  persistent_command_.clear();
+  persistent_command_start_time_ = ros::Time(0);
+
+  ROS_INFO_STREAM("[RecedingHorizonPlanner] New EE target received. Scheduling one nominal planning attempt. position = ["
+                  << msg->pose.position.x << ", "
+                  << msg->pose.position.y << ", "
+                  << msg->pose.position.z << "]");
 }
 
 bool RecedingHorizonPlanner::hasValidInputs() const {
@@ -151,7 +165,7 @@ void RecedingHorizonPlanner::planningTimerCallback(const ros::TimerEvent&) {
   if (elapsed_ms > overrun_warn_ratio_ * period_ms) {
     ROS_WARN_STREAM_THROTTLE(
         1.0,
-        "[RecedingHorizonPlanner] Planning overrun. elapsed = "
+        "[RecedingHorizonPlanner] Planning/publish overrun. elapsed = "
             << elapsed_ms
             << " ms, period = "
             << period_ms
@@ -161,13 +175,84 @@ void RecedingHorizonPlanner::planningTimerCallback(const ros::TimerEvent&) {
   if (!ok) {
     ROS_WARN_THROTTLE(
         1.0,
-        "[RecedingHorizonPlanner] Planning step failed. No new command trajectory published.");
+        "[RecedingHorizonPlanner] No valid persistent command available. Waiting for a new successful target plan.");
   }
+}
+
+bool RecedingHorizonPlanner::publishPersistentCommand() {
+  arm_trajectory::JointTrajectory persistent_command;
+  ros::Time start_time;
+
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (!has_persistent_command_ || persistent_command_.empty()) {
+      return false;
+    }
+    persistent_command = persistent_command_;
+    start_time = persistent_command_start_time_;
+  }
+
+  const ros::Time now = ros::Time::now();
+  const double elapsed = std::max(0.0, (now - start_time).toSec());
+  const double phase = persistent_command.startTime() + elapsed;
+
+  arm_trajectory::JointTrajectory suffix;
+  double remaining = 0.0;
+
+  if (phase < persistent_command.endTime() - 1e-9) {
+    suffix = persistent_command.truncate(phase, persistent_command.endTime());
+    remaining = persistent_command.endTime() - phase;
+  } else {
+    Eigen::VectorXd q_end;
+    Eigen::VectorXd dq_end;
+    Eigen::VectorXd ddq_end;
+    if (!persistent_command.sample(
+            persistent_command.endTime(), q_end, dq_end, ddq_end)) {
+      ROS_WARN_THROTTLE(
+          1.0,
+          "[RecedingHorizonPlanner] Failed to sample persistent command endpoint.");
+      return false;
+    }
+    suffix = arm_trajectory::JointTrajectory(persistent_command.dof());
+    if (!suffix.addPoint(0.0, q_end, dq_end, ddq_end)) {
+      return false;
+    }
+    remaining = 0.0;
+  }
+
+  if (suffix.empty()) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "[RecedingHorizonPlanner] Persistent command suffix is empty.");
+    return false;
+  }
+
+  trajectory_msgs::JointTrajectory cmd_msg;
+  if (!convertToRosTrajectory(suffix, robot_model_->baseFrame(), cmd_msg)) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "[RecedingHorizonPlanner] Failed to convert persistent command suffix.");
+    return false;
+  }
+
+  command_traj_pub_.publish(cmd_msg);
+
+  ROS_INFO_STREAM_THROTTLE(
+      0.5,
+      "[RecedingHorizonPlanner] Published persistent command suffix. phase="
+          << elapsed
+          << " s, remaining="
+          << remaining
+          << " s, points="
+          << suffix.size());
+
+  return true;
 }
 
 bool RecedingHorizonPlanner::runOnePlanningStep() {
   sensor_msgs::JointState joint_state;
   geometry_msgs::PoseStamped target_pose;
+  bool should_plan_new_target = false;
 
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
@@ -176,10 +261,24 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       return false;
     }
 
-    joint_state = latest_joint_state_;
-    target_pose = latest_target_pose_;
+    if (new_target_pending_) {
+      joint_state = latest_joint_state_;
+      target_pose = latest_target_pose_;
+      should_plan_new_target = true;
+
+      // Claim this target before doing the expensive planning work. A failed
+      // attempt will therefore not be retried at 20 Hz; the user/high-level
+      // planner must publish a new target to request another attempt.
+      new_target_pending_ = false;
+    }
   }
 
+  if (!should_plan_new_target) {
+    return publishPersistentCommand();
+  }
+
+  // From here through successful tau_cmd generation, keep the validated
+  // ae080a9-style planning path unchanged.
   if (!robot_model_->updateJointState(joint_state)) {
     ROS_WARN_THROTTLE(1.0, "[RecedingHorizonPlanner] Failed to update RobotModel from JointState.");
     return false;
@@ -188,15 +287,11 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   const Eigen::VectorXd q_current = robot_model_->getCurrentQ();
   const Eigen::VectorXd dq_measured = robot_model_->getCurrentDq();
 
-  // JointState velocity is a measured input, not a trusted command.  During
+  // JointState velocity is a measured input, not a trusted command. During
   // Gazebo/controller startup we have observed isolated tens-of-rad/s spikes
-  // while the position barely moves.  Feeding those values directly into a
+  // while the position barely moves. Feeding those values directly into a
   // quintic boundary condition creates large trajectory overshoot and can also
-  // make the downstream Stage-III first-step acceleration constraint infeasible.
-  //
-  // Keep normal measured velocities, clip mild over-limit values, and replace
-  // grossly non-physical measurements (>1.5x the configured planner limit) by
-  // zero for this planning cycle.  Position is left untouched.
+  // make downstream acceleration constraints infeasible.
   Eigen::VectorXd dq_planning = dq_measured;
   const auto& velocity_limits = task_generator_.config().joint_velocity_limits;
   bool sanitized_velocity = false;
@@ -215,9 +310,8 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   }
 
   if (sanitized_velocity) {
-    ROS_WARN_STREAM_THROTTLE(
-        0.5,
-        "[RecedingHorizonPlanner] Sanitized JointState velocity before planning. "
+    ROS_WARN_STREAM(
+        "[RecedingHorizonPlanner] Sanitized JointState velocity for the one-shot plan. "
             << "raw=[" << dq_measured.transpose() << "], used=["
             << dq_planning.transpose() << "]");
   }
@@ -227,9 +321,6 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
                                       ? ros::Time::now()
                                       : joint_state.header.stamp;
 
-  // Estimate acceleration from the sanitized velocity history.  Otherwise a
-  // single bad JointState velocity sample would contaminate the next cycle's
-  // ddq estimate even after the velocity itself had returned to normal.
   if (has_previous_dq_for_ddq_ &&
       previous_dq_for_ddq_.size() == dq_planning.size()) {
     const double dt = (current_stamp - previous_dq_stamp_).toSec();
@@ -252,17 +343,13 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       task_generator_.generate(q_current, dq_planning, ddq_current, target_pose, tau_task);
 
   if (gen_status != PlannerStatus::SUCCESS) {
-    ROS_WARN_STREAM_THROTTLE(
-        1.0,
-        "[RecedingHorizonPlanner] Task trajectory generation failed: "
-            << plannerStatusToString(gen_status));
+    ROS_WARN_STREAM(
+        "[RecedingHorizonPlanner] One-shot task trajectory generation failed: "
+            << plannerStatusToString(gen_status)
+            << ". Publish a new target to retry.");
     return false;
   }
 
-  // Fail closed if the generator reached its time-scaling iteration cap while
-  // the trajectory is still outside the configured dynamic limits.  Previously
-  // TaskTrajectoryGenerator warned and returned SUCCESS, allowing a visibly
-  // oscillatory/over-limit nominal trajectory to propagate to TEM and Stage III.
   const auto& task_cfg = task_generator_.config();
   if (task_cfg.enforce_velocity_acceleration_limits) {
     const double check_dt = std::max(0.005, std::min(task_cfg.trajectory_dt, 0.02));
@@ -291,12 +378,12 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
     }
 
     if (worst_velocity_ratio > 1.001 || worst_acceleration_ratio > 1.001) {
-      ROS_ERROR_STREAM_THROTTLE(
-          0.5,
-          "[RecedingHorizonPlanner] Rejecting dynamically invalid tau_task. "
+      ROS_ERROR_STREAM(
+          "[RecedingHorizonPlanner] Rejecting dynamically invalid one-shot tau_task. "
               << "worst_velocity_ratio=" << worst_velocity_ratio
               << ", worst_acceleration_ratio=" << worst_acceleration_ratio
-              << ", duration=" << tau_task.duration());
+              << ", duration=" << tau_task.duration()
+              << ". Publish a new target to retry.");
       return false;
     }
   }
@@ -306,12 +393,12 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       dummy_evaluator_.evaluate(tau_task, eval);
 
   if (eval_status != PlannerStatus::SUCCESS) {
-    ROS_WARN_STREAM_THROTTLE(
-        1.0,
-        "[RecedingHorizonPlanner] Dummy evaluation failed: "
+    ROS_WARN_STREAM(
+        "[RecedingHorizonPlanner] One-shot dummy evaluation failed: "
             << plannerStatusToString(eval_status)
             << ", message: "
-            << eval.message);
+            << eval.message
+            << ". Publish a new target to retry.");
     return false;
   }
 
@@ -324,44 +411,40 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
           tau_cmd);
 
   if (intervention_status != PlannerStatus::SUCCESS) {
-    ROS_WARN_STREAM_THROTTLE(
-        1.0,
-        "[RecedingHorizonPlanner] Intervention failed: "
-            << plannerStatusToString(intervention_status));
+    ROS_WARN_STREAM(
+        "[RecedingHorizonPlanner] One-shot intervention failed: "
+            << plannerStatusToString(intervention_status)
+            << ". Publish a new target to retry.");
     return false;
   }
 
-  trajectory_msgs::JointTrajectory task_msg;
-  trajectory_msgs::JointTrajectory cmd_msg;
-
+  // Preserve the old full task-trajectory visualization once, then cache only
+  // the already validated command trajectory for future suffix publication.
   if (publish_task_trajectory_) {
+    trajectory_msgs::JointTrajectory task_msg;
     if (convertToRosTrajectory(tau_task, robot_model_->baseFrame(), task_msg)) {
       task_traj_pub_.publish(task_msg);
     }
   }
 
-  if (!convertToRosTrajectory(tau_cmd, robot_model_->baseFrame(), cmd_msg)) {
-    ROS_WARN_THROTTLE(
-        1.0,
-        "[RecedingHorizonPlanner] Failed to convert tau_cmd to ROS JointTrajectory.");
-    return false;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    persistent_command_ = tau_cmd;
+    persistent_command_start_time_ = ros::Time::now();
+    has_persistent_command_ = true;
   }
 
-  command_traj_pub_.publish(cmd_msg);
-
-  ROS_INFO_STREAM_THROTTLE(
-      1.0,
-      "[RecedingHorizonPlanner] Published command trajectory. "
-          << "mode = "
+  ROS_INFO_STREAM(
+      "[RecedingHorizonPlanner] Cached one-shot nominal command. mode="
           << interventionModeToString(eval.mode)
-          << ", tau_task duration = "
+          << ", tau_task duration="
           << tau_task.duration()
-          << ", tau_cmd duration = "
+          << " s, tau_cmd duration="
           << tau_cmd.duration()
-          << ", tau_cmd points = "
+          << " s, tau_cmd points="
           << tau_cmd.size());
 
-  return true;
+  return publishPersistentCommand();
 }
 
 bool RecedingHorizonPlanner::convertToRosTrajectory(
