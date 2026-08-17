@@ -89,11 +89,18 @@ intervention:
   hold_duration: 0.5
   command_dt: 0.02
 
+# Phase-A nominal planner: one planning attempt per new EE target. After a
+# successful plan, only the advancing suffix is republished; IK is not rerun.
+# Retarget velocity/acceleration boundary conditions come from the actual MPC
+# command history rather than the unreliable Gazebo JointState.velocity field.
 receding_horizon:
   planning_rate: 20.0
+  mpc_command_topic: /care_arm/arm_group_velocity_controller/command
+  mpc_command_timeout: 0.20
 
-# Phase-A C++ velocity QP-MPC. Each new EE target is planned once and the
-# planner then publishes an advancing cached suffix. NCDF/CDF terms are absent.
+# Phase-A C++ velocity QP-MPC. Tracking is a soft objective. The hard constraints
+# are joint position, velocity and acceleration only. NCDF/CDF terms are absent
+# until the next stage.
 mpc:
   rate: 20.0
   horizon_duration: 1.0
@@ -104,13 +111,6 @@ mpc:
   u_tracking_weight: 2.0
   u_smooth_weight: 1.0
 
-  # Phase A has no CDF/NCDF linearization that needs a tight trust region.
-  # Keep the legacy hard tracking-tube rows effectively non-binding so a new
-  # nominal target cannot become infeasible merely because the controller must
-  # transition from the previous command. Physical position/velocity/
-  # acceleration limits remain hard. A proper linearization trust region will
-  # be reintroduced with the future CDF/NCDF SQP formulation.
-  q_tracking_trust: 10.0
   joint_position_margin: 0.01
 
   joint_position_limits:
