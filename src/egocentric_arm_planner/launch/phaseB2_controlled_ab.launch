@@ -1,0 +1,89 @@
+<launch>
+  <!--
+    Reproducible Phase B.2 A/B trial.
+
+    This launch fixes every experimental input except lambda_vis:
+      - fixed initial Gazebo reset is supplied externally by the user;
+      - fixed EE goal is published exactly once by phase_b2_controlled_trial_node;
+      - the nominal task trajectory is evaluated by trajectory_risk_node;
+      - trajectory_risk publishes candidate x* on a private candidate topic;
+      - the FIRST real low-confidence frontier sample is frozen for the whole trial;
+      - the frozen x* is republished at 20 Hz on the NCDF target topic.
+
+    Important: do NOT run the old manual rostopic target publisher with this launch.
+    The NCDF horizon observer still runs separately in the ncdf_l4c conda env.
+  -->
+
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="use_trajectory_visualizer" default="true" />
+
+  <arg name="lambda_vis" default="0.0" />
+  <arg name="visibility_timeout" default="0.15" />
+  <arg name="gradient_norm_clip" default="0.0" />
+
+  <!-- Validated fixed EE goal used for all A/B trials. -->
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+
+  <arg name="candidate_target_topic"
+       default="/care_planner/active_sensing/target_candidate" />
+  <arg name="frozen_target_topic"
+       default="/care_planner/active_sensing/target_point" />
+
+  <!-- Phase-A planner + Phase-B.2 velocity MPC. Interactive marker is disabled
+       so no human variation enters the A/B trial. -->
+  <include file="$(find egocentric_arm_planner)/launch/phaseB2_visibility_qp_mpc.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+    <arg name="lambda_vis" value="$(arg lambda_vis)" />
+    <arg name="visibility_timeout" value="$(arg visibility_timeout)" />
+    <arg name="gradient_norm_clip" value="$(arg gradient_norm_clip)" />
+  </include>
+
+  <!-- Confidence map used by trajectory-risk attribution. -->
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch" />
+
+  <!-- Evaluate the fixed nominal task trajectory.  Publish candidate x* to a
+       separate topic so it cannot change the frozen target after selection. -->
+  <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="active_sensing_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="show_full_trajectory_markers" value="false" />
+    <arg name="show_worst_timestep_markers" value="false" />
+    <arg name="show_attribution_markers" value="false" />
+  </include>
+
+  <!-- Trial coordinator: one fixed EE goal + first candidate target latch. -->
+  <node pkg="egocentric_arm_planner"
+        type="phase_b2_controlled_trial_node.py"
+        name="phase_b2_controlled_trial"
+        output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="goal_topic" value="/care_planner/ee_target_pose" />
+    <param name="candidate_topic" value="$(arg candidate_target_topic)" />
+    <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
+    <param name="publish_rate" value="20.0" />
+    <param name="goal_delay" value="$(arg goal_delay)" />
+
+    <param name="goal/x" value="$(arg goal_x)" />
+    <param name="goal/y" value="$(arg goal_y)" />
+    <param name="goal/z" value="$(arg goal_z)" />
+    <param name="goal/qx" value="$(arg goal_qx)" />
+    <param name="goal/qy" value="$(arg goal_qy)" />
+    <param name="goal/qz" value="$(arg goal_qz)" />
+    <param name="goal/qw" value="$(arg goal_qw)" />
+  </node>
+</launch>
