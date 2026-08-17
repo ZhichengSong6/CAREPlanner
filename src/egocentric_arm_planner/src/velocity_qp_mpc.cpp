@@ -27,6 +27,7 @@ bool VelocityQPMPC::initialize(const ros::NodeHandle& nh,
   if (!buildStaticQP()) return false;
 
   previous_command_ = Eigen::VectorXd::Zero(dof_);
+  latest_visibility_gradient_ = Eigen::VectorXd::Zero(n_u_);
 
   auto& settings = piqp_solver_.settings();
   settings.max_iter = piqp_max_iterations_;
@@ -41,6 +42,15 @@ bool VelocityQPMPC::initialize(const ros::NodeHandle& nh,
   reference_sub_ = nh_.subscribe(
       reference_topic_, 1, &VelocityQPMPC::referenceCallback, this);
 
+  if (visibility_enabled_) {
+    visibility_active_sub_ = nh_.subscribe(
+        visibility_active_topic_, 1,
+        &VelocityQPMPC::visibilityActiveCallback, this);
+    visibility_gradient_sub_ = nh_.subscribe(
+        visibility_gradient_topic_, 1,
+        &VelocityQPMPC::visibilityGradientCallback, this);
+  }
+
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       velocity_command_topic_, 1);
   prediction_pub_ = nh_.advertise<trajectory_msgs::JointTrajectory>(
@@ -51,7 +61,7 @@ bool VelocityQPMPC::initialize(const ros::NodeHandle& nh,
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / rate_), &VelocityQPMPC::timerCallback, this);
 
-  ROS_WARN("[VelocityQPMPC] Phase A owns the low-level velocity command topic. Do NOT run TrajectoryExecutionManager simultaneously.");
+  ROS_WARN("[VelocityQPMPC] This node owns the low-level velocity command topic. Do NOT run TrajectoryExecutionManager simultaneously.");
   ROS_INFO_STREAM("[VelocityQPMPC] solver=PIQP dense v0.6.2, rate=" << rate_
                   << " Hz, horizon=" << horizon_duration_
                   << " s, K=" << num_intervals_
@@ -60,6 +70,17 @@ bool VelocityQPMPC::initialize(const ros::NodeHandle& nh,
                   << ", general_constraints=" << n_constraints_);
   ROS_INFO_STREAM("[VelocityQPMPC] reference=" << reference_topic_
                   << ", command=" << velocity_command_topic_);
+  if (visibility_enabled_) {
+    ROS_WARN_STREAM("[VelocityQPMPC] Phase B.2 visibility objective ENABLED: lambda="
+                    << visibility_weight_
+                    << ", timeout=" << visibility_timeout_
+                    << " s, grad_clip=" << visibility_gradient_norm_clip_);
+    ROS_INFO_STREAM("[VelocityQPMPC] visibility active="
+                    << visibility_active_topic_
+                    << ", gradient=" << visibility_gradient_topic_);
+  } else {
+    ROS_INFO("[VelocityQPMPC] visibility objective disabled: exact Phase-A objective.");
+  }
   return true;
 }
 
@@ -129,7 +150,7 @@ bool VelocityQPMPC::loadConfig() {
     return false;
   }
   if (joint_names_.size() != 7) {
-    ROS_ERROR("[VelocityQPMPC] Phase A currently expects exactly 7 joints.");
+    ROS_ERROR("[VelocityQPMPC] Controller currently expects exactly 7 joints.");
     return false;
   }
   dof_ = static_cast<int>(joint_names_.size());
@@ -142,6 +163,21 @@ bool VelocityQPMPC::loadConfig() {
                      terminal_q_tracking_weight_, terminal_q_tracking_weight_);
   pnh_.param<double>("mpc/u_tracking_weight", u_tracking_weight_, u_tracking_weight_);
   pnh_.param<double>("mpc/u_smooth_weight", u_smooth_weight_, u_smooth_weight_);
+
+  pnh_.param<bool>("mpc/visibility/enabled",
+                   visibility_enabled_, visibility_enabled_);
+  pnh_.param<double>("mpc/visibility/weight",
+                     visibility_weight_, visibility_weight_);
+  pnh_.param<double>("mpc/visibility/timeout",
+                     visibility_timeout_, visibility_timeout_);
+  pnh_.param<double>("mpc/visibility/gradient_norm_clip",
+                     visibility_gradient_norm_clip_,
+                     visibility_gradient_norm_clip_);
+  pnh_.param<std::string>("mpc/visibility/active_topic",
+                          visibility_active_topic_, visibility_active_topic_);
+  pnh_.param<std::string>("mpc/visibility/gradient_topic",
+                          visibility_gradient_topic_, visibility_gradient_topic_);
+
   pnh_.param<double>("mpc/joint_position_margin",
                      joint_position_margin_, joint_position_margin_);
   pnh_.param<double>("mpc/joint_state_timeout",
@@ -175,7 +211,12 @@ bool VelocityQPMPC::loadConfig() {
   }
   if (std::min(std::min(q_tracking_weight_, terminal_q_tracking_weight_),
                std::min(u_tracking_weight_, u_smooth_weight_)) < 0.0) {
-    ROS_ERROR("[VelocityQPMPC] MPC weights must be non-negative.");
+    ROS_ERROR("[VelocityQPMPC] MPC tracking/smoothing weights must be non-negative.");
+    return false;
+  }
+  if (visibility_weight_ < 0.0 || visibility_timeout_ <= 0.0 ||
+      visibility_gradient_norm_clip_ < 0.0) {
+    ROS_ERROR("[VelocityQPMPC] Invalid Phase B.2 visibility parameters.");
     return false;
   }
 
@@ -270,9 +311,9 @@ bool VelocityQPMPC::buildStaticQP() {
         -Eigen::MatrixXd::Identity(dof_, dof_);
   }
 
-  // Velocity bounds are native PIQP variable bounds. Phase A has no nonlinear
-  // CDF/NCDF linearization yet, so G contains only hard physical acceleration
-  // and joint-position constraints. Nominal tracking is purely in the cost.
+  // Velocity bounds are native PIQP variable bounds. G contains only hard
+  // physical acceleration and joint-position constraints. Phase B.2 changes
+  // only the linear objective, never H or the hard-constraint matrices.
   acceleration_row0_ = 0;
   position_row0_ = acceleration_row0_ + n_u_;
   n_constraints_ = position_row0_ + n_u_;
@@ -312,6 +353,52 @@ void VelocityQPMPC::referenceCallback(
   latest_reference_ = *msg;
   latest_reference_received_ = ros::Time::now();
   has_reference_ = true;
+}
+
+void VelocityQPMPC::visibilityActiveCallback(const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_visibility_active_ = msg->data;
+  latest_visibility_active_received_ = ros::Time::now();
+  has_visibility_active_ = true;
+}
+
+void VelocityQPMPC::visibilityGradientCallback(
+    const std_msgs::Float64MultiArrayConstPtr& msg) {
+  if (!msg) return;
+  if (msg->data.size() != static_cast<std::size_t>(n_u_)) {
+    ROS_WARN_STREAM_THROTTLE(
+        1.0, "[VelocityQPMPC] ignoring visibility gradient with "
+                 << msg->data.size() << " values; expected " << n_u_);
+    return;
+  }
+  if (msg->layout.dim.size() >= 2) {
+    const std::size_t rows = msg->layout.dim[0].size;
+    const std::size_t cols = msg->layout.dim[1].size;
+    if (rows != static_cast<std::size_t>(num_intervals_) ||
+        cols != static_cast<std::size_t>(dof_)) {
+      ROS_WARN_STREAM_THROTTLE(
+          1.0, "[VelocityQPMPC] ignoring visibility gradient layout "
+                   << rows << "x" << cols << "; expected "
+                   << num_intervals_ << "x" << dof_);
+      return;
+    }
+  }
+
+  Eigen::VectorXd gradient(n_u_);
+  for (int i = 0; i < n_u_; ++i) {
+    gradient[i] = msg->data[static_cast<std::size_t>(i)];
+  }
+  if (!finiteVector(gradient)) {
+    ROS_WARN_THROTTLE(1.0,
+                      "[VelocityQPMPC] ignoring non-finite visibility gradient");
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_visibility_gradient_ = gradient;
+  latest_visibility_gradient_received_ = ros::Time::now();
+  has_visibility_gradient_ = true;
 }
 
 bool VelocityQPMPC::extractMeasuredQ(const sensor_msgs::JointState& msg,
@@ -491,9 +578,8 @@ bool VelocityQPMPC::solveWithPIQP(const Eigen::VectorXd& gradient,
                        x_lower_, x_upper_);
     piqp_setup_done_ = true;
   } else {
-    // H, G and variable velocity bounds are static in Phase A. Keep PIQP's
-    // factorization/preconditioner hot and update only the per-cycle linear cost
-    // and general-constraint bounds.
+    // H, G and variable velocity bounds are static. Keep PIQP's factorization
+    // and preconditioner hot; update only the per-cycle linear cost and bounds.
     piqp_solver_.update(piqp::nullopt, gradient,
                         piqp::nullopt, piqp::nullopt,
                         piqp::nullopt, lower, upper);
@@ -574,6 +660,14 @@ void VelocityQPMPC::timerCallback(const ros::TimerEvent&) {
   trajectory_msgs::JointTrajectory reference;
   ros::Time joint_received;
   ros::Time reference_received;
+
+  bool has_visibility_active = false;
+  bool has_visibility_gradient = false;
+  bool visibility_active = false;
+  ros::Time visibility_active_received;
+  ros::Time visibility_gradient_received;
+  Eigen::VectorXd visibility_gradient;
+
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     if (!has_joint_state_) {
@@ -588,6 +682,17 @@ void VelocityQPMPC::timerCallback(const ros::TimerEvent&) {
     reference = latest_reference_;
     joint_received = latest_joint_state_received_;
     reference_received = latest_reference_received_;
+
+    if (visibility_enabled_) {
+      has_visibility_active = has_visibility_active_;
+      has_visibility_gradient = has_visibility_gradient_;
+      visibility_active = latest_visibility_active_;
+      visibility_active_received = latest_visibility_active_received_;
+      visibility_gradient_received = latest_visibility_gradient_received_;
+      if (has_visibility_gradient_) {
+        visibility_gradient = latest_visibility_gradient_;
+      }
+    }
   }
 
   const ros::Time now = ros::Time::now();
@@ -615,6 +720,64 @@ void VelocityQPMPC::timerCallback(const ros::TimerEvent&) {
 
   Eigen::VectorXd gradient, lower, upper;
   buildCycleQP(q_current, q_ref, u_ref, gradient, lower, upper);
+  const double base_gradient_inf = gradient.lpNorm<Eigen::Infinity>();
+
+  // Phase B.2 sequential linearization. The observer evaluates h_k=df/dq on
+  // the most recently solved q1...qK horizon. Since
+  //   q_stack = 1*q_current + S*u,
+  // maximizing sum_k h_k^T q_k is equivalent, up to constants, to adding
+  //   c_vis = -lambda_vis * S^T * h_stack
+  // to PIQP's linear cost. This leaves H and every hard physical constraint
+  // unchanged. Missing/inactive/stale data falls back to the Phase-A cost.
+  std::string visibility_status = visibility_enabled_ ? "waiting" : "disabled";
+  double visibility_age = -1.0;
+  double visibility_grad_max_norm = 0.0;
+  double visibility_linear_inf = 0.0;
+
+  if (visibility_enabled_) {
+    if (visibility_weight_ <= 0.0) {
+      visibility_status = "zero_weight";
+    } else if (!has_visibility_active || !has_visibility_gradient) {
+      visibility_status = "waiting";
+    } else if (!visibility_active) {
+      visibility_status = "inactive";
+    } else {
+      const double active_age = (now - visibility_active_received).toSec();
+      const double gradient_age = (now - visibility_gradient_received).toSec();
+      visibility_age = std::max(active_age, gradient_age);
+
+      if (active_age < 0.0 || gradient_age < 0.0 ||
+          visibility_age > visibility_timeout_) {
+        visibility_status = "stale";
+      } else if (visibility_gradient.size() != n_u_ ||
+                 !finiteVector(visibility_gradient)) {
+        visibility_status = "invalid";
+      } else {
+        Eigen::VectorXd h_stack = visibility_gradient;
+        for (int k = 0; k < num_intervals_; ++k) {
+          Eigen::VectorXd h = h_stack.segment(k * dof_, dof_);
+          const double norm = h.norm();
+          visibility_grad_max_norm = std::max(visibility_grad_max_norm, norm);
+          if (visibility_gradient_norm_clip_ > 0.0 &&
+              norm > visibility_gradient_norm_clip_) {
+            h *= visibility_gradient_norm_clip_ / norm;
+            h_stack.segment(k * dof_, dof_) = h;
+          }
+        }
+
+        const Eigen::VectorXd visibility_linear =
+            -visibility_weight_ * S_.transpose() * h_stack;
+        if (finiteVector(visibility_linear)) {
+          visibility_linear_inf =
+              visibility_linear.lpNorm<Eigen::Infinity>();
+          gradient += visibility_linear;
+          visibility_status = "used";
+        } else {
+          visibility_status = "invalid_linear";
+        }
+      }
+    }
+  }
 
   const ros::WallTime tic = ros::WallTime::now();
   Eigen::VectorXd solution;
@@ -661,6 +824,12 @@ void VelocityQPMPC::timerCallback(const ros::TimerEvent&) {
       << " tracking_inf=" << tracking_inf
       << " command_inf=" << command_inf
       << " pred_dev_inf=" << pred_dev_inf
+      << " vis=" << visibility_status
+      << " lambda_vis=" << visibility_weight_
+      << " vis_age=" << visibility_age
+      << " vis_grad_max=" << visibility_grad_max_norm
+      << " base_grad_inf=" << base_gradient_inf
+      << " vis_linear_inf=" << visibility_linear_inf
       << " ref_horizon="
       << (reference.points.empty() ? 0.0
           : reference.points.back().time_from_start.toSec());
