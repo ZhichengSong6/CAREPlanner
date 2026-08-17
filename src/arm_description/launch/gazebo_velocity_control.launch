@@ -6,13 +6,16 @@
   <arg name="use_sim_time" default="true" />
   <arg name="gazebo_gui" default="true" />
 
-  <!-- RViz is part of the normal simulation launch, but starts after a short
-       delay so Gazebo, robot spawning, camera plugins, TF, and controllers have
-       time to initialize first. This reduced the startup-associated RViz
-       instability observed on this system. A separate low-probability
-       RViz/OGRE/NVIDIA render-path SIGSEGV may still occur during long use. -->
+  <!-- RViz remains part of the normal simulation launch, but no longer starts
+       after an arbitrary wall-clock delay. It waits for the first joint-state
+       message, which means the robot has been spawned and gazebo_ros_control /
+       the joint-state controller are operational, then gives TF/rendering a
+       short settling interval before creating the RViz/OGRE render context.
+       This targets the startup-associated crash mode. A separate low-probability
+       RViz/OGRE/NVIDIA render-path SIGSEGV observed during long use may remain. -->
   <arg name="use_rviz" default="true" />
-  <arg name="rviz_start_delay" default="1.0" />
+  <arg name="rviz_ready_timeout" default="30.0" />
+  <arg name="rviz_post_ready_delay" default="0.5" />
   <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
   <arg name="verbose" default="false" />
 
@@ -63,6 +66,6 @@
         type="rviz"
         name="rviz"
         args="-d $(arg rviz_config)"
-        launch-prefix="bash -c 'sleep $(arg rviz_start_delay); exec &quot;$0&quot; &quot;$@&quot;' "
+        launch-prefix="bash -c 'timeout $(arg rviz_ready_timeout)s rostopic echo -n 1 /care_arm/joint_states &gt;/dev/null 2&gt;&amp;1 || true; sleep $(arg rviz_post_ready_delay); exec &quot;$0&quot; &quot;$@&quot;' "
         output="screen" />
 </launch>
