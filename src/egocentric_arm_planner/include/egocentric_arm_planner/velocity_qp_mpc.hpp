@@ -24,16 +24,11 @@ namespace egocentric_arm_planner {
  * latest measured q as the closed-loop state, solves a condensed convex QP over
  * stacked joint velocity commands, and publishes only the first command.
  *
- * Phase A intentionally contains no NCDF/CDF terms. The PIQP problem is kept in
- * the generic form
- *
- *   min 0.5 u' H u + g' u
- *   s.t. h_l <= G u <= h_u
- *        x_l <= u <= x_u
- *
- * so later visibility gradients can alter the linear objective and Yiming CDF
- * linearizations can add collision-avoidance rows without changing the
- * controller/executor boundary.
+ * Phase A intentionally contains no NCDF/CDF terms. Tracking is therefore a
+ * soft objective, while physical joint position / velocity / acceleration
+ * limits remain hard constraints. Future CDF/NCDF linearization trust regions
+ * should be introduced explicitly with those nonlinear terms rather than as a
+ * hard nominal-tracking tube.
  */
 class VelocityQPMPC {
 public:
@@ -124,7 +119,6 @@ private:
   double u_tracking_weight_ = 2.0;
   double u_smooth_weight_ = 1.0;
 
-  Eigen::VectorXd q_tracking_trust_;
   Eigen::VectorXd velocity_limits_;
   Eigen::VectorXd acceleration_limits_;
   Eigen::VectorXd q_min_;
@@ -164,7 +158,6 @@ private:
   int n_constraints_ = 0;
   int acceleration_row0_ = 0;
   int position_row0_ = 0;
-  int trust_row0_ = 0;
 
   piqp::DenseSolver<double> piqp_solver_;
 
