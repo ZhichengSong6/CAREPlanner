@@ -3,6 +3,7 @@
 #include <ros/ros.h>
 
 #include <sensor_msgs/JointState.h>
+#include <std_msgs/Bool.h>
 #include <std_msgs/Float32.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/String.h>
@@ -18,17 +19,18 @@
 namespace egocentric_arm_planner {
 
 /**
- * Phase-A joint-space velocity QP-MPC.
+ * Joint-space velocity QP-MPC used by CAREPlanner Phase A / Phase B.2.
  *
  * The nominal quintic is a moving task reference only. The controller uses the
  * latest measured q as the closed-loop state, solves a condensed convex QP over
  * stacked joint velocity commands, and publishes only the first command.
  *
- * Phase A intentionally contains no NCDF/CDF terms. Tracking is therefore a
- * soft objective, while physical joint position / velocity / acceleration
- * limits remain hard constraints. Future CDF/NCDF linearization trust regions
- * should be introduced explicitly with those nonlinear terms rather than as a
- * hard nominal-tracking tube.
+ * Physical joint position / velocity / acceleration limits remain hard
+ * constraints. Phase B.2 optionally adds a first-order visibility NCDF term to
+ * the QP linear objective using gradients evaluated on the previous solved MPC
+ * horizon by the Python NCDF observer. If visibility data is disabled, inactive,
+ * missing, malformed, or stale, the controller falls back to the exact Phase-A
+ * tracking QP for that cycle.
  */
 class VelocityQPMPC {
 public:
@@ -39,6 +41,8 @@ public:
 private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void referenceCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void visibilityActiveCallback(const std_msgs::BoolConstPtr& msg);
+  void visibilityGradientCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
   bool loadConfig();
@@ -91,6 +95,8 @@ private:
 
   ros::Subscriber joint_state_sub_;
   ros::Subscriber reference_sub_;
+  ros::Subscriber visibility_active_sub_;
+  ros::Subscriber visibility_gradient_sub_;
   ros::Publisher velocity_command_pub_;
   ros::Publisher prediction_pub_;
   ros::Publisher solve_time_pub_;
@@ -105,6 +111,13 @@ private:
   bool has_joint_state_ = false;
   bool has_reference_ = false;
 
+  bool latest_visibility_active_ = false;
+  bool has_visibility_active_ = false;
+  bool has_visibility_gradient_ = false;
+  ros::Time latest_visibility_active_received_;
+  ros::Time latest_visibility_gradient_received_;
+  Eigen::VectorXd latest_visibility_gradient_;
+
   std::vector<std::string> joint_names_;
   int dof_ = 7;
 
@@ -118,6 +131,15 @@ private:
   double terminal_q_tracking_weight_ = 100.0;
   double u_tracking_weight_ = 2.0;
   double u_smooth_weight_ = 1.0;
+
+  // Phase B.2 visibility objective. The observer publishes h=[df/dq(q1);...;
+  // df/dq(qK)]. The condensed QP adds c_vis=-weight*S^T*h, which maximizes the
+  // first-order visibility prediction while leaving H and all hard constraints
+  // unchanged. A non-positive clip disables per-horizon gradient clipping.
+  bool visibility_enabled_ = false;
+  double visibility_weight_ = 0.0;
+  double visibility_timeout_ = 0.15;
+  double visibility_gradient_norm_clip_ = 0.0;
 
   Eigen::VectorXd velocity_limits_;
   Eigen::VectorXd acceleration_limits_;
@@ -142,6 +164,8 @@ private:
   std::string velocity_command_topic_ =
       "/care_arm/arm_group_velocity_controller/command";
   std::string prediction_topic_ = "/care_planner/mpc/predicted_trajectory";
+  std::string visibility_active_topic_ = "/ncdf_horizon_observer/active";
+  std::string visibility_gradient_topic_ = "/ncdf_horizon_observer/gradient_q";
 
   // Condensed MPC matrices. u_stack=[u0;...;uK-1]. S maps u_stack to
   // [q1-q0;...;qK-q0], and D maps it to
