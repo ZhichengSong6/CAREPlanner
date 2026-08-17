@@ -11,8 +11,9 @@
        message, which means the robot has been spawned and gazebo_ros_control /
        the joint-state controller are operational, then gives TF/rendering a
        short settling interval before creating the RViz/OGRE render context.
-       This targets the startup-associated crash mode. A separate low-probability
-       RViz/OGRE/NVIDIA render-path SIGSEGV observed during long use may remain. -->
+       RViz is also forced onto the OpenGL 2.1 compatibility path with
+       anti-aliasing and stereo disabled to reduce exposure to the intermittent
+       OGRE/NVIDIA render-path SIGSEGV observed on this system. -->
   <arg name="use_rviz" default="true" />
   <arg name="rviz_ready_timeout" default="30.0" />
   <arg name="rviz_post_ready_delay" default="0.5" />
@@ -65,7 +66,7 @@
         pkg="rviz"
         type="rviz"
         name="rviz"
-        args="-d $(arg rviz_config)"
+        args="--opengl 210 --disable-anti-aliasing --no-stereo -d $(arg rviz_config)"
         launch-prefix="bash -c 'timeout $(arg rviz_ready_timeout)s rostopic echo -n 1 /care_arm/joint_states &gt;/dev/null 2&gt;&amp;1 || true; sleep $(arg rviz_post_ready_delay); exec &quot;$0&quot; &quot;$@&quot;' "
         output="screen" />
 </launch>
