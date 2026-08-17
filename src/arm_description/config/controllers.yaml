@@ -1,41 +1,10 @@
 care_arm:
-  gazebo_ros_control:
-    pid_gains:
-      joint1:
-        p: 5.0
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      joint2:
-        p: 5.0
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      joint3:
-        p: 5.0
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      joint4:
-        p: 5.0
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      wrist_joint1:
-        p: 0.2
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      wrist_joint2:
-        p: 0.2
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
-      wrist_joint3:
-        p: 0.2
-        i: 0.0
-        d: 0.0
-        i_clamp: 0.0
+  # Do not configure gazebo_ros_control PID gains for these
+  # VelocityJointInterface transmissions. Without pid_gains,
+  # DefaultRobotHWSim keeps the joints in direct velocity mode instead of
+  # wrapping the commanded velocity in an internal effort-based velocity PID.
+  # CAREPlanner / JointGroupVelocityController remains the sole velocity-command
+  # path, while Gazebo joint dynamics provide the simulated mechanical response.
 
   joint_state_controller:
     type: joint_state_controller/JointStateController
