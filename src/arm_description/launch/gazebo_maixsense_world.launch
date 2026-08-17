@@ -14,6 +14,14 @@
   <arg name="verbose"
        default="false" />
 
+  <!-- CAREPlanner intentionally leaves gazebo_ros_control PID gains undefined
+       for VelocityJointInterface so DefaultRobotHWSim uses direct Gazebo
+       velocity control. Noetic still probes control_toolbox PID gains during
+       initialization and otherwise prints seven expected "No p gain" errors.
+       This ROS console config suppresses only that control_toolbox logger. -->
+  <env name="ROSCONSOLE_CONFIG_FILE"
+       value="$(find arm_description)/config/rosconsole_gazebo_direct_velocity.conf" />
+
   <include file="$(find gazebo_ros)/launch/empty_world.launch">
     <arg name="world_name" value="$(arg world_file)" />
     <arg name="paused" value="$(arg paused)" />
