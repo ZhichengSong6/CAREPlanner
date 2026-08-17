@@ -12,6 +12,7 @@
 
 #include <sensor_msgs/JointState.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <std_msgs/Float64MultiArray.h>
 #include <trajectory_msgs/JointTrajectory.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 
@@ -32,6 +33,7 @@ public:
 private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg);
+  void mpcCommandCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
 
   void planningTimerCallback(const ros::TimerEvent& event);
 
@@ -51,6 +53,7 @@ private:
 
   ros::Subscriber joint_state_sub_;
   ros::Subscriber target_pose_sub_;
+  ros::Subscriber mpc_command_sub_;
 
   ros::Publisher task_traj_pub_;
   ros::Publisher command_traj_pub_;
@@ -68,9 +71,15 @@ private:
   bool has_target_pose_ = false;
   bool new_target_pending_ = false;
   bool has_persistent_command_ = false;
+  bool has_mpc_command_ = false;
+  bool has_previous_mpc_command_ = false;
 
   sensor_msgs::JointState latest_joint_state_;
   geometry_msgs::PoseStamped latest_target_pose_;
+  Eigen::VectorXd latest_mpc_command_;
+  Eigen::VectorXd previous_mpc_command_;
+  ros::Time latest_mpc_command_received_;
+  ros::Time previous_mpc_command_received_;
 
   // The validated old planner path is executed exactly once for each new EE
   // target. Only after generate/evaluate/intervention all succeed do we cache
@@ -80,19 +89,16 @@ private:
   ros::Time persistent_command_start_time_;
 
   double planning_rate_ = 30.0;
+  double mpc_command_timeout_ = 0.20;
 
   std::string joint_state_topic_ = "/joint_states";
   std::string target_pose_topic_ = "/care_planner/ee_target_pose";
   std::string task_trajectory_topic_ = "/care_planner/task_trajectory";
   std::string command_trajectory_topic_ = "/care_planner/command_trajectory";
+  std::string mpc_command_topic_ =
+      "/care_arm/arm_group_velocity_controller/command";
 
   bool publish_task_trajectory_ = true;
-
-  bool has_previous_dq_for_ddq_ = false;
-  bool has_ddq_estimate_ = false;
-  ros::Time previous_dq_stamp_;
-  Eigen::VectorXd previous_dq_for_ddq_;
-  Eigen::VectorXd latest_ddq_estimate_;
 
   double overrun_warn_ratio_ = 1.0;
 };
