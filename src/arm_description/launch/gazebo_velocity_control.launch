@@ -6,13 +6,13 @@
   <arg name="use_sim_time" default="true" />
   <arg name="gazebo_gui" default="true" />
 
-  <!-- Keep RViz out of the default Gazebo startup path. On this system,
-       starting RViz/OGRE concurrently with Gazebo, the arm camera plugins,
-       robot spawning, and controller initialization caused intermittent RViz
-       SIGSEGVs while interacting with the EE marker. Launching RViz after the
-       simulation/control stack is initialized is stable. The override remains
-       available for explicit experiments with use_rviz:=true. -->
-  <arg name="use_rviz" default="false" />
+  <!-- RViz is part of the normal simulation launch, but starts after a short
+       delay so Gazebo, robot spawning, camera plugins, TF, and controllers have
+       time to initialize first. This reduced the startup-associated RViz
+       instability observed on this system. A separate low-probability
+       RViz/OGRE/NVIDIA render-path SIGSEGV may still occur during long use. -->
+  <arg name="use_rviz" default="true" />
+  <arg name="rviz_start_delay" default="5.0" />
   <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
   <arg name="verbose" default="false" />
 
@@ -63,5 +63,6 @@
         type="rviz"
         name="rviz"
         args="-d $(arg rviz_config)"
+        launch-prefix="bash -c 'sleep $(arg rviz_start_delay); exec &quot;$0&quot; &quot;$@&quot;' "
         output="screen" />
 </launch>
