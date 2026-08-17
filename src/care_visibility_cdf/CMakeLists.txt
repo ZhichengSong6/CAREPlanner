@@ -9,6 +9,7 @@ catkin_package()
 # source tree and are imported by these nodes through the package source path.
 catkin_install_python(PROGRAMS
   scripts/ncdf_active_sensing_dryrun_node.py
+  scripts/ncdf_horizon_observer_node.py
   scripts/ncdf_action_qp_dryrun_node.py
   scripts/ncdf_action_qp_logger_node.py
   scripts/ncdf_stage3_trajectory_qp_node.py
