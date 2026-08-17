@@ -12,7 +12,7 @@
        instability observed on this system. A separate low-probability
        RViz/OGRE/NVIDIA render-path SIGSEGV may still occur during long use. -->
   <arg name="use_rviz" default="true" />
-  <arg name="rviz_start_delay" default="5.0" />
+  <arg name="rviz_start_delay" default="1.0" />
   <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
   <arg name="verbose" default="false" />
 
