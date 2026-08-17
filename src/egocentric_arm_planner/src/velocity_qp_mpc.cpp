@@ -186,11 +186,8 @@ bool VelocityQPMPC::loadConfig() {
   default_velocity << 2.0, 2.0, 2.0, 2.0, 2.5, 2.5, 2.5;
   Eigen::VectorXd default_acceleration(7);
   default_acceleration << 8.0, 8.0, 10.0, 10.0, 15.0, 15.0, 15.0;
-  Eigen::VectorXd default_trust = Eigen::VectorXd::Constant(7, 0.50);
 
-  if (!loadJointVectorParam("mpc/q_tracking_trust", default_trust,
-                            q_tracking_trust_) ||
-      !loadJointVectorParam("mpc/joint_velocity_limits", default_velocity,
+  if (!loadJointVectorParam("mpc/joint_velocity_limits", default_velocity,
                             velocity_limits_) ||
       !loadJointVectorParam("mpc/joint_acceleration_limits", default_acceleration,
                             acceleration_limits_)) {
@@ -198,9 +195,8 @@ bool VelocityQPMPC::loadConfig() {
   }
 
   for (int i = 0; i < dof_; ++i) {
-    if (!(q_tracking_trust_[i] > 0.0) || !(velocity_limits_[i] > 0.0) ||
-        !(acceleration_limits_[i] > 0.0)) {
-      ROS_ERROR("[VelocityQPMPC] trust/velocity/acceleration limits must be positive.");
+    if (!(velocity_limits_[i] > 0.0) || !(acceleration_limits_[i] > 0.0)) {
+      ROS_ERROR("[VelocityQPMPC] velocity/acceleration limits must be positive.");
       return false;
     }
   }
@@ -274,17 +270,16 @@ bool VelocityQPMPC::buildStaticQP() {
         -Eigen::MatrixXd::Identity(dof_, dof_);
   }
 
-  // Velocity bounds are native PIQP variable bounds. G therefore contains only
-  // acceleration, joint-position, and nominal-tracking trust constraints.
+  // Velocity bounds are native PIQP variable bounds. Phase A has no nonlinear
+  // CDF/NCDF linearization yet, so G contains only hard physical acceleration
+  // and joint-position constraints. Nominal tracking is purely in the cost.
   acceleration_row0_ = 0;
   position_row0_ = acceleration_row0_ + n_u_;
-  trust_row0_ = position_row0_ + n_u_;
-  n_constraints_ = trust_row0_ + n_u_;
+  n_constraints_ = position_row0_ + n_u_;
 
   G_ = Eigen::MatrixXd::Zero(n_constraints_, n_u_);
   G_.block(acceleration_row0_, 0, n_u_, n_u_) = D_;
   G_.block(position_row0_, 0, n_u_, n_u_) = S_;
-  G_.block(trust_row0_, 0, n_u_, n_u_) = S_;
 
   H_ = 2.0 * (
       q_tracking_weight_ * S_.transpose() * S_
@@ -466,12 +461,6 @@ void VelocityQPMPC::buildCycleQP(const Eigen::VectorXd& q_current,
   for (int k = 0; k < num_intervals_; ++k) {
     lower.segment(position_row0_ + k * dof_, dof_) = q_min_ - q_current;
     upper.segment(position_row0_ + k * dof_, dof_) = q_max_ - q_current;
-
-    const Eigen::VectorXd ref_delta = q_ref.col(k + 1) - q_current;
-    lower.segment(trust_row0_ + k * dof_, dof_) =
-        ref_delta - q_tracking_trust_;
-    upper.segment(trust_row0_ + k * dof_, dof_) =
-        ref_delta + q_tracking_trust_;
   }
 }
 
