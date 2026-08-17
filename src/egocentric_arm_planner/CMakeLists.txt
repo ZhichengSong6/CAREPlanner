@@ -108,7 +108,7 @@ target_link_libraries(trajectory_execution_manager_node
   ${catkin_LIBRARIES}
 )
 
-# Standalone Phase-A MPC executable. Compile velocity_qp_mpc.cpp directly into
+# Standalone Phase-A/B MPC executable. Compile velocity_qp_mpc.cpp directly into
 # this executable and add PIQP only to this target. It does not link against the
 # egocentric_arm_planner library.
 add_executable(velocity_qp_mpc_node
@@ -147,4 +147,9 @@ add_dependencies(ee_interactive_marker_node
 
 target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
+)
+
+catkin_install_python(PROGRAMS
+  scripts/phase_b2_controlled_trial_node.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
