@@ -1,0 +1,65 @@
+<launch>
+  <!-- Phase B.1: visibility NCDF horizon observer. Diagnostic only. -->
+
+  <arg name="checkpoint"
+       default="$(find care_visibility_cdf)/checkpoints/exp1_yiming_k500_fov_signed/final.pt" />
+  <arg name="urdf"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <arg name="device" default="cpu" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="target_topic"
+       default="/care_planner/active_sensing/target_point" />
+  <arg name="predicted_trajectory_topic"
+       default="/care_planner/mpc/predicted_trajectory" />
+
+  <arg name="update_rate" default="20.0" />
+  <arg name="target_timeout" default="0.25" />
+  <arg name="trajectory_timeout" default="0.25" />
+  <arg name="include_current_state" default="false" />
+
+  <!-- Expensive finite-difference sanity check. 0 disables it. -->
+  <arg name="fd_check_every_n" default="0" />
+  <arg name="fd_eps" default="0.0001" />
+  <arg name="fd_horizon_index" default="0" />
+
+  <node pkg="care_visibility_cdf"
+        type="ncdf_horizon_observer_node.py"
+        name="ncdf_horizon_observer"
+        output="screen">
+
+    <param name="checkpoint" value="$(arg checkpoint)" />
+    <param name="urdf" value="$(arg urdf)" />
+    <param name="device" value="$(arg device)" />
+
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="target_topic" value="$(arg target_topic)" />
+    <param name="predicted_trajectory_topic"
+           value="$(arg predicted_trajectory_topic)" />
+
+    <param name="update_rate" value="$(arg update_rate)" />
+    <param name="target_timeout" value="$(arg target_timeout)" />
+    <param name="trajectory_timeout" value="$(arg trajectory_timeout)" />
+    <param name="include_current_state" value="$(arg include_current_state)" />
+
+    <param name="fd_check_every_n" value="$(arg fd_check_every_n)" />
+    <param name="fd_eps" value="$(arg fd_eps)" />
+    <param name="fd_horizon_index" value="$(arg fd_horizon_index)" />
+
+    <param name="oracle_horizontal_fov_deg" value="50.0" />
+    <param name="oracle_vertical_fov_deg" value="66.0" />
+    <param name="oracle_z_min" value="0.20" />
+    <param name="oracle_z_max" value="0.70" />
+    <param name="oracle_delta" value="0.01" />
+
+    <rosparam param="joint_names">
+      - joint1
+      - joint2
+      - joint3
+      - joint4
+      - wrist_joint1
+      - wrist_joint2
+      - wrist_joint3
+    </rosparam>
+  </node>
+</launch>
