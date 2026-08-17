@@ -5,7 +5,14 @@
   <arg name="paused" default="false" />
   <arg name="use_sim_time" default="true" />
   <arg name="gazebo_gui" default="true" />
-  <arg name="use_rviz" default="true" />
+
+  <!-- Keep RViz out of the default Gazebo startup path. On this system,
+       starting RViz/OGRE concurrently with Gazebo, the arm camera plugins,
+       robot spawning, and controller initialization caused intermittent RViz
+       SIGSEGVs while interacting with the EE marker. Launching RViz after the
+       simulation/control stack is initialized is stable. The override remains
+       available for explicit experiments with use_rviz:=true. -->
+  <arg name="use_rviz" default="false" />
   <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
   <arg name="verbose" default="false" />
 
