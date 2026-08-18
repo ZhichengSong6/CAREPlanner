@@ -119,9 +119,8 @@ target_link_libraries(velocity_qp_mpc_node
   ${catkin_LIBRARIES}
 )
 
-# Experimental Visibility-Before-Contact deadline-waypoint MPC.  Kept as a
-# separate executable so the previously validated Phase-A/B.2 controller remains
-# untouched for ablations and regression checks.
+# Experimental Visibility-Before-Contact deadline-waypoint MPC. Kept separate
+# from the validated Phase-A/B.2 executable for clean regression/ablation runs.
 add_executable(velocity_qp_mpc_waypoint_node
   src/velocity_qp_mpc_waypoint_node.cpp
   src/velocity_qp_mpc_waypoint.cpp
@@ -157,6 +156,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
   scripts/phase_b2_steering_logger_node.py
+  scripts/phase_b2_vbc_waypoint_logger_node.py
   scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
