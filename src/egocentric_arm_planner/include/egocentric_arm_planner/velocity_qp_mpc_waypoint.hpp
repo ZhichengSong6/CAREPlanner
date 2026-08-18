@@ -13,6 +13,7 @@
 #include <Eigen/Dense>
 #include <piqp/piqp.hpp>
 
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,7 +23,7 @@ namespace egocentric_arm_planner {
 /**
  * Experimental CAREPlanner VBC deadline-waypoint controller.
  *
- * Base task tracking is identical in structure to VelocityQPMPC.  When a fresh
+ * Base task tracking is identical in structure to VelocityQPMPC. When a fresh
  * active visibility waypoint is available, this controller adds one exact soft
  * quadratic configuration cost at the rolling horizon step at-or-before the
  * absolute visibility deadline:
@@ -31,9 +32,9 @@ namespace egocentric_arm_planner {
  *   q_kd = q_current + S_kd u.
  *
  * Therefore both the Hessian and linear objective are updated for that cycle,
- * while joint position, velocity, and acceleration constraints remain exactly
- * hard.  If the waypoint is inactive, missing, stale, or still beyond the MPC
- * horizon, the cycle reduces to the Phase-A task-tracking QP.
+ * while joint position, velocity, and acceleration constraints remain hard.
+ * If the waypoint is inactive, missing, stale, or still beyond the MPC horizon,
+ * the cycle reduces to the Phase-A task-tracking QP.
  */
 class VelocityQPMPCWaypoint {
 public:
@@ -176,7 +177,6 @@ private:
   std::string waypoint_deadline_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_deadline";
 
-  // Condensed MPC matrices. u=[u0;...;uK-1]. q1...qK = 1*q0 + S*u.
   Eigen::MatrixXd S_;
   Eigen::MatrixXd S_terminal_;
   Eigen::MatrixXd D_;
