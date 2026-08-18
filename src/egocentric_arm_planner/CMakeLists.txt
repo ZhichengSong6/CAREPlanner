@@ -119,6 +119,29 @@ target_link_libraries(velocity_qp_mpc_node
   ${catkin_LIBRARIES}
 )
 
+# Experimental Visibility-Before-Contact deadline-waypoint MPC.  Kept as a
+# separate executable so the previously validated Phase-A/B.2 controller remains
+# untouched for ablations and regression checks.
+add_executable(velocity_qp_mpc_waypoint_node
+  src/velocity_qp_mpc_waypoint_node.cpp
+  src/velocity_qp_mpc_waypoint.cpp
+)
+add_dependencies(velocity_qp_mpc_waypoint_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_include_directories(velocity_qp_mpc_waypoint_node PRIVATE
+  ${PIQP_INCLUDE_DIR}
+)
+target_compile_options(velocity_qp_mpc_waypoint_node PRIVATE
+  -O3
+)
+target_compile_definitions(velocity_qp_mpc_waypoint_node PRIVATE
+  NDEBUG
+)
+target_link_libraries(velocity_qp_mpc_waypoint_node
+  ${catkin_LIBRARIES}
+)
+
 add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
