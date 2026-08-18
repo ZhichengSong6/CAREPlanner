@@ -86,6 +86,9 @@
     <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
     <arg name="visibility_threshold" value="$(arg seen_threshold)" />
     <arg name="sweep_extra_margin" value="$(arg executed_vbc_sweep_extra_margin)" />
+    <arg name="trial_label" value="$(arg trial_label)" />
+    <arg name="lambda_vis" value="$(arg lambda_vis)" />
+    <arg name="output_root" value="$(arg log_output_root)" />
   </include>
 
   <node pkg="egocentric_arm_planner"
@@ -122,7 +125,5 @@
     <param name="adapter_summary_topic"
            value="/phase_b2_visibility_acquisition_adapter/summary" />
     <param name="observer_summary_topic" value="/ncdf_horizon_observer/summary" />
-    <param name="executed_vbc_summary_topic"
-           value="/care_planner/trajectory_risk/executed_vbc_summary" />
   </node>
 </launch>
