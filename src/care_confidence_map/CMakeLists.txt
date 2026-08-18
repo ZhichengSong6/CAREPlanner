@@ -157,6 +157,7 @@ catkin_install_python(PROGRAMS
   scripts/test_query_confidence.py
   scripts/generate_body_samples.py
   scripts/body_sample_marker_publisher.py
+  scripts/initialize_body_prior_once.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
