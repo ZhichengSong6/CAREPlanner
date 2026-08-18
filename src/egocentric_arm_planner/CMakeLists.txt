@@ -69,11 +69,9 @@ target_link_libraries(egocentric_arm_planner
 add_executable(receding_horizon_planner_node
   src/receding_horizon_planner_node.cpp
 )
-
 add_dependencies(receding_horizon_planner_node
   ${catkin_EXPORTED_TARGETS}
 )
-
 target_link_libraries(receding_horizon_planner_node
   egocentric_arm_planner
   ${catkin_LIBRARIES}
@@ -82,11 +80,9 @@ target_link_libraries(receding_horizon_planner_node
 add_executable(trajectory_visualizer_node
   src/trajectory_visualizer_node.cpp
 )
-
 add_dependencies(trajectory_visualizer_node
   ${catkin_EXPORTED_TARGETS}
 )
-
 target_link_libraries(trajectory_visualizer_node
   egocentric_arm_planner
   ${catkin_LIBRARIES}
@@ -95,11 +91,9 @@ target_link_libraries(trajectory_visualizer_node
 add_executable(trajectory_execution_manager_node
   src/trajectory_execution_manager_node.cpp
 )
-
 add_dependencies(trajectory_execution_manager_node
   ${catkin_EXPORTED_TARGETS}
 )
-
 target_link_libraries(trajectory_execution_manager_node
   egocentric_arm_planner
   ${catkin_LIBRARIES}
@@ -109,22 +103,18 @@ add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc_node.cpp
   src/velocity_qp_mpc.cpp
 )
-
 add_dependencies(velocity_qp_mpc_node
   ${catkin_EXPORTED_TARGETS}
 )
-
 target_include_directories(velocity_qp_mpc_node PRIVATE
   ${PIQP_INCLUDE_DIR}
 )
-
 target_compile_options(velocity_qp_mpc_node PRIVATE
   -O3
 )
 target_compile_definitions(velocity_qp_mpc_node PRIVATE
   NDEBUG
 )
-
 target_link_libraries(velocity_qp_mpc_node
   ${catkin_LIBRARIES}
 )
@@ -132,11 +122,9 @@ target_link_libraries(velocity_qp_mpc_node
 add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
-
 add_dependencies(ee_interactive_marker_node
   ${catkin_EXPORTED_TARGETS}
 )
-
 target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
 )
@@ -145,6 +133,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_b2_controlled_trial_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
+  scripts/phase_b2_steering_logger_node.py
   scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
