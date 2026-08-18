@@ -1,5 +1,5 @@
 <launch>
-  <!-- Reproducible Phase B.2-v2 A/B trial with visibility-before-contact gating. -->
+  <!-- Controlled visibility-before-contact experiments. -->
 
   <arg name="config_file"
        default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
@@ -11,7 +11,17 @@
   <arg name="visibility_timeout" default="0.15" />
   <arg name="gradient_norm_clip" default="0.0" />
   <arg name="seen_threshold" default="0.50" />
-  <arg name="gradient_normalization_eps" default="1e-6" />
+  <arg name="gradient_normalization_eps" default="1e-8" />
+
+  <!-- Steering ablation. normalized_ascent = legacy B.2-v2;
+       projection_ascent = B.2-v3. -->
+  <arg name="steering_mode" default="projection_ascent" />
+  <arg name="projection_epsilon_f" default="0.03" />
+  <arg name="projection_damping" default="0.5" />
+  <arg name="projection_max_step_norm" default="0.25" />
+  <arg name="ascent_step_size" default="0.05" />
+  <arg name="ascent_max_step_norm" default="0.25" />
+  <arg name="legacy_ascent_scale" default="1.0" />
 
   <arg name="vbc_min_margin_s" default="0.30" />
   <arg name="enable_executed_vbc_logger" default="true" />
@@ -53,6 +63,13 @@
     <arg name="active_target_topic" value="$(arg frozen_target_topic)" />
     <arg name="seen_threshold" value="$(arg seen_threshold)" />
     <arg name="gradient_normalization_eps" value="$(arg gradient_normalization_eps)" />
+    <arg name="steering_mode" value="$(arg steering_mode)" />
+    <arg name="projection_epsilon_f" value="$(arg projection_epsilon_f)" />
+    <arg name="projection_damping" value="$(arg projection_damping)" />
+    <arg name="projection_max_step_norm" value="$(arg projection_max_step_norm)" />
+    <arg name="ascent_step_size" value="$(arg ascent_step_size)" />
+    <arg name="ascent_max_step_norm" value="$(arg ascent_max_step_norm)" />
+    <arg name="legacy_ascent_scale" value="$(arg legacy_ascent_scale)" />
   </include>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
@@ -78,7 +95,7 @@
     <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
   </include>
 
-  <!-- Executed VBC logger: actual-body TF sweep event + actual sensor-seen event. -->
+  <!-- Actual executed body sweep vs actual sensor-seen logger. -->
   <include if="$(arg enable_executed_vbc_logger)"
            file="$(find care_confidence_map)/launch/executed_vbc_logger.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
