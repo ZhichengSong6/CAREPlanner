@@ -98,9 +98,8 @@ receding_horizon:
   mpc_command_timeout: 0.20
 
 # C++ velocity QP-MPC. Tracking is a soft objective. Joint position, velocity,
-# and acceleration remain hard constraints. Phase B.2-v2 consumes a confidence-
-# gated, per-horizon normalized NCDF direction from the acquisition adapter.
-# Visibility stays disabled by default so Phase-A launch behavior is unchanged.
+# and acceleration remain hard constraints. Legacy B.2 visibility remains
+# disabled by default so Phase-A behavior is unchanged.
 mpc:
   rate: 20.0
   horizon_duration: 1.0
@@ -111,6 +110,7 @@ mpc:
   u_tracking_weight: 2.0
   u_smooth_weight: 1.0
 
+  # Legacy B.2-v2/v3 sequential linear visibility steering.
   visibility:
     enabled: false
     weight: 0.0
@@ -118,6 +118,19 @@ mpc:
     gradient_norm_clip: 0.0
     active_topic: /care_planner/active_sensing/acquisition_active
     gradient_topic: /care_planner/active_sensing/normalized_gradient_q
+
+  # New Visibility-Before-Contact (VBC) deadline-waypoint objective. The
+  # dedicated velocity_qp_mpc_waypoint_node uses this group; ordinary Phase-A
+  # launches keep it disabled. Its exact soft cost is
+  #   weight * ||q(k_deadline) - q_vis||^2.
+  visibility_waypoint:
+    enabled: false
+    weight: 100.0
+    timeout: 0.20
+    horizon_slack: 0.025
+    active_topic: /care_planner/active_sensing/visibility_waypoint_active
+    q_topic: /care_planner/active_sensing/visibility_waypoint_q
+    deadline_topic: /care_planner/active_sensing/visibility_waypoint_deadline
 
   joint_position_margin: 0.01
 
