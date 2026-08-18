@@ -153,6 +153,23 @@ target_link_libraries(trajectory_risk_node
   pinocchio::pinocchio
 )
 
+add_executable(trajectory_vbc_selector_node
+  src/trajectory_vbc_selector_node.cpp
+)
+
+add_dependencies(trajectory_vbc_selector_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_vbc_selector_node
+  trajectory_risk_evaluator
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+  pinocchio::pinocchio
+)
+
 catkin_install_python(PROGRAMS
   scripts/test_query_confidence.py
   scripts/generate_body_samples.py
@@ -168,6 +185,7 @@ install(TARGETS
   body_sample_model_node
   body_observability_node
   trajectory_risk_node
+  trajectory_vbc_selector_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
