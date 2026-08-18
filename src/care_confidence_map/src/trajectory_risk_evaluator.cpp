@@ -230,6 +230,71 @@ bool TrajectoryRiskEvaluator::computeSamplesForConfiguration(
   return true;
 }
 
+bool TrajectoryRiskEvaluator::computeFramePosesForConfiguration(
+    const Eigen::VectorXd& q,
+    const std::vector<std::string>& frame_names,
+    std::vector<FramePoseInBase>* out,
+    std::string* error_msg) const
+{
+  if (!initialized_)
+  {
+    if (error_msg)
+    {
+      *error_msg = "TrajectoryRiskEvaluator is not initialized.";
+    }
+    return false;
+  }
+
+  if (!out)
+  {
+    if (error_msg)
+    {
+      *error_msg = "Output frame-pose pointer is null.";
+    }
+    return false;
+  }
+
+  if (!checkConfigurationSize(q, error_msg))
+  {
+    return false;
+  }
+
+  for (const auto& frame_name : frame_names)
+  {
+    if (!model_.existFrame(frame_name))
+    {
+      if (error_msg)
+      {
+        *error_msg = "Requested frame does not exist in Pinocchio model: " + frame_name;
+      }
+      return false;
+    }
+  }
+
+  pinocchio::forwardKinematics(model_, data_, q);
+  pinocchio::updateFramePlacements(model_, data_);
+
+  const pinocchio::FrameIndex base_fid = model_.getFrameId(base_frame_);
+  const pinocchio::SE3 T_base_world = data_.oMf[base_fid].inverse();
+
+  out->clear();
+  out->reserve(frame_names.size());
+
+  for (const auto& frame_name : frame_names)
+  {
+    const pinocchio::FrameIndex fid = model_.getFrameId(frame_name);
+    const pinocchio::SE3 T_base_frame = T_base_world * data_.oMf[fid];
+
+    FramePoseInBase pose;
+    pose.frame_name = frame_name;
+    pose.translation_base = T_base_frame.translation();
+    pose.rotation_base = T_base_frame.rotation();
+    out->push_back(pose);
+  }
+
+  return true;
+}
+
 TrajectorySampleResult TrajectoryRiskEvaluator::computeTrajectorySamples(
     const std::vector<Eigen::VectorXd>& q_traj) const
 {
