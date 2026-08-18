@@ -76,7 +76,6 @@
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
 
-  <!-- Legacy confidence/frontier analysis remains diagnostic only. -->
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
@@ -86,7 +85,6 @@
     <arg name="show_attribution_markers" value="false" />
   </include>
 
-  <!-- VBC selector owns the real candidate topic. -->
   <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
@@ -95,7 +93,6 @@
     <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
   </include>
 
-  <!-- Actual executed body sweep vs actual sensor-seen logger. -->
   <include if="$(arg enable_executed_vbc_logger)"
            file="$(find care_confidence_map)/launch/executed_vbc_logger.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -142,5 +139,17 @@
     <param name="adapter_summary_topic"
            value="/phase_b2_visibility_acquisition_adapter/summary" />
     <param name="observer_summary_topic" value="/ncdf_horizon_observer/summary" />
+  </node>
+
+  <node if="$(arg enable_ab_logger)"
+        pkg="egocentric_arm_planner"
+        type="phase_b2_steering_logger_node.py"
+        name="phase_b2_steering_logger"
+        output="screen">
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="lambda_vis" value="$(arg lambda_vis)" />
+    <param name="output_root" value="$(arg log_output_root)" />
+    <param name="adapter_summary_topic"
+           value="/phase_b2_visibility_acquisition_adapter/summary" />
   </node>
 </launch>
