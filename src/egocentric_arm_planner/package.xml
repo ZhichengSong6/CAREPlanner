@@ -24,8 +24,9 @@
 
   <depend>eigen</depend>
 
-  <!-- Runtime-only tools used by the Phase-A A/B diagnostic launch. -->
+  <!-- Runtime-only tools used by the Phase-A/B diagnostic launches. -->
   <exec_depend>rospy</exec_depend>
   <exec_depend>rosnode</exec_depend>
   <exec_depend>rosbag</exec_depend>
+  <exec_depend>care_confidence_map</exec_depend>
 </package>
