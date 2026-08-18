@@ -13,7 +13,7 @@ confidence_map:
   update_rate: 30.0
   publish_rate: 10.0
 
-  # Temporal memory of observed / known-clear space.
+  # Temporal memory of observed / initially trusted-clear space.
   # If a voxel is not currently visible, confidence decays as:
   # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
   # 100 s is intentionally very slow for current active-sensing debugging,
@@ -25,18 +25,21 @@ confidence_map:
   fov_marker_topic: /care_planner/confidence_map/fov_markers
   query_service: /care_planner/confidence_map/query
 
+# Legacy parameter namespace kept for compatibility. Semantically this is now
+# an INITIAL trusted-free bootstrap around the robot's starting configuration.
+# It must be written exactly once and must never follow the moving robot.
 current_body_prior:
   enabled: true
 
   # This file is set by confidence_map.launch so that $(find ...) works.
   body_samples_file: ""
 
-  # Use current TF + body_samples. Each sample sphere is inflated by this radius.
+  # Small trusted-clear envelope around the initial body geometry.
   inflation_radius: 0.10
 
-  # If true, also refresh once at node startup. Even if TF is not ready at startup,
-  # trajectory_risk_node will call the refresh service before every trajectory query.
-  refresh_on_startup: true
+  # IMPORTANT: disabled here. initialize_body_prior_once.py waits until all
+  # required body TFs are available, performs one complete refresh, then locks.
+  refresh_on_startup: false
 
   # false = include all body samples, including base if present.
   # true  = only include samples marked include_for_risk in body_samples.yaml.
