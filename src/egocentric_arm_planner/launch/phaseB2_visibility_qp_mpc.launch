@@ -1,13 +1,20 @@
 <launch>
   <!--
-    Phase B.2: Phase-A velocity QP-MPC + first-order learned visibility cost.
+    Phase B.2-v2: Phase-A velocity QP-MPC + confidence-gated normalized
+    visibility acquisition.
 
-    The NCDF horizon observer is intentionally NOT launched here because it runs
-    in the dedicated ncdf_l4c conda environment. Start it separately with:
+    The frozen NCDF horizon observer is intentionally NOT launched here because
+    it runs in the dedicated ncdf_l4c conda environment. Start it separately:
       python src/care_visibility_cdf/scripts/ncdf_horizon_observer_node.py _device:=cpu
 
-    lambda_vis=0.0 is the exact Phase-A objective and is the recommended first
-    A/B sanity run. Positive lambda_vis enables the linear visibility term.
+    The lightweight adapter launched below keeps the observer diagnostic-only:
+      raw df/dq -> per-horizon unit direction
+      confidence(target) < seen_threshold -> acquisition_active=true
+      once seen -> latch acquisition_active=false until x* changes
+
+    A running /care_planner/confidence_map/query service is required for the v2
+    visibility term to activate. If the service is missing, the adapter fails
+    closed and the MPC falls back to the Phase-A tracking objective.
   -->
 
   <arg name="config_file"
@@ -20,10 +27,21 @@
   <arg name="lambda_vis" default="0.10" />
   <arg name="visibility_timeout" default="0.15" />
   <arg name="gradient_norm_clip" default="0.0" />
-  <arg name="visibility_active_topic"
+
+  <arg name="active_target_topic"
+       default="/care_planner/active_sensing/target_point" />
+  <arg name="observer_active_topic"
        default="/ncdf_horizon_observer/active" />
-  <arg name="visibility_gradient_topic"
+  <arg name="raw_visibility_gradient_topic"
        default="/ncdf_horizon_observer/gradient_q" />
+  <arg name="visibility_active_topic"
+       default="/care_planner/active_sensing/acquisition_active" />
+  <arg name="visibility_gradient_topic"
+       default="/care_planner/active_sensing/normalized_gradient_q" />
+  <arg name="confidence_query_service"
+       default="/care_planner/confidence_map/query" />
+  <arg name="seen_threshold" default="0.50" />
+  <arg name="gradient_normalization_eps" default="1e-6" />
 
   <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
     <arg name="config_file" value="$(arg config_file)" />
@@ -33,6 +51,23 @@
     <arg name="use_interactive_marker" value="$(arg use_interactive_marker)" />
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
+
+  <node pkg="egocentric_arm_planner"
+        type="phase_b2_visibility_acquisition_adapter_node.py"
+        name="phase_b2_visibility_acquisition_adapter"
+        output="screen">
+    <param name="target_topic" value="$(arg active_target_topic)" />
+    <param name="observer_active_topic" value="$(arg observer_active_topic)" />
+    <param name="raw_gradient_topic" value="$(arg raw_visibility_gradient_topic)" />
+    <param name="confidence_query_service" value="$(arg confidence_query_service)" />
+    <param name="acquisition_active_topic" value="$(arg visibility_active_topic)" />
+    <param name="normalized_gradient_topic" value="$(arg visibility_gradient_topic)" />
+    <param name="seen_threshold" value="$(arg seen_threshold)" />
+    <param name="normalization_eps" value="$(arg gradient_normalization_eps)" />
+    <param name="rate" value="20.0" />
+    <param name="target_timeout" value="0.25" />
+    <param name="observer_timeout" value="$(arg visibility_timeout)" />
+  </node>
 
   <node pkg="egocentric_arm_planner"
         type="velocity_qp_mpc_node"
