@@ -4,6 +4,8 @@
 
     This launch fixes every experimental input except lambda_vis:
       - fixed initial Gazebo reset is supplied externally by the user;
+      - confidence_map builds an INITIAL trusted-free body envelope exactly once;
+      - the controlled trial waits for that bootstrap to be ready before motion;
       - fixed EE goal is published exactly once by phase_b2_controlled_trial_node;
       - the nominal task trajectory is evaluated by trajectory_risk_node;
       - trajectory_risk publishes candidate x* on a private candidate topic;
@@ -30,6 +32,9 @@
   <arg name="gradient_norm_clip" default="0.0" />
   <arg name="seen_threshold" default="0.50" />
   <arg name="gradient_normalization_eps" default="1e-6" />
+
+  <arg name="initial_prior_ready_topic"
+       default="/care_planner/confidence_map/initial_prior_ready" />
 
   <!-- Automatic per-cycle A/B logging. Empty trial_label lets the logger use
        baseline for lambda=0 and b2_v2 for lambda>0. -->
@@ -69,8 +74,10 @@
     <arg name="gradient_normalization_eps" value="$(arg gradient_normalization_eps)" />
   </include>
 
-  <!-- Confidence map used by trajectory-risk attribution and B.2-v2 gating. -->
-  <include file="$(find care_confidence_map)/launch/confidence_map.launch" />
+  <!-- Confidence map + one-shot initial trusted-free bootstrap. -->
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+  </include>
 
   <!-- Evaluate the fixed nominal task trajectory. Publish candidate x* to a
        separate topic so it cannot change the frozen target after selection. -->
@@ -83,7 +90,8 @@
     <arg name="show_attribution_markers" value="false" />
   </include>
 
-  <!-- Trial coordinator: one fixed EE goal + first candidate target latch. -->
+  <!-- Trial coordinator: wait for initial prior, then one fixed EE goal + first
+       candidate target latch. -->
   <node pkg="egocentric_arm_planner"
         type="phase_b2_controlled_trial_node.py"
         name="phase_b2_controlled_trial"
@@ -92,6 +100,8 @@
     <param name="goal_topic" value="/care_planner/ee_target_pose" />
     <param name="candidate_topic" value="$(arg candidate_target_topic)" />
     <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
+    <param name="require_initial_prior_ready" value="true" />
+    <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
     <param name="publish_rate" value="20.0" />
     <param name="goal_delay" value="$(arg goal_delay)" />
 
