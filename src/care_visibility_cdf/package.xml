@@ -18,4 +18,6 @@
   <exec_depend>trajectory_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>arm_description</exec_depend>
+  <exec_depend>care_confidence_map</exec_depend>
+  <exec_depend>egocentric_arm_planner</exec_depend>
 </package>
