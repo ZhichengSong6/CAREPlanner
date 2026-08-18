@@ -1,0 +1,93 @@
+<launch>
+  <!--
+    Non-actuating setup for the explicit VBC deadline projection smoke test.
+
+    This launch intentionally does NOT start VelocityQPMPC and does NOT start
+    TrajectoryExecutionManager. It only creates the same nominal task trajectory,
+    confidence map, VBC selector, and frozen target used by the controlled B.2
+    experiments. Run vbc_deadline_projection_smoke_node.py separately inside the
+    ncdf_l4c environment.
+  -->
+
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="use_trajectory_visualizer" default="true" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+
+  <arg name="initial_prior_ready_topic"
+       default="/care_planner/confidence_map/initial_prior_ready" />
+  <arg name="candidate_target_topic"
+       default="/care_planner/active_sensing/target_candidate" />
+  <arg name="legacy_candidate_target_topic"
+       default="/care_planner/active_sensing/legacy_target_candidate" />
+  <arg name="frozen_target_topic"
+       default="/care_planner/active_sensing/target_point" />
+
+  <!-- Same controlled fixed EE goal used by the A/B experiments. -->
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+
+  <!-- Nominal planner only. No execution manager. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+  </include>
+
+  <!-- Legacy frontier path stays diagnostic-only, matching controlled A/B. -->
+  <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="active_sensing_target_topic" value="$(arg legacy_candidate_target_topic)" />
+    <arg name="show_full_trajectory_markers" value="false" />
+    <arg name="show_worst_timestep_markers" value="false" />
+    <arg name="show_attribution_markers" value="false" />
+  </include>
+
+  <!-- Real target selection: nominal visibility-before-contact deadline. -->
+  <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+    <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+  </include>
+
+  <!-- Publish fixed task goal after one-shot initial trusted-free prior is ready,
+       then freeze the first VBC-selected candidate as x*. -->
+  <node pkg="egocentric_arm_planner"
+        type="phase_b2_controlled_trial_node.py"
+        name="phase_b2_projection_smoke_trial"
+        output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="goal_topic" value="/care_planner/ee_target_pose" />
+    <param name="candidate_topic" value="$(arg candidate_target_topic)" />
+    <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
+    <param name="require_initial_prior_ready" value="true" />
+    <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+    <param name="publish_rate" value="20.0" />
+    <param name="goal_delay" value="$(arg goal_delay)" />
+    <param name="goal/x" value="$(arg goal_x)" />
+    <param name="goal/y" value="$(arg goal_y)" />
+    <param name="goal/z" value="$(arg goal_z)" />
+    <param name="goal/qx" value="$(arg goal_qx)" />
+    <param name="goal/qy" value="$(arg goal_qy)" />
+    <param name="goal/qz" value="$(arg goal_qz)" />
+    <param name="goal/qw" value="$(arg goal_qw)" />
+  </node>
+</launch>
