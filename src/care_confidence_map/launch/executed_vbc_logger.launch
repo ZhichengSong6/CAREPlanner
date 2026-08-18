@@ -9,6 +9,10 @@
   <arg name="visibility_threshold" default="0.50" />
   <arg name="rate" default="50.0" />
   <arg name="sweep_extra_margin" default="0.0" />
+  <arg name="trial_label" default="trial" />
+  <arg name="lambda_vis" default="0.0" />
+  <arg name="output_root"
+       default="$(find egocentric_arm_planner)/../../outputs/phase_b2_v2_ab" />
 
   <node pkg="care_confidence_map"
         type="executed_vbc_logger_node.py"
@@ -21,6 +25,9 @@
     <param name="visibility_threshold" value="$(arg visibility_threshold)" />
     <param name="rate" value="$(arg rate)" />
     <param name="sweep_extra_margin" value="$(arg sweep_extra_margin)" />
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="lambda_vis" value="$(arg lambda_vis)" />
+    <param name="output_root" value="$(arg output_root)" />
     <rosparam param="ignored_links">[base_link, link1]</rosparam>
   </node>
 </launch>
