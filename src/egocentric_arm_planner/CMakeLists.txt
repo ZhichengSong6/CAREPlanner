@@ -19,9 +19,6 @@ find_package(catkin REQUIRED COMPONENTS
 
 find_package(Eigen3 REQUIRED)
 
-# PIQP is used only by the standalone velocity_qp_mpc_node. Keep its include
-# path out of the planner library so the validated planner/IK build path remains
-# isolated from the template-heavy PIQP headers.
 set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
   message(FATAL_ERROR
@@ -108,9 +105,6 @@ target_link_libraries(trajectory_execution_manager_node
   ${catkin_LIBRARIES}
 )
 
-# Standalone Phase-A/B MPC executable. Compile velocity_qp_mpc.cpp directly into
-# this executable and add PIQP only to this target. It does not link against the
-# egocentric_arm_planner library.
 add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc_node.cpp
   src/velocity_qp_mpc.cpp
@@ -124,8 +118,6 @@ target_include_directories(velocity_qp_mpc_node PRIVATE
   ${PIQP_INCLUDE_DIR}
 )
 
-# PIQP and Eigen are template-heavy. Optimize only the MPC executable so the
-# planner/IK build remains independent of this compilation choice.
 target_compile_options(velocity_qp_mpc_node PRIVATE
   -O3
 )
@@ -151,5 +143,6 @@ target_link_libraries(ee_interactive_marker_node
 
 catkin_install_python(PROGRAMS
   scripts/phase_b2_controlled_trial_node.py
+  scripts/phase_b2_visibility_acquisition_adapter_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
