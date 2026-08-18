@@ -1,6 +1,9 @@
 <launch>
+  <!-- VBC needs both robot body link frames and the eight ToF sensor frames.
+       Use the complete Arm.urdf here; the self-filter collision URDF does not
+       contain the ToF frames and would make the selector fail during startup. -->
   <arg name="robot_urdf_file"
-       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+       default="$(find arm_description)/urdf/Arm.urdf" />
   <arg name="body_samples_file"
        default="$(find care_confidence_map)/config/body_samples.yaml" />
   <arg name="config_file"
