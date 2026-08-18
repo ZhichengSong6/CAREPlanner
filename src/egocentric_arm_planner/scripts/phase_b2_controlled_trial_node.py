@@ -11,11 +11,12 @@ class PhaseB2ControlledTrialNode:
     """Publish one fixed EE goal and freeze the first trajectory-risk target.
 
     The node is intentionally simple and deterministic:
-      1. publish exactly one latched EE goal after the planner subscriber exists;
-      2. wait for the first active-sensing candidate produced from the nominal
+      1. wait until the one-shot initial trusted-free prior is ready;
+      2. publish exactly one latched EE goal after the planner subscriber exists;
+      3. wait for the first active-sensing candidate produced from the nominal
          task trajectory;
-      3. freeze that candidate for the rest of the trial;
-      4. republish the frozen target with a fresh timestamp at a fixed rate so
+      4. freeze that candidate for the rest of the trial;
+      5. republish the frozen target with a fresh timestamp at a fixed rate so
          the NCDF observer never treats it as stale.
 
     The trajectory-risk node is expected to publish candidates on a separate
@@ -42,6 +43,15 @@ class PhaseB2ControlledTrialNode:
                 "/care_planner/active_sensing/target_point",
             )
         )
+        self.require_initial_prior_ready = bool(
+            rospy.get_param("~require_initial_prior_ready", True)
+        )
+        self.initial_prior_ready_topic = str(
+            rospy.get_param(
+                "~initial_prior_ready_topic",
+                "/care_planner/confidence_map/initial_prior_ready",
+            )
+        )
         self.publish_rate = float(rospy.get_param("~publish_rate", 20.0))
         self.goal_delay = float(rospy.get_param("~goal_delay", 0.5))
 
@@ -61,6 +71,7 @@ class PhaseB2ControlledTrialNode:
         self._startup_time = rospy.Time.now()
         self._goal_sent = False
         self._frozen_target = None
+        self._initial_prior_ready = not self.require_initial_prior_ready
 
         # Latch the fixed goal so a late planner subscriber still receives the
         # exact same single target pose.  The planner therefore gets one fixed
@@ -78,6 +89,12 @@ class PhaseB2ControlledTrialNode:
             self.candidate_topic,
             PointStamped,
             self._candidate_callback,
+            queue_size=1,
+        )
+        self.initial_prior_ready_sub = rospy.Subscriber(
+            self.initial_prior_ready_topic,
+            Bool,
+            self._initial_prior_ready_callback,
             queue_size=1,
         )
 
@@ -101,9 +118,11 @@ class PhaseB2ControlledTrialNode:
             self.goal_qw,
         )
         rospy.loginfo(
-            "[phase_b2_trial] candidate=%s frozen_target=%s",
+            "[phase_b2_trial] candidate=%s frozen_target=%s initial_prior_ready=%s require=%d",
             self.candidate_topic,
             self.frozen_target_topic,
+            self.initial_prior_ready_topic,
+            int(self.require_initial_prior_ready),
         )
 
     def _publish_frozen_state(self, frozen):
@@ -111,9 +130,27 @@ class PhaseB2ControlledTrialNode:
         msg.data = bool(frozen)
         self.frozen_pub.publish(msg)
 
+    def _initial_prior_ready_callback(self, msg):
+        if msg is None or not bool(msg.data):
+            return
+        with self._lock:
+            first = not self._initial_prior_ready
+            self._initial_prior_ready = True
+        if first:
+            rospy.logwarn(
+                "[phase_b2_trial] initial trusted-free prior READY; controlled motion may begin"
+            )
+
     def _goal_timer_callback(self, _event):
         with self._lock:
             if self._goal_sent:
+                return
+
+            if not self._initial_prior_ready:
+                rospy.logwarn_throttle(
+                    1.0,
+                    "[phase_b2_trial] waiting for one-shot initial trusted-free prior",
+                )
                 return
 
             elapsed = (rospy.Time.now() - self._startup_time).to_sec()
