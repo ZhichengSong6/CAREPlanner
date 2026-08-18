@@ -1,15 +1,19 @@
 <launch>
   <!--
-    Reproducible Phase B.2-v2 A/B trial.
+    Reproducible Phase B.2-v2 A/B trial with visibility-before-contact gating.
 
     This launch fixes every experimental input except lambda_vis:
       - fixed initial Gazebo reset is supplied externally by the user;
       - confidence_map builds an INITIAL trusted-free body envelope exactly once;
       - the controlled trial waits for that bootstrap to be ready before motion;
       - fixed EE goal is published exactly once by phase_b2_controlled_trial_node;
-      - the nominal task trajectory is evaluated by trajectory_risk_node;
-      - trajectory_risk publishes candidate x* on a private candidate topic;
-      - the FIRST real low-confidence frontier sample is frozen for the whole trial;
+      - legacy trajectory_risk_node remains active for confidence/attribution diagnostics;
+      - trajectory_vbc_selector predicts, for each low-confidence future sweep point,
+        when the nominal body first sweeps it (t_sweep) and when any nominal sensor
+        first sees it (t_see);
+      - active sensing is requested only if t_sweep - t_see is below the required
+        safety margin, or the point is never visible within the nominal horizon;
+      - the FIRST true VBC-violation target is frozen for the whole controlled trial;
       - the frozen x* is republished at 20 Hz on the NCDF target topic;
       - the v2 adapter normalizes each NCDF horizon gradient and disables the
         visibility objective permanently for that x* once confidence confirms it seen;
@@ -33,6 +37,9 @@
   <arg name="seen_threshold" default="0.50" />
   <arg name="gradient_normalization_eps" default="1e-6" />
 
+  <!-- Required nominal lead time between seeing and sweeping the candidate. -->
+  <arg name="vbc_min_margin_s" default="0.30" />
+
   <arg name="initial_prior_ready_topic"
        default="/care_planner/confidence_map/initial_prior_ready" />
 
@@ -53,8 +60,12 @@
   <arg name="goal_qw" default="0.70710678" />
   <arg name="goal_delay" default="0.5" />
 
+  <!-- The VBC selector owns the real candidate topic. The legacy risk node is
+       deliberately routed elsewhere so the two selectors can never race. -->
   <arg name="candidate_target_topic"
        default="/care_planner/active_sensing/target_candidate" />
+  <arg name="legacy_candidate_target_topic"
+       default="/care_planner/active_sensing/legacy_target_candidate" />
   <arg name="frozen_target_topic"
        default="/care_planner/active_sensing/target_point" />
 
@@ -79,19 +90,28 @@
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
 
-  <!-- Evaluate the fixed nominal task trajectory. Publish candidate x* to a
-       separate topic so it cannot change the frozen target after selection. -->
+  <!-- Keep legacy risk/frontier analysis for diagnostics only. -->
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
-    <arg name="active_sensing_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="active_sensing_target_topic" value="$(arg legacy_candidate_target_topic)" />
     <arg name="show_full_trajectory_markers" value="false" />
     <arg name="show_worst_timestep_markers" value="false" />
     <arg name="show_attribution_markers" value="false" />
   </include>
 
+  <!-- New decision layer: only publish x* if the nominal trajectory violates
+       the required visibility-before-contact lead-time margin. -->
+  <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+    <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+  </include>
+
   <!-- Trial coordinator: wait for initial prior, then one fixed EE goal + first
-       candidate target latch. -->
+       VBC-violation candidate target latch. -->
   <node pkg="egocentric_arm_planner"
         type="phase_b2_controlled_trial_node.py"
         name="phase_b2_controlled_trial"
@@ -114,7 +134,7 @@
     <param name="goal/qw" value="$(arg goal_qw)" />
   </node>
 
-  <!-- Unthrottled per-cycle recorder.  It is observational only. -->
+  <!-- Unthrottled per-cycle recorder. It is observational only. -->
   <node if="$(arg enable_ab_logger)"
         pkg="egocentric_arm_planner"
         type="phase_b2_ab_logger_node.py"
