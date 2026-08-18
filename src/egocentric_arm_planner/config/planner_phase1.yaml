@@ -98,10 +98,9 @@ receding_horizon:
   mpc_command_timeout: 0.20
 
 # C++ velocity QP-MPC. Tracking is a soft objective. Joint position, velocity,
-# and acceleration remain hard constraints. Phase B.2 optionally adds a learned
-# visibility NCDF linear objective from the horizon observer. It is disabled by
-# default so phaseA_qp_mpc.launch is numerically identical to the Phase-A
-# controller unless explicitly overridden by the Phase-B.2 launch.
+# and acceleration remain hard constraints. Phase B.2-v2 consumes a confidence-
+# gated, per-horizon normalized NCDF direction from the acquisition adapter.
+# Visibility stays disabled by default so Phase-A launch behavior is unchanged.
 mpc:
   rate: 20.0
   horizon_duration: 1.0
@@ -117,8 +116,8 @@ mpc:
     weight: 0.0
     timeout: 0.15
     gradient_norm_clip: 0.0
-    active_topic: /ncdf_horizon_observer/active
-    gradient_topic: /ncdf_horizon_observer/gradient_q
+    active_topic: /care_planner/active_sensing/acquisition_active
+    gradient_topic: /care_planner/active_sensing/normalized_gradient_q
 
   joint_position_margin: 0.01
 
