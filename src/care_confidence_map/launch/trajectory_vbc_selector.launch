@@ -13,6 +13,7 @@
        default="/care_planner/active_sensing/target_candidate" />
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
+  <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
 
   <node pkg="care_confidence_map"
         type="trajectory_vbc_selector_node"
@@ -32,5 +33,7 @@
            value="$(arg output_target_topic)" />
     <param name="trajectory_vbc/confidence_query_service"
            value="$(arg confidence_query_service)" />
+    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s"
+           value="$(arg min_visibility_before_sweep_margin_s)" />
   </node>
 </launch>
