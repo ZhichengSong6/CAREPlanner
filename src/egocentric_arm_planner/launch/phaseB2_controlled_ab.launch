@@ -1,6 +1,6 @@
 <launch>
   <!--
-    Reproducible Phase B.2 A/B trial.
+    Reproducible Phase B.2-v2 A/B trial.
 
     This launch fixes every experimental input except lambda_vis:
       - fixed initial Gazebo reset is supplied externally by the user;
@@ -8,7 +8,9 @@
       - the nominal task trajectory is evaluated by trajectory_risk_node;
       - trajectory_risk publishes candidate x* on a private candidate topic;
       - the FIRST real low-confidence frontier sample is frozen for the whole trial;
-      - the frozen x* is republished at 20 Hz on the NCDF target topic.
+      - the frozen x* is republished at 20 Hz on the NCDF target topic;
+      - the v2 adapter normalizes each NCDF horizon gradient and disables the
+        visibility objective permanently for that x* once confidence confirms it seen.
 
     Important: do NOT run the old manual rostopic target publisher with this launch.
     The NCDF horizon observer still runs separately in the ncdf_l4c conda env.
@@ -23,6 +25,8 @@
   <arg name="lambda_vis" default="0.0" />
   <arg name="visibility_timeout" default="0.15" />
   <arg name="gradient_norm_clip" default="0.0" />
+  <arg name="seen_threshold" default="0.50" />
+  <arg name="gradient_normalization_eps" default="1e-6" />
 
   <!-- Validated fixed EE goal used for all A/B trials. -->
   <arg name="goal_x" default="0.286881" />
@@ -39,8 +43,8 @@
   <arg name="frozen_target_topic"
        default="/care_planner/active_sensing/target_point" />
 
-  <!-- Phase-A planner + Phase-B.2 velocity MPC. Interactive marker is disabled
-       so no human variation enters the A/B trial. -->
+  <!-- Phase-A planner + Phase-B.2-v2 velocity MPC. Interactive marker is
+       disabled so no human variation enters the A/B trial. -->
   <include file="$(find egocentric_arm_planner)/launch/phaseB2_visibility_qp_mpc.launch">
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -50,12 +54,15 @@
     <arg name="lambda_vis" value="$(arg lambda_vis)" />
     <arg name="visibility_timeout" value="$(arg visibility_timeout)" />
     <arg name="gradient_norm_clip" value="$(arg gradient_norm_clip)" />
+    <arg name="active_target_topic" value="$(arg frozen_target_topic)" />
+    <arg name="seen_threshold" value="$(arg seen_threshold)" />
+    <arg name="gradient_normalization_eps" value="$(arg gradient_normalization_eps)" />
   </include>
 
-  <!-- Confidence map used by trajectory-risk attribution. -->
+  <!-- Confidence map used by trajectory-risk attribution and B.2-v2 gating. -->
   <include file="$(find care_confidence_map)/launch/confidence_map.launch" />
 
-  <!-- Evaluate the fixed nominal task trajectory.  Publish candidate x* to a
+  <!-- Evaluate the fixed nominal task trajectory. Publish candidate x* to a
        separate topic so it cannot change the frozen target after selection. -->
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
