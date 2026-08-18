@@ -144,5 +144,7 @@ target_link_libraries(ee_interactive_marker_node
 catkin_install_python(PROGRAMS
   scripts/phase_b2_controlled_trial_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
+  scripts/phase_b2_ab_logger_node.py
+  scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
