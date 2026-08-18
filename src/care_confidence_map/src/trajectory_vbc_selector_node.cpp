@@ -58,12 +58,13 @@ public:
     }
 
     if (candidate_resolution_ <= 0.0 ||
+        fallback_dt_ <= 0.0 ||
         tof_min_range_ < 0.0 ||
         tof_max_range_ <= tof_min_range_ ||
         horizontal_fov_deg_ <= 0.0 ||
         vertical_fov_deg_ <= 0.0)
     {
-      ROS_ERROR("[trajectory_vbc] Invalid VBC geometry parameters.");
+      ROS_ERROR("[trajectory_vbc] Invalid VBC geometry/timing parameters.");
       return false;
     }
 
@@ -72,7 +73,8 @@ public:
     tan_half_v_fov_ =
         std::tan(0.5 * vertical_fov_deg_ * M_PI / 180.0);
 
-    // Validate sensor frame names before accepting trajectories.
+    // Validate sensor frame names once. q=0 is only used for frame existence/FK
+    // validation; it does not affect runtime target selection.
     Eigen::VectorXd q0(evaluator_.nq());
     q0.setZero();
     std::vector<care_confidence_map::FramePoseInBase> poses;
@@ -144,8 +146,9 @@ private:
     int see_original_timestep = -1;
     double see_time_s = std::numeric_limits<double>::infinity();
 
-    // Positive means nominal visibility happens before sweep.  Negative means
-    // the nominal body arrives first.  -inf means never visible in horizon.
+    // m_VBC = t_sweep - t_see.
+    // Positive: seen before sweep. Negative: swept before seen.
+    // -inf: never seen within the nominal horizon.
     double margin_s = -std::numeric_limits<double>::infinity();
   };
 
@@ -257,7 +260,7 @@ private:
       return false;
     }
 
-    // Match confidence_map_node's basis convention exactly.
+    // Match confidence_map_node's nominal FOV basis convention exactly.
     if (forward_axis_ == "x" || forward_axis_ == "-x")
     {
       right_dir_ = Eigen::Vector3d::UnitY();
@@ -313,7 +316,8 @@ private:
     for (int k = 0; k < max_steps; ++k)
     {
       const double s =
-          static_cast<double>(k) / static_cast<double>(max_steps - 1);
+          static_cast<double>(k) /
+          static_cast<double>(max_steps - 1);
       int idx = static_cast<int>(
           std::round(s * static_cast<double>(input_size - 1)));
       idx = std::max(0, std::min(input_size - 1, idx));
@@ -364,7 +368,8 @@ private:
     std::vector<int> required_to_input(required_names.size(), -1);
     for (int i = 0; i < static_cast<int>(required_names.size()); ++i)
     {
-      const auto it = input_joint_index.find(required_names[static_cast<std::size_t>(i)]);
+      const auto it =
+          input_joint_index.find(required_names[static_cast<std::size_t>(i)]);
       if (it == input_joint_index.end())
       {
         if (error_msg)
@@ -411,6 +416,7 @@ private:
           ? pt.time_from_start.toSec()
           : static_cast<double>(original_index) * fallback_dt_;
 
+      // Be defensive against malformed non-monotonic timestamps.
       if (!eval_times_s->empty() && t < eval_times_s->back())
       {
         t = eval_times_s->back();
@@ -426,10 +432,11 @@ private:
 
   bool queryConfidence(
       const care_confidence_map::TrajectorySampleResult& samples,
-      care_confidence_map::QueryConfidence* srv) const
+      care_confidence_map::QueryConfidence* srv)
   {
     srv->request.points.clear();
-    srv->request.points.reserve(static_cast<std::size_t>(samples.total_samples));
+    srv->request.points.reserve(
+        static_cast<std::size_t>(samples.total_samples));
 
     for (const auto& frame : samples.frames)
     {
@@ -443,10 +450,12 @@ private:
       }
     }
 
-    if (!confidence_query_client_.waitForExistence(ros::Duration(query_timeout_)))
+    if (!confidence_query_client_.waitForExistence(
+            ros::Duration(query_timeout_)))
     {
       return false;
     }
+
     if (!confidence_query_client_.call(*srv))
     {
       return false;
@@ -502,27 +511,133 @@ private:
     return false;
   }
 
-  bool betterCandidate(const Candidate& a, const Candidate& b) const
+  bool isViolation(const Candidate& c) const
   {
-    // Never-visible-before-end candidates are treated as the strongest
-    // violations; among them, protect the earliest impending sweep first.
+    return !c.nominally_visible || c.margin_s < min_margin_s_;
+  }
+
+  bool betterViolation(const Candidate& a, const Candidate& b) const
+  {
+    // Never-visible candidates are strongest violations. Among them protect
+    // the earliest impending sweep first. Otherwise choose minimum VBC margin.
     if (a.nominally_visible != b.nominally_visible)
     {
       return !a.nominally_visible;
     }
+
     if (!a.nominally_visible)
     {
       return a.sweep_time_s < b.sweep_time_s;
     }
+
     if (std::fabs(a.margin_s - b.margin_s) > 1e-9)
     {
       return a.margin_s < b.margin_s;
     }
+
     return a.sweep_time_s < b.sweep_time_s;
   }
 
-  void evaluate(
-      const trajectory_msgs::JointTrajectory& traj)
+  void publishNoTargetSummary(
+      const std::string& reason,
+      int candidate_count,
+      int violation_count)
+  {
+    std::ostringstream oss;
+    oss << "vbc success=1 has_violation=0"
+        << " reason=" << reason
+        << " candidate_count=" << candidate_count
+        << " violation_count=" << violation_count
+        << " min_required_margin_s=" << min_margin_s_;
+
+    std_msgs::String msg;
+    msg.data = oss.str();
+    summary_pub_.publish(msg);
+  }
+
+  void publishSelected(
+      const Candidate& selected,
+      int candidate_count,
+      int violation_count)
+  {
+    geometry_msgs::PointStamped target_msg;
+    target_msg.header.stamp = ros::Time::now();
+    target_msg.header.frame_id = base_frame_;
+    target_msg.point.x = selected.point_base.x();
+    target_msg.point.y = selected.point_base.y();
+    target_msg.point.z = selected.point_base.z();
+    target_pub_.publish(target_msg);
+
+    std_msgs::Float32 sweep_msg;
+    sweep_msg.data = static_cast<float>(selected.sweep_time_s);
+    selected_sweep_time_pub_.publish(sweep_msg);
+
+    std_msgs::Float32 see_msg;
+    see_msg.data = selected.nominally_visible
+        ? static_cast<float>(selected.see_time_s)
+        : std::numeric_limits<float>::infinity();
+    selected_see_time_pub_.publish(see_msg);
+
+    std_msgs::Float32 margin_msg;
+    margin_msg.data = selected.nominally_visible
+        ? static_cast<float>(selected.margin_s)
+        : -std::numeric_limits<float>::infinity();
+    selected_margin_pub_.publish(margin_msg);
+
+    std::ostringstream oss;
+    oss << "vbc success=1"
+        << " has_violation=1"
+        << " candidate_count=" << candidate_count
+        << " violation_count=" << violation_count
+        << " min_required_margin_s=" << min_margin_s_
+        << " target=[" << selected.point_base.x() << ","
+        << selected.point_base.y() << ","
+        << selected.point_base.z() << "]"
+        << " confidence=" << selected.confidence
+        << " link=" << selected.link_name
+        << " sample_index=" << selected.sample_index_in_link
+        << " sweep_eval_t=" << selected.sweep_eval_timestep
+        << " sweep_original_t=" << selected.sweep_original_timestep
+        << " sweep_time_s=" << selected.sweep_time_s
+        << " nominally_visible=" << selected.nominally_visible
+        << " see_eval_t=" << selected.see_eval_timestep
+        << " see_original_t=" << selected.see_original_timestep;
+
+    if (selected.nominally_visible)
+    {
+      oss << " see_time_s=" << selected.see_time_s
+          << " margin_s=" << selected.margin_s;
+    }
+    else
+    {
+      oss << " see_time_s=inf margin_s=-inf";
+    }
+
+    std_msgs::String summary_msg;
+    summary_msg.data = oss.str();
+    summary_pub_.publish(summary_msg);
+
+    ROS_WARN_STREAM_THROTTLE(
+        1.0,
+        "[trajectory_vbc] VBC VIOLATION target=["
+            << selected.point_base.x() << " "
+            << selected.point_base.y() << " "
+            << selected.point_base.z() << "]"
+            << " sweep=" << selected.sweep_time_s << "s"
+            << " see="
+            << (selected.nominally_visible
+                    ? std::to_string(selected.see_time_s)
+                    : std::string("never"))
+            << " margin="
+            << (selected.nominally_visible
+                    ? std::to_string(selected.margin_s)
+                    : std::string("-inf"))
+            << " required=" << min_margin_s_ << "s"
+            << " candidates=" << candidate_count
+            << " violations=" << violation_count);
+  }
+
+  void evaluate(const trajectory_msgs::JointTrajectory& traj)
   {
     if (!enabled_)
     {
@@ -536,7 +651,11 @@ private:
     std::string error_msg;
 
     if (!convertTrajectory(
-            traj, &q_traj, &original_indices, &eval_times_s, &error_msg))
+            traj,
+            &q_traj,
+            &original_indices,
+            &eval_times_s,
+            &error_msg))
     {
       ROS_WARN_STREAM_THROTTLE(2.0, "[trajectory_vbc] " << error_msg);
       return;
@@ -547,7 +666,9 @@ private:
     if (!sample_result.success)
     {
       ROS_WARN_STREAM_THROTTLE(
-          2.0, "[trajectory_vbc] body-sweep FK failed: " << sample_result.message);
+          2.0,
+          "[trajectory_vbc] body-sweep FK failed: "
+              << sample_result.message);
       return;
     }
 
@@ -560,6 +681,9 @@ private:
       return;
     }
 
+    // Candidate points are future body-sample centers projected into the
+    // current confidence map and spatially de-duplicated at map resolution.
+    // This intentionally matches the current trajectory-risk discretization.
     std::map<CandidateKey, Candidate> candidate_map;
     std::size_t flat_index = 0;
 
@@ -574,11 +698,14 @@ private:
 
       for (const auto& sample : frame.samples)
       {
-        const bool inside = confidence_srv.response.inside_map[flat_index] != 0;
+        const bool inside =
+            confidence_srv.response.inside_map[flat_index] != 0;
         const double confidence =
-            static_cast<double>(confidence_srv.response.confidence[flat_index]);
+            static_cast<double>(
+                confidence_srv.response.confidence[flat_index]);
         const double current_visibility =
-            static_cast<double>(confidence_srv.response.current_visibility[flat_index]);
+            static_cast<double>(
+                confidence_srv.response.current_visibility[flat_index]);
 
         flat_index += 1;
 
@@ -586,6 +713,7 @@ private:
         {
           continue;
         }
+
         if (confidence > frontier_confidence_threshold_ ||
             current_visibility > 0.5)
         {
@@ -594,6 +722,7 @@ private:
 
         const CandidateKey key = candidateKey(sample.center_base);
         auto it = candidate_map.find(key);
+
         if (it == candidate_map.end())
         {
           Candidate c;
@@ -603,14 +732,19 @@ private:
           c.confidence = confidence;
           c.current_visibility = current_visibility;
           c.sweep_eval_timestep = k;
-          c.sweep_original_timestep = original_indices[static_cast<std::size_t>(k)];
+          c.sweep_original_timestep =
+              original_indices[static_cast<std::size_t>(k)];
           c.sweep_time_s = eval_times_s[static_cast<std::size_t>(k)];
           candidate_map.emplace(key, c);
         }
         else
         {
           it->second.confidence = std::min(it->second.confidence, confidence);
-          if (eval_times_s[static_cast<std::size_t>(k)] < it->second.sweep_time_s)
+
+          // The earliest occurrence of this spatial cell is its nominal sweep
+          // deadline in the current sample-center approximation.
+          if (eval_times_s[static_cast<std::size_t>(k)] <
+              it->second.sweep_time_s)
           {
             it->second.point_base = sample.center_base;
             it->second.link_name = sample.link_name;
@@ -618,7 +752,8 @@ private:
             it->second.sweep_eval_timestep = k;
             it->second.sweep_original_timestep =
                 original_indices[static_cast<std::size_t>(k)];
-            it->second.sweep_time_s = eval_times_s[static_cast<std::size_t>(k)];
+            it->second.sweep_time_s =
+                eval_times_s[static_cast<std::size_t>(k)];
           }
         }
       }
@@ -630,15 +765,21 @@ private:
       return;
     }
 
+    // Predict all arm-mounted sensor poses along the same nominal trajectory.
     std::vector<std::vector<care_confidence_map::FramePoseInBase>> sensor_poses;
     sensor_poses.resize(q_traj.size());
+
     for (std::size_t k = 0; k < q_traj.size(); ++k)
     {
       if (!evaluator_.computeFramePosesForConfiguration(
-              q_traj[k], sensor_frames_, &sensor_poses[k], &error_msg))
+              q_traj[k],
+              sensor_frames_,
+              &sensor_poses[k],
+              &error_msg))
       {
         ROS_WARN_STREAM_THROTTLE(
-            2.0, "[trajectory_vbc] sensor FK failed: " << error_msg);
+            2.0,
+            "[trajectory_vbc] sensor FK failed: " << error_msg);
         return;
       }
     }
@@ -647,9 +788,10 @@ private:
     candidates.reserve(candidate_map.size());
     int violation_count = 0;
 
-    for (auto& kv : candidate_map)
+    for (const auto& kv : candidate_map)
     {
       Candidate c = kv.second;
+
       for (std::size_t k = 0; k < sensor_poses.size(); ++k)
       {
         if (pointVisibleFromAnySensor(c.point_base, sensor_poses[k]))
@@ -663,25 +805,23 @@ private:
         }
       }
 
-      const bool violation =
-          !c.nominally_visible || c.margin_s < min_margin_s_;
-      if (violation)
+      if (isViolation(c))
       {
         violation_count += 1;
       }
+
       candidates.push_back(c);
     }
 
     const Candidate* selected = nullptr;
     for (const auto& c : candidates)
     {
-      const bool violation =
-          !c.nominally_visible || c.margin_s < min_margin_s_;
-      if (!violation)
+      if (!isViolation(c))
       {
         continue;
       }
-      if (!selected || betterCandidate(c, *selected))
+
+      if (!selected || betterViolation(c, *selected))
       {
         selected = &c;
       }
@@ -693,6 +833,7 @@ private:
           "all_low_confidence_points_seen_before_deadline",
           static_cast<int>(candidates.size()),
           violation_count);
+
       ROS_INFO_THROTTLE(
           1.0,
           "[trajectory_vbc] no intervention: all %zu low-confidence sweep candidates have VBC margin >= %.3fs",
@@ -701,106 +842,24 @@ private:
       return;
     }
 
-    geometry_msgs::PointStamped target_msg;
-    target_msg.header.stamp = ros::Time::now();
-    target_msg.header.frame_id = base_frame_;
-    target_msg.point.x = selected->point_base.x();
-    target_msg.point.y = selected->point_base.y();
-    target_msg.point.z = selected->point_base.z();
-    target_pub_.publish(target_msg);
-
-    std_msgs::Float32 sweep_msg;
-    sweep_msg.data = static_cast<float>(selected->sweep_time_s);
-    selected_sweep_time_pub_.publish(sweep_msg);
-
-    std_msgs::Float32 see_msg;
-    see_msg.data = selected->nominally_visible
-        ? static_cast<float>(selected->see_time_s)
-        : std::numeric_limits<float>::infinity();
-    selected_see_time_pub_.publish(see_msg);
-
-    std_msgs::Float32 margin_msg;
-    margin_msg.data = selected->nominally_visible
-        ? static_cast<float>(selected->margin_s)
-        : -std::numeric_limits<float>::infinity();
-    selected_margin_pub_.publish(margin_msg);
-
-    std::ostringstream oss;
-    oss << "vbc success=1"
-        << " has_violation=1"
-        << " candidate_count=" << candidates.size()
-        << " violation_count=" << violation_count
-        << " min_required_margin_s=" << min_margin_s_
-        << " target=[" << selected->point_base.x() << ","
-        << selected->point_base.y() << ","
-        << selected->point_base.z() << "]"
-        << " confidence=" << selected->confidence
-        << " link=" << selected->link_name
-        << " sweep_eval_t=" << selected->sweep_eval_timestep
-        << " sweep_original_t=" << selected->sweep_original_timestep
-        << " sweep_time_s=" << selected->sweep_time_s
-        << " nominally_visible=" << selected->nominally_visible
-        << " see_eval_t=" << selected->see_eval_timestep
-        << " see_original_t=" << selected->see_original_timestep;
-    if (selected->nominally_visible)
-    {
-      oss << " see_time_s=" << selected->see_time_s
-          << " margin_s=" << selected->margin_s;
-    }
-    else
-    {
-      oss << " see_time_s=inf margin_s=-inf";
-    }
-
-    std_msgs::String summary_msg;
-    summary_msg.data = oss.str();
-    summary_pub_.publish(summary_msg);
-
-    ROS_WARN_THROTTLE(
-        1.0,
-        "[trajectory_vbc] VBC VIOLATION target=[%.3f %.3f %.3f] sweep=%.3fs see=%s margin=%s required=%.3fs candidates=%zu violations=%d",
-        selected->point_base.x(),
-        selected->point_base.y(),
-        selected->point_base.z(),
-        selected->sweep_time_s,
-        selected->nominally_visible
-            ? std::to_string(selected->see_time_s).c_str()
-            : "never",
-        selected->nominally_visible
-            ? std::to_string(selected->margin_s).c_str()
-            : "-inf",
-        min_margin_s_,
-        candidates.size(),
+    publishSelected(
+        *selected,
+        static_cast<int>(candidates.size()),
         violation_count);
   }
 
-  void publishNoTargetSummary(
-      const std::string& reason,
-      int candidate_count,
-      int violation_count)
-  {
-    std::ostringstream oss;
-    oss << "vbc success=1 has_violation=0"
-        << " reason=" << reason
-        << " candidate_count=" << candidate_count
-        << " violation_count=" << violation_count
-        << " min_required_margin_s=" << min_margin_s_;
-    std_msgs::String msg;
-    msg.data = oss.str();
-    summary_pub_.publish(msg);
-  }
-
-  void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg)
+  void trajectoryCallback(
+      const trajectory_msgs::JointTrajectoryConstPtr& msg)
   {
     std::lock_guard<std::mutex> lock(mutex_);
     latest_traj_ = *msg;
-    latest_traj_time_ = ros::Time::now();
     has_traj_ = true;
   }
 
   void timerCallback(const ros::TimerEvent&)
   {
     trajectory_msgs::JointTrajectory traj;
+
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!has_traj_)
@@ -813,6 +872,7 @@ private:
       }
       traj = latest_traj_;
     }
+
     evaluate(traj);
   }
 
@@ -836,8 +896,9 @@ private:
     {
       ROS_INFO_STREAM("  " << frame);
     }
-    ROS_INFO_STREAM("Interpretation: intervene only if nominal see-before-sweep "
-                    "margin is below the required safety buffer.");
+    ROS_INFO_STREAM("Rule: request active sensing only when "
+                    "t_sweep - t_see < required margin, or t_see does not "
+                    "exist in the nominal horizon.");
     ROS_INFO_STREAM("=============================================");
   }
 
@@ -858,7 +919,6 @@ private:
 
   std::mutex mutex_;
   trajectory_msgs::JointTrajectory latest_traj_;
-  ros::Time latest_traj_time_;
   bool has_traj_ = false;
 
   bool enabled_ = true;
