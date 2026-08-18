@@ -5,6 +5,11 @@
   <arg name="body_samples_file"
        default="$(find care_confidence_map)/config/body_samples.yaml" />
 
+  <arg name="initialize_body_prior_once" default="true" />
+  <arg name="initial_prior_retry_rate" default="20.0" />
+  <arg name="initial_prior_ready_topic"
+       default="/care_planner/confidence_map/initial_prior_ready" />
+
   <node pkg="care_confidence_map"
         type="confidence_map_node"
         name="confidence_map_node"
@@ -12,5 +17,22 @@
     <rosparam command="load" file="$(arg config_file)" />
     <param name="current_body_prior/body_samples_file"
            value="$(arg body_samples_file)" />
+  </node>
+
+  <!-- Bootstrap the trusted-free envelope around the INITIAL robot pose only.
+       The helper retries until all body TFs are available, calls the existing
+       refresh service once successfully, latches ready=true, and never refreshes
+       again. The region therefore stays fixed in world coordinates and then
+       evolves only through normal confidence decay and sensor observations. -->
+  <node if="$(arg initialize_body_prior_once)"
+        pkg="care_confidence_map"
+        type="initialize_body_prior_once.py"
+        name="initial_body_prior_initializer"
+        output="screen">
+    <param name="refresh_service"
+           value="/care_planner/confidence_map/refresh_body_prior" />
+    <param name="ready_topic" value="$(arg initial_prior_ready_topic)" />
+    <param name="retry_rate" value="$(arg initial_prior_retry_rate)" />
+    <param name="service_wait_timeout" value="0.05" />
   </node>
 </launch>
