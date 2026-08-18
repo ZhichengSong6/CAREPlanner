@@ -10,10 +10,13 @@
       - the FIRST real low-confidence frontier sample is frozen for the whole trial;
       - the frozen x* is republished at 20 Hz on the NCDF target topic;
       - the v2 adapter normalizes each NCDF horizon gradient and disables the
-        visibility objective permanently for that x* once confidence confirms it seen.
+        visibility objective permanently for that x* once confidence confirms it seen;
+      - the A/B logger records every MPC cycle together with the latest adapter
+        and NCDF-observer state, and writes per_cycle.csv + summary.json.
 
     Important: do NOT run the old manual rostopic target publisher with this launch.
-    The NCDF horizon observer still runs separately in the ncdf_l4c conda env.
+    The NCDF horizon observer still runs separately in the ncdf_l4c conda env and
+    should be fully loaded before starting this controlled launch.
   -->
 
   <arg name="config_file"
@@ -27,6 +30,13 @@
   <arg name="gradient_norm_clip" default="0.0" />
   <arg name="seen_threshold" default="0.50" />
   <arg name="gradient_normalization_eps" default="1e-6" />
+
+  <!-- Automatic per-cycle A/B logging. Empty trial_label lets the logger use
+       baseline for lambda=0 and b2_v2 for lambda>0. -->
+  <arg name="enable_ab_logger" default="true" />
+  <arg name="trial_label" default="" />
+  <arg name="log_output_root"
+       default="$(find egocentric_arm_planner)/../../outputs/phase_b2_v2_ab" />
 
   <!-- Validated fixed EE goal used for all A/B trials. -->
   <arg name="goal_x" default="0.286881" />
@@ -92,5 +102,21 @@
     <param name="goal/qy" value="$(arg goal_qy)" />
     <param name="goal/qz" value="$(arg goal_qz)" />
     <param name="goal/qw" value="$(arg goal_qw)" />
+  </node>
+
+  <!-- Unthrottled per-cycle recorder.  It is observational only. -->
+  <node if="$(arg enable_ab_logger)"
+        pkg="egocentric_arm_planner"
+        type="phase_b2_ab_logger_node.py"
+        name="phase_b2_ab_logger"
+        output="screen">
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="lambda_vis" value="$(arg lambda_vis)" />
+    <param name="output_root" value="$(arg log_output_root)" />
+    <param name="target_topic" value="$(arg frozen_target_topic)" />
+    <param name="mpc_summary_topic" value="/velocity_qp_mpc_node/summary" />
+    <param name="adapter_summary_topic"
+           value="/phase_b2_visibility_acquisition_adapter/summary" />
+    <param name="observer_summary_topic" value="/ncdf_horizon_observer/summary" />
   </node>
 </launch>
