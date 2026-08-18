@@ -10,22 +10,70 @@ trajectory_risk:
   refresh_body_prior_service: /care_planner/confidence_map/refresh_body_prior
   refresh_body_prior_timeout: 0.10
 
-  # Kept as debug for mean-risk frontier. Active sensing now uses
-  # sample-temporal frontier detection instead.
+  # Legacy low-confidence frontier attribution is kept for diagnostics and
+  # visualization. B.2 target selection is now handled by trajectory_vbc below.
   risk_frontier_threshold: 0.30
-
-  # Primary temporal frontier group:
-  # first_bad_eval_timestep ... first_bad_eval_timestep + 5
   primary_frontier_window_steps: 5
-
-  # Backward-compatible name; can keep this too.
   risk_frontier_window_steps: 5
-
   safe_prefix_margin_steps: 2
-
   frontier_confidence_threshold: 0.50
   frontier_gap_threshold: 0.50
   frontier_radius_margin: 0.05
 
   enable_secondary_frontier_group: true
   secondary_frontier_max_reported_samples: 200
+
+# Visibility-before-contact (VBC) target selector.
+#
+# For each currently low-confidence point in the nominal future swept volume:
+#   t_sweep = first nominal time when a body sample reaches that workspace cell
+#   t_see   = first nominal time when any sensor FOV contains that point
+#   margin  = t_sweep - t_see
+#
+# Positive margin means the nominal trajectory sees the point before sweeping
+# it. Active sensing is requested only when margin is smaller than the required
+# safety buffer, or when the point is never visible within the nominal horizon.
+trajectory_vbc:
+  enabled: true
+
+  eval_rate: 20.0
+  max_eval_timesteps: 50
+  query_timeout: 0.10
+
+  # Used only if JointTrajectory.time_from_start is absent/zero.
+  fallback_dt: 0.05
+
+  # Same trusted-known threshold used by the existing frontier logic.
+  frontier_confidence_threshold: 0.50
+
+  # Spatial de-duplication of future body-sample centers. Match confidence-map
+  # voxel resolution for the first controlled experiments.
+  candidate_resolution: 0.05
+
+  # Required nominal lead time between first visibility and first sweep.
+  # Start with 0.30 s; this is a safety/deadline buffer, not a VisCDF weight.
+  min_visibility_before_sweep_margin_s: 0.30
+
+  ignored_risk_links:
+    - base_link
+    - link1
+
+  # IMPORTANT: deadline prediction uses the nominal physical sensor model,
+  # matching confidence_map current_visibility. The learned VisCDF remains
+  # deliberately conservative (50x66 deg, 0.20-0.70 m) for HOW to look.
+  sensor_model:
+    forward_axis: z
+    tof_min_range: 0.15
+    tof_max_range: 0.75
+    horizontal_fov_deg: 55.0
+    vertical_fov_deg: 72.0
+
+  sensor_frames:
+    - link2_sensor1_tof_link
+    - link2_sensor2_tof_link
+    - link3_sensor1_tof_link
+    - link3_sensor2_tof_link
+    - link4_sensor1_tof_link
+    - link4_sensor2_tof_link
+    - EE_sensor1_tof_link
+    - EE_sensor2_tof_link
