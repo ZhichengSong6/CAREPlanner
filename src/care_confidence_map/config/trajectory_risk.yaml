@@ -3,7 +3,10 @@ trajectory_risk:
     - base_link
     - link1
 
-  refresh_body_prior_before_query: true
+  # The body prior is now an INITIAL trusted-free bootstrap only. It is
+  # initialized once by initialize_body_prior_once.py and must never be moved
+  # with the robot during trajectory-risk evaluation.
+  refresh_body_prior_before_query: false
   refresh_body_prior_service: /care_planner/confidence_map/refresh_body_prior
   refresh_body_prior_timeout: 0.10
 
