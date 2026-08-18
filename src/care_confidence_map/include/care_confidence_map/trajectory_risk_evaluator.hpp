@@ -51,6 +51,16 @@ struct TrajectorySampleResult
   std::vector<TrajectoryFrameSamples> frames;
 };
 
+// Pose of an arbitrary URDF/Pinocchio frame expressed in base_frame_.  This
+// lightweight representation intentionally keeps Pinocchio types out of the
+// public VBC selector interface.
+struct FramePoseInBase
+{
+  std::string frame_name;
+  Eigen::Vector3d translation_base = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d rotation_base = Eigen::Matrix3d::Identity();
+};
+
 class TrajectoryRiskEvaluator
 {
 public:
@@ -93,6 +103,15 @@ public:
       const Eigen::VectorXd& q,
       int timestep_index,
       TrajectoryFrameSamples* out,
+      std::string* error_msg = nullptr) const;
+
+  // Compute poses of requested frames for a future configuration.  This is
+  // used by visibility-before-contact analysis to predict when a workspace
+  // point enters any arm-mounted sensor FOV along the nominal trajectory.
+  bool computeFramePosesForConfiguration(
+      const Eigen::VectorXd& q,
+      const std::vector<std::string>& frame_names,
+      std::vector<FramePoseInBase>* out,
       std::string* error_msg = nullptr) const;
 
 private:
