@@ -51,6 +51,9 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   waypoint_deadline_sub_ = nh_.subscribe(
       waypoint_deadline_topic_, 1,
       &VelocityQPMPCWaypoint::waypointDeadlineCallback, this);
+  replan_ready_sub_ = nh_.subscribe(
+      replan_ready_topic_, 1,
+      &VelocityQPMPCWaypoint::replanReadyCallback, this);
 
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       velocity_command_topic_, 1);
@@ -58,6 +61,12 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
       prediction_topic_, 1);
   solve_time_pub_ = pnh_.advertise<std_msgs::Float32>("solve_time_ms", 1);
   summary_pub_ = pnh_.advertise<std_msgs::String>("summary", 1);
+  recovery_active_pub_ = nh_.advertise<std_msgs::Bool>(
+      recovery_active_topic_, 1, true);
+  recovery_complete_pub_ = nh_.advertise<std_msgs::Bool>(
+      recovery_complete_topic_, 1, false);
+
+  publishRecoveryActive(false);
 
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / rate_), &VelocityQPMPCWaypoint::timerCallback, this);
@@ -78,7 +87,13 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                   << " s, active=" << waypoint_active_topic_
                   << ", q_vis=" << waypoint_q_topic_
                   << ", deadline=" << waypoint_deadline_topic_);
-  ROS_INFO("[VelocityQPMPCWaypoint] Hard joint-position, velocity, and acceleration constraints are unchanged from Phase-A.");
+  ROS_WARN_STREAM("[VelocityQPMPCWaypoint] deadline-miss recovery "
+                  << (recovery_enabled_ ? "ENABLED" : "DISABLED")
+                  << ": recovery_weight="
+                  << waypoint_weight_ * recovery_weight_scale_
+                  << ", complete=" << recovery_complete_topic_
+                  << ", replan_ready=" << replan_ready_topic_);
+  ROS_INFO("[VelocityQPMPCWaypoint] Recovery removes nominal q/terminal/u-reference tracking but preserves hard joint-position, velocity, and acceleration constraints plus effort/smoothness regularization.");
   return true;
 }
 
@@ -182,6 +197,16 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                           waypoint_q_topic_, waypoint_q_topic_);
   pnh_.param<std::string>("mpc/visibility_waypoint/deadline_topic",
                           waypoint_deadline_topic_, waypoint_deadline_topic_);
+  pnh_.param<bool>("mpc/visibility_waypoint/recovery_enabled",
+                   recovery_enabled_, recovery_enabled_);
+  pnh_.param<double>("mpc/visibility_waypoint/recovery_weight_scale",
+                     recovery_weight_scale_, recovery_weight_scale_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/recovery_active_topic",
+                          recovery_active_topic_, recovery_active_topic_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/recovery_complete_topic",
+                          recovery_complete_topic_, recovery_complete_topic_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/replan_ready_topic",
+                          replan_ready_topic_, replan_ready_topic_);
 
   pnh_.param<double>("mpc/joint_position_margin",
                      joint_position_margin_, joint_position_margin_);
@@ -220,8 +245,8 @@ bool VelocityQPMPCWaypoint::loadConfig() {
     return false;
   }
   if (waypoint_weight_ < 0.0 || waypoint_timeout_ <= 0.0 ||
-      waypoint_horizon_slack_ < 0.0) {
-    ROS_ERROR("[VelocityQPMPCWaypoint] invalid visibility-waypoint parameters.");
+      waypoint_horizon_slack_ < 0.0 || recovery_weight_scale_ <= 0.0) {
+    ROS_ERROR("[VelocityQPMPCWaypoint] invalid visibility-waypoint/recovery parameters.");
     return false;
   }
 
@@ -333,13 +358,19 @@ bool VelocityQPMPCWaypoint::buildStaticQP() {
       + u_smooth_weight_ * D_.transpose() * D_);
   H_base_.diagonal().array() += 1e-8;
 
+  // Recovery keeps velocity-effort and smoothness regularization only.
+  H_regularization_ = 2.0 * (
+      u_tracking_weight_ * Eigen::MatrixXd::Identity(n_u_, n_u_)
+      + u_smooth_weight_ * D_.transpose() * D_);
+  H_regularization_.diagonal().array() += 1e-8;
+
   x_lower_ = Eigen::VectorXd::Zero(n_u_);
   x_upper_ = Eigen::VectorXd::Zero(n_u_);
   for (int k = 0; k < num_intervals_; ++k) {
     x_lower_.segment(k * dof_, dof_) = -velocity_limits_;
     x_upper_.segment(k * dof_, dof_) = velocity_limits_;
   }
-  return finiteMatrix(H_base_) && finiteMatrix(G_);
+  return finiteMatrix(H_base_) && finiteMatrix(H_regularization_) && finiteMatrix(G_);
 }
 
 void VelocityQPMPCWaypoint::jointStateCallback(
@@ -402,6 +433,13 @@ void VelocityQPMPCWaypoint::waypointDeadlineCallback(
   latest_waypoint_deadline_abs_s_ = msg->data;
   latest_waypoint_deadline_received_ = ros::Time::now();
   has_waypoint_deadline_ = true;
+}
+
+void VelocityQPMPCWaypoint::replanReadyCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg || !msg->data) return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  replan_ready_received_ = true;
 }
 
 bool VelocityQPMPCWaypoint::extractMeasuredQ(
@@ -507,6 +545,30 @@ bool VelocityQPMPCWaypoint::buildReferenceHorizon(
   return true;
 }
 
+void VelocityQPMPCWaypoint::buildBounds(
+    const Eigen::VectorXd& q_current,
+    Eigen::VectorXd& lower,
+    Eigen::VectorXd& upper) const {
+  lower = Eigen::VectorXd::Zero(n_constraints_);
+  upper = Eigen::VectorXd::Zero(n_constraints_);
+
+  lower.segment(acceleration_row0_, dof_) =
+      previous_command_ - acceleration_limits_ * control_period_;
+  upper.segment(acceleration_row0_, dof_) =
+      previous_command_ + acceleration_limits_ * control_period_;
+  for (int k = 1; k < num_intervals_; ++k) {
+    lower.segment(acceleration_row0_ + k * dof_, dof_) =
+        -acceleration_limits_ * dt_;
+    upper.segment(acceleration_row0_ + k * dof_, dof_) =
+        acceleration_limits_ * dt_;
+  }
+
+  for (int k = 0; k < num_intervals_; ++k) {
+    lower.segment(position_row0_ + k * dof_, dof_) = q_min_ - q_current;
+    upper.segment(position_row0_ + k * dof_, dof_) = q_max_ - q_current;
+  }
+}
+
 void VelocityQPMPCWaypoint::buildBaseCycleQP(
     const Eigen::VectorXd& q_current,
     const Eigen::MatrixXd& q_ref,
@@ -536,24 +598,20 @@ void VelocityQPMPCWaypoint::buildBaseCycleQP(
       - u_tracking_weight_ * u_ref_stack
       + u_smooth_weight_ * D_.transpose() * smooth_offset);
 
-  lower = Eigen::VectorXd::Zero(n_constraints_);
-  upper = Eigen::VectorXd::Zero(n_constraints_);
+  buildBounds(q_current, lower, upper);
+}
 
-  lower.segment(acceleration_row0_, dof_) =
-      previous_command_ - acceleration_limits_ * control_period_;
-  upper.segment(acceleration_row0_, dof_) =
-      previous_command_ + acceleration_limits_ * control_period_;
-  for (int k = 1; k < num_intervals_; ++k) {
-    lower.segment(acceleration_row0_ + k * dof_, dof_) =
-        -acceleration_limits_ * dt_;
-    upper.segment(acceleration_row0_ + k * dof_, dof_) =
-        acceleration_limits_ * dt_;
-  }
-
-  for (int k = 0; k < num_intervals_; ++k) {
-    lower.segment(position_row0_ + k * dof_, dof_) = q_min_ - q_current;
-    upper.segment(position_row0_ + k * dof_, dof_) = q_max_ - q_current;
-  }
+void VelocityQPMPCWaypoint::buildRegularizationCycleQP(
+    const Eigen::VectorXd& q_current,
+    Eigen::VectorXd& gradient,
+    Eigen::VectorXd& lower,
+    Eigen::VectorXd& upper) const {
+  Eigen::VectorXd smooth_offset = Eigen::VectorXd::Zero(n_u_);
+  smooth_offset.head(dof_) = -previous_command_;
+  // u_tracking_weight becomes zero-velocity effort regularization in recovery.
+  // Its Hessian remains in H_regularization_; there is no nominal u_ref linear term.
+  gradient = 2.0 * u_smooth_weight_ * D_.transpose() * smooth_offset;
+  buildBounds(q_current, lower, upper);
 }
 
 bool VelocityQPMPCWaypoint::solveWithPIQP(
@@ -581,11 +639,6 @@ bool VelocityQPMPCWaypoint::solveWithPIQP(
     }
   }
 
-  // Experimental waypoint MPC intentionally rebuilds the dense QP each cycle.
-  // k_d changes as the absolute deadline approaches, so the waypoint Hessian
-  // block changes.  Rebuilding avoids relying on matrix-update semantics while
-  // preserving the exact quadratic waypoint cost.  Solve time is logged; once
-  // the formulation is validated this can be optimized with factorization reuse.
   piqp::DenseSolver<double> solver;
   auto& settings = solver.settings();
   settings.max_iter = piqp_max_iterations_;
@@ -671,6 +724,18 @@ void VelocityQPMPCWaypoint::publishPrediction(
   prediction_pub_.publish(msg);
 }
 
+void VelocityQPMPCWaypoint::publishRecoveryActive(bool active) {
+  std_msgs::Bool msg;
+  msg.data = active;
+  recovery_active_pub_.publish(msg);
+}
+
+void VelocityQPMPCWaypoint::publishRecoveryComplete() {
+  std_msgs::Bool msg;
+  msg.data = true;
+  recovery_complete_pub_.publish(msg);
+}
+
 void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   sensor_msgs::JointState joint_state;
   trajectory_msgs::JointTrajectory reference;
@@ -687,21 +752,23 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   Eigen::VectorXd q_vis;
   double deadline_abs_s = 0.0;
 
+  bool local_recovery_active = false;
+  bool local_recovery_hold = false;
+  bool local_replan_ready = false;
+
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     if (!has_joint_state_) {
       publishSafeStop("waiting for JointState");
       return;
     }
-    if (!has_reference_) {
-      publishSafeStop("waiting for nominal reference");
-      return;
-    }
 
     joint_state = latest_joint_state_;
-    reference = latest_reference_;
     joint_received = latest_joint_state_received_;
-    reference_received = latest_reference_received_;
+    if (has_reference_) {
+      reference = latest_reference_;
+      reference_received = latest_reference_received_;
+    }
 
     has_wp_active = has_waypoint_active_;
     has_wp_q = has_waypoint_q_;
@@ -712,15 +779,15 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     wp_deadline_received = latest_waypoint_deadline_received_;
     if (has_waypoint_q_) q_vis = latest_waypoint_q_;
     deadline_abs_s = latest_waypoint_deadline_abs_s_;
+
+    local_recovery_active = recovery_active_;
+    local_recovery_hold = recovery_hold_;
+    local_replan_ready = replan_ready_received_;
   }
 
   const ros::Time now = ros::Time::now();
   if ((now - joint_received).toSec() > joint_state_timeout_) {
     publishSafeStop("stale JointState");
-    return;
-  }
-  if ((now - reference_received).toSec() > reference_timeout_) {
-    publishSafeStop("stale nominal reference");
     return;
   }
 
@@ -730,55 +797,176 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     return;
   }
 
-  Eigen::MatrixXd q_ref;
-  Eigen::MatrixXd u_ref;
-  if (!buildReferenceHorizon(reference, q_ref, u_ref)) {
-    publishSafeStop("invalid nominal reference");
+  const bool reference_fresh =
+      has_reference_ && !reference.points.empty() &&
+      (now - reference_received).toSec() >= 0.0 &&
+      (now - reference_received).toSec() <= reference_timeout_;
+
+  // Recovery-hold ends only when the gate confirms that a newly replanned
+  // reference has actually been installed and published.
+  bool exited_recovery_hold = false;
+  if (local_recovery_hold && local_replan_ready && reference_fresh) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    recovery_hold_ = false;
+    replan_ready_received_ = false;
+    recovery_complete_published_ = false;
+    local_recovery_hold = false;
+    local_replan_ready = false;
+    exited_recovery_hold = true;
+  }
+  if (exited_recovery_hold) {
+    ROS_WARN("[VelocityQPMPCWaypoint] RECOVERY REPLAN READY: resuming nominal task tracking on the new reference.");
+  }
+
+  double waypoint_age = -1.0;
+  double deadline_remaining = std::numeric_limits<double>::quiet_NaN();
+  bool waypoint_data_fresh = false;
+  if (has_wp_active && has_wp_q && has_wp_deadline &&
+      q_vis.size() == dof_ && finiteVector(q_vis) &&
+      std::isfinite(deadline_abs_s)) {
+    const double active_age = (now - wp_active_received).toSec();
+    const double q_age = (now - wp_q_received).toSec();
+    const double deadline_age = (now - wp_deadline_received).toSec();
+    waypoint_age = std::max(active_age, std::max(q_age, deadline_age));
+    deadline_remaining = deadline_abs_s - now.toSec();
+    waypoint_data_fresh =
+        active_age >= 0.0 && q_age >= 0.0 && deadline_age >= 0.0 &&
+        waypoint_age <= waypoint_timeout_;
+  }
+
+  bool entered_recovery = false;
+  bool completed_recovery = false;
+  if (waypoint_enabled_ && waypoint_weight_ > 0.0 && recovery_enabled_) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+
+    if (recovery_active_) {
+      // The learned generator turns active=false only after the real sensor
+      // reports the frozen target visible. That transition ends recovery.
+      if (has_wp_active && !wp_active) {
+        recovery_active_ = false;
+        recovery_hold_ = true;
+        replan_ready_received_ = false;
+        completed_recovery = true;
+        if (!recovery_complete_published_) {
+          recovery_complete_published_ = true;
+        }
+      }
+    } else if (!recovery_hold_ && waypoint_data_fresh && wp_active &&
+               std::isfinite(deadline_remaining) && deadline_remaining <= 0.0) {
+      recovery_active_ = true;
+      recovery_complete_published_ = false;
+      entered_recovery = true;
+    }
+
+    local_recovery_active = recovery_active_;
+    local_recovery_hold = recovery_hold_;
+  }
+
+  if (entered_recovery) {
+    publishRecoveryActive(true);
+    ROS_ERROR("[VelocityQPMPCWaypoint] VBC DEADLINE MISSED WHILE UNSEEN: entering VISIBILITY RECOVERY; nominal task tracking is suspended.");
+  }
+  if (completed_recovery) {
+    publishRecoveryActive(false);
+    publishRecoveryComplete();
+    ROS_WARN("[VelocityQPMPCWaypoint] VISIBILITY RECOVERY COMPLETE: target is seen; holding/decelerating while the original task is replanned from measured q.");
+  }
+
+  if (!local_recovery_active && !local_recovery_hold && !reference_fresh) {
+    publishSafeStop(has_reference_ ? "stale nominal reference" : "waiting for nominal reference");
     return;
   }
 
-  Eigen::VectorXd gradient, lower, upper;
-  buildBaseCycleQP(q_current, q_ref, u_ref, gradient, lower, upper);
-  const double base_gradient_inf = gradient.lpNorm<Eigen::Infinity>();
-  Eigen::MatrixXd hessian = H_base_;
+  Eigen::MatrixXd q_ref = Eigen::MatrixXd::Zero(dof_, num_intervals_ + 1);
+  Eigen::MatrixXd u_ref = Eigen::MatrixXd::Zero(dof_, num_intervals_);
+  if (reference_fresh) {
+    if (!buildReferenceHorizon(reference, q_ref, u_ref)) {
+      if (!local_recovery_active && !local_recovery_hold) {
+        publishSafeStop("invalid nominal reference");
+        return;
+      }
+      for (int k = 0; k <= num_intervals_; ++k) q_ref.col(k) = q_current;
+    }
+  } else {
+    for (int k = 0; k <= num_intervals_; ++k) q_ref.col(k) = q_current;
+  }
 
+  // Always compute the nominal gradient for diagnostics, even when recovery
+  // deliberately removes it from the actual QP.
+  Eigen::VectorXd nominal_gradient, dummy_lower, dummy_upper;
+  buildBaseCycleQP(q_current, q_ref, u_ref,
+                   nominal_gradient, dummy_lower, dummy_upper);
+  const double base_gradient_inf = nominal_gradient.lpNorm<Eigen::Infinity>();
+
+  Eigen::VectorXd gradient, lower, upper;
+  Eigen::MatrixXd hessian;
+  std::string control_mode = "normal";
   std::string waypoint_status = waypoint_enabled_ ? "waiting" : "disabled";
-  double waypoint_age = -1.0;
-  double deadline_remaining = std::numeric_limits<double>::quiet_NaN();
   int waypoint_k = -1;
   double waypoint_grid_time = -1.0;
   double waypoint_nominal_error_inf = std::numeric_limits<double>::quiet_NaN();
   double waypoint_pred_error_inf = std::numeric_limits<double>::quiet_NaN();
   double waypoint_linear_inf = 0.0;
   double waypoint_hessian_inf = 0.0;
+  double applied_waypoint_weight = 0.0;
 
-  if (waypoint_enabled_) {
-    if (waypoint_weight_ <= 0.0) {
-      waypoint_status = "zero_weight";
-    } else if (!has_wp_active || !has_wp_q || !has_wp_deadline) {
-      waypoint_status = "waiting";
-    } else if (!wp_active) {
-      waypoint_status = "inactive";
-    } else if (q_vis.size() != dof_ || !finiteVector(q_vis) ||
-               !std::isfinite(deadline_abs_s)) {
-      waypoint_status = "invalid";
-    } else {
-      const double active_age = (now - wp_active_received).toSec();
-      const double q_age = (now - wp_q_received).toSec();
-      const double deadline_age = (now - wp_deadline_received).toSec();
-      waypoint_age = std::max(active_age, std::max(q_age, deadline_age));
-      deadline_remaining = deadline_abs_s - now.toSec();
+  if (local_recovery_hold) {
+    control_mode = "recovery_hold";
+    waypoint_status = "recovery_hold";
+    hessian = H_regularization_;
+    buildRegularizationCycleQP(q_current, gradient, lower, upper);
+  } else if (local_recovery_active) {
+    control_mode = "recovery";
+    waypoint_status = "recovery";
+    if (!waypoint_data_fresh || !wp_active || q_vis.size() != dof_) {
+      publishSafeStop("recovery requires fresh active q_vis");
+      return;
+    }
 
-      if (active_age < 0.0 || q_age < 0.0 || deadline_age < 0.0 ||
-          waypoint_age > waypoint_timeout_) {
+    hessian = H_regularization_;
+    buildRegularizationCycleQP(q_current, gradient, lower, upper);
+
+    waypoint_k = num_intervals_;
+    waypoint_grid_time = horizon_duration_;
+    applied_waypoint_weight = waypoint_weight_ * recovery_weight_scale_;
+    const Eigen::VectorXd waypoint_offset = q_current - q_vis;
+    const Eigen::MatrixXd H_wp =
+        2.0 * applied_waypoint_weight *
+        S_terminal_.transpose() * S_terminal_;
+    const Eigen::VectorXd g_wp =
+        2.0 * applied_waypoint_weight *
+        S_terminal_.transpose() * waypoint_offset;
+    if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
+      publishSafeStop("invalid recovery visibility cost");
+      return;
+    }
+    hessian += H_wp;
+    gradient += g_wp;
+    waypoint_linear_inf = g_wp.lpNorm<Eigen::Infinity>();
+    waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
+    waypoint_nominal_error_inf =
+        (q_ref.col(num_intervals_) - q_vis).lpNorm<Eigen::Infinity>();
+  } else {
+    hessian = H_base_;
+    buildBaseCycleQP(q_current, q_ref, u_ref, gradient, lower, upper);
+
+    if (waypoint_enabled_) {
+      if (waypoint_weight_ <= 0.0) {
+        waypoint_status = "zero_weight";
+      } else if (!has_wp_active || !has_wp_q || !has_wp_deadline) {
+        waypoint_status = "waiting";
+      } else if (!wp_active) {
+        waypoint_status = "inactive";
+      } else if (q_vis.size() != dof_ || !finiteVector(q_vis) ||
+                 !std::isfinite(deadline_abs_s)) {
+        waypoint_status = "invalid";
+      } else if (!waypoint_data_fresh) {
         waypoint_status = "stale";
-      } else if (deadline_remaining > horizon_duration_ + waypoint_horizon_slack_) {
-        // The absolute deadline has not entered the current MPC horizon yet.
+      } else if (deadline_remaining >
+                 horizon_duration_ + waypoint_horizon_slack_) {
         waypoint_status = "future";
       } else {
-        // Pick the latest predicted configuration whose grid time is not after
-        // the deadline.  Once overdue, keep pulling the first controllable step
-        // toward q_vis until the real sensor gate switches active=false.
+        control_mode = "intervention";
         if (deadline_remaining <= dt_) {
           waypoint_k = 1;
         } else {
@@ -791,14 +979,15 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
         const Eigen::MatrixXd S_k =
             S_.block((waypoint_k - 1) * dof_, 0, dof_, n_u_);
         const Eigen::VectorXd waypoint_offset = q_current - q_vis;
-
+        applied_waypoint_weight = waypoint_weight_;
         const Eigen::MatrixXd H_wp =
-            2.0 * waypoint_weight_ * S_k.transpose() * S_k;
+            2.0 * applied_waypoint_weight * S_k.transpose() * S_k;
         const Eigen::VectorXd g_wp =
-            2.0 * waypoint_weight_ * S_k.transpose() * waypoint_offset;
+            2.0 * applied_waypoint_weight * S_k.transpose() * waypoint_offset;
 
         if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
           waypoint_status = "invalid_cost";
+          control_mode = "normal";
         } else {
           hessian += H_wp;
           gradient += g_wp;
@@ -806,7 +995,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
           waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
           waypoint_nominal_error_inf =
               (q_ref.col(waypoint_k) - q_vis).lpNorm<Eigen::Infinity>();
-          waypoint_status = deadline_remaining <= 0.0 ? "overdue_used" : "used";
+          waypoint_status = "used";
         }
       }
     }
@@ -830,10 +1019,11 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   previous_command_ = command;
 
   const Eigen::MatrixXd q_pred = reconstructPredictedQ(q_current, solution);
-  publishPrediction(q_pred, solution, reference.header.frame_id);
+  publishPrediction(q_pred, solution,
+                    reference_fresh ? reference.header.frame_id : std::string("base_link"));
 
   if (waypoint_k >= 1 && q_vis.size() == dof_ &&
-      (waypoint_status == "used" || waypoint_status == "overdue_used")) {
+      (waypoint_status == "used" || waypoint_status == "recovery")) {
     waypoint_pred_error_inf =
         (q_pred.col(waypoint_k) - q_vis).lpNorm<Eigen::Infinity>();
   }
@@ -861,11 +1051,14 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " iter=" << iterations
       << " primal=" << primal
       << " dual=" << dual
+      << " control_mode=" << control_mode
+      << " recovery_active=" << static_cast<int>(local_recovery_active)
+      << " recovery_hold=" << static_cast<int>(local_recovery_hold)
       << " tracking_inf=" << tracking_inf
       << " command_inf=" << command_inf
       << " pred_dev_inf=" << pred_dev_inf
       << " vbc_wp=" << waypoint_status
-      << " waypoint_weight=" << waypoint_weight_
+      << " waypoint_weight=" << applied_waypoint_weight
       << " waypoint_age=" << waypoint_age
       << " deadline_remaining=" << deadline_remaining
       << " waypoint_k=" << waypoint_k
@@ -876,8 +1069,9 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " waypoint_hessian_inf=" << waypoint_hessian_inf
       << " base_grad_inf=" << base_gradient_inf
       << " ref_horizon="
-      << (reference.points.empty() ? 0.0
-          : reference.points.back().time_from_start.toSec());
+      << (reference_fresh && !reference.points.empty()
+              ? reference.points.back().time_from_start.toSec()
+              : 0.0);
 
   std_msgs::String summary;
   summary.data = oss.str();
