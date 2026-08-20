@@ -1,28 +1,16 @@
 #!/usr/bin/env python3
-"""Gate and re-time the nominal command trajectory for VBC waypoint control.
+"""Gate/re-time nominal references and coordinate post-recovery replanning.
 
-The one-shot planner is intentionally left untouched. It may publish its normal
-advancing /command_trajectory_candidate immediately after planning, but this node
-captures the longest (therefore earliest/fullest) candidate and withholds it
-from the waypoint MPC until the pre-execution VBC decision is complete.
+Initial execution is unchanged from the validated Phase-B2 gate:
+  nominal plan -> stable VBC decision -> q_vis ready -> release synchronized T0
 
-Release rules are fail-closed:
-  * first stable VBC decision says no violation -> release nominal execution;
-  * first stable VBC decision says violation -> wait until the matching frozen
-    sweep time exists and the explicit learned visibility waypoint reports ready.
-
-At release, now becomes synchronized execution epoch T0. The cached nominal
-trajectory is replayed from phase zero on a gated-reference topic. For a VBC
-violation the absolute waypoint deadline is re-based to
-
-    T_deadline = T0 + max(0, t_sweep - safety_margin).
-
-After release the same absolute T_deadline is re-published at the gate rate.
-The numerical deadline never moves; only message freshness is renewed so the
-MPC's waypoint timeout remains a useful fail-safe if this gate stops running.
-
-This removes projector/model latency from the robot's available visibility
-preparation time without modifying RecedingHorizonPlanner internals.
+If the waypoint MPC later reports visibility recovery complete, the gate stops
+publishing the old advancing nominal reference. The controlled-trial node
+republishes the original EE goal; RecedingHorizonPlanner emits a fresh
+/task_trajectory only after that measured-state replan succeeds. The gate uses
+that message as an unambiguous generation marker, accepts the *next* upstream
+command trajectory as the new master, re-bases it at phase zero, and only then
+emits visibility_replan_ready so the MPC may leave RECOVERY_HOLD.
 """
 
 from __future__ import annotations
@@ -71,6 +59,8 @@ class VBCExecutionReferenceGate:
             "~input_reference_topic", "/care_planner/command_trajectory_candidate"))
         self.output_reference_topic = str(rospy.get_param(
             "~output_reference_topic", "/care_planner/command_trajectory_vbc_gated"))
+        self.task_trajectory_topic = str(rospy.get_param(
+            "~task_trajectory_topic", "/care_planner/task_trajectory"))
         self.vbc_summary_topic = str(rospy.get_param(
             "~vbc_summary_topic", "/care_planner/trajectory_risk/vbc_summary"))
         self.waypoint_summary_topic = str(rospy.get_param(
@@ -79,6 +69,12 @@ class VBCExecutionReferenceGate:
         self.frozen_sweep_topic = str(rospy.get_param(
             "~frozen_sweep_time_topic",
             "/care_planner/active_sensing/frozen_sweep_time_s"))
+        self.recovery_complete_topic = str(rospy.get_param(
+            "~recovery_complete_topic",
+            "/care_planner/execution/visibility_recovery_complete"))
+        self.replan_ready_topic = str(rospy.get_param(
+            "~replan_ready_topic",
+            "/care_planner/execution/visibility_replan_ready"))
 
         self.execution_ready_topic = str(rospy.get_param(
             "~execution_ready_topic", "/care_planner/execution/ready"))
@@ -113,7 +109,7 @@ class VBCExecutionReferenceGate:
         self._master_duration_s = -1.0
         self._master_received_ros_s: Optional[float] = None
 
-        self._decision: Optional[bool] = None  # True means VBC violation.
+        self._decision: Optional[bool] = None
         self._last_observed_decision: Optional[bool] = None
         self._decision_repeat_count = 0
         self._waypoint_ready = False
@@ -126,6 +122,11 @@ class VBCExecutionReferenceGate:
         self._publish_count = 0
         self._deadline_publish_count = 0
 
+        self._waiting_replan = False
+        self._replan_task_seen = False
+        self._replan_ready_pending = False
+        self._replan_count = 0
+
         self.reference_pub = rospy.Publisher(
             self.output_reference_topic, JointTrajectory, queue_size=1)
         self.ready_pub = rospy.Publisher(
@@ -136,18 +137,26 @@ class VBCExecutionReferenceGate:
             self.synced_deadline_topic, Float64, queue_size=1, latch=True)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
+        self.replan_ready_pub = rospy.Publisher(
+            self.replan_ready_topic, Bool, queue_size=1, latch=False)
 
-        self.reference_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.input_reference_topic, JointTrajectory,
             self._reference_callback, queue_size=5)
-        self.vbc_sub = rospy.Subscriber(
+        rospy.Subscriber(
+            self.task_trajectory_topic, JointTrajectory,
+            self._task_trajectory_callback, queue_size=5)
+        rospy.Subscriber(
             self.vbc_summary_topic, String, self._vbc_summary_callback, queue_size=5)
-        self.waypoint_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.waypoint_summary_topic, String,
             self._waypoint_summary_callback, queue_size=5)
-        self.sweep_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.frozen_sweep_topic, Float32,
             self._frozen_sweep_callback, queue_size=1)
+        rospy.Subscriber(
+            self.recovery_complete_topic, Bool,
+            self._recovery_complete_callback, queue_size=1)
 
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.publish_rate), self._timer_callback)
@@ -159,7 +168,9 @@ class VBCExecutionReferenceGate:
             "[vbc_exec_gate] PRE-EXECUTION GATE ARMED: input=%s output=%s",
             self.input_reference_topic, self.output_reference_topic)
         rospy.logwarn(
-            "[vbc_exec_gate] robot reference remains locked until VBC is safe or q_vis is ready")
+            "[vbc_exec_gate] recovery protocol: complete=%s task_marker=%s replan_ready=%s",
+            self.recovery_complete_topic, self.task_trajectory_topic,
+            self.replan_ready_topic)
 
     @staticmethod
     def _duration(msg: JointTrajectory) -> float:
@@ -173,16 +184,67 @@ class VBCExecutionReferenceGate:
         duration = self._duration(msg)
         if not math.isfinite(duration) or duration < 0.0:
             return
+
         with self._lock:
-            if self._released:
+            if not self._released:
+                if self._master_reference is None or duration > self._master_duration_s + 1e-9:
+                    self._master_reference = copy.deepcopy(msg)
+                    self._master_duration_s = duration
+                    self._master_received_ros_s = rospy.Time.now().to_sec()
+                    rospy.logwarn(
+                        "[vbc_exec_gate] cached fuller nominal reference: duration=%.6f s points=%d",
+                        duration, len(msg.points))
                 return
-            if self._master_reference is None or duration > self._master_duration_s + 1e-9:
-                self._master_reference = copy.deepcopy(msg)
-                self._master_duration_s = duration
-                self._master_received_ros_s = rospy.Time.now().to_sec()
-                rospy.logwarn(
-                    "[vbc_exec_gate] cached fuller nominal reference: duration=%.6f s points=%d",
-                    duration, len(msg.points))
+
+            # During post-recovery hold, old persistent suffixes are ignored.
+            # Only after the planner publishes a fresh task_trajectory generation
+            # marker can an upstream command become the new master reference.
+            if not (self._waiting_replan and self._replan_task_seen):
+                return
+
+            now = rospy.Time.now().to_sec()
+            self._master_reference = copy.deepcopy(msg)
+            self._master_duration_s = duration
+            self._master_received_ros_s = now
+            self._execution_start_ros_s = now
+            self._synced_deadline_ros_s = None
+            self._waiting_replan = False
+            self._replan_task_seen = False
+            self._replan_ready_pending = True
+            self._replan_count += 1
+            self._release_reason = "recovery_replan_installed"
+
+            start = Float64(); start.data = now; self.start_pub.publish(start)
+            rospy.logwarn(
+                "[vbc_exec_gate] NEW POST-RECOVERY MASTER INSTALLED: duration=%.6f s points=%d replan_count=%d",
+                duration, len(msg.points), self._replan_count)
+            self._write_trace_locked()
+
+    def _task_trajectory_callback(self, msg: JointTrajectory) -> None:
+        if msg is None or not msg.points:
+            return
+        with self._lock:
+            if not self._waiting_replan:
+                return
+            self._replan_task_seen = True
+            self._release_reason = "recovery_replan_task_generated_waiting_command"
+            rospy.logwarn(
+                "[vbc_exec_gate] fresh post-recovery task trajectory observed; next upstream command will become the new master")
+
+    def _recovery_complete_callback(self, msg: Bool) -> None:
+        if msg is None or not bool(msg.data):
+            return
+        with self._lock:
+            if not self._released or self._waiting_replan:
+                return
+            self._waiting_replan = True
+            self._replan_task_seen = False
+            self._replan_ready_pending = False
+            self._synced_deadline_ros_s = None
+            self._release_reason = "recovery_complete_waiting_task_replan"
+            rospy.logwarn(
+                "[vbc_exec_gate] RECOVERY COMPLETE: freezing old nominal progress and waiting for measured-state task replan")
+            self._write_trace_locked()
 
     def _vbc_summary_callback(self, msg: String) -> None:
         if msg is None:
@@ -270,10 +332,9 @@ class VBCExecutionReferenceGate:
             now, self._master_duration_s)
         if self._synced_deadline_ros_s is not None:
             rospy.logwarn(
-                "[vbc_exec_gate] synchronized VBC deadline: +%.6f s absolute=%.6f; refreshing at %.1f Hz",
+                "[vbc_exec_gate] synchronized VBC deadline: +%.6f s absolute=%.6f",
                 self._synced_deadline_ros_s - now,
-                self._synced_deadline_ros_s,
-                self.publish_rate)
+                self._synced_deadline_ros_s)
         rospy.logwarn("[vbc_exec_gate] ================================================")
         self._write_trace_locked()
 
@@ -364,6 +425,9 @@ class VBCExecutionReferenceGate:
                 f"master_duration={self._master_duration_s:.6f} "
                 f"execution_elapsed={elapsed:.6f} "
                 f"deadline_remaining={deadline_remaining:.6f} "
+                f"waiting_replan={int(self._waiting_replan)} "
+                f"replan_task_seen={int(self._replan_task_seen)} "
+                f"replan_count={self._replan_count} "
                 f"publish_count={self._publish_count} "
                 f"deadline_publish_count={self._deadline_publish_count} "
                 f"reason={self._release_reason}"
@@ -390,7 +454,9 @@ class VBCExecutionReferenceGate:
             "master_received_ros_s": self._master_received_ros_s,
             "reference_publish_count": self._publish_count,
             "deadline_publish_count": self._deadline_publish_count,
-            "deadline_refresh_rate_hz": self.publish_rate,
+            "waiting_replan": self._waiting_replan,
+            "replan_task_seen": self._replan_task_seen,
+            "replan_count": self._replan_count,
             "release_reason": self._release_reason,
             "output_reference_topic": self.output_reference_topic,
             "trace_json": str(self.trace_path),
@@ -405,23 +471,30 @@ class VBCExecutionReferenceGate:
     def _timer_callback(self, _event) -> None:
         reference = None
         deadline_msg = None
+        send_replan_ready = False
+
         with self._lock:
             if self._can_release_locked():
                 self._release_locked()
-            if self._released and self._master_reference is not None:
+
+            # During RECOVERY_HOLD no stale nominal reference is published.
+            if (self._released and not self._waiting_replan
+                    and self._master_reference is not None):
                 elapsed = max(
                     0.0, rospy.Time.now().to_sec() - self._execution_start_ros_s)
                 reference = self._suffix_from_phase(self._master_reference, elapsed)
                 self._publish_count += 1
 
-                # T_deadline is a fixed absolute time for this frozen VBC target.
-                # Re-publishing the same value only renews topic freshness so the
-                # MPC's 0.20 s timeout remains a fail-safe for a dead gate instead
-                # of expiring a perfectly valid static deadline during execution.
                 if self._synced_deadline_ros_s is not None:
                     deadline_msg = Float64()
                     deadline_msg.data = self._synced_deadline_ros_s
                     self._deadline_publish_count += 1
+
+                if self._replan_ready_pending:
+                    # Publish the new gated reference first; the ready pulse below
+                    # tells MPC that RECOVERY_HOLD may now end.
+                    send_replan_ready = True
+                    self._replan_ready_pending = False
 
                 if self._publish_count % 10 == 0:
                     self._write_trace_locked()
@@ -430,6 +503,10 @@ class VBCExecutionReferenceGate:
             self.reference_pub.publish(reference)
         if deadline_msg is not None:
             self.deadline_pub.publish(deadline_msg)
+        if send_replan_ready:
+            msg = Bool(); msg.data = True; self.replan_ready_pub.publish(msg)
+            rospy.logwarn(
+                "[vbc_exec_gate] POST-RECOVERY REPLAN RELEASED from phase zero; MPC may leave recovery hold")
         self._publish_summary()
 
     def _on_shutdown(self) -> None:
