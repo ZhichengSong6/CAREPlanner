@@ -20,7 +20,7 @@
   <arg name="ee_frame" default="EE_link" />
   <arg name="use_trajectory_visualizer" default="true" />
 
-  <arg name="waypoint_weight" default="100.0" />
+  <arg name="waypoint_weight" default="3000.0" />
   <arg name="waypoint_timeout" default="0.20" />
   <arg name="waypoint_horizon_slack" default="0.025" />
   <arg name="vbc_min_margin_s" default="0.30" />
