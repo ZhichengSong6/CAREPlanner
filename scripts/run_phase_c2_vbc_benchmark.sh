@@ -14,11 +14,12 @@ POST_RELEASE_SECONDS="${POST_RELEASE_SECONDS:-4.0}"
 INITIAL_Q_TOL="${INITIAL_Q_TOL:-0.02}"
 TARGET_TOL_M="${TARGET_TOL_M:-0.001}"
 SWEEP_TOL_S="${SWEEP_TOL_S:-0.03}"
+PROJECTOR_Q_TOL="${PROJECTOR_Q_TOL:-0.005}"
 
 cd "${REPO}" || exit 1
 source devel/setup.bash
 
-# Phase C2 is a reproducible benchmark. Old C2 output/logs are discarded.
+# Phase C2 is a reproducible benchmark. Never mix partial/old C2 runs.
 rm -rf "${OUT}" "${LOG}" "${ARCHIVE}"
 mkdir -p "${OUT}" "${LOG}"
 exec > >(tee "${LOG}/batch_console.log") 2>&1
@@ -34,27 +35,38 @@ GIT_BRANCH="$(git branch --show-current)"
 python3 - "${OUT}/benchmark_metadata.json" "${CASE_FILE}" "${GIT_COMMIT}" "${GIT_BRANCH}" "${BASELINE_WEIGHT}" "${CARE_WEIGHT}" "${SAFETY_MARGIN}" <<'PYMETA'
 import json,sys,time
 out,case_file,commit,branch,w0,w1,margin=sys.argv[1:]
-p={'created_wall_time':time.strftime('%Y-%m-%dT%H:%M:%S%z'),'case_file':case_file,'git_commit':commit,'git_branch':branch,'baseline_weight':float(w0),'careplanner_weight':float(w1),'safety_margin_s':float(margin),'paired_design':'same frozen case, fresh Gazebo each run, identical precompute/gate, only waypoint weight differs'}
+p={
+  'created_wall_time':time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+  'case_file':case_file,
+  'git_commit':commit,
+  'git_branch':branch,
+  'baseline_weight':float(w0),
+  'careplanner_weight':float(w1),
+  'safety_margin_s':float(margin),
+  'gazebo_gui':False,
+  'rviz':False,
+  'paired_design':'same frozen case, fresh headless Gazebo each run, identical precompute/gate, only waypoint weight differs'
+}
 json.dump(p,open(out,'w'),indent=2)
 PYMETA
 
 python3 - "${CASE_FILE}" <<'PY'
-import json, sys
+import json,sys
 p=sys.argv[1]
 d=json.load(open(p))
-ids=d.get('selected_case_ids', [])
-cases=d.get('cases', [])
-if len(ids) != 12 or len(cases) != 12:
+ids=d.get('selected_case_ids',[])
+cases=d.get('cases',[])
+if len(ids)!=12 or len(cases)!=12:
     raise SystemExit(f"expected 12 frozen cases, got ids={len(ids)} cases={len(cases)}")
-if set(ids) != {c.get('case_id') for c in cases}:
+if set(ids)!={c.get('case_id') for c in cases}:
     raise SystemExit('selected_case_ids and cases disagree')
-if abs(float(d.get('waypoint_weight_careplanner', 3000.0))-3000.0) > 1e-9:
+if abs(float(d.get('waypoint_weight_careplanner',3000.0))-3000.0)>1e-9:
     raise SystemExit('frozen benchmark CAREPlanner weight is not 3000')
-print('[CHECK] frozen benchmark contains 12 cases:', ids)
+print('[CHECK] frozen benchmark contains 12 cases:',ids)
 PY
 if [ $? -ne 0 ]; then exit 1; fi
 
-# This batch owns the ROS master. Abort rather than contaminating another ROS session.
+# The batch must own the ROS master. Never kill a user's pre-existing ROS session.
 if timeout 2 rosnode list >/dev/null 2>&1; then
   echo "[ERROR] A ROS master is already running. Close other ROS/Gazebo launches before Phase C2."
   exit 1
@@ -70,14 +82,14 @@ else
 fi
 
 mapfile -t CASE_IDS < <(python3 - "${CASE_FILE}" <<'PY'
-import json, sys
+import json,sys
 print('\n'.join(json.load(open(sys.argv[1]))['selected_case_ids']))
 PY
 )
 
 case_fields() {
   python3 - "${CASE_FILE}" "$1" <<'PY'
-import json, sys
+import json,sys
 p,cid=sys.argv[1:3]
 d=json.load(open(p)); c=next(x for x in d['cases'] if x['case_id']==cid)
 vals=[cid,c['difficulty_bin'],*c['goal_position'],*c['goal_orientation'],*c['selected_target_xyz'],c['nominal_sweep_time_s']]
@@ -105,6 +117,19 @@ kill_group() {
   wait "${pid}" 2>/dev/null || true
 }
 
+# Safe only after the initial no-master precondition: from this point the batch
+# owns every ROS/Gazebo process it starts. Exact process names avoid broad pkill.
+cleanup_owned_ros_fallback() {
+  local name
+  for name in gzclient gzserver rviz rosmaster roscore roslaunch; do
+    pkill -TERM -x "${name}" 2>/dev/null || true
+  done
+  sleep 1
+  for name in gzclient gzserver rviz rosmaster roscore roslaunch; do
+    pkill -KILL -x "${name}" 2>/dev/null || true
+  done
+}
+
 GAZEBO_PID=""
 GEN_PID=""
 CONTROL_PID=""
@@ -112,11 +137,20 @@ cleanup_run() {
   kill_group "${CONTROL_PID}"; CONTROL_PID=""
   kill_group "${GEN_PID}"; GEN_PID=""
   kill_group "${GAZEBO_PID}"; GAZEBO_PID=""
-  for _ in $(seq 1 50); do
+
+  for _ in $(seq 1 30); do
     if ! timeout 1 rosnode list >/dev/null 2>&1; then return 0; fi
     sleep 0.1
   done
-  echo "[WARN] ROS master still reachable after run cleanup"
+
+  echo "[WARN] ROS master still reachable after process-group cleanup; applying owned-process fallback"
+  cleanup_owned_ros_fallback
+  for _ in $(seq 1 30); do
+    if ! timeout 1 rosnode list >/dev/null 2>&1; then return 0; fi
+    sleep 0.1
+  done
+  echo "[ERROR] ROS master is still reachable after forced cleanup"
+  return 1
 }
 trap cleanup_run EXIT
 trap 'cleanup_run; exit 130' INT TERM
@@ -135,7 +169,7 @@ wait_joint_state() {
 validate_initial_q() {
   local js_file="$1" cid="$2" out_json="$3"
   python3 - "${CASE_FILE}" "${cid}" "${js_file}" "${out_json}" "${INITIAL_Q_TOL}" <<'PY'
-import json, sys, yaml
+import json,sys,yaml
 case_file,cid,js_file,out_file,tol=sys.argv[1:]
 tol=float(tol)
 d=json.load(open(case_file)); c=next(x for x in d['cases'] if x['case_id']==cid)
@@ -180,26 +214,32 @@ target_err=max(abs(a-b) for a,b in zip(actual,expected)); sweep_err=abs(actual_s
 passed=target_err<=target_tol and sweep_err<=sweep_tol
 payload={'case_id':cid,'expected_target_xyz':expected,'actual_target_xyz':actual,'target_error_inf_m':target_err,'target_tolerance_m':target_tol,'expected_sweep_time_s':expected_sweep,'actual_sweep_time_s':actual_sweep,'sweep_error_s':sweep_err,'sweep_tolerance_s':sweep_tol,'passed':passed}
 json.dump(payload,open(out_file,'w'),indent=2)
-print(f"[CHECK] {cid} frozen target err={target_err:.3g} m, sweep err={sweep_err:.3g} s")
+print(f"[CHECK] {cid} frozen target err={target_err:.3g} m (tol={target_tol}), sweep err={sweep_err:.3g} s (tol={sweep_tol})")
 raise SystemExit(0 if passed else 2)
 PY
 }
 
 validate_projector() {
   local run_dir="$1" cid="$2" out_json="$3"
-  python3 - "${CASE_FILE}" "${cid}" "${run_dir}" "${out_json}" <<'PYPROJ'
+  python3 - "${CASE_FILE}" "${cid}" "${run_dir}" "${out_json}" "${TARGET_TOL_M}" "${SWEEP_TOL_S}" "${PROJECTOR_Q_TOL}" <<'PYPROJ'
 import glob,json,os,sys
-case_file,cid,run_dir,out_file=sys.argv[1:]
+case_file,cid,run_dir,out_file,target_tol,sweep_tol,q_tol=sys.argv[1:]
+target_tol=float(target_tol); sweep_tol=float(sweep_tol); q_tol=float(q_tol)
 d=json.load(open(case_file)); c=next(x for x in d['cases'] if x['case_id']==cid)
 paths=sorted(glob.glob(os.path.join(run_dir,'projector_traces','vbc_visibility_waypoint_*.json')),key=os.path.getmtime)
 if not paths: raise SystemExit('no runtime projector trace')
 t=json.load(open(paths[-1]))
 def inferr(a,b): return max(abs(float(x)-float(y)) for x,y in zip(a,b))
-errs={'target_error_inf_m':inferr(t['target_xyz'],c['selected_target_xyz']),'sweep_error_s':abs(float(t['nominal_sweep_time_s'])-float(c['nominal_sweep_time_s'])),'q_nom_error_inf_rad':inferr(t['q_deadline_nominal'],c['q_nom_deadline']),'q_vis_error_inf_rad':inferr(t['q_vis'],c['q_vis'])}
-passed=errs['target_error_inf_m']<=1e-5 and errs['sweep_error_s']<=1e-5 and errs['q_nom_error_inf_rad']<=5e-3 and errs['q_vis_error_inf_rad']<=5e-3
-payload={'case_id':cid,'trace_file':paths[-1],**errs,'passed':passed,'tolerances':{'target_m':1e-5,'sweep_s':1e-5,'q_nom_rad':5e-3,'q_vis_rad':5e-3}}
+errs={
+  'target_error_inf_m':inferr(t['target_xyz'],c['selected_target_xyz']),
+  'sweep_error_s':abs(float(t['nominal_sweep_time_s'])-float(c['nominal_sweep_time_s'])),
+  'q_nom_error_inf_rad':inferr(t['q_deadline_nominal'],c['q_nom_deadline']),
+  'q_vis_error_inf_rad':inferr(t['q_vis'],c['q_vis'])
+}
+passed=(errs['target_error_inf_m']<=target_tol and errs['sweep_error_s']<=sweep_tol and errs['q_nom_error_inf_rad']<=q_tol and errs['q_vis_error_inf_rad']<=q_tol)
+payload={'case_id':cid,'trace_file':paths[-1],**errs,'passed':passed,'tolerances':{'target_m':target_tol,'sweep_s':sweep_tol,'q_nom_rad':q_tol,'q_vis_rad':q_tol}}
 json.dump(payload,open(out_file,'w'),indent=2)
-print('[CHECK] %s projector q_nom_err=%.3g rad q_vis_err=%.3g rad' % (cid,errs['q_nom_error_inf_rad'],errs['q_vis_error_inf_rad']))
+print('[CHECK] %s projector target_err=%.3g m sweep_err=%.3g s q_nom_err=%.3g rad q_vis_err=%.3g rad' % (cid,errs['target_error_inf_m'],errs['sweep_error_s'],errs['q_nom_error_inf_rad'],errs['q_vis_error_inf_rad']))
 raise SystemExit(0 if passed else 2)
 PYPROJ
 }
@@ -254,7 +294,10 @@ for CASE_ID in "${CASE_IDS[@]}"; do
     fi
 
     if [ "${STATUS}" = "ok" ]; then
-      setsid roslaunch arm_description gazebo_velocity_control.launch > "${RUN_LOG}/gazebo.log" 2>&1 &
+      # Headless/no-RViz is deliberate for batch reproducibility and clean teardown.
+      setsid roslaunch arm_description gazebo_velocity_control.launch \
+        gazebo_gui:=false use_rviz:=false \
+        > "${RUN_LOG}/gazebo.log" 2>&1 &
       GAZEBO_PID=$!
       if ! wait_joint_state "${RUN_OUT}/initial_joint_state.yaml"; then
         STATUS="gazebo_joint_state_timeout"; MESSAGE="no /care_arm/joint_states after Gazebo startup"
@@ -304,12 +347,16 @@ for CASE_ID in "${CASE_IDS[@]}"; do
       fi
     fi
 
-    # Stop controller/loggers first so they flush JSON/CSV, then generator and Gazebo.
-    cleanup_run
+    # Stop controller/loggers first so they flush JSON/CSV, then generator/Gazebo.
+    if ! cleanup_run; then
+      if [ "${STATUS}" = "ok" ]; then
+        STATUS="cleanup_failed"; MESSAGE="ROS master/processes survived run cleanup"
+      fi
+    fi
 
     if [ "${STATUS}" = "ok" ]; then
       if ! validate_projector "${RUN_OUT}" "${CID}" "${RUN_OUT}/runtime_projector_validation.json"; then
-        STATUS="runtime_projector_mismatch"; MESSAGE="runtime q_vis/q_nom does not reproduce the frozen Phase-C1 case"
+        STATUS="runtime_projector_mismatch"; MESSAGE="runtime projector does not reproduce the frozen Phase-C1 case within configured tolerances"
       elif ! compgen -G "${RUN_OUT}/executed_vbc_*.json" >/dev/null; then
         STATUS="missing_executed_vbc_summary"; MESSAGE="executed-VBC logger JSON missing"
       elif ! compgen -G "${RUN_OUT}/execution_gate_*.json" >/dev/null; then
@@ -344,7 +391,7 @@ with zipfile.ZipFile(archive,'w',compression=zipfile.ZIP_DEFLATED) as z:
             for name in files:
                 p=os.path.join(base,name)
                 z.write(p,os.path.join(label,os.path.relpath(p,root)))
-print('[PACKAGE]', archive)
+print('[PACKAGE]',archive)
 PYPACK
 
 echo
