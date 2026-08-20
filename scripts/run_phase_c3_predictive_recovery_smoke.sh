@@ -8,6 +8,8 @@ LOG="${REPO}/logs/phase_c3_predictive_recovery_smoke"
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-6.0}"
 PRED_ERROR_INF="${PRED_ERROR_INF:-0.10}"
+# Kept as a diagnostic/optional stricter criterion. The default Phase-C3 guard
+# does NOT require stagnation; stable high predicted deadline error is enough.
 PRED_MIN_IMPROVEMENT_INF="${PRED_MIN_IMPROVEMENT_INF:-0.002}"
 PRED_STREAK="${PRED_STREAK:-3}"
 
@@ -108,22 +110,37 @@ PRED="$(timeout 2 rostopic echo -n 1 /care_planner/execution/predictive_recovery
 printf '%s\n' "${MPC}" > "${OUT}/final_mpc_summary.yaml"
 printf '%s\n' "${GATE}" > "${OUT}/final_gate_summary.yaml"
 printf '%s\n' "${PRED}" > "${OUT}/final_predictive_recovery_summary.yaml"
+grep '\[predictive_recovery_guard\]' "${LOG}/controlled.log" \
+  > "${OUT}/predictive_recovery_guard.log" 2>/dev/null || true
 
-TRIGGER_COUNT="$(grep -c 'PREDICTIVE RECOVERY TRIGGER' "${LOG}/controlled.log" 2>/dev/null || true)"
-RECOVERY_COUNT="$(grep -c 'control_mode=recovery' "${LOG}/controlled.log" 2>/dev/null || true)"
-HOLD_COUNT="$(grep -c 'RECOVERY COMPLETE\|recovery_hold' "${LOG}/controlled.log" 2>/dev/null || true)"
+# Event-specific checks. Do not grep summary fields such as recovery_hold=0,
+# which produced false positives in the first Phase-C3 smoke script.
+TRIGGER_LOG_COUNT="$(grep -c 'PREDICTIVE RECOVERY TRIGGER' "${LOG}/controlled.log" 2>/dev/null || true)"
+RECOVERY_ENTER_COUNT="$(grep -c 'entering VISIBILITY RECOVERY' "${LOG}/controlled.log" 2>/dev/null || true)"
+RECOVERY_COMPLETE_COUNT="$(grep -c 'VISIBILITY RECOVERY COMPLETE' "${LOG}/controlled.log" 2>/dev/null || true)"
 REPLAN_COUNT="$(echo "${GATE}" | sed -n 's/.*replan_count=\([0-9][0-9]*\).*/\1/p' | head -n1)"
 REPLAN_COUNT="${REPLAN_COUNT:-0}"
-TRIGGER_LEAD="$(grep 'PREDICTIVE RECOVERY TRIGGER' "${LOG}/controlled.log" 2>/dev/null | sed -n 's/.*physical_deadline_lead=\([-0-9.]*\)s.*/\1/p' | head -n1)"
+
+TRIGGER_TOTAL="$(echo "${PRED}" | sed -n 's/.*trigger_count_total=\([0-9][0-9]*\).*/\1/p' | head -n1)"
+TRIGGER_TOTAL="${TRIGGER_TOTAL:-0}"
+TRIGGER_LEAD="$(echo "${PRED}" | sed -n 's/.*last_trigger_lead_s=\([-0-9.nan]*\).*/\1/p' | head -n1)"
 TRIGGER_LEAD="${TRIGGER_LEAD:-nan}"
+if [ "${TRIGGER_TOTAL}" -lt 1 ]; then
+  # Fall back to the one-shot log event if the final topic could not be read.
+  TRIGGER_TOTAL="${TRIGGER_LOG_COUNT}"
+  TRIGGER_LEAD="$(grep 'PREDICTIVE RECOVERY TRIGGER' "${LOG}/controlled.log" 2>/dev/null | sed -n 's/.*physical_deadline_lead=\([-0-9.]*\)s.*/\1/p' | head -n1)"
+  TRIGGER_LEAD="${TRIGGER_LEAD:-nan}"
+fi
 
-echo "[CHECK] predictive trigger hits=${TRIGGER_COUNT}"
-echo "[CHECK] first predictive trigger lead=${TRIGGER_LEAD}s"
-echo "[CHECK] recovery log hits=${RECOVERY_COUNT}"
-echo "[CHECK] recovery-complete/hold log hits=${HOLD_COUNT}"
+echo "[CHECK] predictive trigger log hits=${TRIGGER_LOG_COUNT}"
+echo "[CHECK] predictive trigger total=${TRIGGER_TOTAL}"
+echo "[CHECK] last predictive trigger lead=${TRIGGER_LEAD}s"
+echo "[CHECK] recovery-enter events=${RECOVERY_ENTER_COUNT}"
+echo "[CHECK] recovery-complete events=${RECOVERY_COMPLETE_COUNT}"
 echo "[CHECK] gate replan_count=${REPLAN_COUNT}"
+echo "[CHECK] final predictive summary: ${PRED}"
 
-if [ "${TRIGGER_COUNT}" -lt 1 ]; then
+if [ "${TRIGGER_TOTAL}" -lt 1 ]; then
   echo "[FAIL] predictive recovery was never triggered"
   exit 2
 fi
@@ -137,12 +154,12 @@ then
   echo "[FAIL] predictive trigger did not occur before the physical deadline"
   exit 2
 fi
-if [ "${RECOVERY_COUNT}" -lt 1 ]; then
-  echo "[FAIL] recovery was never entered after predictive trigger"
+if [ "${RECOVERY_ENTER_COUNT}" -lt 1 ]; then
+  echo "[FAIL] recovery entry event was not observed after predictive trigger"
   exit 2
 fi
-if [ "${HOLD_COUNT}" -lt 1 ]; then
-  echo "[FAIL] recovery never completed / hold was never observed"
+if [ "${RECOVERY_COMPLETE_COUNT}" -lt 1 ]; then
+  echo "[FAIL] recovery completion event was not observed"
   exit 2
 fi
 if [ "${REPLAN_COUNT}" -lt 1 ]; then
@@ -150,5 +167,5 @@ if [ "${REPLAN_COUNT}" -lt 1 ]; then
   exit 2
 fi
 
-echo "[PASS] ${CASE_ID}: predictive miss -> early recovery -> recovery hold -> task replan observed"
+echo "[PASS] ${CASE_ID}: predicted miss -> early recovery -> recovery complete -> task replan observed"
 echo "[RESULT] ${OUT}"
