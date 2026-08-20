@@ -9,23 +9,28 @@ from trajectory_msgs.msg import JointTrajectory
 
 
 class PredictiveRecoveryGuard:
-    """Advance the controller recovery deadline when soft MPC predicts a miss.
+    """Advance the recovery deadline when the soft MPC stably predicts a miss.
 
-    The input deadline remains the physical VBC deadline.  This node publishes
-    an *effective controller deadline*: normally it is identical to the physical
-    deadline; after a stable predicted miss it is advanced to the present time
-    so the existing waypoint MPC enters its already-validated recovery mode on
-    the next control cycle.
+    The physical VBC deadline is preserved on its original topic.  This node
+    publishes a separate effective deadline for the waypoint MPC.  Normally the
+    effective deadline is exactly the physical deadline.  After a stable
+    predicted miss it is advanced to the present time, which reuses the already
+    validated deadline-miss recovery state machine without changing its control
+    law.
 
-    Keeping the trigger outside the MPC makes Phase-C3 attribution clean: the
-    recovery controller/state machine is unchanged, while the trigger policy is
-    independently observable and can later be folded into the MPC if desired.
+    Phase-C3 default decision:
+      predicted deadline error > threshold for N consecutive MPC predictions.
+
+    Prediction improvement is logged as a diagnostic.  An optional
+    require_insufficient_progress switch restores the stricter experimental
+    criterion, but it is disabled by default because a receding-horizon MPC can
+    improve slightly every cycle while still predicting a clear deadline miss.
     """
 
     def __init__(self):
         self._lock = threading.RLock()
 
-        self._enabled = rospy.get_param("~enabled", True)
+        self._enabled = bool(rospy.get_param("~enabled", True))
         self._rate = float(rospy.get_param("~rate", 20.0))
         self._input_timeout = float(rospy.get_param("~input_timeout", 0.25))
         self._horizon_slack = float(rospy.get_param("~horizon_slack", 0.025))
@@ -34,6 +39,9 @@ class PredictiveRecoveryGuard:
         )
         self._min_improvement_inf = float(
             rospy.get_param("~min_prediction_improvement_inf", 0.002)
+        )
+        self._require_insufficient_progress = bool(
+            rospy.get_param("~require_insufficient_progress", False)
         )
         self._consecutive_misses_required = int(
             rospy.get_param("~consecutive_misses_required", 3)
@@ -59,8 +67,7 @@ class PredictiveRecoveryGuard:
             "/care_planner/active_sensing/visibility_waypoint_deadline_synced",
         )
         self._prediction_topic = rospy.get_param(
-            "~prediction_topic",
-            "/care_planner/mpc/predicted_trajectory",
+            "~prediction_topic", "/care_planner/mpc/predicted_trajectory"
         )
         self._effective_deadline_topic = rospy.get_param(
             "~effective_deadline_topic",
@@ -108,6 +115,12 @@ class PredictiveRecoveryGuard:
         self._trigger_time_abs = None
         self._trigger_lead_s = float("nan")
 
+        # Historical fields survive target deactivation so the end-of-run
+        # summary still tells us whether predictive recovery really happened.
+        self._trigger_count_total = 0
+        self._last_trigger_lead_s = float("nan")
+        self._last_trigger_error_inf = float("nan")
+
         self._last_status = "waiting"
         self._last_error_inf = float("nan")
         self._last_improvement_inf = float("nan")
@@ -143,12 +156,14 @@ class PredictiveRecoveryGuard:
         self._timer = rospy.Timer(rospy.Duration(1.0 / self._rate), self._timer_cb)
 
         rospy.logwarn(
-            "[predictive_recovery_guard] enabled=%s error_inf>%.4f, "
-            "min_improvement=%.4f, consecutive=%d, horizon_slack=%.3fs",
+            "[predictive_recovery_guard] enabled=%s error_inf>%.4f "
+            "consecutive=%d require_stall=%s min_improvement=%.4f "
+            "horizon_slack=%.3fs",
             self._enabled,
             self._error_threshold_inf,
-            self._min_improvement_inf,
             self._consecutive_misses_required,
+            self._require_insufficient_progress,
+            self._min_improvement_inf,
             self._horizon_slack,
         )
         rospy.loginfo(
@@ -167,7 +182,7 @@ class PredictiveRecoveryGuard:
             return float("inf")
         return max(abs(float(x) - float(y)) for x, y in zip(a, b))
 
-    def _reset_decision_locked(self, clear_target):
+    def _reset_current_decision_locked(self, clear_target):
         self._previous_pred_error_inf = None
         self._miss_streak = 0
         self._triggered = False
@@ -197,7 +212,7 @@ class PredictiveRecoveryGuard:
             )
 
         if is_new:
-            self._reset_decision_locked(clear_target=False)
+            self._reset_current_decision_locked(clear_target=False)
             self._tracked_q_vis = list(self._q_vis)
             self._tracked_deadline_abs = float(self._physical_deadline_abs)
             self._last_status = "new_target"
@@ -208,14 +223,15 @@ class PredictiveRecoveryGuard:
             self._active = bool(msg.data)
             self._active_received = now
             if not self._active:
-                self._reset_decision_locked(clear_target=True)
+                self._reset_current_decision_locked(clear_target=True)
                 self._last_status = "inactive"
 
     def _q_cb(self, msg):
         values = [float(v) for v in msg.data]
         if not self._finite_vector(values):
             rospy.logwarn_throttle(
-                1.0, "[predictive_recovery_guard] ignoring malformed/non-finite q_vis"
+                1.0,
+                "[predictive_recovery_guard] ignoring malformed/non-finite q_vis",
             )
             return
         with self._lock:
@@ -243,7 +259,8 @@ class PredictiveRecoveryGuard:
     def _deadline_cb(self, msg):
         if not math.isfinite(msg.data) or msg.data <= 0.0:
             rospy.logwarn_throttle(
-                1.0, "[predictive_recovery_guard] ignoring invalid physical deadline"
+                1.0,
+                "[predictive_recovery_guard] ignoring invalid physical deadline",
             )
             return
         now = rospy.Time.now()
@@ -284,8 +301,8 @@ class PredictiveRecoveryGuard:
         if deadline_remaining > horizon + self._horizon_slack:
             return None, -1, horizon
 
-        # Match the waypoint MPC convention: choose the latest grid point not
-        # after the physical deadline, but never use k=0 for intervention.
+        # Match the waypoint MPC convention: latest grid point not after the
+        # physical deadline, never k=0 for an active intervention.
         k = 1
         if deadline_remaining > msg.points[1].time_from_start.to_sec():
             for i in range(1, len(msg.points)):
@@ -325,7 +342,7 @@ class PredictiveRecoveryGuard:
             self._last_status = "triggered"
             return
         if deadline_remaining <= 0.0:
-            # Preserve the original deadline-miss recovery as the fallback.
+            # Original physical-deadline recovery remains the hard fallback.
             self._last_status = "physical_deadline_elapsed"
             return
 
@@ -365,8 +382,11 @@ class PredictiveRecoveryGuard:
             self._previous_pred_error_inf is None
             or improvement < self._min_improvement_inf
         )
+        miss_this_cycle = high_error and (
+            (not self._require_insufficient_progress) or insufficient_progress
+        )
 
-        if high_error and insufficient_progress:
+        if miss_this_cycle:
             self._miss_streak += 1
             self._last_status = "predicted_miss_streak"
         else:
@@ -385,6 +405,9 @@ class PredictiveRecoveryGuard:
             self._triggered = True
             self._trigger_time_abs = now_s
             self._trigger_lead_s = deadline_remaining
+            self._trigger_count_total += 1
+            self._last_trigger_lead_s = deadline_remaining
+            self._last_trigger_error_inf = error_inf
             self._last_status = "predictive_recovery_triggered"
             self._triggered_pub.publish(Bool(data=True))
             rospy.logwarn(
@@ -393,55 +416,81 @@ class PredictiveRecoveryGuard:
                 "improvement_inf=%s streak=%d waypoint_k=%d",
                 deadline_remaining,
                 error_inf,
-                "nan" if not math.isfinite(improvement) else "%.4f" % improvement,
+                "nan"
+                if not math.isfinite(improvement)
+                else "%.4f" % improvement,
                 self._miss_streak,
                 k,
             )
 
-    def _publish_summary_locked(self, now):
+    def _summary_text_locked(self, now):
         effective = self._effective_deadline_locked(now.to_sec())
         effective_remaining = float("nan")
         if effective is not None:
             effective_remaining = effective - now.to_sec()
 
-        fields = [
-            "enabled=%d" % int(self._enabled),
-            "active=%d" % int(self._active),
-            "triggered=%d" % int(self._triggered),
-            "status=%s" % self._last_status,
-            "miss_streak=%d" % self._miss_streak,
-            "required_streak=%d" % self._consecutive_misses_required,
-            "error_threshold_inf=%.6f" % self._error_threshold_inf,
-            "min_improvement_inf=%.6f" % self._min_improvement_inf,
-            "pred_error_inf=%s"
-            % ("nan" if not math.isfinite(self._last_error_inf) else "%.6f" % self._last_error_inf),
-            "pred_improvement_inf=%s"
-            % (
-                "nan"
-                if not math.isfinite(self._last_improvement_inf)
-                else "%.6f" % self._last_improvement_inf
-            ),
-            "physical_deadline_remaining=%s"
-            % (
-                "nan"
-                if not math.isfinite(self._last_deadline_remaining)
-                else "%.6f" % self._last_deadline_remaining
-            ),
-            "effective_deadline_remaining=%s"
-            % (
-                "nan"
-                if not math.isfinite(effective_remaining)
-                else "%.6f" % effective_remaining
-            ),
-            "trigger_lead_s=%s"
-            % (
-                "nan"
-                if not math.isfinite(self._trigger_lead_s)
-                else "%.6f" % self._trigger_lead_s
-            ),
-            "waypoint_k=%d" % self._last_waypoint_k,
-        ]
-        self._summary_pub.publish(String(data=" ".join(fields)))
+        return " ".join(
+            [
+                "enabled=%d" % int(self._enabled),
+                "active=%d" % int(self._active),
+                "triggered=%d" % int(self._triggered),
+                "trigger_count_total=%d" % self._trigger_count_total,
+                "status=%s" % self._last_status,
+                "miss_streak=%d" % self._miss_streak,
+                "required_streak=%d" % self._consecutive_misses_required,
+                "error_threshold_inf=%.6f" % self._error_threshold_inf,
+                "require_stall=%d" % int(self._require_insufficient_progress),
+                "min_improvement_inf=%.6f" % self._min_improvement_inf,
+                "pred_error_inf=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._last_error_inf)
+                    else "%.6f" % self._last_error_inf
+                ),
+                "pred_improvement_inf=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._last_improvement_inf)
+                    else "%.6f" % self._last_improvement_inf
+                ),
+                "physical_deadline_remaining=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._last_deadline_remaining)
+                    else "%.6f" % self._last_deadline_remaining
+                ),
+                "effective_deadline_remaining=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(effective_remaining)
+                    else "%.6f" % effective_remaining
+                ),
+                "trigger_lead_s=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._trigger_lead_s)
+                    else "%.6f" % self._trigger_lead_s
+                ),
+                "last_trigger_lead_s=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._last_trigger_lead_s)
+                    else "%.6f" % self._last_trigger_lead_s
+                ),
+                "last_trigger_error_inf=%s"
+                % (
+                    "nan"
+                    if not math.isfinite(self._last_trigger_error_inf)
+                    else "%.6f" % self._last_trigger_error_inf
+                ),
+                "waypoint_k=%d" % self._last_waypoint_k,
+            ]
+        )
+
+    def _publish_summary_locked(self, now):
+        text = self._summary_text_locked(now)
+        self._summary_pub.publish(String(data=text))
+        rospy.loginfo_throttle(0.5, "[predictive_recovery_guard] %s", text)
 
     def _timer_cb(self, _event):
         now = rospy.Time.now()
