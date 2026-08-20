@@ -10,9 +10,10 @@ SEED="${SEED:-20260820}"
 cd "${REPO}"
 source devel/setup.bash
 
-# Phase C1 is a deterministic prescreen. Do not retain or mix old runs: every
-# invocation starts from an empty experiment output/log directory.
-rm -rf "${OUT}" "${LOG}"
+# Phase C1 is a deterministic prescreen. Keep only the current run: delete the
+# previous output/log tree and any legacy *_previous_* directories created by
+# older versions of this script.
+rm -rf "${OUT}" "${OUT}"_previous_* "${LOG}"
 mkdir -p "${OUT}/waypoint_traces" "${LOG}"
 
 # Start Gazebo separately before this script. It supplies TF + JointState but no
