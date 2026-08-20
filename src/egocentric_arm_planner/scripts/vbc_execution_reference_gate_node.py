@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Gate and re-time the nominal command trajectory for VBC waypoint control.
 
-The one-shot planner is intentionally left untouched.  It may publish its normal
+The one-shot planner is intentionally left untouched. It may publish its normal
 advancing /command_trajectory_candidate immediately after planning, but this node
-captures the *longest* (therefore earliest/fullest) candidate and withholds it
+captures the longest (therefore earliest/fullest) candidate and withholds it
 from the waypoint MPC until the pre-execution VBC decision is complete.
 
 Release rules are fail-closed:
   * first stable VBC decision says no violation -> release nominal execution;
-  * first stable VBC decision says violation -> wait until the explicit learned
-    visibility waypoint reports ready=1, then release.
+  * first stable VBC decision says violation -> wait until the matching frozen
+    sweep time exists and the explicit learned visibility waypoint reports ready.
 
-At release, now becomes the synchronized execution epoch T0.  The cached nominal
-trajectory is replayed from phase zero on a new gated-reference topic.  For a VBC
-violation, the absolute waypoint deadline is re-based to
+At release, now becomes synchronized execution epoch T0. The cached nominal
+trajectory is replayed from phase zero on a gated-reference topic. For a VBC
+violation the absolute waypoint deadline is re-based to
 
     T_deadline = T0 + max(0, t_sweep - safety_margin).
 
@@ -171,9 +171,6 @@ class VBCExecutionReferenceGate:
         with self._lock:
             if self._released:
                 return
-            # The upstream planner publishes an advancing suffix.  The longest
-            # message observed before release is therefore the earliest/fullest
-            # nominal command and is the one we want to replay from phase zero.
             if self._master_reference is None or duration > self._master_duration_s + 1e-9:
                 self._master_reference = copy.deepcopy(msg)
                 self._master_duration_s = duration
@@ -199,6 +196,7 @@ class VBCExecutionReferenceGate:
                 self._decision_repeat_count += 1
             if self._decision_repeat_count >= self.decision_stability_count:
                 self._decision = decision
+                self._waypoint_ready = False
                 self._release_reason = (
                     "vbc_violation_waiting_waypoint" if decision
                     else "vbc_safe_waiting_reference")
@@ -214,9 +212,12 @@ class VBCExecutionReferenceGate:
         if ready is None:
             return
         with self._lock:
-            if ready and not self._waypoint_ready:
+            current_violation_context = (
+                self._decision is True and self._frozen_sweep_time_s is not None)
+            if ready and current_violation_context and not self._waypoint_ready:
                 self._waypoint_ready = True
-                rospy.logwarn("[vbc_exec_gate] explicit visibility waypoint READY")
+                rospy.logwarn(
+                    "[vbc_exec_gate] explicit visibility waypoint READY for current frozen VBC target")
 
     def _frozen_sweep_callback(self, msg: Float32) -> None:
         if msg is None:
@@ -371,7 +372,7 @@ class VBCExecutionReferenceGate:
             "frozen_sweep_time_s": self._frozen_sweep_time_s,
             "safety_margin_s": self.safety_margin_s,
             "deadline_from_execution_start_s": (
-                None if not self._decision or self._frozen_sweep_time_s is None
+                None if self._decision is not True or self._frozen_sweep_time_s is None
                 else max(0.0, self._frozen_sweep_time_s - self.safety_margin_s)),
             "execution_start_ros_s": self._execution_start_ros_s,
             "synced_deadline_ros_s": self._synced_deadline_ros_s,
