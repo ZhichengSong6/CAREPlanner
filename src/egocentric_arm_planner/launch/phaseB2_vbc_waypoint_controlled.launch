@@ -1,5 +1,5 @@
 <launch>
-  <!-- Controlled VBC experiment: precompute -> soft intervention -> recovery -> replan. -->
+  <!-- Controlled VBC experiment: precompute -> soft intervention -> predictive/deadline recovery -> replan. -->
   <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
   <arg name="base_frame" default="base_link" />
   <arg name="ee_frame" default="EE_link" />
@@ -13,6 +13,17 @@
   <arg name="recovery_enabled" default="true" />
   <arg name="recovery_weight_scale" default="1.0" />
 
+  <!-- Phase C3 predictive recovery. The gate still publishes the physical VBC
+       deadline. The guard passes it through unchanged unless the current soft
+       MPC prediction stably predicts a miss; only then does it advance the
+       effective controller deadline so the validated recovery state machine
+       activates early. -->
+  <arg name="predictive_recovery_enabled" default="true" />
+  <arg name="predictive_recovery_error_threshold_inf" default="0.10" />
+  <arg name="predictive_recovery_min_improvement_inf" default="0.002" />
+  <arg name="predictive_recovery_consecutive_misses" default="3" />
+  <arg name="predictive_recovery_input_timeout" default="0.25" />
+
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
   <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
   <arg name="candidate_sweep_time_topic" default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
@@ -25,6 +36,7 @@
   <arg name="execution_ready_topic" default="/care_planner/execution/ready" />
   <arg name="execution_start_topic" default="/care_planner/execution/start_time" />
   <arg name="synced_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+  <arg name="effective_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_effective" />
   <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
   <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
   <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
@@ -76,6 +88,26 @@
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
 
+  <!-- Phase C3 supervisor. It observes the *soft* MPC prediction and preserves
+       the physical deadline topic for logging/ground truth. -->
+  <node pkg="egocentric_arm_planner" type="predictive_recovery_guard_node.py"
+        name="predictive_recovery_guard" output="screen">
+    <param name="enabled" value="$(arg predictive_recovery_enabled)" />
+    <param name="rate" value="20.0" />
+    <param name="input_timeout" value="$(arg predictive_recovery_input_timeout)" />
+    <param name="horizon_slack" value="$(arg waypoint_horizon_slack)" />
+    <param name="prediction_error_threshold_inf" value="$(arg predictive_recovery_error_threshold_inf)" />
+    <param name="min_prediction_improvement_inf" value="$(arg predictive_recovery_min_improvement_inf)" />
+    <param name="consecutive_misses_required" value="$(arg predictive_recovery_consecutive_misses)" />
+    <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
+    <param name="physical_deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="prediction_topic" value="/care_planner/mpc/predicted_trajectory" />
+    <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="summary_topic" value="/care_planner/execution/predictive_recovery_summary" />
+    <param name="triggered_topic" value="/care_planner/execution/predictive_recovery_triggered" />
+  </node>
+
   <node pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
         name="velocity_qp_mpc_waypoint_node" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
@@ -88,7 +120,7 @@
     <param name="mpc/visibility_waypoint/horizon_slack" value="$(arg waypoint_horizon_slack)" />
     <param name="mpc/visibility_waypoint/active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="mpc/visibility_waypoint/q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
-    <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg effective_deadline_topic)" />
     <param name="mpc/visibility_waypoint/recovery_enabled" value="$(arg recovery_enabled)" />
     <param name="mpc/visibility_waypoint/recovery_weight_scale" value="$(arg recovery_weight_scale)" />
     <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
