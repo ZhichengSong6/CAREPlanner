@@ -1,21 +1,6 @@
 <launch>
-  <!--
-    Controlled VBC deadline-waypoint experiment with PRECOMPUTE-BEFORE-EXECUTE.
-
-    Start the learned waypoint generator first in ncdf_l4c:
-      python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_node.py _device:=cpu
-
-    Sequence:
-      nominal plan -> VBC decision -> q_vis ready (if needed) -> release T0 ->
-      replay nominal reference from phase zero -> waypoint MPC.
-
-    The upstream RecedingHorizonPlanner remains unchanged. A reference gate is
-    started BEFORE the planner so it can capture the earliest/fullest command
-    trajectory and withhold it until pre-execution VBC work is complete.
-  -->
-
-  <arg name="config_file"
-       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <!-- Controlled VBC experiment: precompute -> soft intervention -> recovery -> replan. -->
+  <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
   <arg name="base_frame" default="base_link" />
   <arg name="ee_frame" default="EE_link" />
   <arg name="use_trajectory_visualizer" default="true" />
@@ -25,37 +10,29 @@
   <arg name="waypoint_horizon_slack" default="0.025" />
   <arg name="vbc_min_margin_s" default="0.30" />
   <arg name="seen_threshold" default="0.50" />
+  <arg name="recovery_enabled" default="true" />
+  <arg name="recovery_weight_scale" default="1.0" />
 
-  <arg name="initial_prior_ready_topic"
-       default="/care_planner/confidence_map/initial_prior_ready" />
-  <arg name="candidate_target_topic"
-       default="/care_planner/active_sensing/target_candidate" />
-  <arg name="candidate_sweep_time_topic"
-       default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
-  <arg name="frozen_target_topic"
-       default="/care_planner/active_sensing/target_point" />
-  <arg name="frozen_sweep_time_topic"
-       default="/care_planner/active_sensing/frozen_sweep_time_s" />
-  <arg name="legacy_candidate_target_topic"
-       default="/care_planner/active_sensing/legacy_target_candidate" />
+  <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
+  <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_sweep_time_topic" default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
+  <arg name="frozen_target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="frozen_sweep_time_topic" default="/care_planner/active_sensing/frozen_sweep_time_s" />
+  <arg name="legacy_candidate_target_topic" default="/care_planner/active_sensing/legacy_target_candidate" />
 
-  <!-- Synchronized execution topics. -->
-  <arg name="upstream_command_topic"
-       default="/care_planner/command_trajectory_candidate" />
-  <arg name="gated_command_topic"
-       default="/care_planner/command_trajectory_vbc_gated" />
-  <arg name="execution_ready_topic"
-       default="/care_planner/execution/ready" />
-  <arg name="execution_start_topic"
-       default="/care_planner/execution/start_time" />
-  <arg name="synced_deadline_topic"
-       default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+  <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
+  <arg name="gated_command_topic" default="/care_planner/command_trajectory_vbc_gated" />
+  <arg name="execution_ready_topic" default="/care_planner/execution/ready" />
+  <arg name="execution_start_topic" default="/care_planner/execution/start_time" />
+  <arg name="synced_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+  <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
+  <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
+  <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
 
   <arg name="enable_executed_vbc_logger" default="true" />
   <arg name="enable_waypoint_logger" default="true" />
   <arg name="trial_label" default="vbc_waypoint" />
-  <arg name="log_output_root"
-       default="$(find egocentric_arm_planner)/../../outputs/phase_b2_vbc_waypoint" />
+  <arg name="log_output_root" default="$(find egocentric_arm_planner)/../../outputs/phase_b2_vbc_waypoint" />
 
   <arg name="goal_x" default="0.286881" />
   <arg name="goal_y" default="0.0" />
@@ -66,19 +43,20 @@
   <arg name="goal_qw" default="0.70710678" />
   <arg name="goal_delay" default="0.5" />
 
-  <!-- IMPORTANT: start the gate before the planner so the first/full command
-       suffix cannot be missed. -->
-  <node pkg="egocentric_arm_planner"
-        type="vbc_execution_reference_gate_node.py"
-        name="vbc_execution_reference_gate"
-        output="screen">
+  <!-- Gate starts first so it captures the full nominal command. After a
+       recovery-complete event it stops the old reference, waits for a fresh
+       task-trajectory generation marker, installs the next replanned command,
+       and emits replan_ready. -->
+  <node pkg="egocentric_arm_planner" type="vbc_execution_reference_gate_node.py"
+        name="vbc_execution_reference_gate" output="screen">
     <param name="input_reference_topic" value="$(arg upstream_command_topic)" />
     <param name="output_reference_topic" value="$(arg gated_command_topic)" />
-    <param name="vbc_summary_topic"
-           value="/care_planner/trajectory_risk/vbc_summary" />
-    <param name="waypoint_summary_topic"
-           value="/care_planner/active_sensing/visibility_waypoint_summary" />
+    <param name="task_trajectory_topic" value="/care_planner/task_trajectory" />
+    <param name="vbc_summary_topic" value="/care_planner/trajectory_risk/vbc_summary" />
+    <param name="waypoint_summary_topic" value="/care_planner/active_sensing/visibility_waypoint_summary" />
     <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
     <param name="execution_start_topic" value="$(arg execution_start_topic)" />
     <param name="synced_deadline_topic" value="$(arg synced_deadline_topic)" />
@@ -89,9 +67,6 @@
     <param name="output_root" value="$(arg log_output_root)" />
   </node>
 
-  <!-- Nominal one-shot planner only; no TrajectoryExecutionManager. Its normal
-       command suffix is captured by the gate and is NOT consumed directly by
-       the waypoint MPC. -->
   <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -101,12 +76,8 @@
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
 
-  <!-- Dedicated exact quadratic deadline-waypoint MPC. It receives only the
-       synchronized gated reference and the re-based deadline. -->
-  <node pkg="egocentric_arm_planner"
-        type="velocity_qp_mpc_waypoint_node"
-        name="velocity_qp_mpc_waypoint_node"
-        output="screen">
+  <node pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
+        name="velocity_qp_mpc_waypoint_node" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
@@ -114,21 +85,21 @@
     <param name="mpc/visibility_waypoint/enabled" value="true" />
     <param name="mpc/visibility_waypoint/weight" value="$(arg waypoint_weight)" />
     <param name="mpc/visibility_waypoint/timeout" value="$(arg waypoint_timeout)" />
-    <param name="mpc/visibility_waypoint/horizon_slack"
-           value="$(arg waypoint_horizon_slack)" />
-    <param name="mpc/visibility_waypoint/active_topic"
-           value="/care_planner/active_sensing/visibility_waypoint_active" />
-    <param name="mpc/visibility_waypoint/q_topic"
-           value="/care_planner/active_sensing/visibility_waypoint_q" />
-    <param name="mpc/visibility_waypoint/deadline_topic"
-           value="$(arg synced_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/horizon_slack" value="$(arg waypoint_horizon_slack)" />
+    <param name="mpc/visibility_waypoint/active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="mpc/visibility_waypoint/q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
+    <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_enabled" value="$(arg recovery_enabled)" />
+    <param name="mpc/visibility_waypoint/recovery_weight_scale" value="$(arg recovery_weight_scale)" />
+    <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
   </node>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
 
-  <!-- Legacy risk path remains diagnostic-only. -->
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
@@ -138,7 +109,6 @@
     <arg name="show_attribution_markers" value="false" />
   </include>
 
-  <!-- VBC selector owns the real candidate and nominal sweep deadline. -->
   <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
@@ -147,17 +117,15 @@
     <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
   </include>
 
-  <!-- Freeze the first candidate and its matching sweep time. -->
-  <node pkg="egocentric_arm_planner"
-        type="phase_b2_controlled_trial_node.py"
-        name="phase_b2_controlled_trial"
-        output="screen">
+  <node pkg="egocentric_arm_planner" type="phase_b2_controlled_trial_node.py"
+        name="phase_b2_controlled_trial" output="screen">
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="goal_topic" value="/care_planner/ee_target_pose" />
     <param name="candidate_topic" value="$(arg candidate_target_topic)" />
     <param name="candidate_sweep_time_topic" value="$(arg candidate_sweep_time_topic)" />
     <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
     <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="require_initial_prior_ready" value="true" />
     <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
     <param name="publish_rate" value="20.0" />
@@ -171,31 +139,25 @@
     <param name="goal/qw" value="$(arg goal_qw)" />
   </node>
 
-  <!-- Actual executed body-sweep vs actual sensor-seen metric. -->
-  <include if="$(arg enable_executed_vbc_logger)"
-           file="$(find care_confidence_map)/launch/executed_vbc_logger.launch">
+  <include if="$(arg enable_executed_vbc_logger)" file="$(find care_confidence_map)/launch/executed_vbc_logger.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="target_topic" value="$(arg frozen_target_topic)" />
     <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
     <arg name="visibility_threshold" value="$(arg seen_threshold)" />
     <arg name="sweep_extra_margin" value="0.0" />
     <arg name="trial_label" value="$(arg trial_label)" />
-    <!-- Reuse metadata slot only for file naming; this is waypoint weight, not lambda_vis. -->
     <arg name="lambda_vis" value="$(arg waypoint_weight)" />
     <arg name="output_root" value="$(arg log_output_root)" />
   </include>
 
-  <node if="$(arg enable_waypoint_logger)"
-        pkg="egocentric_arm_planner"
+  <node if="$(arg enable_waypoint_logger)" pkg="egocentric_arm_planner"
         type="phase_b2_vbc_waypoint_logger_node.py"
-        name="phase_b2_vbc_waypoint_logger"
-        output="screen">
+        name="phase_b2_vbc_waypoint_logger" output="screen">
     <param name="trial_label" value="$(arg trial_label)" />
     <param name="waypoint_weight" value="$(arg waypoint_weight)" />
     <param name="output_root" value="$(arg log_output_root)" />
     <param name="target_topic" value="$(arg frozen_target_topic)" />
     <param name="mpc_summary_topic" value="/velocity_qp_mpc_waypoint_node/summary" />
-    <param name="generator_summary_topic"
-           value="/care_planner/active_sensing/visibility_waypoint_summary" />
+    <param name="generator_summary_topic" value="/care_planner/active_sensing/visibility_waypoint_summary" />
   </node>
 </launch>
