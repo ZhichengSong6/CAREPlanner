@@ -17,6 +17,10 @@ violation the absolute waypoint deadline is re-based to
 
     T_deadline = T0 + max(0, t_sweep - safety_margin).
 
+After release the same absolute T_deadline is re-published at the gate rate.
+The numerical deadline never moves; only message freshness is renewed so the
+MPC's waypoint timeout remains a useful fail-safe if this gate stops running.
+
 This removes projector/model latency from the robot's available visibility
 preparation time without modifying RecedingHorizonPlanner internals.
 """
@@ -120,6 +124,7 @@ class VBCExecutionReferenceGate:
         self._synced_deadline_ros_s: Optional[float] = None
         self._release_reason = "waiting_vbc_decision"
         self._publish_count = 0
+        self._deadline_publish_count = 0
 
         self.reference_pub = rospy.Publisher(
             self.output_reference_topic, JointTrajectory, queue_size=1)
@@ -256,6 +261,7 @@ class VBCExecutionReferenceGate:
         ready = Bool(); ready.data = True; self.ready_pub.publish(ready)
         if self._synced_deadline_ros_s is not None:
             d = Float64(); d.data = self._synced_deadline_ros_s; self.deadline_pub.publish(d)
+            self._deadline_publish_count += 1
 
         rospy.logwarn("[vbc_exec_gate] ================================================")
         rospy.logwarn("[vbc_exec_gate] EXECUTION RELEASED: reason=%s", self._release_reason)
@@ -264,9 +270,10 @@ class VBCExecutionReferenceGate:
             now, self._master_duration_s)
         if self._synced_deadline_ros_s is not None:
             rospy.logwarn(
-                "[vbc_exec_gate] synchronized VBC deadline: +%.6f s absolute=%.6f",
+                "[vbc_exec_gate] synchronized VBC deadline: +%.6f s absolute=%.6f; refreshing at %.1f Hz",
                 self._synced_deadline_ros_s - now,
-                self._synced_deadline_ros_s)
+                self._synced_deadline_ros_s,
+                self.publish_rate)
         rospy.logwarn("[vbc_exec_gate] ================================================")
         self._write_trace_locked()
 
@@ -357,7 +364,9 @@ class VBCExecutionReferenceGate:
                 f"master_duration={self._master_duration_s:.6f} "
                 f"execution_elapsed={elapsed:.6f} "
                 f"deadline_remaining={deadline_remaining:.6f} "
-                f"publish_count={self._publish_count} reason={self._release_reason}"
+                f"publish_count={self._publish_count} "
+                f"deadline_publish_count={self._deadline_publish_count} "
+                f"reason={self._release_reason}"
             )
         self.summary_pub.publish(msg)
 
@@ -380,6 +389,8 @@ class VBCExecutionReferenceGate:
             "master_points": 0 if self._master_reference is None else len(self._master_reference.points),
             "master_received_ros_s": self._master_received_ros_s,
             "reference_publish_count": self._publish_count,
+            "deadline_publish_count": self._deadline_publish_count,
+            "deadline_refresh_rate_hz": self.publish_rate,
             "release_reason": self._release_reason,
             "output_reference_topic": self.output_reference_topic,
             "trace_json": str(self.trace_path),
@@ -393,6 +404,7 @@ class VBCExecutionReferenceGate:
 
     def _timer_callback(self, _event) -> None:
         reference = None
+        deadline_msg = None
         with self._lock:
             if self._can_release_locked():
                 self._release_locked()
@@ -401,11 +413,23 @@ class VBCExecutionReferenceGate:
                     0.0, rospy.Time.now().to_sec() - self._execution_start_ros_s)
                 reference = self._suffix_from_phase(self._master_reference, elapsed)
                 self._publish_count += 1
+
+                # T_deadline is a fixed absolute time for this frozen VBC target.
+                # Re-publishing the same value only renews topic freshness so the
+                # MPC's 0.20 s timeout remains a fail-safe for a dead gate instead
+                # of expiring a perfectly valid static deadline during execution.
+                if self._synced_deadline_ros_s is not None:
+                    deadline_msg = Float64()
+                    deadline_msg.data = self._synced_deadline_ros_s
+                    self._deadline_publish_count += 1
+
                 if self._publish_count % 10 == 0:
                     self._write_trace_locked()
 
         if reference is not None and reference.points:
             self.reference_pub.publish(reference)
+        if deadline_msg is not None:
+            self.deadline_pub.publish(deadline_msg)
         self._publish_summary()
 
     def _on_shutdown(self) -> None:
