@@ -21,20 +21,24 @@
 namespace egocentric_arm_planner {
 
 /**
- * Experimental CAREPlanner VBC deadline-waypoint controller.
+ * CAREPlanner VBC deadline-waypoint controller with deadline-miss recovery.
  *
- * Base task tracking is identical in structure to VelocityQPMPC. When a fresh
- * active visibility waypoint is available, this controller adds one exact soft
- * quadratic configuration cost at the rolling horizon step at-or-before the
- * absolute visibility deadline:
+ * NORMAL:
+ *   J = J_task + J_control + J_smooth
  *
- *   J_vbc = w_vbc || q_kd - q_vis ||^2,
- *   q_kd = q_current + S_kd u.
+ * INTERVENTION (fresh active q_vis before deadline):
+ *   J = J_task + J_control + J_smooth
+ *       + w_vis ||q_kd - q_vis||^2
  *
- * Therefore both the Hessian and linear objective are updated for that cycle,
- * while joint position, velocity, and acceleration constraints remain hard.
- * If the waypoint is inactive, missing, stale, or still beyond the MPC horizon,
- * the cycle reduces to the Phase-A task-tracking QP.
+ * RECOVERY (deadline missed while target is still unseen):
+ *   J = J_control_effort + J_smooth
+ *       + w_vis ||q_K - q_vis||^2
+ *
+ * Task position/terminal tracking and nominal velocity tracking are removed in
+ * RECOVERY. Hard position/velocity/acceleration constraints are unchanged.
+ * Once the real visibility gate sets waypoint active=false, the controller
+ * enters RECOVERY_HOLD (regularization-only deceleration), emits a one-shot
+ * recovery-complete event, and waits for a newly replanned nominal reference.
  */
 class VelocityQPMPCWaypoint {
 public:
@@ -48,6 +52,7 @@ private:
   void waypointActiveCallback(const std_msgs::BoolConstPtr& msg);
   void waypointQCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void waypointDeadlineCallback(const std_msgs::Float64ConstPtr& msg);
+  void replanReadyCallback(const std_msgs::BoolConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
   bool loadConfig();
@@ -69,12 +74,19 @@ private:
   bool extractMeasuredQ(const sensor_msgs::JointState& msg,
                         Eigen::VectorXd& q) const;
 
+  void buildBounds(const Eigen::VectorXd& q_current,
+                   Eigen::VectorXd& lower,
+                   Eigen::VectorXd& upper) const;
   void buildBaseCycleQP(const Eigen::VectorXd& q_current,
                         const Eigen::MatrixXd& q_ref,
                         const Eigen::MatrixXd& u_ref,
                         Eigen::VectorXd& gradient,
                         Eigen::VectorXd& lower,
                         Eigen::VectorXd& upper) const;
+  void buildRegularizationCycleQP(const Eigen::VectorXd& q_current,
+                                  Eigen::VectorXd& gradient,
+                                  Eigen::VectorXd& lower,
+                                  Eigen::VectorXd& upper) const;
 
   bool solveWithPIQP(const Eigen::MatrixXd& hessian,
                      const Eigen::VectorXd& gradient,
@@ -93,6 +105,8 @@ private:
   void publishPrediction(const Eigen::MatrixXd& q_pred,
                          const Eigen::VectorXd& u_stack,
                          const std::string& frame_id);
+  void publishRecoveryActive(bool active);
+  void publishRecoveryComplete();
 
 private:
   ros::NodeHandle nh_;
@@ -103,11 +117,14 @@ private:
   ros::Subscriber waypoint_active_sub_;
   ros::Subscriber waypoint_q_sub_;
   ros::Subscriber waypoint_deadline_sub_;
+  ros::Subscriber replan_ready_sub_;
 
   ros::Publisher velocity_command_pub_;
   ros::Publisher prediction_pub_;
   ros::Publisher solve_time_pub_;
   ros::Publisher summary_pub_;
+  ros::Publisher recovery_active_pub_;
+  ros::Publisher recovery_complete_pub_;
   ros::Timer timer_;
 
   mutable std::mutex data_mutex_;
@@ -127,6 +144,13 @@ private:
   ros::Time latest_waypoint_deadline_received_;
   Eigen::VectorXd latest_waypoint_q_;
   double latest_waypoint_deadline_abs_s_ = 0.0;
+
+  bool recovery_enabled_ = true;
+  bool recovery_active_ = false;
+  bool recovery_hold_ = false;
+  bool recovery_complete_published_ = false;
+  bool replan_ready_received_ = false;
+  double recovery_weight_scale_ = 1.0;
 
   std::vector<std::string> joint_names_;
   int dof_ = 7;
@@ -176,12 +200,19 @@ private:
       "/care_planner/active_sensing/visibility_waypoint_q";
   std::string waypoint_deadline_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_deadline";
+  std::string recovery_active_topic_ =
+      "/care_planner/execution/visibility_recovery_active";
+  std::string recovery_complete_topic_ =
+      "/care_planner/execution/visibility_recovery_complete";
+  std::string replan_ready_topic_ =
+      "/care_planner/execution/visibility_replan_ready";
 
   Eigen::MatrixXd S_;
   Eigen::MatrixXd S_terminal_;
   Eigen::MatrixXd D_;
   Eigen::MatrixXd G_;
   Eigen::MatrixXd H_base_;
+  Eigen::MatrixXd H_regularization_;
   Eigen::VectorXd x_lower_;
   Eigen::VectorXd x_upper_;
 
