@@ -1,0 +1,68 @@
+<launch>
+  <!-- Phase C1: generate nominal trajectories only; robot is never commanded. -->
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+  <arg name="base_frame" default="base_link" />
+
+  <arg name="num_goals" default="20" />
+  <arg name="random_seed" default="20260820" />
+  <arg name="select_num_cases" default="12" />
+  <arg name="safety_margin_s" default="0.30" />
+  <arg name="goals_file" default="" />
+
+  <arg name="output_root"
+       default="$(find egocentric_arm_planner)/../../outputs/phase_c1_vbc_prescreen" />
+  <arg name="output_path"
+       default="$(arg output_root)/vbc_robustness_prescreen.json" />
+  <arg name="waypoint_trace_dir"
+       default="$(arg output_root)/waypoint_traces" />
+
+  <!-- Fixed q0 + varying EE goal. No execution manager / MPC / interactive marker. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="false" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch" />
+
+  <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="output_target_topic" value="/care_planner/active_sensing/target_candidate" />
+    <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+    <arg name="min_visibility_before_sweep_margin_s" value="$(arg safety_margin_s)" />
+  </include>
+
+  <!-- required=true intentionally shuts this launch down when screening ends. -->
+  <node pkg="egocentric_arm_planner"
+        type="vbc_robustness_prescreen_node.py"
+        name="vbc_robustness_prescreen"
+        output="screen"
+        required="true">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="num_goals" value="$(arg num_goals)" />
+    <param name="random_seed" value="$(arg random_seed)" />
+    <param name="select_num_cases" value="$(arg select_num_cases)" />
+    <param name="safety_margin_s" value="$(arg safety_margin_s)" />
+    <param name="goals_file" value="$(arg goals_file)" />
+    <param name="output_path" value="$(arg output_path)" />
+    <param name="waypoint_trace_dir" value="$(arg waypoint_trace_dir)" />
+
+    <!-- Conservative reachable box around the currently validated operating region. -->
+    <param name="goal_bounds/x_min" value="0.22" />
+    <param name="goal_bounds/x_max" value="0.46" />
+    <param name="goal_bounds/y_min" value="-0.26" />
+    <param name="goal_bounds/y_max" value="0.26" />
+    <param name="goal_bounds/z_min" value="0.40" />
+    <param name="goal_bounds/z_max" value="0.72" />
+
+    <!-- Hold orientation fixed in C1 so only trajectory geometry changes. -->
+    <param name="goal_orientation/qx" value="0.0" />
+    <param name="goal_orientation/qy" value="0.0" />
+    <param name="goal_orientation/qz" value="0.70710678" />
+    <param name="goal_orientation/qw" value="0.70710678" />
+  </node>
+</launch>
