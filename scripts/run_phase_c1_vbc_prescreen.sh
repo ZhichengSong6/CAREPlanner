@@ -10,16 +10,10 @@ SEED="${SEED:-20260820}"
 cd "${REPO}"
 source devel/setup.bash
 
-# Preserve any previous C1 run instead of mixing traces/results across runs.
-if [ -d "${OUT}" ] && [ -n "$(find "${OUT}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
-  PREV_STAMP="$(date +%Y%m%d_%H%M%S)"
-  mv "${OUT}" "${OUT}_previous_${PREV_STAMP}"
-fi
-mkdir -p "${OUT}/waypoint_traces" "${LOG}/ros"
-
-# Isolate roslaunch logs for this experiment. This avoids the global
-# ~/.ros/log >1GB warning without deleting the user's existing ROS logs.
-export ROS_LOG_DIR="${LOG}/ros"
+# Phase C1 is a deterministic prescreen. Do not retain or mix old runs: every
+# invocation starts from an empty experiment output/log directory.
+rm -rf "${OUT}" "${LOG}"
+mkdir -p "${OUT}/waypoint_traces" "${LOG}"
 
 # Start Gazebo separately before this script. It supplies TF + JointState but no
 # execution node is launched in Phase C1, so q0 remains fixed.
@@ -95,8 +89,7 @@ echo "[RUN] deterministic Phase-C1 prescreen: NUM_GOALS=${NUM_GOALS}, SEED=${SEE
 
 # Run roslaunch in the background. The prescreen node exits normally when all
 # goals are processed; this wrapper then shuts the remaining read-only nodes
-# down cleanly instead of using required=true (which prints a misleading
-# "REQUIRED process has died" banner even on success).
+# down cleanly.
 roslaunch egocentric_arm_planner phaseC1_vbc_prescreen.launch \
   num_goals:="${NUM_GOALS}" \
   random_seed:="${SEED}" \
@@ -141,7 +134,7 @@ wait "${LAUNCH_PID}" 2>/dev/null || true
 LAUNCH_PID=""
 
 # Replace topic-race-prone projector fields with the authoritative trace result
-# and rebuild the difficulty selection.  require-all makes trace pairing a hard
+# and rebuild the difficulty selection. require-all makes trace pairing a hard
 # validation gate before any benchmark cases are accepted.
 python3 scripts/finalize_phase_c1_vbc_prescreen.py \
   --input "${OUT}/vbc_robustness_prescreen.json" \
@@ -157,4 +150,5 @@ p=Path("${OUT}/vbc_robustness_prescreen.json")
 d=json.loads(p.read_text())
 print(json.dumps(d.get("summary", {}), indent=2))
 print("selected_case_ids:", d.get("selected_case_ids", []))
+print("projector_trace_pairing_summary:", d.get("projector_trace_pairing_summary", {}))
 PY
