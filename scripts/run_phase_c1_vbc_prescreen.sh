@@ -9,7 +9,17 @@ SEED="${SEED:-20260820}"
 
 cd "${REPO}"
 source devel/setup.bash
-mkdir -p "${OUT}/waypoint_traces" "${LOG}"
+
+# Preserve any previous C1 run instead of mixing traces/results across runs.
+if [ -d "${OUT}" ] && [ -n "$(find "${OUT}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+  PREV_STAMP="$(date +%Y%m%d_%H%M%S)"
+  mv "${OUT}" "${OUT}_previous_${PREV_STAMP}"
+fi
+mkdir -p "${OUT}/waypoint_traces" "${LOG}/ros"
+
+# Isolate roslaunch logs for this experiment. This avoids the global
+# ~/.ros/log >1GB warning without deleting the user's existing ROS logs.
+export ROS_LOG_DIR="${LOG}/ros"
 
 # Start Gazebo separately before this script. It supplies TF + JointState but no
 # execution node is launched in Phase C1, so q0 remains fixed.
@@ -29,7 +39,12 @@ else
 fi
 
 GEN_PID=""
+LAUNCH_PID=""
 cleanup() {
+  if [ -n "${LAUNCH_PID}" ] && kill -0 "${LAUNCH_PID}" 2>/dev/null; then
+    kill -INT "${LAUNCH_PID}" 2>/dev/null || true
+    wait "${LAUNCH_PID}" 2>/dev/null || true
+  fi
   if [ -n "${GEN_PID}" ] && kill -0 "${GEN_PID}" 2>/dev/null; then
     kill -INT "${GEN_PID}" 2>/dev/null || true
     wait "${GEN_PID}" 2>/dev/null || true
@@ -78,13 +93,52 @@ fi
 echo "[READY] frozen VisCDF loaded"
 echo "[RUN] deterministic Phase-C1 prescreen: NUM_GOALS=${NUM_GOALS}, SEED=${SEED}"
 
+# Run roslaunch in the background. The prescreen node exits normally when all
+# goals are processed; this wrapper then shuts the remaining read-only nodes
+# down cleanly instead of using required=true (which prints a misleading
+# "REQUIRED process has died" banner even on success).
 roslaunch egocentric_arm_planner phaseC1_vbc_prescreen.launch \
   num_goals:="${NUM_GOALS}" \
   random_seed:="${SEED}" \
   select_num_cases:=12 \
   safety_margin_s:=0.30 \
   output_root:="${OUT}" \
-  2>&1 | tee "${LOG}/prescreen_launch.log"
+  > >(tee "${LOG}/prescreen_launch.log") 2>&1 &
+LAUNCH_PID=$!
+
+DONE=0
+for _ in $(seq 1 600); do
+  if [ -f "${OUT}/vbc_robustness_prescreen.json" ]; then
+    DONE=$(python3 - <<PY
+import json
+from pathlib import Path
+p=Path("${OUT}/vbc_robustness_prescreen.json")
+try:
+    d=json.loads(p.read_text())
+    print(1 if int(d.get("summary", {}).get("num_attempted", -1)) >= int("${NUM_GOALS}") else 0)
+except Exception:
+    print(0)
+PY
+)
+    if [ "${DONE}" = "1" ]; then
+      break
+    fi
+  fi
+  if ! kill -0 "${LAUNCH_PID}" 2>/dev/null; then
+    echo "[ERROR] Phase-C1 roslaunch exited before completion"
+    exit 1
+  fi
+  sleep 0.25
+done
+
+if [ "${DONE}" != "1" ]; then
+  echo "[ERROR] Phase-C1 prescreen did not finish within 150 s"
+  exit 1
+fi
+
+kill -INT "${LAUNCH_PID}" 2>/dev/null || true
+wait "${LAUNCH_PID}" 2>/dev/null || true
+LAUNCH_PID=""
 
 echo
 python3 - <<PY
