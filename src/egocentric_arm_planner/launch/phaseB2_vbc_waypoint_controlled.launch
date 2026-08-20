@@ -1,13 +1,17 @@
 <launch>
   <!--
-    Controlled VBC deadline-waypoint experiment.
+    Controlled VBC deadline-waypoint experiment with PRECOMPUTE-BEFORE-EXECUTE.
 
-    The learned waypoint generator is intentionally NOT launched here because it
-    runs in the ncdf_l4c conda environment. Start it first with:
+    Start the learned waypoint generator first in ncdf_l4c:
       python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_node.py _device:=cpu
 
-    This launch owns robot actuation through velocity_qp_mpc_waypoint_node.
-    Do not run the legacy velocity_qp_mpc_node or TrajectoryExecutionManager.
+    Sequence:
+      nominal plan -> VBC decision -> q_vis ready (if needed) -> release T0 ->
+      replay nominal reference from phase zero -> waypoint MPC.
+
+    The upstream RecedingHorizonPlanner remains unchanged.  A reference gate
+    captures its earliest/fullest command trajectory and withholds it from the
+    waypoint MPC until the VBC pre-execution stage is complete.
   -->
 
   <arg name="config_file"
@@ -35,6 +39,18 @@
   <arg name="legacy_candidate_target_topic"
        default="/care_planner/active_sensing/legacy_target_candidate" />
 
+  <!-- Synchronized execution topics. -->
+  <arg name="upstream_command_topic"
+       default="/care_planner/command_trajectory_candidate" />
+  <arg name="gated_command_topic"
+       default="/care_planner/command_trajectory_vbc_gated" />
+  <arg name="execution_ready_topic"
+       default="/care_planner/execution/ready" />
+  <arg name="execution_start_topic"
+       default="/care_planner/execution/start_time" />
+  <arg name="synced_deadline_topic"
+       default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+
   <arg name="enable_executed_vbc_logger" default="true" />
   <arg name="enable_waypoint_logger" default="true" />
   <arg name="trial_label" default="vbc_waypoint" />
@@ -50,7 +66,9 @@
   <arg name="goal_qw" default="0.70710678" />
   <arg name="goal_delay" default="0.5" />
 
-  <!-- Nominal one-shot planner only; no TrajectoryExecutionManager. -->
+  <!-- Nominal one-shot planner only; no TrajectoryExecutionManager.  Its normal
+       command suffix is captured by vbc_execution_reference_gate and is NOT
+       consumed directly by the waypoint MPC. -->
   <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -60,7 +78,32 @@
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
 
-  <!-- Dedicated exact quadratic deadline-waypoint MPC. -->
+  <!-- Pre-execution reference gate.  It stores the longest upstream command,
+       waits for a stable VBC decision and (for violations) q_vis readiness,
+       then defines T0 and replays the stored trajectory from phase zero. -->
+  <node pkg="egocentric_arm_planner"
+        type="vbc_execution_reference_gate_node.py"
+        name="vbc_execution_reference_gate"
+        output="screen">
+    <param name="input_reference_topic" value="$(arg upstream_command_topic)" />
+    <param name="output_reference_topic" value="$(arg gated_command_topic)" />
+    <param name="vbc_summary_topic"
+           value="/care_planner/trajectory_risk/vbc_summary" />
+    <param name="waypoint_summary_topic"
+           value="/care_planner/active_sensing/visibility_waypoint_summary" />
+    <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
+    <param name="synced_deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="publish_rate" value="20.0" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="decision_stability_count" value="2" />
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="output_root" value="$(arg log_output_root)" />
+  </node>
+
+  <!-- Dedicated exact quadratic deadline-waypoint MPC.  It receives only the
+       synchronized gated reference and the re-based deadline. -->
   <node pkg="egocentric_arm_planner"
         type="velocity_qp_mpc_waypoint_node"
         name="velocity_qp_mpc_waypoint_node"
@@ -68,8 +111,7 @@
     <rosparam command="load" file="$(arg config_file)" />
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
-    <param name="mpc/reference_trajectory"
-           value="/care_planner/command_trajectory_candidate" />
+    <param name="mpc/reference_trajectory" value="$(arg gated_command_topic)" />
     <param name="mpc/visibility_waypoint/enabled" value="true" />
     <param name="mpc/visibility_waypoint/weight" value="$(arg waypoint_weight)" />
     <param name="mpc/visibility_waypoint/timeout" value="$(arg waypoint_timeout)" />
@@ -80,7 +122,7 @@
     <param name="mpc/visibility_waypoint/q_topic"
            value="/care_planner/active_sensing/visibility_waypoint_q" />
     <param name="mpc/visibility_waypoint/deadline_topic"
-           value="/care_planner/active_sensing/visibility_waypoint_deadline" />
+           value="$(arg synced_deadline_topic)" />
   </node>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
