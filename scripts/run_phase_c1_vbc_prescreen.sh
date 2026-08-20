@@ -140,6 +140,15 @@ kill -INT "${LAUNCH_PID}" 2>/dev/null || true
 wait "${LAUNCH_PID}" 2>/dev/null || true
 LAUNCH_PID=""
 
+# Replace topic-race-prone projector fields with the authoritative trace result
+# and rebuild the difficulty selection.  require-all makes trace pairing a hard
+# validation gate before any benchmark cases are accepted.
+python3 scripts/finalize_phase_c1_vbc_prescreen.py \
+  --input "${OUT}/vbc_robustness_prescreen.json" \
+  --trace-dir "${OUT}/waypoint_traces" \
+  --select-num 12 \
+  --require-all
+
 echo
 python3 - <<PY
 import json
