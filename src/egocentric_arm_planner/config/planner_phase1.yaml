@@ -125,7 +125,7 @@ mpc:
   #   weight * ||q(k_deadline) - q_vis||^2.
   visibility_waypoint:
     enabled: false
-    weight: 100.0
+    weight: 3000.0
     timeout: 0.20
     horizon_slack: 0.025
     active_topic: /care_planner/active_sensing/visibility_waypoint_active
