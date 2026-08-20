@@ -36,12 +36,11 @@
     <arg name="min_visibility_before_sweep_margin_s" value="$(arg safety_margin_s)" />
   </include>
 
-  <!-- required=true intentionally shuts this launch down when screening ends. -->
+  <!-- The wrapper stops roslaunch after the prescreen JSON reports completion. -->
   <node pkg="egocentric_arm_planner"
         type="vbc_robustness_prescreen_node.py"
         name="vbc_robustness_prescreen"
-        output="screen"
-        required="true">
+        output="screen">
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="num_goals" value="$(arg num_goals)" />
     <param name="random_seed" value="$(arg random_seed)" />
@@ -50,6 +49,7 @@
     <param name="goals_file" value="$(arg goals_file)" />
     <param name="output_path" value="$(arg output_path)" />
     <param name="waypoint_trace_dir" value="$(arg waypoint_trace_dir)" />
+    <param name="inter_goal_delay_s" value="1.10" />
 
     <!-- Conservative reachable box around the currently validated operating region. -->
     <param name="goal_bounds/x_min" value="0.22" />
