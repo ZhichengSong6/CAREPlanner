@@ -15,24 +15,23 @@
       <uri>model://ground_plane</uri>
     </include>
 
-    <!-- Simple visual reference objects for first sensor testing.
-         If they are not in the link4 sensor FOV, move them in Gazebo. -->
+    <!--
+      Phase-C2 visibility robustness benchmark uses a genuinely empty world.
+      The legacy sensor-test objects are intentionally disabled below so they
+      cannot affect the frozen Phase-C1 trajectories or the executed motion.
+
     <model name="test_box_front">
       <static>true</static>
       <pose>0.35 0 0.35 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.25 0.25 0.25</size>
-            </box>
+            <box><size>0.25 0.25 0.25</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.25 0.25 0.25</size>
-            </box>
+            <box><size>0.25 0.25 0.25</size></box>
           </geometry>
           <material>
             <ambient>0.8 0.2 0.2 1</ambient>
@@ -42,24 +41,18 @@
       </link>
     </model>
 
-    <!-- Left-side obstacle box.
-         Positive y is treated as the left side here. -->
     <model name="test_box_left">
       <static>true</static>
       <pose>0.10 0.35 0.30 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.20 0.18 0.25</size>
-            </box>
+            <box><size>0.20 0.18 0.25</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.20 0.18 0.25</size>
-            </box>
+            <box><size>0.20 0.18 0.25</size></box>
           </geometry>
           <material>
             <ambient>0.2 0.8 0.3 1</ambient>
@@ -69,24 +62,18 @@
       </link>
     </model>
 
-    <!-- Right-side obstacle box.
-         Negative y is treated as the right side here. -->
     <model name="test_box_right">
       <static>true</static>
       <pose>0.15 -0.25 0.10 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.35 0.15 0.15</size>
-            </box>
+            <box><size>0.35 0.15 0.15</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.35 0.15 0.15</size>
-            </box>
+            <box><size>0.35 0.15 0.15</size></box>
           </geometry>
           <material>
             <ambient>0.9 0.7 0.2 1</ambient>
@@ -102,16 +89,12 @@
       <link name="link">
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.05 1.0 1.0</size>
-            </box>
+            <box><size>0.05 1.0 1.0</size></box>
           </geometry>
         </collision>
         <visual name="visual">
           <geometry>
-            <box>
-              <size>0.05 1.0 0.8</size>
-            </box>
+            <box><size>0.05 1.0 0.8</size></box>
           </geometry>
           <material>
             <ambient>0.2 0.6 0.9 1</ambient>
@@ -120,5 +103,6 @@
         </visual>
       </link>
     </model>
+    -->
   </world>
 </sdf>
