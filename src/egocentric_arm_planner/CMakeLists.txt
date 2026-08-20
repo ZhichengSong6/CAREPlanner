@@ -148,6 +148,7 @@ add_dependencies(ee_interactive_marker_node
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(ee_interactive_marker_node
+  egocentric_arm_planner
   ${catkin_LIBRARIES}
 )
 
@@ -158,6 +159,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_b2_steering_logger_node.py
   scripts/phase_b2_vbc_waypoint_logger_node.py
   scripts/vbc_execution_reference_gate_node.py
+  scripts/vbc_robustness_prescreen_node.py
   scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
