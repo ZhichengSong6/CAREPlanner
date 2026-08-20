@@ -14,30 +14,14 @@ joint_names:
   - wrist_joint3
 
 sensors:
-  - id: 0
-    name: link2_sensor1
-    frame: link2_sensor1_tof_link
-  - id: 1
-    name: link2_sensor2
-    frame: link2_sensor2_tof_link
-  - id: 2
-    name: link3_sensor1
-    frame: link3_sensor1_tof_link
-  - id: 3
-    name: link3_sensor2
-    frame: link3_sensor2_tof_link
-  - id: 4
-    name: link4_sensor1
-    frame: link4_sensor1_tof_link
-  - id: 5
-    name: link4_sensor2
-    frame: link4_sensor2_tof_link
-  - id: 6
-    name: ee_sensor1
-    frame: EE_sensor1_tof_link
-  - id: 7
-    name: ee_sensor2
-    frame: EE_sensor2_tof_link
+  - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
+  - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
+  - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
+  - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
+  - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
+  - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
+  - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
+  - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}
 
 ik:
   position_weight: 1.0
@@ -53,10 +37,8 @@ task_generator:
   trajectory_dt: 0.02
   use_quintic: true
   enable_time_scaling: true
-
   min_plan_duration: 0.05
   max_plan_duration: 5.0
-
   nominal_max_joint_velocity: 2.0
   joint_velocity_limits:
     joint1: 2.0
@@ -66,7 +48,6 @@ task_generator:
     wrist_joint1: 2.5
     wrist_joint2: 2.5
     wrist_joint3: 2.5
-
   nominal_max_joint_acceleration: 10.0
   joint_acceleration_limits:
     joint1: 3.0
@@ -76,11 +57,9 @@ task_generator:
     wrist_joint1: 6.0
     wrist_joint2: 6.0
     wrist_joint3: 6.0
-
   enforce_velocity_acceleration_limits: true
   duration_limit_check_iterations: 6
   duration_limit_check_margin: 1.02
-
   reject_large_joint_jump: true
   max_joint_jump_inf_norm: 3.0
 
@@ -89,28 +68,20 @@ intervention:
   hold_duration: 0.5
   command_dt: 0.02
 
-# Nominal planner: one planning attempt per new EE target. After a successful
-# plan, only the advancing suffix is republished; IK is not rerun. Retarget
-# velocity/acceleration boundary conditions come from actual MPC command history.
 receding_horizon:
   planning_rate: 20.0
   mpc_command_topic: /care_arm/arm_group_velocity_controller/command
   mpc_command_timeout: 0.20
 
-# C++ velocity QP-MPC. Tracking is a soft objective. Joint position, velocity,
-# and acceleration remain hard constraints. Legacy B.2 visibility remains
-# disabled by default so Phase-A behavior is unchanged.
 mpc:
   rate: 20.0
   horizon_duration: 1.0
   num_intervals: 20
-
   q_tracking_weight: 50.0
   terminal_q_tracking_weight: 100.0
   u_tracking_weight: 2.0
   u_smooth_weight: 1.0
 
-  # Legacy B.2-v2/v3 sequential linear visibility steering.
   visibility:
     enabled: false
     weight: 0.0
@@ -119,10 +90,12 @@ mpc:
     active_topic: /care_planner/active_sensing/acquisition_active
     gradient_topic: /care_planner/active_sensing/normalized_gradient_q
 
-  # New Visibility-Before-Contact (VBC) deadline-waypoint objective. The
-  # dedicated velocity_qp_mpc_waypoint_node uses this group; ordinary Phase-A
-  # launches keep it disabled. Its exact soft cost is
-  #   weight * ||q(k_deadline) - q_vis||^2.
+  # VBC soft intervention before the deadline. If the deadline is missed while
+  # the target is still unseen, the dedicated waypoint MPC switches to recovery:
+  # task q/terminal/u-reference tracking is removed, hard constraints remain,
+  # and q_vis becomes a terminal horizon objective. After the real sensor sees
+  # the target, the controller holds/decelerates until a measured-state replan
+  # of the original EE task is installed by the reference gate.
   visibility_waypoint:
     enabled: false
     weight: 3000.0
@@ -131,9 +104,13 @@ mpc:
     active_topic: /care_planner/active_sensing/visibility_waypoint_active
     q_topic: /care_planner/active_sensing/visibility_waypoint_q
     deadline_topic: /care_planner/active_sensing/visibility_waypoint_deadline
+    recovery_enabled: true
+    recovery_weight_scale: 1.0
+    recovery_active_topic: /care_planner/execution/visibility_recovery_active
+    recovery_complete_topic: /care_planner/execution/visibility_recovery_complete
+    replan_ready_topic: /care_planner/execution/visibility_replan_ready
 
   joint_position_margin: 0.01
-
   joint_position_limits:
     joint1: {lower: -3.14, upper: 3.14}
     joint2: {lower: -2.30, upper: 2.30}
@@ -142,7 +119,6 @@ mpc:
     wrist_joint1: {lower: -3.14, upper: 3.14}
     wrist_joint2: {lower: -3.14, upper: 3.14}
     wrist_joint3: {lower: -1.20, upper: 1.20}
-
   joint_velocity_limits:
     joint1: 2.0
     joint2: 2.0
@@ -151,7 +127,6 @@ mpc:
     wrist_joint1: 2.5
     wrist_joint2: 2.5
     wrist_joint3: 2.5
-
   joint_acceleration_limits:
     joint1: 3.0
     joint2: 3.0
@@ -160,14 +135,12 @@ mpc:
     wrist_joint1: 6.0
     wrist_joint2: 6.0
     wrist_joint3: 6.0
-
   piqp:
     max_iterations: 100
     eps_abs: 0.000001
     eps_rel: 0.000001
     verbose: false
     compute_timings: true
-
   joint_states: /care_arm/joint_states
   reference_trajectory: /care_planner/command_trajectory_candidate
   output_velocity_command: /care_arm/arm_group_velocity_controller/command
