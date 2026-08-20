@@ -11,18 +11,13 @@ from std_msgs.msg import Bool, Float32, String
 class PhaseB2ControlledTrialNode:
     """Publish one fixed EE goal and freeze the first VBC target + sweep time.
 
-    Deterministic controlled-trial sequence:
-      1. wait until the one-shot initial trusted-free prior is ready;
-      2. publish exactly one latched EE goal;
-      3. receive the first VBC candidate point;
-      4. pair it with the immediately following selector sweep-time message;
-      5. freeze both x* and t_sweep for the rest of the trial;
-      6. republish the frozen target at a fixed rate while the frozen sweep time
-         is latched on its own topic.
+    The first goal generates the frozen Phase-B2/C2 case. If deadline-miss
+    recovery later succeeds, the MPC emits a one-shot recovery-complete event.
+    This node then republishes the *same original EE goal* exactly once, asking
+    RecedingHorizonPlanner to replan from the robot's measured post-recovery q.
 
-    Pairing the candidate and sweep time here avoids a race in downstream NCDF
-    waypoint generation: trajectory_vbc_selector publishes target first and its
-    selected sweep time immediately afterward.
+    The first VBC target/sweep remains frozen throughout the trial; recovery
+    replanning does not silently select a different benchmark target.
     """
 
     def __init__(self):
@@ -40,6 +35,9 @@ class PhaseB2ControlledTrialNode:
         self.frozen_sweep_time_topic = str(rospy.get_param(
             "~frozen_sweep_time_topic",
             "/care_planner/active_sensing/frozen_sweep_time_s"))
+        self.recovery_complete_topic = str(rospy.get_param(
+            "~recovery_complete_topic",
+            "/care_planner/execution/visibility_recovery_complete"))
         self.require_initial_prior_ready = bool(rospy.get_param("~require_initial_prior_ready", True))
         self.initial_prior_ready_topic = str(rospy.get_param(
             "~initial_prior_ready_topic",
@@ -65,6 +63,8 @@ class PhaseB2ControlledTrialNode:
 
         self._startup_time = rospy.Time.now()
         self._goal_sent = False
+        self._replan_goal_sent = False
+        self._replan_count = 0
         self._frozen_target = None
         self._frozen_sweep_time = None
         self._pending_candidate = None
@@ -78,12 +78,14 @@ class PhaseB2ControlledTrialNode:
         self.frozen_pub = rospy.Publisher("~target_frozen", Bool, queue_size=1, latch=True)
         self.summary_pub = rospy.Publisher("~summary", String, queue_size=1, latch=True)
 
-        self.candidate_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.candidate_topic, PointStamped, self._candidate_callback, queue_size=1)
-        self.sweep_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.candidate_sweep_time_topic, Float32, self._candidate_sweep_callback, queue_size=1)
-        self.initial_prior_ready_sub = rospy.Subscriber(
+        rospy.Subscriber(
             self.initial_prior_ready_topic, Bool, self._initial_prior_ready_callback, queue_size=1)
+        rospy.Subscriber(
+            self.recovery_complete_topic, Bool, self._recovery_complete_callback, queue_size=1)
 
         self.goal_timer = rospy.Timer(rospy.Duration(0.05), self._goal_timer_callback)
         self.target_timer = rospy.Timer(
@@ -97,12 +99,41 @@ class PhaseB2ControlledTrialNode:
             self.goal_x, self.goal_y, self.goal_z,
             self.goal_qx, self.goal_qy, self.goal_qz, self.goal_qw)
         rospy.loginfo(
-            "[phase_b2_trial] candidate=%s candidate_sweep=%s frozen_target=%s frozen_sweep=%s",
-            self.candidate_topic, self.candidate_sweep_time_topic,
-            self.frozen_target_topic, self.frozen_sweep_time_topic)
+            "[phase_b2_trial] recovery_complete=%s; successful recovery republishes the original EE goal once",
+            self.recovery_complete_topic)
 
     def _publish_frozen_state(self, frozen):
         msg = Bool(); msg.data = bool(frozen); self.frozen_pub.publish(msg)
+
+    def _goal_message(self):
+        goal = PoseStamped()
+        goal.header.stamp = rospy.Time.now()
+        goal.header.frame_id = self.base_frame
+        goal.pose.position.x = self.goal_x
+        goal.pose.position.y = self.goal_y
+        goal.pose.position.z = self.goal_z
+        goal.pose.orientation.x = self.goal_qx
+        goal.pose.orientation.y = self.goal_qy
+        goal.pose.orientation.z = self.goal_qz
+        goal.pose.orientation.w = self.goal_qw
+        return goal
+
+    def _publish_summary_locked(self):
+        summary = String()
+        if self._frozen_target is None or self._frozen_sweep_time is None:
+            summary.data = "frozen=0 replan_count={}".format(self._replan_count)
+        else:
+            summary.data = (
+                "frozen_target=[{:.9f},{:.9f},{:.9f}] frame={} "
+                "frozen_sweep_time_s={:.9f} replan_count={}"
+            ).format(
+                self._frozen_target.point.x,
+                self._frozen_target.point.y,
+                self._frozen_target.point.z,
+                self.base_frame,
+                self._frozen_sweep_time,
+                self._replan_count)
+        self.summary_pub.publish(summary)
 
     def _initial_prior_ready_callback(self, msg):
         if msg is None or not bool(msg.data):
@@ -128,22 +159,29 @@ class PhaseB2ControlledTrialNode:
             if self.goal_pub.get_num_connections() <= 0:
                 rospy.logwarn_throttle(1.0, "[phase_b2_trial] waiting for EE-goal subscriber")
                 return
-
-            goal = PoseStamped()
-            goal.header.stamp = rospy.Time.now()
-            goal.header.frame_id = self.base_frame
-            goal.pose.position.x = self.goal_x
-            goal.pose.position.y = self.goal_y
-            goal.pose.position.z = self.goal_z
-            goal.pose.orientation.x = self.goal_qx
-            goal.pose.orientation.y = self.goal_qy
-            goal.pose.orientation.z = self.goal_qz
-            goal.pose.orientation.w = self.goal_qw
+            goal = self._goal_message()
             self.goal_pub.publish(goal)
             self._goal_sent = True
             rospy.logwarn(
                 "[phase_b2_trial] FIXED EE GOAL PUBLISHED exactly once: p=[%.6f, %.6f, %.6f]",
                 self.goal_x, self.goal_y, self.goal_z)
+
+    def _recovery_complete_callback(self, msg):
+        if msg is None or not bool(msg.data):
+            return
+        with self._lock:
+            if not self._goal_sent or self._replan_goal_sent:
+                return
+            if self.goal_pub.get_num_connections() <= 0:
+                rospy.logerr("[phase_b2_trial] recovery complete but no EE-goal subscriber; cannot request replan")
+                return
+            goal = self._goal_message()
+            self.goal_pub.publish(goal)
+            self._replan_goal_sent = True
+            self._replan_count += 1
+            self._publish_summary_locked()
+        rospy.logwarn(
+            "[phase_b2_trial] RECOVERY COMPLETE -> REPUBLISHED ORIGINAL EE GOAL for one measured-state replan")
 
     def _candidate_callback(self, msg):
         if msg is None:
@@ -193,17 +231,7 @@ class PhaseB2ControlledTrialNode:
             sweep_msg = Float32(); sweep_msg.data = self._frozen_sweep_time
             self.sweep_pub.publish(sweep_msg)
             self._publish_frozen_state(True)
-
-            summary = String()
-            summary.data = (
-                "frozen_target=[{:.9f},{:.9f},{:.9f}] frame={} frozen_sweep_time_s={:.9f}"
-            ).format(
-                self._frozen_target.point.x,
-                self._frozen_target.point.y,
-                self._frozen_target.point.z,
-                self.base_frame,
-                self._frozen_sweep_time)
-            self.summary_pub.publish(summary)
+            self._publish_summary_locked()
 
             rospy.logwarn(
                 "[phase_b2_trial] VBC TARGET+SWEEP FROZEN: x=%.9f y=%.9f z=%.9f sweep=%.6f s",
