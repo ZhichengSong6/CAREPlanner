@@ -9,9 +9,9 @@
       nominal plan -> VBC decision -> q_vis ready (if needed) -> release T0 ->
       replay nominal reference from phase zero -> waypoint MPC.
 
-    The upstream RecedingHorizonPlanner remains unchanged.  A reference gate
-    captures its earliest/fullest command trajectory and withholds it from the
-    waypoint MPC until the VBC pre-execution stage is complete.
+    The upstream RecedingHorizonPlanner remains unchanged. A reference gate is
+    started BEFORE the planner so it can capture the earliest/fullest command
+    trajectory and withhold it until pre-execution VBC work is complete.
   -->
 
   <arg name="config_file"
@@ -66,21 +66,8 @@
   <arg name="goal_qw" default="0.70710678" />
   <arg name="goal_delay" default="0.5" />
 
-  <!-- Nominal one-shot planner only; no TrajectoryExecutionManager.  Its normal
-       command suffix is captured by vbc_execution_reference_gate and is NOT
-       consumed directly by the waypoint MPC. -->
-  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
-    <arg name="config_file" value="$(arg config_file)" />
-    <arg name="base_frame" value="$(arg base_frame)" />
-    <arg name="ee_frame" value="$(arg ee_frame)" />
-    <arg name="use_execution_manager" value="false" />
-    <arg name="use_interactive_marker" value="false" />
-    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
-  </include>
-
-  <!-- Pre-execution reference gate.  It stores the longest upstream command,
-       waits for a stable VBC decision and (for violations) q_vis readiness,
-       then defines T0 and replays the stored trajectory from phase zero. -->
+  <!-- IMPORTANT: start the gate before the planner so the first/full command
+       suffix cannot be missed. -->
   <node pkg="egocentric_arm_planner"
         type="vbc_execution_reference_gate_node.py"
         name="vbc_execution_reference_gate"
@@ -102,7 +89,19 @@
     <param name="output_root" value="$(arg log_output_root)" />
   </node>
 
-  <!-- Dedicated exact quadratic deadline-waypoint MPC.  It receives only the
+  <!-- Nominal one-shot planner only; no TrajectoryExecutionManager. Its normal
+       command suffix is captured by the gate and is NOT consumed directly by
+       the waypoint MPC. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
+  </include>
+
+  <!-- Dedicated exact quadratic deadline-waypoint MPC. It receives only the
        synchronized gated reference and the re-based deadline. -->
   <node pkg="egocentric_arm_planner"
         type="velocity_qp_mpc_waypoint_node"
