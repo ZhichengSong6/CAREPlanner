@@ -161,6 +161,7 @@ catkin_install_python(PROGRAMS
   scripts/vbc_execution_reference_gate_node.py
   scripts/vbc_robustness_prescreen_node.py
   scripts/predictive_recovery_guard_node.py
+  scripts/predicted_vbc_recovery_guard_node.py
   scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
