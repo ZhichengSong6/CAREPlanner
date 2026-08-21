@@ -30,15 +30,17 @@ namespace egocentric_arm_planner {
  *   J = J_task + J_control + J_smooth
  *       + w_vis ||q_kd - q_vis||^2
  *
- * RECOVERY (deadline missed while target is still unseen):
+ * VERIFICATION_HOLD (C4 audit temporarily unavailable):
+ *   J = J_control_effort + J_smooth
+ *
+ * RECOVERY (confirmed predicted VBC failure / legacy deadline trigger):
  *   J = J_control_effort + J_smooth
  *       + w_vis ||q_K - q_vis||^2
  *
  * Task position/terminal tracking and nominal velocity tracking are removed in
- * RECOVERY. Hard position/velocity/acceleration constraints are unchanged.
- * Once the real visibility gate sets waypoint active=false, the controller
- * enters RECOVERY_HOLD (regularization-only deceleration), emits a one-shot
- * recovery-complete event, and waits for a newly replanned nominal reference.
+ * VERIFICATION_HOLD and RECOVERY. Hard position/velocity/acceleration
+ * constraints are unchanged. VERIFICATION_HOLD is only a transient Bool input;
+ * it does not add another persistent controller state.
  */
 class VelocityQPMPCWaypoint {
 public:
@@ -52,6 +54,7 @@ private:
   void waypointActiveCallback(const std_msgs::BoolConstPtr& msg);
   void waypointQCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void waypointDeadlineCallback(const std_msgs::Float64ConstPtr& msg);
+  void verificationHoldCallback(const std_msgs::BoolConstPtr& msg);
   void replanReadyCallback(const std_msgs::BoolConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
@@ -117,6 +120,7 @@ private:
   ros::Subscriber waypoint_active_sub_;
   ros::Subscriber waypoint_q_sub_;
   ros::Subscriber waypoint_deadline_sub_;
+  ros::Subscriber verification_hold_sub_;
   ros::Subscriber replan_ready_sub_;
 
   ros::Publisher velocity_command_pub_;
@@ -144,6 +148,10 @@ private:
   ros::Time latest_waypoint_deadline_received_;
   Eigen::VectorXd latest_waypoint_q_;
   double latest_waypoint_deadline_abs_s_ = 0.0;
+
+  bool latest_verification_hold_ = false;
+  bool has_verification_hold_ = false;
+  ros::Time latest_verification_hold_received_;
 
   bool recovery_enabled_ = true;
   bool recovery_active_ = false;
@@ -200,6 +208,8 @@ private:
       "/care_planner/active_sensing/visibility_waypoint_q";
   std::string waypoint_deadline_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_deadline";
+  std::string verification_hold_topic_ =
+      "/care_planner/execution/predicted_vbc_verification_hold";
   std::string recovery_active_topic_ =
       "/care_planner/execution/visibility_recovery_active";
   std::string recovery_complete_topic_ =
