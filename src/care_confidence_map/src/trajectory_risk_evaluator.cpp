@@ -295,6 +295,102 @@ bool TrajectoryRiskEvaluator::computeFramePosesForConfiguration(
   return true;
 }
 
+bool TrajectoryRiskEvaluator::computeAuditGeometryForConfiguration(
+    const Eigen::VectorXd& q,
+    int timestep_index,
+    const std::vector<std::string>& frame_names,
+    ConfigurationAuditGeometry* out,
+    std::string* error_msg) const
+{
+  if (!initialized_)
+  {
+    if (error_msg)
+    {
+      *error_msg = "TrajectoryRiskEvaluator is not initialized.";
+    }
+    return false;
+  }
+
+  if (!out)
+  {
+    if (error_msg)
+    {
+      *error_msg = "Output audit-geometry pointer is null.";
+    }
+    return false;
+  }
+
+  if (!checkConfigurationSize(q, error_msg))
+  {
+    return false;
+  }
+
+  for (const auto& frame_name : frame_names)
+  {
+    if (!model_.existFrame(frame_name))
+    {
+      if (error_msg)
+      {
+        *error_msg = "Requested frame does not exist in Pinocchio model: " + frame_name;
+      }
+      return false;
+    }
+  }
+
+  pinocchio::forwardKinematics(model_, data_, q);
+  pinocchio::updateFramePlacements(model_, data_);
+
+  const pinocchio::FrameIndex base_fid = model_.getFrameId(base_frame_);
+  const pinocchio::SE3 T_base_world = data_.oMf[base_fid].inverse();
+
+  out->timestep_index = timestep_index;
+  out->body_samples.clear();
+  out->body_samples.reserve(body_sample_model_.riskSampleCount());
+  out->frame_poses.clear();
+  out->frame_poses.reserve(frame_names.size());
+
+  for (const auto& sample : body_sample_model_.samples())
+  {
+    if (!sample.include_for_risk || !model_.existFrame(sample.frame_name))
+    {
+      continue;
+    }
+
+    const pinocchio::FrameIndex fid = model_.getFrameId(sample.frame_name);
+    const Eigen::Vector3d center_link(
+        sample.center_link.x(),
+        sample.center_link.y(),
+        sample.center_link.z());
+    const Eigen::Vector3d center_world = data_.oMf[fid].act(center_link);
+
+    TrajectoryBodySample out_sample;
+    out_sample.timestep_index = timestep_index;
+    out_sample.link_name = sample.link_name;
+    out_sample.frame_name = sample.frame_name;
+    out_sample.center_base = T_base_world.act(center_world);
+    out_sample.radius = sample.radius;
+    out_sample.source_type = sample.source_type;
+    out_sample.source_collision_index = sample.source_collision_index;
+    out_sample.sample_index_in_link = sample.sample_index_in_link;
+    out_sample.include_for_risk = sample.include_for_risk;
+    out->body_samples.push_back(out_sample);
+  }
+
+  for (const auto& frame_name : frame_names)
+  {
+    const pinocchio::FrameIndex fid = model_.getFrameId(frame_name);
+    const pinocchio::SE3 T_base_frame = T_base_world * data_.oMf[fid];
+
+    FramePoseInBase pose;
+    pose.frame_name = frame_name;
+    pose.translation_base = T_base_frame.translation();
+    pose.rotation_base = T_base_frame.rotation();
+    out->frame_poses.push_back(pose);
+  }
+
+  return true;
+}
+
 TrajectorySampleResult TrajectoryRiskEvaluator::computeTrajectorySamples(
     const std::vector<Eigen::VectorXd>& q_traj) const
 {
