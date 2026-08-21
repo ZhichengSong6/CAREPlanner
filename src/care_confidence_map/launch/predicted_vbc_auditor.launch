@@ -1,0 +1,47 @@
+<launch>
+  <!-- C4.1 diagnostic verifier. It subscribes to the already-computed MPC
+       predicted trajectory and never publishes control commands. -->
+  <arg name="robot_urdf_file"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="config_file"
+       default="$(find care_confidence_map)/config/trajectory_risk.yaml" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="prediction_topic"
+       default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="target_topic"
+       default="/care_planner/active_sensing/target_point" />
+  <arg name="active_topic"
+       default="/care_planner/active_sensing/visibility_waypoint_active" />
+  <arg name="min_margin_s" default="0.30" />
+  <arg name="require_active" default="true" />
+  <arg name="audit_warn_ms" default="5.0" />
+
+  <node pkg="care_confidence_map"
+        type="predicted_vbc_auditor_node"
+        name="predicted_vbc_auditor_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+
+    <param name="predicted_vbc/robot_urdf_file"
+           value="$(arg robot_urdf_file)" />
+    <param name="predicted_vbc/body_samples_file"
+           value="$(arg body_samples_file)" />
+    <param name="predicted_vbc/base_frame"
+           value="$(arg base_frame)" />
+    <param name="predicted_vbc/prediction_topic"
+           value="$(arg prediction_topic)" />
+    <param name="predicted_vbc/target_topic"
+           value="$(arg target_topic)" />
+    <param name="predicted_vbc/active_topic"
+           value="$(arg active_topic)" />
+    <param name="predicted_vbc/min_margin_s"
+           value="$(arg min_margin_s)" />
+    <param name="predicted_vbc/require_active"
+           value="$(arg require_active)" />
+    <param name="predicted_vbc/audit_warn_ms"
+           value="$(arg audit_warn_ms)" />
+  </node>
+</launch>
