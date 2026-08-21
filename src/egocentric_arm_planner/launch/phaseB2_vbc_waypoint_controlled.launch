@@ -13,16 +13,18 @@
   <arg name="recovery_enabled" default="true" />
   <arg name="recovery_weight_scale" default="1.0" />
 
-  <!-- Phase C3 predictive recovery. The gate still publishes the physical VBC
-       deadline. The guard passes it through unchanged unless the current soft
-       MPC prediction stably predicts a miss; only then does it advance the
-       effective controller deadline so the validated recovery state machine
-       activates early. -->
-  <arg name="predictive_recovery_enabled" default="true" />
+  <!-- Phase C3 predictive recovery. Keep this opt-in so older deadline-only
+       experiments remain scientifically backward compatible. -->
+  <arg name="predictive_recovery_enabled" default="false" />
   <arg name="predictive_recovery_error_threshold_inf" default="0.10" />
   <arg name="predictive_recovery_min_improvement_inf" default="0.002" />
   <arg name="predictive_recovery_consecutive_misses" default="3" />
   <arg name="predictive_recovery_input_timeout" default="0.25" />
+
+  <!-- Phase C4.1 diagnostic only: audit the already-computed MPC prediction
+       against the real nominal FOV/body geometry. It does not affect control. -->
+  <arg name="enable_predicted_vbc_auditor" default="false" />
+  <arg name="predicted_vbc_audit_warn_ms" default="5.0" />
 
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
   <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
@@ -127,6 +129,17 @@
     <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
   </node>
+
+  <include if="$(arg enable_predicted_vbc_auditor)"
+           file="$(find care_confidence_map)/launch/predicted_vbc_auditor.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="prediction_topic" value="/care_planner/mpc/predicted_trajectory" />
+    <arg name="target_topic" value="$(arg frozen_target_topic)" />
+    <arg name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <arg name="min_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="require_active" value="true" />
+    <arg name="audit_warn_ms" value="$(arg predicted_vbc_audit_warn_ms)" />
+  </include>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
