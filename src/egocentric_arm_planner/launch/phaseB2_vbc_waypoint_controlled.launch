@@ -24,16 +24,11 @@
   <arg name="enable_predicted_vbc_auditor" default="false" />
   <arg name="predicted_vbc_audit_warn_ms" default="5.0" />
 
-  <!-- Phase C4.2: the audit, not the stale nominal deadline, decides Recovery.
-       The physical deadline remains unchanged for logging and pre-deadline
-       q_vis timing. After it elapses without a predicted violation, the guard
-       keeps the effective deadline slightly ahead of now, preserving k=1 soft
-       steering without triggering legacy deadline Recovery. -->
+  <!-- Phase C4.2: physical deadline is used only for q_vis timing. Recovery is
+       triggered directly by N consecutive predicted-VBC violations. -->
   <arg name="predicted_vbc_recovery_enabled" default="false" />
   <arg name="predicted_vbc_recovery_consecutive_violations" default="2" />
   <arg name="predicted_vbc_recovery_input_timeout" default="0.25" />
-  <arg name="predicted_vbc_recovery_post_deadline_hold_future_s" default="0.025" />
-  <arg name="predicted_vbc_recovery_force_past_s" default="0.01" />
 
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
   <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
@@ -115,7 +110,8 @@
     <param name="triggered_topic" value="/care_planner/execution/predictive_recovery_triggered" />
   </node>
 
-  <!-- C4.2 guard is the sole effective-deadline publisher when enabled. -->
+  <!-- C4.2 guard passes the physical deadline through unchanged and publishes
+       separate trigger/verification-hold Bool signals. -->
   <node if="$(arg predicted_vbc_recovery_enabled)"
         pkg="egocentric_arm_planner" type="predicted_vbc_recovery_guard_node.py"
         name="predicted_vbc_recovery_guard" output="screen">
@@ -123,12 +119,11 @@
     <param name="rate" value="20.0" />
     <param name="input_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
     <param name="consecutive_violations_required" value="$(arg predicted_vbc_recovery_consecutive_violations)" />
-    <param name="force_past_s" value="$(arg predicted_vbc_recovery_force_past_s)" />
-    <param name="post_deadline_hold_future_s" value="$(arg predicted_vbc_recovery_post_deadline_hold_future_s)" />
     <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="violation_topic" value="/care_planner/execution/predicted_vbc_violation" />
     <param name="physical_deadline_topic" value="$(arg synced_deadline_topic)" />
     <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
     <param name="summary_topic" value="/care_planner/execution/predicted_vbc_recovery_summary" />
     <param name="triggered_topic" value="/care_planner/execution/predicted_vbc_recovery_triggered" />
   </node>
@@ -146,6 +141,9 @@
     <param name="mpc/visibility_waypoint/active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="mpc/visibility_waypoint/q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
     <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_trigger" value="$(arg predicted_vbc_recovery_enabled)" />
+    <param name="mpc/visibility_waypoint/recovery_trigger_topic" value="/care_planner/execution/predicted_vbc_recovery_triggered" />
     <param name="mpc/visibility_waypoint/recovery_enabled" value="$(arg recovery_enabled)" />
     <param name="mpc/visibility_waypoint/recovery_weight_scale" value="$(arg recovery_weight_scale)" />
     <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
