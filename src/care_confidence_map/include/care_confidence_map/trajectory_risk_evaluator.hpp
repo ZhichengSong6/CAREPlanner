@@ -61,6 +61,16 @@ struct FramePoseInBase
   Eigen::Matrix3d rotation_base = Eigen::Matrix3d::Identity();
 };
 
+// Geometry required by the predicted-VBC verifier for one future q.  Body
+// samples and sensor poses are produced from the same Pinocchio FK/update pass
+// so the real-time verifier does not pay for duplicated forward kinematics.
+struct ConfigurationAuditGeometry
+{
+  int timestep_index = -1;
+  std::vector<TrajectoryBodySample> body_samples;
+  std::vector<FramePoseInBase> frame_poses;
+};
+
 class TrajectoryRiskEvaluator
 {
 public:
@@ -112,6 +122,16 @@ public:
       const Eigen::VectorXd& q,
       const std::vector<std::string>& frame_names,
       std::vector<FramePoseInBase>* out,
+      std::string* error_msg = nullptr) const;
+
+  // Real-time helper for C4 predicted-trajectory VBC auditing.  Performs one
+  // FK/updateFramePlacements call and extracts both body samples and the
+  // requested sensor poses from that same kinematic state.
+  bool computeAuditGeometryForConfiguration(
+      const Eigen::VectorXd& q,
+      int timestep_index,
+      const std::vector<std::string>& frame_names,
+      ConfigurationAuditGeometry* out,
       std::string* error_msg = nullptr) const;
 
 private:
