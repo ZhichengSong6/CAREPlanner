@@ -160,6 +160,7 @@ audit=records(os.path.join(out,'predicted_vbc_audit.csv'))
 guard=records(os.path.join(out,'predicted_vbc_recovery_guard.csv'))
 active_audit=[r for r in audit if r.get('status') not in ('inactive','waiting_target') and 'audit_ms' in r]
 viol=[r for r in active_audit if r.get('violation')=='1']
+hold_records=[r for r in guard if r.get('verification_hold')=='1']
 
 def f(v):
     try:
@@ -169,7 +170,8 @@ def f(v):
 times=[f(r.get('audit_ms')) for r in active_audit]; times=[x for x in times if x is not None]
 lastg=guard[-1] if guard else {}
 text=open(controlled,errors='replace').read() if os.path.isfile(controlled) else ''
-recovery_entries=len(re.findall(r'entering VISIBILITY RECOVERY',text))
+recovery_entries=len(re.findall(
+    r'(?:entering VISIBILITY RECOVERY|VBC RECOVERY TRIGGERED WHILE UNSEEN)', text))
 trigger_logs=len(re.findall(r'PREDICTED VBC RECOVERY TRIGGER',text))
 
 exe={}
@@ -203,6 +205,8 @@ payload={
   'audit_violation_observed':bool(viol),
   'audit_ms_mean':sum(times)/len(times) if times else None,
   'audit_ms_max':max(times) if times else None,
+  'verification_hold_observed':bool(hold_records),
+  'verification_hold_summary_records':len(hold_records),
   'guard_triggered':trigger_logs>0 or lastg.get('trigger_count_total','0') not in ('0',None),
   'guard_trigger_count_total':int(lastg.get('trigger_count_total','0')) if lastg else 0,
   'guard_last_trigger_lead_s':f(lastg.get('last_trigger_lead_s')),
