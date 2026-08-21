@@ -8,27 +8,19 @@ from std_msgs.msg import Bool, Float64, String
 
 
 class PredictedVbcRecoveryGuard:
-    """C4.2 recovery supervisor driven by the predicted-trajectory VBC audit.
+    """C4.2 recovery supervisor driven by predicted-trajectory VBC audit.
 
-    The physical/nominal VBC deadline remains unchanged on its original topic
-    for logging and for the pre-deadline soft q_vis timing objective.
+    Keep the logic intentionally small:
+      * before the physical deadline: pass it through unchanged;
+      * after the physical deadline with a fresh audit: keep soft steering alive;
+      * after N consecutive violation audits: force the effective deadline past
+        so the validated Recovery controller takes over;
+      * if the audit is temporarily unavailable while the target is still
+        active: publish verification_hold=true. The MPC only decelerates until
+        a fresh audit returns. This is not a new persistent Recovery state.
 
-    This node publishes the controller's *effective* deadline:
-      1) before the physical deadline: pass the physical deadline through;
-      2) after the physical deadline, while a FRESH C4 audit predicts no VBC
-         violation: keep the effective deadline a small amount in the future.
-         The waypoint MPC therefore continues its nearest-grid (k=1) soft q_vis
-         objective, but the legacy deadline-miss Recovery transition cannot
-         fire merely because the stale nominal deadline elapsed;
-      3) after N consecutive *new auditor messages* report violation=true:
-         force the effective deadline slightly into the past, reusing the
-         validated Recovery state machine immediately;
-      4) if the auditor becomes stale/missing after the physical deadline:
-         fail safe by passing the physical (already elapsed) deadline through,
-         which restores the validated legacy Recovery fallback.
-
-    Streaks are updated only in the auditor callback, not by this node's timer,
-    so N=2 means two distinct MPC-prediction audits.
+    Streaks are updated only by new auditor messages, so N=2 means two distinct
+    MPC-prediction audits.
     """
 
     def __init__(self):
@@ -57,6 +49,9 @@ class PredictedVbcRecoveryGuard:
         self._effective_deadline_topic = str(rospy.get_param(
             "~effective_deadline_topic",
             "/care_planner/active_sensing/visibility_waypoint_deadline_effective"))
+        self._verification_hold_topic = str(rospy.get_param(
+            "~verification_hold_topic",
+            "/care_planner/execution/predicted_vbc_verification_hold"))
         self._triggered_topic = str(rospy.get_param(
             "~triggered_topic",
             "/care_planner/execution/predicted_vbc_recovery_triggered"))
@@ -78,7 +73,6 @@ class PredictedVbcRecoveryGuard:
         self._active = False
         self._active_received = None
         self._physical_deadline_abs = None
-        self._deadline_received = None
         self._violation_received = None
         self._last_violation = False
 
@@ -92,6 +86,8 @@ class PredictedVbcRecoveryGuard:
 
         self._deadline_pub = rospy.Publisher(
             self._effective_deadline_topic, Float64, queue_size=1)
+        self._verification_hold_pub = rospy.Publisher(
+            self._verification_hold_topic, Bool, queue_size=1, latch=True)
         self._triggered_pub = rospy.Publisher(
             self._triggered_topic, Bool, queue_size=1, latch=True)
         self._summary_pub = rospy.Publisher(
@@ -105,18 +101,14 @@ class PredictedVbcRecoveryGuard:
             self._physical_deadline_topic, Float64, self._deadline_cb, queue_size=1)
 
         self._triggered_pub.publish(Bool(data=False))
+        self._verification_hold_pub.publish(Bool(data=False))
         self._timer = rospy.Timer(rospy.Duration(1.0 / self._rate), self._timer_cb)
 
         rospy.logwarn(
             "[predicted_vbc_recovery_guard] C4.2 enabled=%d consecutive=%d "
-            "hold_future=%.3fs force_past=%.3fs violation=%s",
-            int(self._enabled), self._consecutive_required,
-            self._post_deadline_hold_future_s, self._force_past_s,
-            self._violation_topic)
-        rospy.logwarn(
-            "[predicted_vbc_recovery_guard] physical deadline remains ground truth: %s; "
-            "effective controller deadline: %s",
-            self._physical_deadline_topic, self._effective_deadline_topic)
+            "timeout=%.3fs hold_future=%.3fs force_past=%.3fs",
+            int(self._enabled), self._consecutive_required, self._input_timeout,
+            self._post_deadline_hold_future_s, self._force_past_s)
 
     def _reset_decision_locked(self):
         self._violation_streak = 0
@@ -125,6 +117,7 @@ class PredictedVbcRecoveryGuard:
         self._trigger_time_abs = None
         self._last_violation = False
         self._triggered_pub.publish(Bool(data=False))
+        self._verification_hold_pub.publish(Bool(data=False))
 
     def _active_cb(self, msg):
         if msg is None:
@@ -147,7 +140,6 @@ class PredictedVbcRecoveryGuard:
             return
         with self._lock:
             self._physical_deadline_abs = float(msg.data)
-            self._deadline_received = rospy.Time.now()
 
     def _active_fresh_locked(self, now):
         if self._active_received is None:
@@ -207,36 +199,36 @@ class PredictedVbcRecoveryGuard:
                     "nan" if not math.isfinite(self._last_trigger_lead_s)
                     else "%.3fs" % self._last_trigger_lead_s)
 
-    def _effective_deadline_locked(self, now):
+    def _routing_locked(self, now):
         now_s = now.to_sec()
         if self._physical_deadline_abs is None:
-            return None, "missing_physical_deadline"
+            return None, False, "missing_physical_deadline"
 
         physical = float(self._physical_deadline_abs)
         if not self._enabled:
-            return physical, "disabled_passthrough"
+            return physical, False, "disabled_passthrough"
         if self._triggered:
-            return min(physical, now_s - self._force_past_s), "trigger_forced_past"
+            return min(physical, now_s - self._force_past_s), False, "trigger_forced_past"
         if physical > now_s:
-            return physical, "predeadline_passthrough"
+            return physical, False, "predeadline_passthrough"
 
-        # Post-deadline suppression is allowed only with a fresh, active C4
-        # verdict. Missing/stale verification is fail-safe: restore the elapsed
-        # physical deadline so the legacy controller enters Recovery.
-        if (not self._active or not self._active_fresh_locked(now) or
-                not self._audit_fresh_locked(now)):
-            return physical, "postdeadline_stale_audit_fallback"
+        # Target already seen/inactive: never turn missing audits into Recovery.
+        if not self._active:
+            return now_s + self._post_deadline_hold_future_s, False, "postdeadline_inactive"
 
-        # A first violation may be waiting for the configured second confirming
-        # MPC audit. During that short consistency window keep the legacy
-        # transition suppressed; the next distinct audit either triggers or
-        # resets the streak. A stale second audit falls back above.
-        return now_s + self._post_deadline_hold_future_s, "postdeadline_c4_verified_hold"
+        fresh = self._active_fresh_locked(now) and self._audit_fresh_locked(now)
+        if not fresh:
+            # Lightweight fail-safe: suppress the stale nominal deadline and ask
+            # the MPC to decelerate until a fresh C4 verdict arrives.
+            return now_s + self._post_deadline_hold_future_s, True, "postdeadline_verification_hold"
+
+        return now_s + self._post_deadline_hold_future_s, False, "postdeadline_c4_verified"
 
     def _publish_locked(self, now):
-        effective, routing_status = self._effective_deadline_locked(now)
+        effective, verification_hold, routing_status = self._routing_locked(now)
         if effective is not None and math.isfinite(effective):
             self._deadline_pub.publish(Float64(data=effective))
+        self._verification_hold_pub.publish(Bool(data=bool(verification_hold)))
 
         violation_age = float("nan")
         if self._violation_received is not None:
@@ -252,6 +244,7 @@ class PredictedVbcRecoveryGuard:
             "enabled=%d" % int(self._enabled),
             "active=%d" % int(self._active),
             "triggered=%d" % int(self._triggered),
+            "verification_hold=%d" % int(verification_hold),
             "trigger_count_total=%d" % self._trigger_count_total,
             "status=%s" % self._last_status,
             "routing=%s" % routing_status,
@@ -277,7 +270,7 @@ class PredictedVbcRecoveryGuard:
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         with self._lock:
-            if (self._enabled and not self._triggered and
+            if (self._enabled and not self._triggered and self._active and
                     self._violation_received is not None and
                     not self._audit_fresh_locked(now)):
                 self._violation_streak = 0
