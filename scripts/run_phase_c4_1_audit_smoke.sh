@@ -162,14 +162,21 @@ import json, math, re, sys
 src,out=sys.argv[1:]
 text=open(src,errors='replace').read()
 records=[]
-for m in re.finditer(r'data:\s*["\']?([^\n]+)', text):
-    s=m.group(1).strip().strip('"\'')
+for line in text.splitlines():
+    line=line.strip()
+    if not line.startswith('data:'):
+        continue
+    s=line.split('data:',1)[1].strip()
+    if len(s)>=2 and s[0] in ('"', "'") and s[-1]==s[0]:
+        s=s[1:-1]
     tok=dict(re.findall(r'([A-Za-z0-9_]+)=([^\s]+)',s))
-    if 'audit_ms' not in tok: continue
+    if 'audit_ms' not in tok:
+        continue
     def f(k):
         try:
             x=float(tok.get(k,'nan')); return x if math.isfinite(x) else None
-        except: return None
+        except Exception:
+            return None
     records.append({
         'status':tok.get('status'),
         'violation':int(tok.get('violation','0')),
