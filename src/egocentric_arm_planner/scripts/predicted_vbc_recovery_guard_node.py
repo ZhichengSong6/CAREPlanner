@@ -15,14 +15,17 @@ class PredictedVbcRecoveryGuard:
 
     This node publishes the controller's *effective* deadline:
       1) before the physical deadline: pass the physical deadline through;
-      2) after the physical deadline, while C4 predicts no VBC violation:
-         keep the effective deadline a small amount in the future.  The
-         waypoint MPC therefore continues its nearest-grid (k=1) soft q_vis
+      2) after the physical deadline, while a FRESH C4 audit predicts no VBC
+         violation: keep the effective deadline a small amount in the future.
+         The waypoint MPC therefore continues its nearest-grid (k=1) soft q_vis
          objective, but the legacy deadline-miss Recovery transition cannot
          fire merely because the stale nominal deadline elapsed;
       3) after N consecutive *new auditor messages* report violation=true:
          force the effective deadline slightly into the past, reusing the
-         validated Recovery state machine immediately.
+         validated Recovery state machine immediately;
+      4) if the auditor becomes stale/missing after the physical deadline:
+         fail safe by passing the physical (already elapsed) deadline through,
+         which restores the validated legacy Recovery fallback.
 
     Streaks are updated only in the auditor callback, not by this node's timer,
     so N=2 means two distinct MPC-prediction audits.
@@ -152,6 +155,12 @@ class PredictedVbcRecoveryGuard:
         age = (now - self._active_received).to_sec()
         return 0.0 <= age <= self._input_timeout
 
+    def _audit_fresh_locked(self, now):
+        if self._violation_received is None:
+            return False
+        age = (now - self._violation_received).to_sec()
+        return 0.0 <= age <= self._input_timeout
+
     def _violation_cb(self, msg):
         if msg is None:
             return
@@ -198,7 +207,8 @@ class PredictedVbcRecoveryGuard:
                     "nan" if not math.isfinite(self._last_trigger_lead_s)
                     else "%.3fs" % self._last_trigger_lead_s)
 
-    def _effective_deadline_locked(self, now_s):
+    def _effective_deadline_locked(self, now):
+        now_s = now.to_sec()
         if self._physical_deadline_abs is None:
             return None, "missing_physical_deadline"
 
@@ -210,13 +220,21 @@ class PredictedVbcRecoveryGuard:
         if physical > now_s:
             return physical, "predeadline_passthrough"
 
-        # Critical C4.2 behavior: elapsed nominal deadline alone is no longer a
-        # Recovery command. Keep it slightly ahead of 'now' so the existing MPC
-        # retains k=1 soft q_vis steering without satisfying deadline<=0.
-        return now_s + self._post_deadline_hold_future_s, "postdeadline_c4_safe_hold"
+        # Post-deadline suppression is allowed only with a fresh, active C4
+        # verdict. Missing/stale verification is fail-safe: restore the elapsed
+        # physical deadline so the legacy controller enters Recovery.
+        if (not self._active or not self._active_fresh_locked(now) or
+                not self._audit_fresh_locked(now)):
+            return physical, "postdeadline_stale_audit_fallback"
+
+        # A first violation may be waiting for the configured second confirming
+        # MPC audit. During that short consistency window keep the legacy
+        # transition suppressed; the next distinct audit either triggers or
+        # resets the streak. A stale second audit falls back above.
+        return now_s + self._post_deadline_hold_future_s, "postdeadline_c4_verified_hold"
 
     def _publish_locked(self, now):
-        effective, routing_status = self._effective_deadline_locked(now.to_sec())
+        effective, routing_status = self._effective_deadline_locked(now)
         if effective is not None and math.isfinite(effective):
             self._deadline_pub.publish(Float64(data=effective))
 
@@ -259,15 +277,11 @@ class PredictedVbcRecoveryGuard:
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         with self._lock:
-            # A stale auditor signal is never converted into a new trigger. If
-            # already triggered, Recovery remains latched until visibility turns
-            # the waypoint inactive and resets the target.
             if (self._enabled and not self._triggered and
-                    self._violation_received is not None):
-                age = (now - self._violation_received).to_sec()
-                if age < 0.0 or age > self._input_timeout:
-                    self._violation_streak = 0
-                    self._last_status = "stale_audit"
+                    self._violation_received is not None and
+                    not self._audit_fresh_locked(now)):
+                self._violation_streak = 0
+                self._last_status = "stale_audit"
             self._publish_locked(now)
 
 
