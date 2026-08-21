@@ -135,8 +135,10 @@ if [ "${READY}" != "1" ]; then
   exit 1
 fi
 
-setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo /care_planner/execution/predicted_vbc_audit_summary" \
-  > "${OUT}/predicted_vbc_audit.log" 2>&1 &
+# -p keeps each std_msgs/String summary on one CSV record, avoiding rostopic's
+# human-readable line wrapping for long summary strings.
+setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p /care_planner/execution/predicted_vbc_audit_summary" \
+  > "${OUT}/predicted_vbc_audit.csv" 2>&1 &
 AUDIT_ECHO_PID=$!
 
 RELEASED=0
@@ -157,35 +159,35 @@ sleep "${RUN_SECONDS}"
 
 kill_group "${AUDIT_ECHO_PID}"; AUDIT_ECHO_PID=""
 
-python3 - "${OUT}/predicted_vbc_audit.log" "${OUT}/audit_summary.json" <<'PY'
-import json, math, re, sys
+python3 - "${OUT}/predicted_vbc_audit.csv" "${OUT}/audit_summary.json" <<'PY'
+import csv, json, math, re, sys
 src,out=sys.argv[1:]
-text=open(src,errors='replace').read()
 records=[]
-for line in text.splitlines():
-    line=line.strip()
-    if not line.startswith('data:'):
-        continue
-    s=line.split('data:',1)[1].strip()
-    if len(s)>=2 and s[0] in ('"', "'") and s[-1]==s[0]:
-        s=s[1:-1]
-    tok=dict(re.findall(r'([A-Za-z0-9_]+)=([^\s]+)',s))
-    if 'audit_ms' not in tok:
-        continue
-    def f(k):
-        try:
-            x=float(tok.get(k,'nan')); return x if math.isfinite(x) else None
-        except Exception:
-            return None
-    records.append({
-        'status':tok.get('status'),
-        'violation':int(tok.get('violation','0')),
-        'predicted_seen':int(tok.get('predicted_seen','0')) if 'predicted_seen' in tok else None,
-        'predicted_sweep':int(tok.get('predicted_sweep','0')) if 'predicted_sweep' in tok else None,
-        'see_time_s':f('see_time_s'),'sweep_time_s':f('sweep_time_s'),'margin_s':f('margin_s'),
-        'evaluated_q':int(tok.get('evaluated_q','0')),'prediction_q':int(tok.get('prediction_q','0')),
-        'audit_ms':f('audit_ms')
-    })
+with open(src,newline='',errors='replace') as fh:
+    reader=csv.reader(fh)
+    header=next(reader,[])
+    data_idx=header.index('field.data') if 'field.data' in header else 1
+    for row in reader:
+        if len(row)<=data_idx:
+            continue
+        s=row[data_idx]
+        tok=dict(re.findall(r'([A-Za-z0-9_]+)=([^\s]+)',s))
+        if 'audit_ms' not in tok:
+            continue
+        def f(k):
+            try:
+                x=float(tok.get(k,'nan')); return x if math.isfinite(x) else None
+            except Exception:
+                return None
+        records.append({
+            'status':tok.get('status'),
+            'violation':int(tok.get('violation','0')),
+            'predicted_seen':int(tok.get('predicted_seen','0')) if 'predicted_seen' in tok else None,
+            'predicted_sweep':int(tok.get('predicted_sweep','0')) if 'predicted_sweep' in tok else None,
+            'see_time_s':f('see_time_s'),'sweep_time_s':f('sweep_time_s'),'margin_s':f('margin_s'),
+            'evaluated_q':int(tok.get('evaluated_q','0')),'prediction_q':int(tok.get('prediction_q','0')),
+            'audit_ms':f('audit_ms')
+        })
 active=[r for r in records if r['audit_ms'] is not None and r['status'] not in ('inactive','waiting_target')]
 times=[r['audit_ms'] for r in active]
 viol=[r for r in active if r['violation']==1]
@@ -195,6 +197,7 @@ payload={
     'audit_ms_mean':sum(times)/len(times) if times else None,
     'audit_ms_max':max(times) if times else None,
     'evaluated_q_mean':sum(r['evaluated_q'] for r in active)/len(active) if active else None,
+    'first_violation_record':viol[0] if viol else None,
     'last_active_record':active[-1] if active else None,
 }
 json.dump(payload,open(out,'w'),indent=2)
@@ -202,5 +205,5 @@ print(json.dumps(payload,indent=2))
 PY
 
 echo "[RESULT] ${OUT}/audit_summary.json"
-echo "[RAW] ${OUT}/predicted_vbc_audit.log"
+echo "[RAW] ${OUT}/predicted_vbc_audit.csv"
 echo "[NOTE] For C4.1 validation run this script once with CASE_ID=case_003 and once with CASE_ID=case_007."
