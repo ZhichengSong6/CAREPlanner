@@ -5,6 +5,8 @@
 #include <pinocchio/algorithm/joint-configuration.hpp>
 #include <pinocchio/algorithm/kinematics.hpp>
 
+#include <cmath>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 
@@ -18,6 +20,10 @@ bool TrajectoryRiskEvaluator::initialize(
     std::string* error_msg)
 {
   initialized_ = false;
+  fast_audit_prepared_ = false;
+  fast_audit_sensor_frame_ids_.clear();
+  fast_audit_body_frames_.clear();
+  fast_audit_body_sample_count_ = 0;
 
   robot_urdf_file_ = robot_urdf_file;
   body_samples_file_ = body_samples_file;
@@ -388,6 +394,188 @@ bool TrajectoryRiskEvaluator::computeAuditGeometryForConfiguration(
     out->frame_poses.push_back(pose);
   }
 
+  return true;
+}
+
+bool TrajectoryRiskEvaluator::prepareFastAudit(
+    const std::vector<std::string>& sensor_frame_names,
+    const std::vector<std::string>& ignored_risk_links,
+    std::string* error_msg)
+{
+  if (!initialized_)
+  {
+    if (error_msg)
+    {
+      *error_msg = "TrajectoryRiskEvaluator is not initialized.";
+    }
+    return false;
+  }
+
+  fast_audit_prepared_ = false;
+  fast_audit_sensor_frame_ids_.clear();
+  fast_audit_body_frames_.clear();
+  fast_audit_body_sample_count_ = 0;
+
+  if (!model_.existFrame(base_frame_))
+  {
+    if (error_msg)
+    {
+      *error_msg = "Base frame does not exist: " + base_frame_;
+    }
+    return false;
+  }
+  fast_audit_base_frame_id_ = model_.getFrameId(base_frame_);
+
+  fast_audit_sensor_frame_ids_.reserve(sensor_frame_names.size());
+  for (const auto& frame_name : sensor_frame_names)
+  {
+    if (!model_.existFrame(frame_name))
+    {
+      if (error_msg)
+      {
+        *error_msg = "Requested sensor frame does not exist: " + frame_name;
+      }
+      return false;
+    }
+    fast_audit_sensor_frame_ids_.push_back(model_.getFrameId(frame_name));
+  }
+
+  const std::unordered_set<std::string> ignored(
+      ignored_risk_links.begin(), ignored_risk_links.end());
+
+  for (const auto& sample : body_sample_model_.samples())
+  {
+    if (!sample.include_for_risk || ignored.count(sample.link_name) != 0)
+    {
+      continue;
+    }
+    if (!model_.existFrame(sample.frame_name))
+    {
+      if (error_msg)
+      {
+        *error_msg = "Body sample frame does not exist: " + sample.frame_name;
+      }
+      return false;
+    }
+
+    const pinocchio::FrameIndex fid = model_.getFrameId(sample.frame_name);
+    CachedAuditBodyFrame* group = nullptr;
+    for (auto& existing : fast_audit_body_frames_)
+    {
+      if (existing.frame_id == fid)
+      {
+        group = &existing;
+        break;
+      }
+    }
+    if (!group)
+    {
+      CachedAuditBodyFrame created;
+      created.frame_id = fid;
+      fast_audit_body_frames_.push_back(created);
+      group = &fast_audit_body_frames_.back();
+    }
+
+    CachedAuditBodySample cached;
+    cached.center_link = Eigen::Vector3d(
+        sample.center_link.x(),
+        sample.center_link.y(),
+        sample.center_link.z());
+    cached.radius = sample.radius;
+    group->samples.push_back(cached);
+    ++fast_audit_body_sample_count_;
+  }
+
+  if (fast_audit_sensor_frame_ids_.empty() || fast_audit_body_sample_count_ == 0)
+  {
+    if (error_msg)
+    {
+      *error_msg = "Fast audit cache is empty.";
+    }
+    return false;
+  }
+
+  fast_audit_prepared_ = true;
+  return true;
+}
+
+bool TrajectoryRiskEvaluator::evaluateFastAuditForConfiguration(
+    const Eigen::VectorXd& q,
+    const Eigen::Vector3d& target_base,
+    std::vector<FastAuditSensorPose>* sensor_poses,
+    double* min_clearance_m,
+    std::string* error_msg) const
+{
+  if (!fast_audit_prepared_)
+  {
+    if (error_msg)
+    {
+      *error_msg = "Fast audit cache has not been prepared.";
+    }
+    return false;
+  }
+  if (!sensor_poses || !min_clearance_m)
+  {
+    if (error_msg)
+    {
+      *error_msg = "Fast audit output pointer is null.";
+    }
+    return false;
+  }
+  if (!target_base.allFinite() || !checkConfigurationSize(q, error_msg))
+  {
+    return false;
+  }
+
+  pinocchio::forwardKinematics(model_, data_, q);
+  pinocchio::updateFramePlacements(model_, data_);
+
+  const pinocchio::SE3 T_base_world =
+      data_.oMf[fast_audit_base_frame_id_].inverse();
+
+  sensor_poses->clear();
+  if (sensor_poses->capacity() < fast_audit_sensor_frame_ids_.size())
+  {
+    sensor_poses->reserve(fast_audit_sensor_frame_ids_.size());
+  }
+  for (const auto fid : fast_audit_sensor_frame_ids_)
+  {
+    const pinocchio::SE3 T_base_sensor = T_base_world * data_.oMf[fid];
+    FastAuditSensorPose pose;
+    pose.translation_base = T_base_sensor.translation();
+    pose.rotation_base = T_base_sensor.rotation();
+    sensor_poses->push_back(pose);
+  }
+
+  double best = std::numeric_limits<double>::infinity();
+  for (const auto& frame : fast_audit_body_frames_)
+  {
+    // One SE3 composition per body frame, then all local sample centers for
+    // that link share the transform.  This replaces one frame lookup and one
+    // world/base composition per body sample in the previous implementation.
+    const pinocchio::SE3 T_base_link = T_base_world * data_.oMf[frame.frame_id];
+    for (const auto& sample : frame.samples)
+    {
+      const Eigen::Vector3d center_base = T_base_link.act(sample.center_link);
+      const double clearance =
+          (center_base - target_base).norm() - sample.radius;
+      if (clearance < best)
+      {
+        best = clearance;
+      }
+    }
+  }
+
+  if (!std::isfinite(best))
+  {
+    if (error_msg)
+    {
+      *error_msg = "Fast audit produced no finite body clearance.";
+    }
+    return false;
+  }
+
+  *min_clearance_m = best;
   return true;
 }
 
