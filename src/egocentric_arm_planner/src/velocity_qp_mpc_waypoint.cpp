@@ -51,6 +51,9 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   waypoint_deadline_sub_ = nh_.subscribe(
       waypoint_deadline_topic_, 1,
       &VelocityQPMPCWaypoint::waypointDeadlineCallback, this);
+  verification_hold_sub_ = nh_.subscribe(
+      verification_hold_topic_, 1,
+      &VelocityQPMPCWaypoint::verificationHoldCallback, this);
   replan_ready_sub_ = nh_.subscribe(
       replan_ready_topic_, 1,
       &VelocityQPMPCWaypoint::replanReadyCallback, this);
@@ -87,6 +90,8 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                   << " s, active=" << waypoint_active_topic_
                   << ", q_vis=" << waypoint_q_topic_
                   << ", deadline=" << waypoint_deadline_topic_);
+  ROS_INFO_STREAM("[VelocityQPMPCWaypoint] verification hold topic="
+                  << verification_hold_topic_);
   ROS_WARN_STREAM("[VelocityQPMPCWaypoint] deadline-miss recovery "
                   << (recovery_enabled_ ? "ENABLED" : "DISABLED")
                   << ": recovery_weight="
@@ -197,6 +202,8 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                           waypoint_q_topic_, waypoint_q_topic_);
   pnh_.param<std::string>("mpc/visibility_waypoint/deadline_topic",
                           waypoint_deadline_topic_, waypoint_deadline_topic_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/verification_hold_topic",
+                          verification_hold_topic_, verification_hold_topic_);
   pnh_.param<bool>("mpc/visibility_waypoint/recovery_enabled",
                    recovery_enabled_, recovery_enabled_);
   pnh_.param<double>("mpc/visibility_waypoint/recovery_weight_scale",
@@ -358,7 +365,6 @@ bool VelocityQPMPCWaypoint::buildStaticQP() {
       + u_smooth_weight_ * D_.transpose() * D_);
   H_base_.diagonal().array() += 1e-8;
 
-  // Recovery keeps velocity-effort and smoothness regularization only.
   H_regularization_ = 2.0 * (
       u_tracking_weight_ * Eigen::MatrixXd::Identity(n_u_, n_u_)
       + u_smooth_weight_ * D_.transpose() * D_);
@@ -433,6 +439,15 @@ void VelocityQPMPCWaypoint::waypointDeadlineCallback(
   latest_waypoint_deadline_abs_s_ = msg->data;
   latest_waypoint_deadline_received_ = ros::Time::now();
   has_waypoint_deadline_ = true;
+}
+
+void VelocityQPMPCWaypoint::verificationHoldCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_verification_hold_ = msg->data;
+  latest_verification_hold_received_ = ros::Time::now();
+  has_verification_hold_ = true;
 }
 
 void VelocityQPMPCWaypoint::replanReadyCallback(
@@ -608,8 +623,6 @@ void VelocityQPMPCWaypoint::buildRegularizationCycleQP(
     Eigen::VectorXd& upper) const {
   Eigen::VectorXd smooth_offset = Eigen::VectorXd::Zero(n_u_);
   smooth_offset.head(dof_) = -previous_command_;
-  // u_tracking_weight becomes zero-velocity effort regularization in recovery.
-  // Its Hessian remains in H_regularization_; there is no nominal u_ref linear term.
   gradient = 2.0 * u_smooth_weight_ * D_.transpose() * smooth_offset;
   buildBounds(q_current, lower, upper);
 }
@@ -752,6 +765,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   Eigen::VectorXd q_vis;
   double deadline_abs_s = 0.0;
 
+  bool has_verification_hold = false;
+  bool verification_hold = false;
+  ros::Time verification_hold_received;
+
   bool local_recovery_active = false;
   bool local_recovery_hold = false;
   bool local_replan_ready = false;
@@ -780,6 +797,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     if (has_waypoint_q_) q_vis = latest_waypoint_q_;
     deadline_abs_s = latest_waypoint_deadline_abs_s_;
 
+    has_verification_hold = has_verification_hold_;
+    verification_hold = latest_verification_hold_;
+    verification_hold_received = latest_verification_hold_received_;
+
     local_recovery_active = recovery_active_;
     local_recovery_hold = recovery_hold_;
     local_replan_ready = replan_ready_received_;
@@ -802,8 +823,13 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       (now - reference_received).toSec() >= 0.0 &&
       (now - reference_received).toSec() <= reference_timeout_;
 
-  // Recovery-hold ends only when the gate confirms that a newly replanned
-  // reference has actually been installed and published.
+  const double verification_hold_age = has_verification_hold
+      ? (now - verification_hold_received).toSec()
+      : std::numeric_limits<double>::infinity();
+  const bool verification_hold_active =
+      has_verification_hold && verification_hold &&
+      verification_hold_age >= 0.0 && verification_hold_age <= waypoint_timeout_;
+
   bool exited_recovery_hold = false;
   if (local_recovery_hold && local_replan_ready && reference_fresh) {
     std::lock_guard<std::mutex> lock(data_mutex_);
@@ -840,8 +866,6 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
     if (recovery_active_) {
-      // The learned generator turns active=false only after the real sensor
-      // reports the frozen target visible. That transition ends recovery.
       if (has_wp_active && !wp_active) {
         recovery_active_ = false;
         recovery_hold_ = true;
@@ -851,7 +875,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
           recovery_complete_published_ = true;
         }
       }
-    } else if (!recovery_hold_ && waypoint_data_fresh && wp_active &&
+    } else if (!recovery_hold_ && !verification_hold_active &&
+               waypoint_data_fresh && wp_active &&
                std::isfinite(deadline_remaining) && deadline_remaining <= 0.0) {
       recovery_active_ = true;
       recovery_complete_published_ = false;
@@ -864,7 +889,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
   if (entered_recovery) {
     publishRecoveryActive(true);
-    ROS_ERROR("[VelocityQPMPCWaypoint] VBC DEADLINE MISSED WHILE UNSEEN: entering VISIBILITY RECOVERY; nominal task tracking is suspended.");
+    ROS_ERROR("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSEEN: nominal task tracking is suspended.");
   }
   if (completed_recovery) {
     publishRecoveryActive(false);
@@ -872,7 +897,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     ROS_WARN("[VelocityQPMPCWaypoint] VISIBILITY RECOVERY COMPLETE: target is seen; holding/decelerating while the original task is replanned from measured q.");
   }
 
-  if (!local_recovery_active && !local_recovery_hold && !reference_fresh) {
+  if (!local_recovery_active && !local_recovery_hold &&
+      !verification_hold_active && !reference_fresh) {
     publishSafeStop(has_reference_ ? "stale nominal reference" : "waiting for nominal reference");
     return;
   }
@@ -881,7 +907,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   Eigen::MatrixXd u_ref = Eigen::MatrixXd::Zero(dof_, num_intervals_);
   if (reference_fresh) {
     if (!buildReferenceHorizon(reference, q_ref, u_ref)) {
-      if (!local_recovery_active && !local_recovery_hold) {
+      if (!local_recovery_active && !local_recovery_hold &&
+          !verification_hold_active) {
         publishSafeStop("invalid nominal reference");
         return;
       }
@@ -891,8 +918,6 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     for (int k = 0; k <= num_intervals_; ++k) q_ref.col(k) = q_current;
   }
 
-  // Always compute the nominal gradient for diagnostics, even when recovery
-  // deliberately removes it from the actual QP.
   Eigen::VectorXd nominal_gradient, dummy_lower, dummy_upper;
   buildBaseCycleQP(q_current, q_ref, u_ref,
                    nominal_gradient, dummy_lower, dummy_upper);
@@ -946,6 +971,11 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
     waypoint_nominal_error_inf =
         (q_ref.col(num_intervals_) - q_vis).lpNorm<Eigen::Infinity>();
+  } else if (verification_hold_active) {
+    control_mode = "verification_hold";
+    waypoint_status = "verification_hold";
+    hessian = H_regularization_;
+    buildRegularizationCycleQP(q_current, gradient, lower, upper);
   } else {
     hessian = H_base_;
     buildBaseCycleQP(q_current, q_ref, u_ref, gradient, lower, upper);
@@ -1052,6 +1082,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " primal=" << primal
       << " dual=" << dual
       << " control_mode=" << control_mode
+      << " verification_hold=" << static_cast<int>(verification_hold_active)
       << " recovery_active=" << static_cast<int>(local_recovery_active)
       << " recovery_hold=" << static_cast<int>(local_recovery_hold)
       << " tracking_inf=" << tracking_inf
