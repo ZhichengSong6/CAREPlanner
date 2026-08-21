@@ -8,6 +8,7 @@
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -51,9 +52,7 @@ struct TrajectorySampleResult
   std::vector<TrajectoryFrameSamples> frames;
 };
 
-// Pose of an arbitrary URDF/Pinocchio frame expressed in base_frame_.  This
-// lightweight representation intentionally keeps Pinocchio types out of the
-// public VBC selector interface.
+// Pose of an arbitrary URDF/Pinocchio frame expressed in base_frame_.
 struct FramePoseInBase
 {
   std::string frame_name;
@@ -61,14 +60,21 @@ struct FramePoseInBase
   Eigen::Matrix3d rotation_base = Eigen::Matrix3d::Identity();
 };
 
-// Geometry required by the predicted-VBC verifier for one future q.  Body
-// samples and sensor poses are produced from the same Pinocchio FK/update pass
-// so the real-time verifier does not pay for duplicated forward kinematics.
+// Geometry required by the original predicted-VBC verifier for one future q.
 struct ConfigurationAuditGeometry
 {
   int timestep_index = -1;
   std::vector<TrajectoryBodySample> body_samples;
   std::vector<FramePoseInBase> frame_poses;
+};
+
+// Allocation-light sensor pose used by the optimized C4 verifier.  The sensor
+// identity is fixed at prepareFastAudit() time, so no strings are copied in the
+// per-configuration hot path.
+struct FastAuditSensorPose
+{
+  Eigen::Vector3d translation_base = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d rotation_base = Eigen::Matrix3d::Identity();
 };
 
 class TrajectoryRiskEvaluator
@@ -115,18 +121,12 @@ public:
       TrajectoryFrameSamples* out,
       std::string* error_msg = nullptr) const;
 
-  // Compute poses of requested frames for a future configuration.  This is
-  // used by visibility-before-contact analysis to predict when a workspace
-  // point enters any arm-mounted sensor FOV along the nominal trajectory.
   bool computeFramePosesForConfiguration(
       const Eigen::VectorXd& q,
       const std::vector<std::string>& frame_names,
       std::vector<FramePoseInBase>* out,
       std::string* error_msg = nullptr) const;
 
-  // Real-time helper for C4 predicted-trajectory VBC auditing.  Performs one
-  // FK/updateFramePlacements call and extracts both body samples and the
-  // requested sensor poses from that same kinematic state.
   bool computeAuditGeometryForConfiguration(
       const Eigen::VectorXd& q,
       int timestep_index,
@@ -134,7 +134,54 @@ public:
       ConfigurationAuditGeometry* out,
       std::string* error_msg = nullptr) const;
 
+  // Prepare the real-time C4 audit path once.  Frame IDs, ignored-link
+  // filtering, body sample local centers/radii and body-frame grouping are all
+  // cached here so evaluateFastAuditForConfiguration() performs no string/frame
+  // lookup in the normal per-MPC-cycle hot path.
+  bool prepareFastAudit(
+      const std::vector<std::string>& sensor_frame_names,
+      const std::vector<std::string>& ignored_risk_links,
+      std::string* error_msg = nullptr);
+
+  // One FK/updateFramePlacements pass for q, followed by:
+  //   * cached 8-sensor pose extraction;
+  //   * cached/grouped body sample transforms and target clearance.
+  // sensor_poses capacity is reused by the caller across horizon states.
+  bool evaluateFastAuditForConfiguration(
+      const Eigen::VectorXd& q,
+      const Eigen::Vector3d& target_base,
+      std::vector<FastAuditSensorPose>* sensor_poses,
+      double* min_clearance_m,
+      std::string* error_msg = nullptr) const;
+
+  std::size_t fastAuditBodySampleCount() const
+  {
+    return fast_audit_body_sample_count_;
+  }
+
+  std::size_t fastAuditBodyFrameCount() const
+  {
+    return fast_audit_body_frames_.size();
+  }
+
+  std::size_t fastAuditSensorCount() const
+  {
+    return fast_audit_sensor_frame_ids_.size();
+  }
+
 private:
+  struct CachedAuditBodySample
+  {
+    Eigen::Vector3d center_link = Eigen::Vector3d::Zero();
+    double radius = 0.0;
+  };
+
+  struct CachedAuditBodyFrame
+  {
+    pinocchio::FrameIndex frame_id = 0;
+    std::vector<CachedAuditBodySample> samples;
+  };
+
   bool buildPinocchioModel(const std::string& robot_urdf_file,
                            std::string* error_msg);
 
@@ -158,6 +205,12 @@ private:
   mutable pinocchio::Data data_;
 
   std::vector<std::string> active_joint_names_;
+
+  bool fast_audit_prepared_ = false;
+  pinocchio::FrameIndex fast_audit_base_frame_id_ = 0;
+  std::vector<pinocchio::FrameIndex> fast_audit_sensor_frame_ids_;
+  std::vector<CachedAuditBodyFrame> fast_audit_body_frames_;
+  std::size_t fast_audit_body_sample_count_ = 0;
 };
 
 }  // namespace care_confidence_map
