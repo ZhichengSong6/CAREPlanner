@@ -180,7 +180,14 @@ paths=sorted(glob.glob(os.path.join(out,'*_weight_*','summary.json')))
 if paths:
     try: wp=json.load(open(paths[-1]))
     except: pass
+gate={}
+paths=sorted(glob.glob(os.path.join(out,'execution_gate_*.json')))
+if paths:
+    try: gate=json.load(open(paths[-1]))
+    except: pass
 
+first_recovery_delay=f(
+    wp.get('first_recovery_delay_from_target_s', wp.get('first_recovery_delay_s')))
 margin=f(exe.get('executed_vbc_margin_s'))
 see=f(exe.get('see_delay_from_target_s'))
 sweep=f(exe.get('sweep_delay_from_target_s'))
@@ -209,13 +216,14 @@ payload={
   'guard_last_routing':lastg.get('routing'),
   'recovery_entered':recovery_entries>0,
   'recovery_entry_log_count':recovery_entries,
-  'first_recovery_delay_s':f(wp.get('first_recovery_delay_s')),
+  'first_recovery_delay_s':first_recovery_delay,
+  'first_recovery_delay_from_target_s':first_recovery_delay,
   'executed_vbc_margin_s':margin,
   'executed_see_delay_s':see,
   'executed_sweep_delay_s':sweep,
   'executed_outcome':outcome,
   'min_clearance_all_m':f(exe.get('min_clearance_all_m')),
-  'replan_count':wp.get('replan_count'),
+  'replan_count':gate.get('replan_count'),
 }
 json.dump(payload,open(os.path.join(out,'c4_2_summary.json'),'w'),indent=2)
 print(json.dumps(payload,indent=2))
