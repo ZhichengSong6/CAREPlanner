@@ -21,21 +21,25 @@
 namespace egocentric_arm_planner {
 
 /**
- * CAREPlanner VBC deadline-waypoint controller with deadline-miss recovery.
+ * CAREPlanner VBC deadline-waypoint controller.
  *
  * NORMAL:
  *   J = J_task + J_control + J_smooth
  *
- * INTERVENTION (fresh active q_vis before deadline):
+ * INTERVENTION (fresh active q_vis):
  *   J = J_task + J_control + J_smooth
  *       + w_vis ||q_kd - q_vis||^2
  *
  * VERIFICATION_HOLD (C4 audit temporarily unavailable):
  *   J = J_control_effort + J_smooth
  *
- * RECOVERY (confirmed predicted VBC failure / legacy deadline trigger):
+ * RECOVERY:
  *   J = J_control_effort + J_smooth
  *       + w_vis ||q_K - q_vis||^2
+ *
+ * Legacy experiments enter RECOVERY when the waypoint deadline expires.
+ * C4.2 can instead use a direct predicted-VBC Bool trigger. The physical
+ * deadline then remains only a timing input for the soft q_vis objective.
  *
  * Task position/terminal tracking and nominal velocity tracking are removed in
  * VERIFICATION_HOLD and RECOVERY. Hard position/velocity/acceleration
@@ -55,6 +59,7 @@ private:
   void waypointQCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void waypointDeadlineCallback(const std_msgs::Float64ConstPtr& msg);
   void verificationHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void recoveryTriggerCallback(const std_msgs::BoolConstPtr& msg);
   void replanReadyCallback(const std_msgs::BoolConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
@@ -121,6 +126,7 @@ private:
   ros::Subscriber waypoint_q_sub_;
   ros::Subscriber waypoint_deadline_sub_;
   ros::Subscriber verification_hold_sub_;
+  ros::Subscriber recovery_trigger_sub_;
   ros::Subscriber replan_ready_sub_;
 
   ros::Publisher velocity_command_pub_;
@@ -152,6 +158,11 @@ private:
   bool latest_verification_hold_ = false;
   bool has_verification_hold_ = false;
   ros::Time latest_verification_hold_received_;
+
+  bool use_external_recovery_trigger_ = false;
+  bool latest_recovery_trigger_ = false;
+  bool has_recovery_trigger_ = false;
+  ros::Time latest_recovery_trigger_received_;
 
   bool recovery_enabled_ = true;
   bool recovery_active_ = false;
@@ -210,6 +221,8 @@ private:
       "/care_planner/active_sensing/visibility_waypoint_deadline";
   std::string verification_hold_topic_ =
       "/care_planner/execution/predicted_vbc_verification_hold";
+  std::string recovery_trigger_topic_ =
+      "/care_planner/execution/predicted_vbc_recovery_triggered";
   std::string recovery_active_topic_ =
       "/care_planner/execution/visibility_recovery_active";
   std::string recovery_complete_topic_ =
