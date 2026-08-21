@@ -70,6 +70,13 @@ class PredictedVbcRecoveryGuard:
         if self._post_deadline_hold_future_s <= 0.0:
             raise ValueError("~post_deadline_hold_future_s must be > 0")
 
+        # The effective deadline is republished at guard rate. Keep it far
+        # enough ahead to survive one full publication period plus jitter;
+        # otherwise a 20 Hz MPC can observe the short 25 ms hold as already
+        # expired and accidentally enter legacy deadline Recovery.
+        self._post_deadline_hold_future_s = max(
+            self._post_deadline_hold_future_s, 1.5 / self._rate)
+
         self._active = False
         self._active_received = None
         self._physical_deadline_abs = None
