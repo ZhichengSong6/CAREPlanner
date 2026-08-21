@@ -10,8 +10,6 @@ CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
 C4_STREAK="${C4_STREAK:-2}"
 C4_INPUT_TIMEOUT="${C4_INPUT_TIMEOUT:-0.25}"
-C4_HOLD_FUTURE_S="${C4_HOLD_FUTURE_S:-0.025}"
-C4_FORCE_PAST_S="${C4_FORCE_PAST_S:-0.01}"
 AUDIT_WARN_MS="${AUDIT_WARN_MS:-5.0}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_2_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_2_smoke/${CASE_ID}}"
@@ -95,8 +93,6 @@ setsid roslaunch egocentric_arm_planner phaseB2_vbc_waypoint_controlled.launch \
   predicted_vbc_recovery_enabled:=true \
   predicted_vbc_recovery_consecutive_violations:="${C4_STREAK}" \
   predicted_vbc_recovery_input_timeout:="${C4_INPUT_TIMEOUT}" \
-  predicted_vbc_recovery_post_deadline_hold_future_s:="${C4_HOLD_FUTURE_S}" \
-  predicted_vbc_recovery_force_past_s:="${C4_FORCE_PAST_S}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
   trial_label:="${CASE_ID}_c4_2" \
   log_output_root:="${OUT}" \
