@@ -62,17 +62,17 @@ public:
     tan_half_h_fov_ = std::tan(0.5 * horizontal_fov_deg_ * M_PI / 180.0);
     tan_half_v_fov_ = std::tan(0.5 * vertical_fov_deg_ * M_PI / 180.0);
 
-    // Validate the sensor frame names only once at startup. Runtime calls use
-    // the same fixed list and the optimized single-FK evaluator helper.
-    Eigen::VectorXd q0(evaluator_.nq());
-    q0.setZero();
-    care_confidence_map::ConfigurationAuditGeometry geometry;
-    if (!evaluator_.computeAuditGeometryForConfiguration(
-            q0, 0, sensor_frames_, &geometry, &error_msg))
+    // Prepare all frame IDs, ignored-link filtering, body-frame grouping and
+    // local sample geometry once.  The per-prediction hot path contains no
+    // frame-name lookup and no body-sample string/object construction.
+    if (!evaluator_.prepareFastAudit(
+            sensor_frames_, ignored_risk_links_, &error_msg))
     {
-      ROS_ERROR_STREAM("[predicted_vbc_auditor] invalid sensor/body geometry: " << error_msg);
+      ROS_ERROR_STREAM("[predicted_vbc_auditor] fast audit preparation failed: "
+                       << error_msg);
       return false;
     }
+    fast_sensor_poses_.reserve(evaluator_.fastAuditSensorCount());
 
     target_sub_ = nh_.subscribe(
         target_topic_, 1, &PredictedVbcAuditorNode::targetCallback, this);
@@ -92,10 +92,12 @@ public:
         << " required_margin=" << min_margin_s_ << "s"
         << " warn_budget=" << audit_warn_ms_ << "ms");
     ROS_INFO_STREAM(
-        "[predicted_vbc_auditor] horizon audit uses full MPC prediction (normally 21 q), "
-        "one Pinocchio FK per evaluated q, " << sensor_frames_.size()
-        << " sensor FOV checks, and " << evaluator_.bodySampleModel().riskSampleCount()
-        << " body samples per q");
+        "[predicted_vbc_auditor] FAST horizon audit: full MPC prediction (normally 21 q), "
+        "one Pinocchio FK per evaluated q, cached sensors="
+        << evaluator_.fastAuditSensorCount()
+        << ", cached body samples=" << evaluator_.fastAuditBodySampleCount()
+        << " grouped into " << evaluator_.fastAuditBodyFrameCount()
+        << " body frames");
     return true;
   }
 
@@ -190,15 +192,9 @@ private:
     return true;
   }
 
-  bool isIgnoredRiskLink(const std::string& link_name) const
-  {
-    return std::find(ignored_risk_links_.begin(), ignored_risk_links_.end(), link_name)
-        != ignored_risk_links_.end();
-  }
-
   bool pointVisibleFromSensor(
       const Eigen::Vector3d& point_base,
-      const care_confidence_map::FramePoseInBase& sensor_pose) const
+      const care_confidence_map::FastAuditSensorPose& sensor_pose) const
   {
     const Eigen::Vector3d p_sensor =
         sensor_pose.rotation_base.transpose() *
@@ -216,7 +212,7 @@ private:
 
   bool pointVisibleFromAnySensor(
       const Eigen::Vector3d& point_base,
-      const std::vector<care_confidence_map::FramePoseInBase>& poses) const
+      const std::vector<care_confidence_map::FastAuditSensorPose>& poses) const
   {
     for (const auto& pose : poses)
     {
@@ -228,29 +224,16 @@ private:
     return false;
   }
 
-  double minBodyClearance(
-      const Eigen::Vector3d& point_base,
-      const std::vector<care_confidence_map::TrajectoryBodySample>& samples) const
-  {
-    double best = std::numeric_limits<double>::infinity();
-    for (const auto& sample : samples)
-    {
-      if (isIgnoredRiskLink(sample.link_name))
-      {
-        continue;
-      }
-      const double clearance =
-          (sample.center_base - point_base).norm() - sample.radius;
-      best = std::min(best, clearance);
-    }
-    return best;
-  }
-
-  bool buildJointMap(
+  bool ensureJointMap(
       const trajectory_msgs::JointTrajectory& traj,
-      std::vector<int>* required_to_input,
-      std::string* error_msg) const
+      std::string* error_msg)
   {
+    if (traj.joint_names == cached_prediction_joint_names_ &&
+        cached_required_to_input_.size() == evaluator_.activeJointNames().size())
+    {
+      return true;
+    }
+
     std::map<std::string, int> input_index;
     for (int i = 0; i < static_cast<int>(traj.joint_names.size()); ++i)
     {
@@ -258,17 +241,20 @@ private:
     }
 
     const auto& required = evaluator_.activeJointNames();
-    required_to_input->assign(required.size(), -1);
+    cached_required_to_input_.assign(required.size(), -1);
     for (std::size_t i = 0; i < required.size(); ++i)
     {
       const auto it = input_index.find(required[i]);
       if (it == input_index.end())
       {
+        cached_prediction_joint_names_.clear();
+        cached_required_to_input_.clear();
         if (error_msg) *error_msg = "prediction missing joint " + required[i];
         return false;
       }
-      (*required_to_input)[i] = it->second;
+      cached_required_to_input_[i] = it->second;
     }
+    cached_prediction_joint_names_ = traj.joint_names;
     return true;
   }
 
@@ -339,9 +325,8 @@ private:
       return;
     }
 
-    std::vector<int> required_to_input;
     std::string error_msg;
-    if (!buildJointMap(*msg, &required_to_input, &error_msg))
+    if (!ensureJointMap(*msg, &error_msg))
     {
       publishError("joint_map_error", 0.0, 0);
       ROS_WARN_STREAM_THROTTLE(1.0, "[predicted_vbc_auditor] " << error_msg);
@@ -362,7 +347,6 @@ private:
     std::string status = "no_sweep_in_horizon";
 
     Eigen::VectorXd q(evaluator_.nq());
-    care_confidence_map::ConfigurationAuditGeometry geometry;
 
     for (std::size_t k = 0; k < msg->points.size(); ++k)
     {
@@ -376,7 +360,7 @@ private:
       for (int j = 0; j < evaluator_.nq(); ++j)
       {
         q(j) = pt.positions[static_cast<std::size_t>(
-            required_to_input[static_cast<std::size_t>(j)])];
+            cached_required_to_input_[static_cast<std::size_t>(j)])];
       }
       if (!q.allFinite())
       {
@@ -390,23 +374,24 @@ private:
         t = static_cast<double>(k) * fallback_dt_;
       }
 
-      if (!evaluator_.computeAuditGeometryForConfiguration(
-              q, static_cast<int>(k), sensor_frames_, &geometry, &error_msg))
+      double clearance = std::numeric_limits<double>::infinity();
+      if (!evaluator_.evaluateFastAuditForConfiguration(
+              q, target, &fast_sensor_poses_, &clearance, &error_msg))
       {
         publishError("fk_error", elapsedMs(tic), evaluated_q);
-        ROS_WARN_STREAM_THROTTLE(1.0, "[predicted_vbc_auditor] FK error: " << error_msg);
+        ROS_WARN_STREAM_THROTTLE(
+            1.0, "[predicted_vbc_auditor] fast FK/audit error: " << error_msg);
         return;
       }
       evaluated_q += 1;
 
       if (!std::isfinite(first_see_s) &&
-          pointVisibleFromAnySensor(target, geometry.frame_poses))
+          pointVisibleFromAnySensor(target, fast_sensor_poses_))
       {
         first_see_s = t;
         see_k = static_cast<int>(k);
       }
 
-      const double clearance = minBodyClearance(target, geometry.body_samples);
       min_clearance_m = std::min(min_clearance_m, clearance);
       if (clearance <= sweep_extra_margin_m_)
       {
@@ -427,13 +412,13 @@ private:
         break;
       }
 
-      // If visibility was established at least min_margin_s_ ago and there has
-      // been no sweep up to the current q, every possible later sweep in this
-      // prediction necessarily satisfies the VBC lead requirement.  Stop here
-      // instead of spending FK on the rest of the horizon.
+      // Once the first visibility event already leads the current horizon time
+      // by the required margin and no sweep has happened yet, any later sweep
+      // is guaranteed safe.  Preserve the full 50 ms grid while avoiding the
+      // remaining FK work.
       if (std::isfinite(first_see_s) && t - first_see_s + 1e-9 >= min_margin_s_)
       {
-        margin_s = t - first_see_s;  // guaranteed lower bound, not exact sweep margin
+        margin_s = t - first_see_s;
         violation = false;
         status = "safe_margin_guaranteed";
         outcome_decided = true;
@@ -580,6 +565,10 @@ private:
   Eigen::Vector3d up_dir_ = Eigen::Vector3d::UnitY();
   std::vector<std::string> sensor_frames_;
   std::vector<std::string> ignored_risk_links_;
+
+  std::vector<std::string> cached_prediction_joint_names_;
+  std::vector<int> cached_required_to_input_;
+  std::vector<care_confidence_map::FastAuditSensorPose> fast_sensor_poses_;
 
   std::mutex mutex_;
   bool has_target_ = false;
