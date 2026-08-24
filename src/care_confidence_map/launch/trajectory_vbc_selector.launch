@@ -25,6 +25,15 @@
   <arg name="primary_frontier_window_s" default="0.25" />
   <arg name="target_switch_hysteresis_s" default="0.05" />
 
+  <!-- C4.3 risk-region clustering. Link identity is diagnostic only; it is not
+       a hard boundary. Connectivity is geometric + sweep-time + frontier. -->
+  <arg name="region_spatial_radius_m" default="0.12" />
+  <arg name="region_sweep_window_s" default="0.15" />
+  <arg name="region_match_radius_m" default="0.15" />
+  <arg name="region_representative_count" default="3" />
+  <arg name="selected_region_representatives_topic"
+       default="/care_planner/trajectory_risk/vbc_selected_region_representatives" />
+
   <node pkg="care_confidence_map"
         type="trajectory_vbc_selector_node"
         name="trajectory_vbc_selector_node"
@@ -57,5 +66,15 @@
            value="$(arg primary_frontier_window_s)" />
     <param name="trajectory_vbc/target_switch_hysteresis_s"
            value="$(arg target_switch_hysteresis_s)" />
+    <param name="trajectory_vbc/region_spatial_radius_m"
+           value="$(arg region_spatial_radius_m)" />
+    <param name="trajectory_vbc/region_sweep_window_s"
+           value="$(arg region_sweep_window_s)" />
+    <param name="trajectory_vbc/region_match_radius_m"
+           value="$(arg region_match_radius_m)" />
+    <param name="trajectory_vbc/region_representative_count"
+           value="$(arg region_representative_count)" />
+    <param name="trajectory_vbc/selected_region_representatives_topic"
+           value="$(arg selected_region_representatives_topic)" />
   </node>
 </launch>
