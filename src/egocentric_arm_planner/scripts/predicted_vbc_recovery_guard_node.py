@@ -46,22 +46,24 @@ class PredictedVbcRecoveryGuard:
     C4.2 selected-target mode (default):
       visibility_waypoint_active + single-target predicted-VBC auditor Bool
       -> N consecutive violations -> direct Recovery trigger.
+      Recovery completion remains the legacy selected-target behavior in the MPC.
 
     C4.3 global-set mode:
       trajectory_vbc_selector summary over the complete Primary+Secondary
       candidate set -> N consecutive *predicted* global violations -> Recovery.
-      The currently selected x* remains a steering target only; it no longer
-      defines the safety truth.
+      Once Recovery is active, N consecutive fresh global-safe evaluations
+      publish recovery_clear=true.  The currently selected x* remains a steering
+      target only; it no longer defines either Recovery entry or Recovery exit.
 
     In both modes the physical steering-target deadline is passed through
-    unchanged to the MPC.  In global mode a separate safety deadline is derived
-    from the selector's currently critical violating candidate for diagnostics;
+    unchanged to the MPC. In global mode a separate safety deadline is derived
+    from the selector's currently selected violating candidate for diagnostics;
     it never replaces the q_vis timing deadline.
 
     Global mode is fail-safe with respect to evaluator freshness: after T0, a
-    missing/stale predicted global summary requests verification hold.  Recovery
+    missing/stale predicted global summary requests verification hold. Recovery
     episodes are explicitly disarmed at recovery_complete and re-armed only at
-    replan_ready so an old latched trigger cannot leak across replans.
+    replan_ready so an old latched trigger/clear cannot leak across replans.
     """
 
     def __init__(self):
@@ -72,6 +74,8 @@ class PredictedVbcRecoveryGuard:
         self._input_timeout = float(rospy.get_param("~input_timeout", 0.25))
         self._consecutive_required = int(
             rospy.get_param("~consecutive_violations_required", 2))
+        self._consecutive_safe_required = int(
+            rospy.get_param("~consecutive_safe_required", 2))
         self._safety_margin_s = float(rospy.get_param("~safety_margin_s", 0.30))
 
         self._use_global_summary = bool(rospy.get_param(
@@ -109,6 +113,9 @@ class PredictedVbcRecoveryGuard:
         self._triggered_topic = str(rospy.get_param(
             "~triggered_topic",
             "/care_planner/execution/predicted_vbc_recovery_triggered"))
+        self._recovery_clear_topic = str(rospy.get_param(
+            "~recovery_clear_topic",
+            "/care_planner/execution/predicted_vbc_recovery_clear"))
         self._summary_topic = str(rospy.get_param(
             "~summary_topic",
             "/care_planner/execution/predicted_vbc_recovery_summary"))
@@ -119,6 +126,8 @@ class PredictedVbcRecoveryGuard:
             raise ValueError("~input_timeout must be > 0")
         if self._consecutive_required < 1:
             raise ValueError("~consecutive_violations_required must be >= 1")
+        if self._consecutive_safe_required < 1:
+            raise ValueError("~consecutive_safe_required must be >= 1")
         if self._safety_margin_s < 0.0:
             raise ValueError("~safety_margin_s must be non-negative")
 
@@ -143,14 +152,18 @@ class PredictedVbcRecoveryGuard:
         self._global_safety_deadline_abs = None
         self._episode_armed = True
 
-        # The physical deadline belongs to the current steering target.  It is
+        # The physical deadline belongs to the current steering target. It is
         # intentionally distinct from the global safety deadline above.
         self._physical_deadline_abs = None
 
         self._violation_streak = 0
         self._max_violation_streak = 0
+        self._safe_streak = 0
+        self._max_safe_streak = 0
         self._triggered = False
+        self._recovery_clear = False
         self._trigger_count_total = 0
+        self._clear_count_total = 0
         self._trigger_time_abs = None
         self._last_trigger_lead_s = float("nan")
         self._last_status = "waiting"
@@ -161,6 +174,8 @@ class PredictedVbcRecoveryGuard:
             self._verification_hold_topic, Bool, queue_size=1, latch=True)
         self._triggered_pub = rospy.Publisher(
             self._triggered_topic, Bool, queue_size=1, latch=True)
+        self._recovery_clear_pub = rospy.Publisher(
+            self._recovery_clear_topic, Bool, queue_size=1, latch=True)
         self._summary_pub = rospy.Publisher(
             self._summary_topic, String, queue_size=1, latch=True)
 
@@ -190,25 +205,45 @@ class PredictedVbcRecoveryGuard:
                     self._replan_ready_cb, queue_size=1)
 
         self._triggered_pub.publish(Bool(data=False))
+        self._recovery_clear_pub.publish(Bool(data=False))
         self._verification_hold_pub.publish(Bool(data=False))
         self._timer = rospy.Timer(
             rospy.Duration(1.0 / self._rate), self._timer_cb)
 
         rospy.logwarn(
-            "[predicted_vbc_recovery_guard] mode=%s enabled=%d consecutive=%d "
-            "timeout=%.3fs episode_rearm=%d",
+            "[predicted_vbc_recovery_guard] mode=%s enabled=%d "
+            "unsafe_consecutive=%d safe_consecutive=%d timeout=%.3fs "
+            "episode_rearm=%d",
             "global_set" if self._use_global_summary else "selected_target",
             int(self._enabled), self._consecutive_required,
-            self._input_timeout, int(self._episode_rearm_enabled))
+            self._consecutive_safe_required, self._input_timeout,
+            int(self._episode_rearm_enabled))
+
+    def _set_recovery_clear_locked(self, clear):
+        clear = bool(clear)
+        if clear == self._recovery_clear:
+            return
+        self._recovery_clear = clear
+        self._recovery_clear_pub.publish(Bool(data=clear))
+        if clear:
+            self._clear_count_total += 1
+            rospy.logwarn(
+                "[predicted_vbc_recovery_guard] GLOBAL VBC RECOVERY CLEAR: "
+                "safe_streak=%d",
+                self._safe_streak)
 
     def _reset_decision_locked(self, publish=True):
         self._violation_streak = 0
         self._max_violation_streak = 0
+        self._safe_streak = 0
+        self._max_safe_streak = 0
         self._triggered = False
         self._trigger_time_abs = None
         self._last_violation = False
+        self._recovery_clear = False
         if publish:
             self._triggered_pub.publish(Bool(data=False))
+            self._recovery_clear_pub.publish(Bool(data=False))
             self._verification_hold_pub.publish(Bool(data=False))
 
     def _active_cb(self, msg):
@@ -252,8 +287,8 @@ class PredictedVbcRecoveryGuard:
                 not self._episode_rearm_enabled):
             return
         with self._lock:
-            # Controller is already in RECOVERY_HOLD at this point. Clear the
-            # latched trigger here, before replan_ready can release the hold.
+            # Controller is already in RECOVERY_HOLD at this point. Clear both
+            # edge signals before replan_ready can release the hold.
             self._episode_armed = False
             self._reset_decision_locked()
             self._global_summary_received = None
@@ -272,8 +307,10 @@ class PredictedVbcRecoveryGuard:
             self._episode_armed = True
             self._reset_decision_locked()
             # Require a genuinely fresh post-replan predicted selector result.
+            # Re-anchor the freshness grace period at the new episode boundary.
             self._global_summary_received = None
             self._global_safety_deadline_abs = None
+            self._execution_ready_received = rospy.Time.now()
             self._last_status = "rearmed_waiting_fresh_global_summary"
             rospy.logwarn(
                 "[predicted_vbc_recovery_guard] replan_ready -> global "
@@ -308,39 +345,57 @@ class PredictedVbcRecoveryGuard:
         if not self._enabled:
             self._last_status = "disabled"
             return
-        if self._triggered:
-            self._last_status = "triggered"
-            return
 
         if violation:
+            self._safe_streak = 0
+            self._set_recovery_clear_locked(False)
+
+            if self._triggered:
+                self._last_status = source_label + "_triggered_unsafe"
+                return
+
             self._violation_streak += 1
             self._max_violation_streak = max(
                 self._max_violation_streak, self._violation_streak)
             self._last_status = source_label + "_violation_streak"
-        else:
-            self._violation_streak = 0
-            self._last_status = source_label + "_safe"
 
-        if self._violation_streak < self._consecutive_required:
+            if self._violation_streak < self._consecutive_required:
+                return
+
+            self._triggered = True
+            self._trigger_time_abs = now.to_sec()
+            self._trigger_count_total += 1
+            deadline = self._current_safety_deadline_locked()
+            if deadline is not None:
+                self._last_trigger_lead_s = deadline - self._trigger_time_abs
+            else:
+                self._last_trigger_lead_s = float("nan")
+            self._last_status = source_label + "_recovery_triggered"
+            self._triggered_pub.publish(Bool(data=True))
+            rospy.logerr(
+                "[predicted_vbc_recovery_guard] PREDICTED VBC RECOVERY TRIGGER: "
+                "mode=%s streak=%d safety_deadline_lead=%s",
+                source_label,
+                self._violation_streak,
+                "nan" if not math.isfinite(self._last_trigger_lead_s)
+                else "%.3fs" % self._last_trigger_lead_s)
             return
 
-        self._triggered = True
-        self._trigger_time_abs = now.to_sec()
-        self._trigger_count_total += 1
-        deadline = self._current_safety_deadline_locked()
-        if deadline is not None:
-            self._last_trigger_lead_s = deadline - self._trigger_time_abs
-        else:
-            self._last_trigger_lead_s = float("nan")
-        self._last_status = source_label + "_recovery_triggered"
-        self._triggered_pub.publish(Bool(data=True))
-        rospy.logerr(
-            "[predicted_vbc_recovery_guard] PREDICTED VBC RECOVERY TRIGGER: "
-            "mode=%s streak=%d safety_deadline_lead=%s",
-            source_label,
-            self._violation_streak,
-            "nan" if not math.isfinite(self._last_trigger_lead_s)
-            else "%.3fs" % self._last_trigger_lead_s)
+        # Safe global evaluations are relevant to Recovery exit only after a
+        # Recovery trigger has been latched. Before that, they simply reset the
+        # entry streak. In C4.2 selected-target mode Recovery exit remains legacy.
+        self._violation_streak = 0
+        self._last_status = source_label + "_safe"
+        if not (self._use_global_summary and self._triggered):
+            self._safe_streak = 0
+            return
+
+        self._safe_streak += 1
+        self._max_safe_streak = max(self._max_safe_streak, self._safe_streak)
+        self._last_status = source_label + "_safe_streak"
+        if self._safe_streak >= self._consecutive_safe_required:
+            self._set_recovery_clear_locked(True)
+            self._last_status = source_label + "_recovery_clear"
 
     def _violation_cb(self, msg):
         if msg is None or self._use_global_summary:
@@ -403,11 +458,13 @@ class PredictedVbcRecoveryGuard:
             if not self._execution_ready:
                 self._last_violation = bool(violation)
                 self._violation_streak = 0
+                self._safe_streak = 0
                 self._last_status = "global_waiting_execution_release"
                 return
             if self._episode_rearm_enabled and not self._episode_armed:
                 self._last_violation = bool(violation)
                 self._violation_streak = 0
+                self._safe_streak = 0
                 self._last_status = "global_disarmed_waiting_replan"
                 return
 
@@ -493,14 +550,19 @@ class PredictedVbcRecoveryGuard:
             "active=%d" % int(active),
             "episode_armed=%d" % int(self._episode_armed),
             "triggered=%d" % int(self._triggered),
+            "recovery_clear=%d" % int(self._recovery_clear),
             "verification_hold=%d" % int(verification_hold),
             "trigger_count_total=%d" % self._trigger_count_total,
+            "clear_count_total=%d" % self._clear_count_total,
             "status=%s" % self._last_status,
             "routing=%s" % routing_status,
             "violation=%d" % int(self._last_violation),
             "violation_streak=%d" % self._violation_streak,
             "max_violation_streak=%d" % self._max_violation_streak,
             "required_streak=%d" % self._consecutive_required,
+            "safe_streak=%d" % self._safe_streak,
+            "max_safe_streak=%d" % self._max_safe_streak,
+            "required_safe_streak=%d" % self._consecutive_safe_required,
             "source_age=%s" % (
                 "nan" if not math.isfinite(source_age)
                 else "%.6f" % source_age),
@@ -534,11 +596,13 @@ class PredictedVbcRecoveryGuard:
             if self._use_global_summary:
                 if (self._enabled and self._execution_ready and
                         (not self._episode_rearm_enabled or self._episode_armed) and
-                        not self._triggered and
                         self._global_summary_received is not None and
                         not self._global_fresh_locked(now)):
                     self._violation_streak = 0
-                    self._last_status = "stale_global_summary"
+                    self._safe_streak = 0
+                    self._set_recovery_clear_locked(False)
+                    if not self._triggered:
+                        self._last_status = "stale_global_summary"
             else:
                 if (self._enabled and not self._triggered and self._active and
                         self._violation_received is not None and
