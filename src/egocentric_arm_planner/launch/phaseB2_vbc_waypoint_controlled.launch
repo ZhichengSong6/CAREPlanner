@@ -19,6 +19,8 @@
   <arg name="selector_predicted_trajectory_timeout" default="0.20" />
   <arg name="primary_frontier_window_s" default="0.25" />
   <arg name="target_switch_hysteresis_s" default="0.05" />
+  <arg name="rolling_safe_clear_consecutive" default="2" />
+  <arg name="rolling_target_cell_resolution" default="0.05" />
 
   <!-- Phase C3 q_vis-distance predictive recovery. Kept for regression only. -->
   <arg name="predictive_recovery_enabled" default="false" />
@@ -33,6 +35,7 @@
   <arg name="predicted_vbc_recovery_enabled" default="false" />
   <arg name="predicted_vbc_recovery_use_global_selector" default="false" />
   <arg name="predicted_vbc_recovery_consecutive_violations" default="2" />
+  <arg name="predicted_vbc_recovery_consecutive_safe" default="2" />
   <arg name="predicted_vbc_recovery_input_timeout" default="0.25" />
 
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
@@ -52,6 +55,8 @@
   <arg name="synced_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
   <arg name="recovery_physical_deadline_topic" default="$(arg synced_deadline_topic)" />
   <arg name="effective_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_effective" />
+  <arg name="recovery_trigger_topic" default="/care_planner/execution/predicted_vbc_recovery_triggered" />
+  <arg name="recovery_clear_topic" default="/care_planner/execution/predicted_vbc_recovery_clear" />
   <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
   <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
   <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
@@ -125,6 +130,7 @@
     <param name="rate" value="20.0" />
     <param name="input_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
     <param name="consecutive_violations_required" value="$(arg predicted_vbc_recovery_consecutive_violations)" />
+    <param name="consecutive_safe_required" value="$(arg predicted_vbc_recovery_consecutive_safe)" />
     <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
     <param name="use_global_summary_input" value="$(arg predicted_vbc_recovery_use_global_selector)" />
     <param name="episode_rearm_enabled" value="$(arg rolling_target_mode)" />
@@ -138,7 +144,8 @@
     <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
     <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
     <param name="summary_topic" value="/care_planner/execution/predicted_vbc_recovery_summary" />
-    <param name="triggered_topic" value="/care_planner/execution/predicted_vbc_recovery_triggered" />
+    <param name="triggered_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="recovery_clear_topic" value="$(arg recovery_clear_topic)" />
   </node>
 
   <node pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
@@ -156,7 +163,10 @@
     <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg effective_deadline_topic)" />
     <param name="mpc/visibility_waypoint/verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
     <param name="mpc/visibility_waypoint/use_external_recovery_trigger" value="$(arg predicted_vbc_recovery_enabled)" />
-    <param name="mpc/visibility_waypoint/recovery_trigger_topic" value="/care_planner/execution/predicted_vbc_recovery_triggered" />
+    <param name="mpc/visibility_waypoint/recovery_trigger_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_clear" value="$(arg predicted_vbc_recovery_use_global_selector)" />
+    <param name="mpc/visibility_waypoint/recovery_clear_topic" value="$(arg recovery_clear_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_signal_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
     <param name="mpc/visibility_waypoint/recovery_enabled" value="$(arg recovery_enabled)" />
     <param name="mpc/visibility_waypoint/recovery_weight_scale" value="$(arg recovery_weight_scale)" />
     <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
@@ -219,6 +229,8 @@
     <param name="rolling_deadline_topic" value="$(arg rolling_deadline_topic)" />
     <param name="rolling_target_mode" value="$(arg rolling_target_mode)" />
     <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="safe_clear_consecutive_required" value="$(arg rolling_safe_clear_consecutive)" />
+    <param name="target_cell_resolution" value="$(arg rolling_target_cell_resolution)" />
     <param name="recovery_active_topic" value="$(arg recovery_active_topic)" />
     <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
