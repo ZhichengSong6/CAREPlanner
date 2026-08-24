@@ -15,11 +15,13 @@ class PhaseB2ControlledTrialNode:
     Legacy mode preserves C4.2: the first target+sweep pair stays frozen and a
     completed Recovery requests at most one measured-state task replan.
 
-    C4.3 rolling mode keeps that same frozen bootstrap until execution T0. Once
+    C4.3 rolling mode keeps the same frozen bootstrap until execution T0. Once
     released, selector target+sweep pairs may roll only while the MPC prediction
-    stream is fresh. The current pair is locked throughout Recovery and
-    RECOVERY_HOLD and is released only after the gate installs the measured-state
-    replan. Multiple Recovery/replan episodes are allowed in rolling mode.
+    stream is fresh. During a Recovery episode the current steering target is
+    sticky only through the selector's hysteresis; it may switch to another
+    critical target without task replanning. A hard target lock is used only
+    after the whole Recovery episode completes, while the measured-state replan
+    is being installed. Multiple Recovery/replan episodes are allowed.
     """
 
     def __init__(self):
@@ -43,7 +45,7 @@ class PhaseB2ControlledTrialNode:
             "~predicted_trajectory_timeout", 0.20))
 
         # Historical topic names remain for C4.2 compatibility. In C4.3 they
-        # carry the current selected/locked pair rather than a trial-long pair.
+        # carry the current selected pair rather than a trial-long pair.
         self.target_topic = str(rospy.get_param(
             "~frozen_target_topic", "/care_planner/active_sensing/target_point"))
         self.sweep_time_topic = str(rospy.get_param(
@@ -82,6 +84,10 @@ class PhaseB2ControlledTrialNode:
         self.goal_delay = float(rospy.get_param("~goal_delay", 0.5))
         self.pair_timeout = float(rospy.get_param(
             "~candidate_pair_timeout", 0.20))
+        self.safe_clear_consecutive_required = int(rospy.get_param(
+            "~safe_clear_consecutive_required", 2))
+        self.target_cell_resolution = float(rospy.get_param(
+            "~target_cell_resolution", 0.05))
 
         self.goal_x = float(rospy.get_param("~goal/x", 0.286881))
         self.goal_y = float(rospy.get_param("~goal/y", 0.0))
@@ -101,6 +107,10 @@ class PhaseB2ControlledTrialNode:
             raise ValueError("safety_margin_s must be non-negative")
         if self.predicted_trajectory_timeout <= 0.0:
             raise ValueError("predicted_trajectory_timeout must be positive")
+        if self.safe_clear_consecutive_required < 1:
+            raise ValueError("safe_clear_consecutive_required must be >= 1")
+        if self.target_cell_resolution <= 0.0:
+            raise ValueError("target_cell_resolution must be positive")
 
         self._startup_time = rospy.Time.now()
         self._goal_sent = False
@@ -110,6 +120,7 @@ class PhaseB2ControlledTrialNode:
         self._selected_target = None
         self._selected_sweep_time = None
         self._selected_active = False
+        self._selected_cell_key = None
         self._candidate_active = False
         self._pending_candidate = None
         self._pending_candidate_received = None
@@ -118,6 +129,9 @@ class PhaseB2ControlledTrialNode:
         self._execution_released = False
         self._execution_start_s = None
         self._target_lock = False
+        self._recovery_episode_active = False
+        self._safe_clear_streak = 0
+        self._recovery_target_switch_count = 0
         self._rolling_deadline_s = None
         self._predicted_trajectory_received = None
 
@@ -180,10 +194,20 @@ class PhaseB2ControlledTrialNode:
         if self.rolling_target_mode:
             rospy.logwarn(
                 "[phase_b2_trial] C4.3 ROLLING MODE: bootstrap frozen to T0; "
-                "fresh-prediction target rolls in NORMAL and locks through Recovery/replan")
+                "targets may switch inside Recovery; hard lock only during "
+                "post-Recovery measured-state replan")
         else:
             rospy.logwarn(
                 "[phase_b2_trial] C4.2 CONTROLLED MODE: first VBC pair frozen")
+
+    def _cell_key(self, target):
+        if target is None:
+            return None
+        inv = 1.0 / self.target_cell_resolution
+        return (
+            int(round(float(target.point.x) * inv)),
+            int(round(float(target.point.y) * inv)),
+            int(round(float(target.point.z) * inv)))
 
     def _prediction_fresh_locked(self):
         if not self.rolling_target_mode or not self._execution_released:
@@ -221,10 +245,15 @@ class PhaseB2ControlledTrialNode:
         prediction_fresh = self._prediction_fresh_locked()
         base = (
             "rolling={} selected_active={} candidate_active={} target_lock={} "
+            "recovery_episode_active={} safe_clear_streak={} "
+            "safe_clear_required={} recovery_target_switch_count={} "
             "released={} prediction_fresh={} replan_count={}"
         ).format(
             int(self.rolling_target_mode), int(self._selected_active),
             int(self._candidate_active), int(self._target_lock),
+            int(self._recovery_episode_active), self._safe_clear_streak,
+            self.safe_clear_consecutive_required,
+            self._recovery_target_switch_count,
             int(self._execution_released), int(prediction_fresh),
             self._replan_count)
 
@@ -234,15 +263,20 @@ class PhaseB2ControlledTrialNode:
             deadline = (
                 "nan" if self._rolling_deadline_s is None
                 else "{:.9f}".format(self._rolling_deadline_s))
+            cell = self._selected_cell_key
+            cell_text = (
+                "none" if cell is None
+                else "[{},{},{}]".format(cell[0], cell[1], cell[2]))
             summary.data = (
-                "selected=1 {} target=[{:.9f},{:.9f},{:.9f}] frame={} "
-                "sweep_time_s={:.9f} rolling_deadline_s={}"
+                "selected=1 {} target=[{:.9f},{:.9f},{:.9f}] "
+                "target_cell={} frame={} sweep_time_s={:.9f} "
+                "rolling_deadline_s={}"
             ).format(
                 base,
                 self._selected_target.point.x,
                 self._selected_target.point.y,
                 self._selected_target.point.z,
-                self.base_frame,
+                cell_text, self.base_frame,
                 self._selected_sweep_time,
                 deadline)
         self.summary_pub.publish(summary)
@@ -299,6 +333,7 @@ class PhaseB2ControlledTrialNode:
     def _clear_selected_locked(self):
         self._selected_target = None
         self._selected_sweep_time = None
+        self._selected_cell_key = None
         self._rolling_deadline_s = None
         self._pending_candidate = None
         self._pending_candidate_received = None
@@ -373,13 +408,28 @@ class PhaseB2ControlledTrialNode:
                     self._set_selected_active_locked(False)
                 return
 
-            if not active:
-                self._clear_selected_locked()
-                rospy.loginfo_throttle(
-                    0.5,
-                    "[phase_b2_trial] rolling selector safe -> target inactive")
-            elif self._selected_target is not None:
-                self._set_selected_active_locked(True)
+            if active:
+                self._safe_clear_streak = 0
+                if self._selected_target is not None:
+                    self._set_selected_active_locked(True)
+                else:
+                    self._publish_summary_locked()
+                return
+
+            # Use the same two-cycle spirit as the global Recovery guard. A
+            # one-frame safe flicker must not destroy the q_vis cache and cause
+            # the same voxel to be regenerated on the next frame.
+            self._safe_clear_streak += 1
+            if self._safe_clear_streak < self.safe_clear_consecutive_required:
+                self._publish_summary_locked()
+                return
+
+            self._clear_selected_locked()
+            rospy.loginfo_throttle(
+                0.5,
+                "[phase_b2_trial] rolling global set safe for %d cycles -> "
+                "steering target inactive",
+                self._safe_clear_streak)
 
     def _candidate_callback(self, msg):
         if msg is None:
@@ -443,10 +493,22 @@ class PhaseB2ControlledTrialNode:
                     age)
                 return
 
+            old_cell = self._selected_cell_key
+            new_cell = self._cell_key(self._pending_candidate)
             self._selected_target = self._pending_candidate
             self._selected_sweep_time = float(msg.data)
+            self._selected_cell_key = new_cell
             self._pending_candidate = None
             self._pending_candidate_received = None
+            self._safe_clear_streak = 0
+
+            if (self.rolling_target_mode and self._recovery_episode_active and
+                    old_cell is not None and new_cell != old_cell):
+                self._recovery_target_switch_count += 1
+                rospy.logwarn(
+                    "[phase_b2_trial] RECOVERY STEERING TARGET SWITCH #%d: "
+                    "%s -> %s",
+                    self._recovery_target_switch_count, old_cell, new_cell)
 
             # Target is intentionally published before sweep. The rolling
             # waypoint node clears its old sweep on a true target-region change.
@@ -457,13 +519,15 @@ class PhaseB2ControlledTrialNode:
                 self._set_selected_active_locked(self._candidate_active)
                 rospy.loginfo_throttle(
                     0.25,
-                    "[phase_b2_trial] rolling pair x=%.3f y=%.3f z=%.3f "
-                    "sweep=%.3f active=%d",
+                    "[phase_b2_trial] rolling pair cell=%s x=%.3f y=%.3f z=%.3f "
+                    "sweep=%.3f active=%d recovery_episode=%d",
+                    self._selected_cell_key,
                     self._selected_target.point.x,
                     self._selected_target.point.y,
                     self._selected_target.point.z,
                     self._selected_sweep_time,
-                    int(self._selected_active))
+                    int(self._selected_active),
+                    int(self._recovery_episode_active))
             else:
                 self._set_selected_active_locked(True)
                 rospy.logwarn(
@@ -497,16 +561,38 @@ class PhaseB2ControlledTrialNode:
             self._publish_summary_locked()
 
     def _recovery_active_callback(self, msg):
-        if msg is None or not self.rolling_target_mode or not bool(msg.data):
+        if msg is None or not self.rolling_target_mode:
             return
+        active = bool(msg.data)
         with self._lock:
-            self._target_lock = True
-            if self._selected_target is not None:
-                self._set_selected_active_locked(True)
-            else:
+            was_active = self._recovery_episode_active
+            self._recovery_episode_active = active
+
+            if active:
+                # Recovery is an episode over the global risk set. Do not hard
+                # lock one steering target; selector hysteresis is the sticky
+                # mechanism and may switch to another critical target.
+                self._target_lock = False
+                self._safe_clear_streak = 0
+                if self._selected_target is not None and self._candidate_active:
+                    self._set_selected_active_locked(True)
+                else:
+                    self._publish_summary_locked()
+            elif was_active:
+                # The controller has declared the *global* Recovery episode
+                # complete. Freeze target lifecycle during measured-state replan.
+                self._target_lock = True
+                self._publish_frozen_state(True)
                 self._publish_summary_locked()
-        rospy.logwarn(
-            "[phase_b2_trial] Recovery active -> rolling target LOCKED")
+
+        if active:
+            rospy.logwarn(
+                "[phase_b2_trial] Recovery episode active -> rolling steering "
+                "target updates remain ENABLED")
+        elif was_active:
+            rospy.logwarn(
+                "[phase_b2_trial] Recovery episode ended -> target lifecycle "
+                "LOCKED for measured-state replan")
 
     def _recovery_complete_callback(self, msg):
         if msg is None or not bool(msg.data):
@@ -525,12 +611,14 @@ class PhaseB2ControlledTrialNode:
             self._replan_count += 1
             if self.rolling_target_mode:
                 self._target_lock = True
+                self._recovery_episode_active = False
             else:
                 self._legacy_replan_goal_sent = True
             self._publish_summary_locked()
 
         rospy.logwarn(
-            "[phase_b2_trial] RECOVERY COMPLETE -> measured-state replan #%d",
+            "[phase_b2_trial] RECOVERY EPISODE COMPLETE -> measured-state "
+            "replan #%d",
             self._replan_count)
 
     def _replan_ready_callback(self, msg):
@@ -538,8 +626,10 @@ class PhaseB2ControlledTrialNode:
             return
         with self._lock:
             self._target_lock = False
-            # The locked target has been resolved. Wait for a fresh selector
-            # pair instead of reviving the old one after replan.
+            self._recovery_episode_active = False
+            self._safe_clear_streak = 0
+            # The old episode is resolved. Wait for a fresh selector pair
+            # instead of reviving its last steering target after replan.
             self._clear_selected_locked()
             self._publish_frozen_state(False)
             self._publish_summary_locked()
@@ -551,16 +641,16 @@ class PhaseB2ControlledTrialNode:
             should_publish = (
                 self._selected_target is not None and
                 (not self.rolling_target_mode or
-                 self._selected_active or self._target_lock))
+                 self._selected_active or self._target_lock or
+                 self._recovery_episode_active))
             if not should_publish:
                 return
 
-            # Publish the current target+sweep pair together every cycle.  ROS
+            # Publish the current target+sweep pair together every cycle. ROS
             # does not guarantee callback ordering across two topics, so the
-            # first delivery may arrive sweep-before-target.  The rolling
-            # waypoint node intentionally clears an old sweep on a new target
-            # cell; repeating the full pair guarantees the next cycle repairs
-            # that ordering without ever pairing a new target with an old sweep.
+            # first delivery may arrive sweep-before-target. Repeating the full
+            # pair repairs that ordering without ever pairing a new target with
+            # an old sweep.
             self._publish_pair_locked()
 
 
