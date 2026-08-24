@@ -31,6 +31,7 @@
   <arg name="enable_predicted_vbc_auditor" default="false" />
   <arg name="predicted_vbc_audit_warn_ms" default="5.0" />
   <arg name="predicted_vbc_recovery_enabled" default="false" />
+  <arg name="predicted_vbc_recovery_use_global_selector" default="false" />
   <arg name="predicted_vbc_recovery_consecutive_violations" default="2" />
   <arg name="predicted_vbc_recovery_input_timeout" default="0.25" />
 
@@ -124,6 +125,13 @@
     <param name="rate" value="20.0" />
     <param name="input_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
     <param name="consecutive_violations_required" value="$(arg predicted_vbc_recovery_consecutive_violations)" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="use_global_summary_input" value="$(arg predicted_vbc_recovery_use_global_selector)" />
+    <param name="episode_rearm_enabled" value="$(arg rolling_target_mode)" />
+    <param name="global_summary_topic" value="/care_planner/trajectory_risk/vbc_summary" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
     <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="violation_topic" value="/care_planner/execution/predicted_vbc_violation" />
     <param name="physical_deadline_topic" value="$(arg recovery_physical_deadline_topic)" />
@@ -156,6 +164,8 @@
     <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
   </node>
 
+  <!-- In C4.3 this auditor is retained as a selected-target diagnostic. The
+       global-set guard above is the Recovery safety source when enabled. -->
   <include if="$(arg enable_predicted_vbc_auditor)"
            file="$(find care_confidence_map)/launch/predicted_vbc_auditor.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -201,6 +211,8 @@
     <param name="candidate_topic" value="$(arg candidate_target_topic)" />
     <param name="candidate_active_topic" value="$(arg candidate_active_topic)" />
     <param name="candidate_sweep_time_topic" value="$(arg candidate_sweep_time_topic)" />
+    <param name="predicted_trajectory_topic" value="/care_planner/mpc/predicted_trajectory" />
+    <param name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
     <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
     <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
     <param name="selected_active_topic" value="$(arg selected_target_active_topic)" />
