@@ -153,7 +153,7 @@ target_link_libraries(trajectory_risk_node
   pinocchio::pinocchio
 )
 
-# C4.3 ordered temporal-layer / all-point active-set selector.
+# C4.3 exact-timestep temporal-layer selector retained for ablation.
 add_executable(trajectory_vbc_selector_node
   src/trajectory_vbc_selector_node.cpp
 )
@@ -164,6 +164,27 @@ add_dependencies(trajectory_vbc_selector_node
 )
 
 target_link_libraries(trajectory_vbc_selector_node
+  trajectory_risk_evaluator
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+  pinocchio::pinocchio
+)
+
+# C4.3 bounded temporal-cluster selector.  The default experiment groups
+# violations over a maximum span of two original MPC prediction steps, then
+# spatially clusters each temporal layer while steering all points in the
+# earliest unsafe layer together.
+add_executable(trajectory_vbc_selector_temporal_cluster_node
+  src/trajectory_vbc_selector_temporal_cluster_node.cpp
+)
+
+add_dependencies(trajectory_vbc_selector_temporal_cluster_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_vbc_selector_temporal_cluster_node
   trajectory_risk_evaluator
   body_sample_model
   ${catkin_LIBRARIES}
@@ -225,6 +246,7 @@ install(TARGETS
   body_observability_node
   trajectory_risk_node
   trajectory_vbc_selector_node
+  trajectory_vbc_selector_temporal_cluster_node
   trajectory_vbc_selector_legacy_node
   predicted_vbc_auditor_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
