@@ -153,6 +153,7 @@ target_link_libraries(trajectory_risk_node
   pinocchio::pinocchio
 )
 
+# C4.3 ordered temporal-layer / all-point active-set selector.
 add_executable(trajectory_vbc_selector_node
   src/trajectory_vbc_selector_node.cpp
 )
@@ -163,6 +164,26 @@ add_dependencies(trajectory_vbc_selector_node
 )
 
 target_link_libraries(trajectory_vbc_selector_node
+  trajectory_risk_evaluator
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+  pinocchio::pinocchio
+)
+
+# Exact point-level selector source frozen before the C4.3 risk-region work.
+# Kept as a separate executable so C4.2 can be reproduced without routing
+# through any of the temporal-layer or clustering semantics.
+add_executable(trajectory_vbc_selector_legacy_node
+  src/trajectory_vbc_selector_legacy_node.cpp
+)
+
+add_dependencies(trajectory_vbc_selector_legacy_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(trajectory_vbc_selector_legacy_node
   trajectory_risk_evaluator
   body_sample_model
   ${catkin_LIBRARIES}
@@ -204,6 +225,7 @@ install(TARGETS
   body_observability_node
   trajectory_risk_node
   trajectory_vbc_selector_node
+  trajectory_vbc_selector_legacy_node
   predicted_vbc_auditor_node
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
