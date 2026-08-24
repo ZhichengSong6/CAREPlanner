@@ -80,7 +80,7 @@ for _ in $(seq 1 120); do
 done
 [ "${READY}" = "1" ] || { echo "[ERROR] Gazebo joint state timeout"; exit 1; }
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_rolling_node.py _device:=cpu _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_rolling_node.py _device:=cpu _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -183,7 +183,7 @@ for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
 REC_PIDS=()
 
 python3 - "${CASE_ID}" "${OUT}" "${LOG}/controlled.log" <<'PY'
-import csv,json,math,os,re,sys
+import csv,glob,json,os,re,sys
 from collections import Counter
 
 cid,out,controlled=sys.argv[1:]
@@ -221,12 +221,19 @@ source_counts=Counter(r.get('trajectory_source','unknown') for r in selector)
 group_counts=Counter(r.get('selected_group','none') for r in selected)
 reason_counts=Counter(r.get('selection_reason','none') for r in selected)
 
-# Count actual selected-target transitions from broker state, not repeated 20-Hz publications.
-targets=[]
+# Logical rolling-target transitions are voxel transitions, not millimetre
+# changes of a sampled point inside the same confidence-map cell.
+cells=[]
+for r in waypoint:
+    if r.get('selection_active')!='1': continue
+    cell=r.get('target_cell')
+    if cell and cell!='none' and (not cells or cells[-1]!=cell): cells.append(cell)
+
+raw_targets=[]
 for r in broker:
     if r.get('selected')!='1' or r.get('selected_active')!='1': continue
     t=r.get('target')
-    if t and (not targets or targets[-1]!=t): targets.append(t)
+    if t and (not raw_targets or raw_targets[-1]!=t): raw_targets.append(t)
 
 active_audit=[r for r in audit if r.get('status') not in ('inactive','waiting_target')]
 viol=[r for r in active_audit if r.get('violation')=='1']
@@ -237,6 +244,7 @@ replan_requested=max([i(r.get('replan_count')) for r in broker] or [0])
 replan_installed=max([i(r.get('replan_count')) for r in gate] or [0])
 lock_records=sum(i(r.get('target_lock'))==1 for r in broker)
 hold_records=sum(i(r.get('verification_hold'))==1 for r in guard)
+prediction_stale_records=sum(i(r.get('prediction_fresh'),1)==0 for r in broker if r.get('released')=='1')
 
 text=open(controlled,errors='replace').read() if os.path.isfile(controlled) else ''
 recovery_entries=len(re.findall(
@@ -252,9 +260,12 @@ payload={
   'selected_group_counts':dict(group_counts),
   'selection_reason_counts':dict(reason_counts),
   'selector_no_violation_records':sum(r.get('has_violation')=='0' for r in selector),
-  'target_transition_count':max(0,len(targets)-1),
-  'selected_target_sequence':targets,
-  'unique_selected_target_count':len(set(targets)),
+  'target_cell_transition_count':max(0,len(cells)-1),
+  'selected_target_cell_sequence':cells,
+  'unique_selected_target_cell_count':len(set(cells)),
+  'raw_broker_target_transition_count':max(0,len(raw_targets)-1),
+  'raw_broker_target_sequence':raw_targets,
+  'waypoint_generation_trace_count':len(glob.glob(os.path.join(out,'projector_traces','vbc_visibility_waypoint_*.json'))),
   'waypoint_records':len(waypoint),
   'waypoint_predicted_source_observed':any(r.get('trajectory_source')=='predicted' for r in waypoint),
   'num_active_audits':len(active_audit),
@@ -267,6 +278,7 @@ payload={
   'target_lock_summary_records':lock_records,
   'target_lock_log_count':lock_logs,
   'target_unlock_log_count':unlock_logs,
+  'prediction_stale_broker_records':prediction_stale_records,
   'verification_hold_summary_records':hold_records,
   'gate_released_observed':any(r.get('released')=='1' for r in gate),
   'final_guard_routing':guard[-1].get('routing') if guard else None,
