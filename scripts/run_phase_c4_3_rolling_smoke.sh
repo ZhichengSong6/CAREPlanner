@@ -209,11 +209,6 @@ def i(v,default=0):
     try: return int(v)
     except: return default
 
-def f(v):
-    try:
-        x=float(v); return x if math.isfinite(x) else None
-    except: return None
-
 selector=records(os.path.join(out,'selector_summary.csv'))
 broker=records(os.path.join(out,'broker_summary.csv'))
 waypoint=records(os.path.join(out,'waypoint_summary.csv'))
@@ -238,7 +233,8 @@ viol=[r for r in active_audit if r.get('violation')=='1']
 audit_status=Counter(r.get('status','unknown') for r in active_audit)
 
 max_trigger=max([i(r.get('trigger_count_total')) for r in guard] or [0])
-max_replan=max([i(r.get('replan_count')) for r in gate+broker] or [0])
+replan_requested=max([i(r.get('replan_count')) for r in broker] or [0])
+replan_installed=max([i(r.get('replan_count')) for r in gate] or [0])
 lock_records=sum(i(r.get('target_lock'))==1 for r in broker)
 hold_records=sum(i(r.get('verification_hold'))==1 for r in guard)
 
@@ -266,7 +262,8 @@ payload={
   'audit_status_counts':dict(audit_status),
   'guard_trigger_count_total':max_trigger,
   'recovery_entry_log_count':recovery_entries,
-  'max_replan_count':max_replan,
+  'replan_requested_count':replan_requested,
+  'replan_installed_count':replan_installed,
   'target_lock_summary_records':lock_records,
   'target_lock_log_count':lock_logs,
   'target_unlock_log_count':unlock_logs,
