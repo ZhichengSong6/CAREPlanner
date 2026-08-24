@@ -1,5 +1,5 @@
 <launch>
-  <!-- Controlled VBC experiment: precompute -> soft intervention -> predictive/deadline recovery -> replan. -->
+  <!-- Controlled VBC experiment. Defaults preserve the validated C4.2 frozen-target path. -->
   <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
   <arg name="base_frame" default="base_link" />
   <arg name="ee_frame" default="EE_link" />
@@ -13,6 +13,13 @@
   <arg name="recovery_enabled" default="true" />
   <arg name="recovery_weight_scale" default="1.0" />
 
+  <!-- C4.3 rolling target selection. False keeps all C4.2 behavior unchanged. -->
+  <arg name="rolling_target_mode" default="false" />
+  <arg name="selector_prefer_predicted_trajectory" default="false" />
+  <arg name="selector_predicted_trajectory_timeout" default="0.20" />
+  <arg name="primary_frontier_window_s" default="0.25" />
+  <arg name="target_switch_hysteresis_s" default="0.05" />
+
   <!-- Phase C3 q_vis-distance predictive recovery. Kept for regression only. -->
   <arg name="predictive_recovery_enabled" default="false" />
   <arg name="predictive_recovery_error_threshold_inf" default="0.10" />
@@ -20,21 +27,21 @@
   <arg name="predictive_recovery_consecutive_misses" default="3" />
   <arg name="predictive_recovery_input_timeout" default="0.25" />
 
-  <!-- Phase C4.1/C4.2 predicted-trajectory VBC audit. -->
+  <!-- C4 predicted-trajectory VBC audit/supervisor. -->
   <arg name="enable_predicted_vbc_auditor" default="false" />
   <arg name="predicted_vbc_audit_warn_ms" default="5.0" />
-
-  <!-- Phase C4.2: physical deadline is used only for q_vis timing. Recovery is
-       triggered directly by N consecutive predicted-VBC violations. -->
   <arg name="predicted_vbc_recovery_enabled" default="false" />
   <arg name="predicted_vbc_recovery_consecutive_violations" default="2" />
   <arg name="predicted_vbc_recovery_input_timeout" default="0.25" />
 
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
   <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_active_topic" default="/care_planner/active_sensing/target_candidate_active" />
   <arg name="candidate_sweep_time_topic" default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
   <arg name="frozen_target_topic" default="/care_planner/active_sensing/target_point" />
   <arg name="frozen_sweep_time_topic" default="/care_planner/active_sensing/frozen_sweep_time_s" />
+  <arg name="selected_target_active_topic" default="/care_planner/active_sensing/target_selection_active" />
+  <arg name="rolling_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_rolling" />
   <arg name="legacy_candidate_target_topic" default="/care_planner/active_sensing/legacy_target_candidate" />
 
   <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
@@ -42,6 +49,7 @@
   <arg name="execution_ready_topic" default="/care_planner/execution/ready" />
   <arg name="execution_start_topic" default="/care_planner/execution/start_time" />
   <arg name="synced_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+  <arg name="recovery_physical_deadline_topic" default="$(arg synced_deadline_topic)" />
   <arg name="effective_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_effective" />
   <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
   <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
@@ -90,7 +98,6 @@
     <arg name="use_trajectory_visualizer" value="$(arg use_trajectory_visualizer)" />
   </include>
 
-  <!-- C3 guard remains the passthrough provider when C4.2 is disabled. -->
   <node unless="$(arg predicted_vbc_recovery_enabled)"
         pkg="egocentric_arm_planner" type="predictive_recovery_guard_node.py"
         name="predictive_recovery_guard" output="screen">
@@ -103,15 +110,13 @@
     <param name="consecutive_misses_required" value="$(arg predictive_recovery_consecutive_misses)" />
     <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
-    <param name="physical_deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="physical_deadline_topic" value="$(arg recovery_physical_deadline_topic)" />
     <param name="prediction_topic" value="/care_planner/mpc/predicted_trajectory" />
     <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
     <param name="summary_topic" value="/care_planner/execution/predictive_recovery_summary" />
     <param name="triggered_topic" value="/care_planner/execution/predictive_recovery_triggered" />
   </node>
 
-  <!-- C4.2 guard passes the physical deadline through unchanged and publishes
-       separate trigger/verification-hold Bool signals. -->
   <node if="$(arg predicted_vbc_recovery_enabled)"
         pkg="egocentric_arm_planner" type="predicted_vbc_recovery_guard_node.py"
         name="predicted_vbc_recovery_guard" output="screen">
@@ -121,7 +126,7 @@
     <param name="consecutive_violations_required" value="$(arg predicted_vbc_recovery_consecutive_violations)" />
     <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
     <param name="violation_topic" value="/care_planner/execution/predicted_vbc_violation" />
-    <param name="physical_deadline_topic" value="$(arg synced_deadline_topic)" />
+    <param name="physical_deadline_topic" value="$(arg recovery_physical_deadline_topic)" />
     <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
     <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
     <param name="summary_topic" value="/care_planner/execution/predicted_vbc_recovery_summary" />
@@ -178,9 +183,15 @@
   <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="predicted_trajectory_topic" value="/care_planner/mpc/predicted_trajectory" />
+    <arg name="prefer_predicted_trajectory" value="$(arg selector_prefer_predicted_trajectory)" />
+    <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
     <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
     <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
     <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="primary_frontier_window_s" value="$(arg primary_frontier_window_s)" />
+    <arg name="target_switch_hysteresis_s" value="$(arg target_switch_hysteresis_s)" />
   </include>
 
   <node pkg="egocentric_arm_planner" type="phase_b2_controlled_trial_node.py"
@@ -188,10 +199,19 @@
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="goal_topic" value="/care_planner/ee_target_pose" />
     <param name="candidate_topic" value="$(arg candidate_target_topic)" />
+    <param name="candidate_active_topic" value="$(arg candidate_active_topic)" />
     <param name="candidate_sweep_time_topic" value="$(arg candidate_sweep_time_topic)" />
     <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
     <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="selected_active_topic" value="$(arg selected_target_active_topic)" />
+    <param name="rolling_deadline_topic" value="$(arg rolling_deadline_topic)" />
+    <param name="rolling_target_mode" value="$(arg rolling_target_mode)" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="recovery_active_topic" value="$(arg recovery_active_topic)" />
     <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
     <param name="require_initial_prior_ready" value="true" />
     <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
     <param name="publish_rate" value="20.0" />
