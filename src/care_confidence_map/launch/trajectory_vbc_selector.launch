@@ -22,59 +22,62 @@
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
   <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
+
+  <!-- False is the frozen C4.2 point selector. True is the C4.3 ordered
+       temporal-layer selector. Keeping separate executables avoids silently
+       changing the validated C4.2 selection semantics. -->
+  <arg name="temporal_layer_mode" default="false" />
+
+  <!-- Frozen C4.2 point-selector parameters. -->
   <arg name="primary_frontier_window_s" default="0.25" />
   <arg name="target_switch_hysteresis_s" default="0.05" />
 
-  <!-- C4.3 risk-region clustering. Link identity is diagnostic only; it is not
-       a hard boundary. Connectivity is geometric + sweep-time + frontier. -->
-  <arg name="region_spatial_radius_m" default="0.12" />
-  <arg name="region_sweep_window_s" default="0.15" />
-  <arg name="region_match_radius_m" default="0.15" />
-  <arg name="region_representative_count" default="3" />
-  <arg name="selected_region_representatives_topic"
-       default="/care_planner/trajectory_risk/vbc_selected_region_representatives" />
+  <!-- C4.3: temporal layers come directly from sweep_eval_timestep, so no
+       hand-set temporal window is needed. Spatial region size is controlled by
+       a physical maximum diameter; point count follows map resolution. -->
+  <arg name="region_max_diameter_m" default="0.12" />
+  <arg name="active_set_points_topic"
+       default="/care_planner/trajectory_risk/vbc_active_set_points" />
 
-  <node pkg="care_confidence_map"
+  <node unless="$(arg temporal_layer_mode)"
+        pkg="care_confidence_map"
+        type="trajectory_vbc_selector_legacy_node"
+        name="trajectory_vbc_selector_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="trajectory_vbc/robot_urdf_file" value="$(arg robot_urdf_file)" />
+    <param name="trajectory_vbc/body_samples_file" value="$(arg body_samples_file)" />
+    <param name="trajectory_vbc/base_frame" value="$(arg base_frame)" />
+    <param name="trajectory_vbc/input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="trajectory_vbc/predicted_trajectory_topic" value="$(arg predicted_trajectory_topic)" />
+    <param name="trajectory_vbc/prefer_predicted_trajectory" value="$(arg prefer_predicted_trajectory)" />
+    <param name="trajectory_vbc/predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+    <param name="trajectory_vbc/output_target_topic" value="$(arg output_target_topic)" />
+    <param name="trajectory_vbc/candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="trajectory_vbc/confidence_query_service" value="$(arg confidence_query_service)" />
+    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s" value="$(arg min_visibility_before_sweep_margin_s)" />
+    <param name="trajectory_vbc/primary_frontier_window_s" value="$(arg primary_frontier_window_s)" />
+    <param name="trajectory_vbc/target_switch_hysteresis_s" value="$(arg target_switch_hysteresis_s)" />
+  </node>
+
+  <node if="$(arg temporal_layer_mode)"
+        pkg="care_confidence_map"
         type="trajectory_vbc_selector_node"
         name="trajectory_vbc_selector_node"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
-
-    <param name="trajectory_vbc/robot_urdf_file"
-           value="$(arg robot_urdf_file)" />
-    <param name="trajectory_vbc/body_samples_file"
-           value="$(arg body_samples_file)" />
-    <param name="trajectory_vbc/base_frame"
-           value="$(arg base_frame)" />
-    <param name="trajectory_vbc/input_trajectory_topic"
-           value="$(arg input_trajectory_topic)" />
-    <param name="trajectory_vbc/predicted_trajectory_topic"
-           value="$(arg predicted_trajectory_topic)" />
-    <param name="trajectory_vbc/prefer_predicted_trajectory"
-           value="$(arg prefer_predicted_trajectory)" />
-    <param name="trajectory_vbc/predicted_trajectory_timeout"
-           value="$(arg predicted_trajectory_timeout)" />
-    <param name="trajectory_vbc/output_target_topic"
-           value="$(arg output_target_topic)" />
-    <param name="trajectory_vbc/candidate_active_topic"
-           value="$(arg candidate_active_topic)" />
-    <param name="trajectory_vbc/confidence_query_service"
-           value="$(arg confidence_query_service)" />
-    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s"
-           value="$(arg min_visibility_before_sweep_margin_s)" />
-    <param name="trajectory_vbc/primary_frontier_window_s"
-           value="$(arg primary_frontier_window_s)" />
-    <param name="trajectory_vbc/target_switch_hysteresis_s"
-           value="$(arg target_switch_hysteresis_s)" />
-    <param name="trajectory_vbc/region_spatial_radius_m"
-           value="$(arg region_spatial_radius_m)" />
-    <param name="trajectory_vbc/region_sweep_window_s"
-           value="$(arg region_sweep_window_s)" />
-    <param name="trajectory_vbc/region_match_radius_m"
-           value="$(arg region_match_radius_m)" />
-    <param name="trajectory_vbc/region_representative_count"
-           value="$(arg region_representative_count)" />
-    <param name="trajectory_vbc/selected_region_representatives_topic"
-           value="$(arg selected_region_representatives_topic)" />
+    <param name="trajectory_vbc/robot_urdf_file" value="$(arg robot_urdf_file)" />
+    <param name="trajectory_vbc/body_samples_file" value="$(arg body_samples_file)" />
+    <param name="trajectory_vbc/base_frame" value="$(arg base_frame)" />
+    <param name="trajectory_vbc/input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="trajectory_vbc/predicted_trajectory_topic" value="$(arg predicted_trajectory_topic)" />
+    <param name="trajectory_vbc/prefer_predicted_trajectory" value="$(arg prefer_predicted_trajectory)" />
+    <param name="trajectory_vbc/predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+    <param name="trajectory_vbc/output_target_topic" value="$(arg output_target_topic)" />
+    <param name="trajectory_vbc/candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="trajectory_vbc/confidence_query_service" value="$(arg confidence_query_service)" />
+    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s" value="$(arg min_visibility_before_sweep_margin_s)" />
+    <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
+    <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />
   </node>
 </launch>
