@@ -15,6 +15,7 @@ catkin_install_python(PROGRAMS
   scripts/ncdf_stage3_trajectory_qp_node.py
   scripts/vbc_deadline_projection_smoke_node.py
   scripts/vbc_deadline_waypoint_node.py
+  scripts/vbc_deadline_waypoint_rolling_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
