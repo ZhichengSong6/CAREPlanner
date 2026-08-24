@@ -6,6 +6,7 @@ import threading
 import rospy
 from geometry_msgs.msg import PointStamped, PoseStamped
 from std_msgs.msg import Bool, Float32, Float64, String
+from trajectory_msgs.msg import JointTrajectory
 
 
 class PhaseB2ControlledTrialNode:
@@ -14,11 +15,11 @@ class PhaseB2ControlledTrialNode:
     Legacy mode preserves C4.2: the first target+sweep pair stays frozen and a
     completed Recovery requests at most one measured-state task replan.
 
-    C4.3 rolling mode keeps that same frozen bootstrap until execution T0.  Once
-    released, selector target+sweep pairs may roll.  The current pair is locked
-    throughout Recovery and RECOVERY_HOLD and is released only after the gate
-    installs the measured-state replan.  Multiple Recovery/replan episodes are
-    allowed in rolling mode.
+    C4.3 rolling mode keeps that same frozen bootstrap until execution T0. Once
+    released, selector target+sweep pairs may roll only while the MPC prediction
+    stream is fresh. The current pair is locked throughout Recovery and
+    RECOVERY_HOLD and is released only after the gate installs the measured-state
+    replan. Multiple Recovery/replan episodes are allowed in rolling mode.
     """
 
     def __init__(self):
@@ -35,8 +36,13 @@ class PhaseB2ControlledTrialNode:
         self.candidate_sweep_time_topic = str(rospy.get_param(
             "~candidate_sweep_time_topic",
             "/care_planner/trajectory_risk/vbc_selected_sweep_time_s"))
+        self.predicted_trajectory_topic = str(rospy.get_param(
+            "~predicted_trajectory_topic",
+            "/care_planner/mpc/predicted_trajectory"))
+        self.predicted_trajectory_timeout = float(rospy.get_param(
+            "~predicted_trajectory_timeout", 0.20))
 
-        # Historical topic names remain for C4.2 compatibility.  In C4.3 they
+        # Historical topic names remain for C4.2 compatibility. In C4.3 they
         # carry the current selected/locked pair rather than a trial-long pair.
         self.target_topic = str(rospy.get_param(
             "~frozen_target_topic", "/care_planner/active_sensing/target_point"))
@@ -93,6 +99,8 @@ class PhaseB2ControlledTrialNode:
             raise ValueError("candidate_pair_timeout must be positive")
         if self.safety_margin_s < 0.0:
             raise ValueError("safety_margin_s must be non-negative")
+        if self.predicted_trajectory_timeout <= 0.0:
+            raise ValueError("predicted_trajectory_timeout must be positive")
 
         self._startup_time = rospy.Time.now()
         self._goal_sent = False
@@ -111,6 +119,7 @@ class PhaseB2ControlledTrialNode:
         self._execution_start_s = None
         self._target_lock = False
         self._rolling_deadline_s = None
+        self._predicted_trajectory_received = None
 
         self.goal_pub = rospy.Publisher(
             self.goal_topic, PoseStamped, queue_size=1, latch=True)
@@ -136,6 +145,9 @@ class PhaseB2ControlledTrialNode:
         rospy.Subscriber(
             self.candidate_sweep_time_topic, Float32,
             self._candidate_sweep_callback, queue_size=1)
+        rospy.Subscriber(
+            self.predicted_trajectory_topic, JointTrajectory,
+            self._predicted_trajectory_callback, queue_size=1)
         rospy.Subscriber(
             self.initial_prior_ready_topic, Bool,
             self._initial_prior_ready_callback, queue_size=1)
@@ -168,10 +180,18 @@ class PhaseB2ControlledTrialNode:
         if self.rolling_target_mode:
             rospy.logwarn(
                 "[phase_b2_trial] C4.3 ROLLING MODE: bootstrap frozen to T0; "
-                "target rolls in NORMAL and locks through Recovery/replan")
+                "fresh-prediction target rolls in NORMAL and locks through Recovery/replan")
         else:
             rospy.logwarn(
                 "[phase_b2_trial] C4.2 CONTROLLED MODE: first VBC pair frozen")
+
+    def _prediction_fresh_locked(self):
+        if not self.rolling_target_mode or not self._execution_released:
+            return True
+        if self._predicted_trajectory_received is None:
+            return False
+        age = (rospy.Time.now() - self._predicted_trajectory_received).to_sec()
+        return 0.0 <= age <= self.predicted_trajectory_timeout
 
     def _publish_frozen_state(self, frozen):
         msg = Bool()
@@ -198,13 +218,15 @@ class PhaseB2ControlledTrialNode:
 
     def _publish_summary_locked(self):
         summary = String()
+        prediction_fresh = self._prediction_fresh_locked()
         base = (
             "rolling={} selected_active={} candidate_active={} target_lock={} "
-            "released={} replan_count={}"
+            "released={} prediction_fresh={} replan_count={}"
         ).format(
             int(self.rolling_target_mode), int(self._selected_active),
             int(self._candidate_active), int(self._target_lock),
-            int(self._execution_released), self._replan_count)
+            int(self._execution_released), int(prediction_fresh),
+            self._replan_count)
 
         if self._selected_target is None or self._selected_sweep_time is None:
             summary.data = "selected=0 " + base
@@ -282,6 +304,12 @@ class PhaseB2ControlledTrialNode:
         self._pending_candidate_received = None
         self._set_selected_active_locked(False)
 
+    def _predicted_trajectory_callback(self, msg):
+        if msg is None or not msg.points:
+            return
+        with self._lock:
+            self._predicted_trajectory_received = rospy.Time.now()
+
     def _initial_prior_ready_callback(self, msg):
         if msg is None or not bool(msg.data):
             return
@@ -313,18 +341,29 @@ class PhaseB2ControlledTrialNode:
                 "[phase_b2_trial] FIXED EE GOAL PUBLISHED: p=[%.6f, %.6f, %.6f]",
                 self.goal_x, self.goal_y, self.goal_z)
 
+    def _rolling_update_allowed_locked(self):
+        if self._prediction_fresh_locked():
+            return True
+        rospy.logwarn_throttle(
+            0.5,
+            "[phase_b2_trial] rolling selector update ignored: MPC prediction stale; retaining current target")
+        return False
+
     def _candidate_active_callback(self, msg):
         if msg is None:
             return
         active = bool(msg.data)
         with self._lock:
+            if (self.rolling_target_mode and self._execution_released and
+                    not self._rolling_update_allowed_locked()):
+                return
             self._candidate_active = active
             if not self.rolling_target_mode or self._target_lock:
                 return
 
             if not self._execution_released:
                 # The first pair is immutable before T0, but the selector sends
-                # target+sweep before its active Bool.  Therefore the later true
+                # target+sweep before its active Bool. Therefore the later true
                 # message must be allowed to activate the already frozen pair.
                 if self._selected_target is not None:
                     if active:
@@ -347,6 +386,9 @@ class PhaseB2ControlledTrialNode:
             return
         with self._lock:
             if not self._goal_sent or self._target_lock:
+                return
+            if (self.rolling_target_mode and self._execution_released and
+                    not self._rolling_update_allowed_locked()):
                 return
             if (msg.header.frame_id and
                     msg.header.frame_id.lstrip("/") != self.base_frame.lstrip("/")):
@@ -379,6 +421,9 @@ class PhaseB2ControlledTrialNode:
         with self._lock:
             if not self._goal_sent or self._target_lock:
                 return
+            if (self.rolling_target_mode and self._execution_released and
+                    not self._rolling_update_allowed_locked()):
+                return
             if not self.rolling_target_mode and self._selected_target is not None:
                 return
             if (self.rolling_target_mode and not self._execution_released and
@@ -403,8 +448,8 @@ class PhaseB2ControlledTrialNode:
             self._pending_candidate = None
             self._pending_candidate_received = None
 
-            # Target is intentionally published before sweep.  The rolling
-            # waypoint node clears its old sweep on target change.
+            # Target is intentionally published before sweep. The rolling
+            # waypoint node clears its old sweep on a true target-region change.
             self._publish_pair_locked()
             self._update_rolling_deadline_locked()
 
@@ -493,7 +538,7 @@ class PhaseB2ControlledTrialNode:
             return
         with self._lock:
             self._target_lock = False
-            # The locked target has been resolved.  Wait for a fresh selector
+            # The locked target has been resolved. Wait for a fresh selector
             # pair instead of reviving the old one after replan.
             self._clear_selected_locked()
             self._publish_frozen_state(False)
