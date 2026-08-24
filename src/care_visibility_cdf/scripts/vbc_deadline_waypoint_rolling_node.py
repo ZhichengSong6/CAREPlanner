@@ -9,8 +9,12 @@ vbc_deadline_waypoint_node.py. This node only changes target lifecycle:
   * q_vis is sticky within one confidence-map voxel;
   * releasing a target invalidates the cache so a later re-selection regenerates.
 
-Recovery target locking is handled by phase_b2_controlled_trial_node.py; this
-node therefore sees one stable target region throughout Recovery/RECOVERY_HOLD.
+The target broker may hand off from one critical voxel to another while a C4.3
+Recovery episode remains active. This node treats each true cell change as a new
+steering task: it invalidates the old q_vis, waits for the paired sweep time, and
+generates a new q_vis from the freshest available MPC prediction. The controller
+owns Recovery lifecycle separately, so this short handoff gap cannot itself end
+Recovery.
 """
 
 from __future__ import annotations
