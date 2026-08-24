@@ -1,7 +1,5 @@
 <launch>
-  <!-- VBC needs both robot body link frames and the eight ToF sensor frames.
-       Use the complete Arm.urdf here; the self-filter collision URDF does not
-       contain the ToF frames and would make the selector fail during startup. -->
+  <!-- VBC needs both robot body link frames and the eight ToF sensor frames. -->
   <arg name="robot_urdf_file"
        default="$(find arm_description)/urdf/Arm.urdf" />
   <arg name="body_samples_file"
@@ -12,11 +10,20 @@
   <arg name="base_frame" default="base_link" />
   <arg name="input_trajectory_topic"
        default="/care_planner/task_trajectory" />
+  <arg name="predicted_trajectory_topic"
+       default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="prefer_predicted_trajectory" default="false" />
+  <arg name="predicted_trajectory_timeout" default="0.20" />
+
   <arg name="output_target_topic"
        default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_active_topic"
+       default="/care_planner/active_sensing/target_candidate_active" />
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
   <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
+  <arg name="primary_frontier_window_s" default="0.25" />
+  <arg name="target_switch_hysteresis_s" default="0.05" />
 
   <node pkg="care_confidence_map"
         type="trajectory_vbc_selector_node"
@@ -32,11 +39,23 @@
            value="$(arg base_frame)" />
     <param name="trajectory_vbc/input_trajectory_topic"
            value="$(arg input_trajectory_topic)" />
+    <param name="trajectory_vbc/predicted_trajectory_topic"
+           value="$(arg predicted_trajectory_topic)" />
+    <param name="trajectory_vbc/prefer_predicted_trajectory"
+           value="$(arg prefer_predicted_trajectory)" />
+    <param name="trajectory_vbc/predicted_trajectory_timeout"
+           value="$(arg predicted_trajectory_timeout)" />
     <param name="trajectory_vbc/output_target_topic"
            value="$(arg output_target_topic)" />
+    <param name="trajectory_vbc/candidate_active_topic"
+           value="$(arg candidate_active_topic)" />
     <param name="trajectory_vbc/confidence_query_service"
            value="$(arg confidence_query_service)" />
     <param name="trajectory_vbc/min_visibility_before_sweep_margin_s"
            value="$(arg min_visibility_before_sweep_margin_s)" />
+    <param name="trajectory_vbc/primary_frontier_window_s"
+           value="$(arg primary_frontier_window_s)" />
+    <param name="trajectory_vbc/target_switch_hysteresis_s"
+           value="$(arg target_switch_hysteresis_s)" />
   </node>
 </launch>
