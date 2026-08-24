@@ -554,15 +554,14 @@ class PhaseB2ControlledTrialNode:
                  self._selected_active or self._target_lock))
             if not should_publish:
                 return
-            target = PointStamped()
-            target.header.frame_id = self.base_frame
-            target.header.stamp = (
-                self._selected_target.header.stamp
-                if self.rolling_target_mode else rospy.Time.now())
-            target.point.x = self._selected_target.point.x
-            target.point.y = self._selected_target.point.y
-            target.point.z = self._selected_target.point.z
-        self.target_pub.publish(target)
+
+            # Publish the current target+sweep pair together every cycle.  ROS
+            # does not guarantee callback ordering across two topics, so the
+            # first delivery may arrive sweep-before-target.  The rolling
+            # waypoint node intentionally clears an old sweep on a new target
+            # cell; repeating the full pair guarantees the next cycle repairs
+            # that ordering without ever pairing a new target with an old sweep.
+            self._publish_pair_locked()
 
 
 def main():
