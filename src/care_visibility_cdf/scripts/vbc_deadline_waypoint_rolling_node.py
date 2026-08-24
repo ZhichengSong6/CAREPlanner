@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import rospy
 from geometry_msgs.msg import PointStamped
-from std_msgs.msg import Bool, Float64
+from std_msgs.msg import Bool, Float64, String
 from trajectory_msgs.msg import JointTrajectory
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -41,12 +41,14 @@ from vbc_deadline_waypoint_node import (  # noqa: E402
 
 class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
     def __init__(self) -> None:
-        # These defaults must exist before the base class creates its timer and
-        # subscribes to overridden target callbacks.
+        # The base class creates a 20-Hz timer before returning from __init__.
+        # Every field touched by an overridden timer path must therefore exist
+        # before super().__init__() to avoid an initialization race.
         self._selection_active = False
         self._predicted_trajectory = None
         self._predicted_trajectory_received = None
         self._rolling_trajectory_source = "bootstrap"
+        self.predicted_trajectory_timeout = 0.20
 
         super().__init__()
 
@@ -69,7 +71,8 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             self._predicted_trajectory_callback, queue_size=1)
 
         rospy.logwarn(
-            "[vbc_waypoint_rolling] C4.3 mode: selection_active=%s predicted=%s timeout=%.3fs",
+            "[vbc_waypoint_rolling] C4.3 mode: selection_active=%s "
+            "predicted=%s timeout=%.3fs",
             self.selection_active_topic,
             self.predicted_trajectory_topic,
             self.predicted_trajectory_timeout)
@@ -82,9 +85,10 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             was_active = self._selection_active
             self._selection_active = active
             if not active:
-                # A safe/no-target interval must explicitly disable the old
-                # q_vis.  Clear the generation cache as well so selecting the
-                # same voxel again later recomputes from the then-current state.
+                # Safe/no-target intervals must explicitly disable old q_vis.
+                # Clearing the generation key also ensures that if the same
+                # voxel becomes critical later it is regenerated from the then
+                # current trajectory/state.
                 self._generation_success = False
                 self._generation_key = None
                 self._summary = "selection_inactive"
@@ -107,16 +111,20 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         if not _finite(xyz):
             return
         with self._lock:
-            old_xyz = None if self._target_xyz is None else self._target_xyz.copy()
+            old_xyz = (
+                None if self._target_xyz is None else self._target_xyz.copy())
         super()._target_callback(msg)
-        changed = old_xyz is None or np.linalg.norm(xyz - old_xyz) > self.target_change_tolerance
+        changed = (
+            old_xyz is None or
+            np.linalg.norm(xyz - old_xyz) > self.target_change_tolerance)
         if changed:
             with self._lock:
                 # The broker publishes target first, then its paired sweep.
-                # Clearing here prevents a one-cycle old-target/new-target mix.
+                # Clearing here prevents an old-target/new-target mix.
                 self._sweep_time_s = None
                 self._summary = "new_rolling_target_waiting_sweep"
-            rospy.logwarn("[vbc_waypoint_rolling] new target x*=%s", _fmt(xyz, 6))
+            rospy.logwarn(
+                "[vbc_waypoint_rolling] new target x*=%s", _fmt(xyz, 6))
 
     def _preferred_trajectory_locked(self):
         now = rospy.Time.now()
@@ -134,7 +142,8 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         with self._lock:
             selection_active = self._selection_active
             target = self._target
-            target_xyz = None if self._target_xyz is None else self._target_xyz.copy()
+            target_xyz = (
+                None if self._target_xyz is None else self._target_xyz.copy())
             sweep = self._sweep_time_s
             old_key = self._generation_key
             trajectory, trajectory_received, trajectory_source = (
@@ -142,13 +151,13 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
         if not selection_active:
             return
-        if target is None or target_xyz is None or trajectory is None or sweep is None:
+        if (target is None or target_xyz is None or
+                trajectory is None or sweep is None):
             return
 
-        # Rolling predictions are stamped every control cycle.  Regenerating
-        # q_vis on every stamp is unnecessary and expensive; q_vis is a
-        # sufficient visible configuration for x*.  Recompute only when the
-        # selected spatial target changes (or after selection was released).
+        # Predictions are re-stamped every control cycle.  q_vis is a
+        # sufficient visible configuration for x*, so recompute on target
+        # selection/re-selection, not on every prediction stamp.
         key = ("rolling", tuple(np.round(target_xyz, 7).tolist()))
         if old_key == key:
             return
@@ -160,8 +169,10 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             with self._lock:
                 self._generation_key = key
                 self._generation_success = False
-                self._summary = "generation_failed:" + str(exc).replace(" ", "_")
-            rospy.logerr("[vbc_waypoint_rolling] generation failed: %s", exc)
+                self._summary = (
+                    "generation_failed:" + str(exc).replace(" ", "_"))
+            rospy.logerr(
+                "[vbc_waypoint_rolling] generation failed: %s", exc)
             return
 
         q_zero = np.asarray(result["q_zero"], dtype=np.float64)
@@ -186,12 +197,19 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
         self.zero_pub.publish(_vector_msg(q_zero))
         self.waypoint_pub.publish(_vector_msg(q_vis))
-        dmsg = Float64(); dmsg.data = deadline_abs; self.deadline_pub.publish(dmsg)
+        dmsg = Float64()
+        dmsg.data = deadline_abs
+        self.deadline_pub.publish(dmsg)
 
         rospy.logwarn(
-            "[vbc_waypoint_rolling] WAYPOINT READY source=%s x*=%s sweep=%.3f q_vis=%s",
-            trajectory_source, _fmt(result["target_xyz"], 6), sweep, _fmt(q_vis, 5))
-        rospy.logwarn("[vbc_waypoint_rolling] saved generation trace: %s", path)
+            "[vbc_waypoint_rolling] WAYPOINT READY source=%s x*=%s "
+            "sweep=%.3f q_vis=%s",
+            trajectory_source,
+            _fmt(result["target_xyz"], 6),
+            sweep,
+            _fmt(q_vis, 5))
+        rospy.logwarn(
+            "[vbc_waypoint_rolling] saved generation trace: %s", path)
 
     def _publish_state(self) -> None:
         with self._lock:
@@ -206,8 +224,11 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             trajectory_source = self._rolling_trajectory_source
 
         if not selection_active:
-            amsg = Bool(); amsg.data = False; self.active_pub.publish(amsg)
+            amsg = Bool()
+            amsg.data = False
+            self.active_pub.publish(amsg)
             msg = self._summary_message(
+                selection_active=False,
                 active=False,
                 seen=seen,
                 ready=False,
@@ -228,24 +249,31 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             response = self._query_confidence(target)
             if response is not None:
                 confidence, current_visibility, inside = response
-                if inside and confidence >= self.seen_threshold and not seen:
+                if (inside and confidence >= self.seen_threshold and
+                        not seen):
                     with self._lock:
                         self._seen_latched = True
                     seen = True
                     rospy.logwarn(
-                        "[vbc_waypoint_rolling] target CONFIRMED SEEN -> waypoint objective OFF: confidence=%.4f",
+                        "[vbc_waypoint_rolling] target CONFIRMED SEEN -> "
+                        "waypoint objective OFF: confidence=%.4f",
                         confidence)
 
         active = bool(
             selection_active and generation_success and q_vis is not None and
             deadline_abs is not None and not seen)
-        amsg = Bool(); amsg.data = active; self.active_pub.publish(amsg)
+        amsg = Bool()
+        amsg.data = active
+        self.active_pub.publish(amsg)
         if q_vis is not None:
             self.waypoint_pub.publish(_vector_msg(q_vis))
         if deadline_abs is not None:
-            dmsg = Float64(); dmsg.data = float(deadline_abs); self.deadline_pub.publish(dmsg)
+            dmsg = Float64()
+            dmsg.data = float(deadline_abs)
+            self.deadline_pub.publish(dmsg)
 
         msg = self._summary_message(
+            selection_active=selection_active,
             active=active,
             seen=seen,
             ready=generation_success,
@@ -257,22 +285,25 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             reason=summary_reason,
             trajectory_source=trajectory_source)
         self.summary_pub.publish(msg)
-        rospy.loginfo_throttle(0.5, "[vbc_waypoint_rolling] %s", msg.data)
+        rospy.loginfo_throttle(
+            0.5, "[vbc_waypoint_rolling] %s", msg.data)
 
     @staticmethod
     def _summary_message(
-            active, seen, ready, confidence, current_visibility, inside,
-            deadline_from_start, deadline_abs, reason, trajectory_source):
-        from std_msgs.msg import String
+            selection_active, active, seen, ready, confidence,
+            current_visibility, inside, deadline_from_start, deadline_abs,
+            reason, trajectory_source):
         now = rospy.Time.now().to_sec()
         remaining = math.nan if deadline_abs is None else deadline_abs - now
         msg = String()
         msg.data = (
             f"active={int(active)} seen={int(seen)} ready={int(ready)} "
-            f"selection_active={int(active or ready)} "
-            f"confidence={confidence:.4f} current_visibility={current_visibility:.4f} "
+            f"selection_active={int(selection_active)} "
+            f"confidence={confidence:.4f} "
+            f"current_visibility={current_visibility:.4f} "
             f"inside_map={int(inside)} "
-            f"deadline_from_start={deadline_from_start if deadline_from_start is not None else math.nan:.6f} "
+            f"deadline_from_start="
+            f"{deadline_from_start if deadline_from_start is not None else math.nan:.6f} "
             f"deadline_remaining={remaining:.6f} "
             f"trajectory_source={trajectory_source} reason={reason}"
         )
@@ -284,7 +315,8 @@ def main() -> None:
     try:
         RollingVbcDeadlineWaypointNode()
     except Exception as exc:
-        rospy.logfatal("[vbc_waypoint_rolling] initialization failed: %s", exc)
+        rospy.logfatal(
+            "[vbc_waypoint_rolling] initialization failed: %s", exc)
         raise
     rospy.spin()
 
