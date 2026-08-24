@@ -18,7 +18,6 @@
 #include <limits>
 #include <map>
 #include <mutex>
-#include <queue>
 #include <set>
 #include <sstream>
 #include <string>
@@ -38,29 +37,24 @@ public:
     if (!evaluator_.initialize(
             robot_urdf_file_, body_samples_file_, base_frame_, &error_msg))
     {
-      ROS_ERROR_STREAM("[trajectory_vbc] Failed to initialize evaluator: "
+      ROS_ERROR_STREAM("[trajectory_vbc_layers] Failed to initialize evaluator: "
                        << error_msg);
       return false;
     }
     if (sensor_frames_.empty())
     {
-      ROS_ERROR("[trajectory_vbc] trajectory_vbc/sensor_frames is empty.");
+      ROS_ERROR("[trajectory_vbc_layers] trajectory_vbc/sensor_frames is empty.");
       return false;
     }
     if (!buildSensorBasis()) return false;
 
     if (candidate_resolution_ <= 0.0 || fallback_dt_ <= 0.0 ||
         predicted_trajectory_timeout_ <= 0.0 ||
-        primary_frontier_window_s_ < 0.0 ||
-        target_switch_hysteresis_s_ < 0.0 ||
-        region_spatial_radius_m_ <= 0.0 ||
-        region_sweep_window_s_ < 0.0 ||
-        region_match_radius_m_ <= 0.0 ||
-        region_representative_count_ < 1 ||
+        region_max_diameter_m_ <= 0.0 ||
         tof_min_range_ < 0.0 || tof_max_range_ <= tof_min_range_ ||
         horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0)
     {
-      ROS_ERROR("[trajectory_vbc] Invalid VBC geometry/timing/region parameters.");
+      ROS_ERROR("[trajectory_vbc_layers] Invalid geometry/timing/cluster parameters.");
       return false;
     }
 
@@ -75,7 +69,7 @@ public:
     if (!evaluator_.computeFramePosesForConfiguration(
             q0, sensor_frames_, &poses, &error_msg))
     {
-      ROS_ERROR_STREAM("[trajectory_vbc] Invalid sensor frame configuration: "
+      ROS_ERROR_STREAM("[trajectory_vbc_layers] Invalid sensor frame configuration: "
                        << error_msg);
       return false;
     }
@@ -103,11 +97,11 @@ public:
         "/care_planner/trajectory_risk/vbc_selected_sweep_time_s", 1, true);
     selected_see_time_pub_ = nh_.advertise<std_msgs::Float32>(
         "/care_planner/trajectory_risk/vbc_selected_see_time_s", 1, true);
-    selected_region_representatives_pub_ =
-        nh_.advertise<std_msgs::Float64MultiArray>(
-            selected_region_representatives_topic_, 1, true);
+    active_set_points_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
+        active_set_points_topic_, 1, true);
 
     publishCandidateActive(false);
+    publishActiveSet({});
 
     timer_ = nh_.createTimer(
         ros::Duration(1.0 / std::max(0.1, eval_rate_)),
@@ -118,12 +112,6 @@ public:
   }
 
 private:
-  enum class FrontierGroup
-  {
-    Primary,
-    Secondary
-  };
-
   struct Candidate
   {
     Eigen::Vector3d point_base = Eigen::Vector3d::Zero();
@@ -143,21 +131,21 @@ private:
 
   using CandidateKey = std::tuple<long long, long long, long long>;
 
-  struct RiskRegion
+  struct SpatialRegion
   {
-    FrontierGroup group = FrontierGroup::Primary;
     std::vector<int> member_indices;
-    std::vector<CandidateKey> member_keys;
     Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-    double earliest_sweep_time_s = std::numeric_limits<double>::infinity();
-    int anchor_index = -1;
+    double diameter_m = 0.0;
     int distinct_link_count = 0;
   };
 
-  static const char* groupName(FrontierGroup group)
+  struct TemporalLayer
   {
-    return group == FrontierGroup::Primary ? "primary" : "secondary";
-  }
+    int sweep_eval_timestep = -1;
+    double sweep_time_s = 0.0;
+    std::vector<int> member_indices;
+    std::vector<SpatialRegion> regions;
+  };
 
   void loadParams()
   {
@@ -184,9 +172,9 @@ private:
         "trajectory_vbc/confidence_query_service",
         confidence_query_service_, "/care_planner/confidence_map/query");
     pnh_.param<std::string>(
-        "trajectory_vbc/selected_region_representatives_topic",
-        selected_region_representatives_topic_,
-        "/care_planner/trajectory_risk/vbc_selected_region_representatives");
+        "trajectory_vbc/active_set_points_topic",
+        active_set_points_topic_,
+        "/care_planner/trajectory_risk/vbc_active_set_points");
 
     pnh_.param("trajectory_vbc/enabled", enabled_, true);
     pnh_.param("trajectory_vbc/eval_rate", eval_rate_, 20.0);
@@ -209,27 +197,8 @@ private:
         "trajectory_vbc/min_visibility_before_sweep_margin_s",
         min_margin_s_, 0.30);
     pnh_.param(
-        "trajectory_vbc/primary_frontier_window_s",
-        primary_frontier_window_s_, 0.25);
-    pnh_.param(
-        "trajectory_vbc/target_switch_hysteresis_s",
-        target_switch_hysteresis_s_, 0.05);
-
-    // C4.3 risk-region clustering. Link identity is deliberately NOT a hard
-    // connectivity condition: nearby swept points from different links may be
-    // one physical low-confidence region. Link names remain diagnostics only.
-    pnh_.param(
-        "trajectory_vbc/region_spatial_radius_m",
-        region_spatial_radius_m_, 0.12);
-    pnh_.param(
-        "trajectory_vbc/region_sweep_window_s",
-        region_sweep_window_s_, 0.15);
-    pnh_.param(
-        "trajectory_vbc/region_match_radius_m",
-        region_match_radius_m_, 0.15);
-    pnh_.param(
-        "trajectory_vbc/region_representative_count",
-        region_representative_count_, 3);
+        "trajectory_vbc/region_max_diameter_m",
+        region_max_diameter_m_, 0.12);
 
     pnh_.param<std::string>(
         "trajectory_vbc/sensor_model/forward_axis", forward_axis_, "z");
@@ -265,7 +234,7 @@ private:
     else if (forward_axis_ == "-z") forward_dir_ = -Eigen::Vector3d::UnitZ();
     else
     {
-      ROS_ERROR_STREAM("[trajectory_vbc] Invalid forward_axis: " << forward_axis_);
+      ROS_ERROR_STREAM("[trajectory_vbc_layers] Invalid forward_axis: " << forward_axis_);
       return false;
     }
 
@@ -306,9 +275,11 @@ private:
     const int max_steps = std::max(2, max_eval_timesteps_);
     if (input_size <= max_steps)
     {
+      indices.reserve(static_cast<std::size_t>(input_size));
       for (int i = 0; i < input_size; ++i) indices.push_back(i);
       return indices;
     }
+
     indices.reserve(static_cast<std::size_t>(max_steps));
     for (int k = 0; k < max_steps; ++k)
     {
@@ -332,6 +303,7 @@ private:
     q_traj->clear();
     original_indices->clear();
     eval_times_s->clear();
+
     if (traj.joint_names.empty() || traj.points.empty())
     {
       if (error_msg) *error_msg = "JointTrajectory has no names or points.";
@@ -367,6 +339,10 @@ private:
         makeDownsampleIndices(static_cast<int>(traj.points.size()));
     const bool has_timing = traj.points.size() > 1 &&
         traj.points.back().time_from_start.toSec() > 1e-9;
+
+    q_traj->reserve(selected.size());
+    original_indices->reserve(selected.size());
+    eval_times_s->reserve(selected.size());
     for (const int original_index : selected)
     {
       const auto& pt = traj.points[static_cast<std::size_t>(original_index)];
@@ -410,6 +386,7 @@ private:
         srv->request.points.push_back(p);
       }
     }
+
     if (!confidence_query_client_.waitForExistence(ros::Duration(query_timeout_)))
       return false;
     if (!confidence_query_client_.call(*srv)) return false;
@@ -468,228 +445,160 @@ private:
     return a.sweep_time_s < b.sweep_time_s;
   }
 
-  bool keepCurrentUnderHysteresis(
-      const Candidate& current,
-      const Candidate& best) const
+  double regionDiameter(
+      const std::vector<int>& members,
+      const std::vector<Candidate>& candidates) const
   {
-    if (candidateKey(current.point_base) == candidateKey(best.point_base))
-      return true;
-    if (current.nominally_visible != best.nominally_visible)
-      return !current.nominally_visible;
-    if (!current.nominally_visible)
-      return current.sweep_time_s <=
-          best.sweep_time_s + target_switch_hysteresis_s_;
-    return current.margin_s <= best.margin_s + target_switch_hysteresis_s_;
-  }
-
-  FrontierGroup groupFor(const Candidate& c, double first_sweep_time_s) const
-  {
-    return c.sweep_time_s <=
-            first_sweep_time_s + primary_frontier_window_s_ + 1e-9
-        ? FrontierGroup::Primary
-        : FrontierGroup::Secondary;
-  }
-
-  bool regionConnected(const Candidate& a, const Candidate& b) const
-  {
-    if ((a.point_base - b.point_base).norm() > region_spatial_radius_m_ + 1e-9)
-      return false;
-    return std::fabs(a.sweep_time_s - b.sweep_time_s) <=
-        region_sweep_window_s_ + 1e-9;
-  }
-
-  std::vector<RiskRegion> buildRiskRegions(
-      const std::vector<Candidate>& candidates,
-      double first_sweep_time_s) const
-  {
-    const int n = static_cast<int>(candidates.size());
-    std::vector<bool> visited(static_cast<std::size_t>(n), false);
-    std::vector<RiskRegion> regions;
-
-    for (int seed = 0; seed < n; ++seed)
+    double diameter = 0.0;
+    for (std::size_t a = 0; a < members.size(); ++a)
     {
-      if (visited[static_cast<std::size_t>(seed)] ||
-          !isViolation(candidates[static_cast<std::size_t>(seed)]))
-        continue;
-
-      RiskRegion region;
-      region.group = groupFor(
-          candidates[static_cast<std::size_t>(seed)], first_sweep_time_s);
-      std::queue<int> frontier;
-      frontier.push(seed);
-      visited[static_cast<std::size_t>(seed)] = true;
-
-      while (!frontier.empty())
+      for (std::size_t b = a + 1; b < members.size(); ++b)
       {
-        const int i = frontier.front();
-        frontier.pop();
-        const Candidate& ci = candidates[static_cast<std::size_t>(i)];
-        region.member_indices.push_back(i);
-        region.member_keys.push_back(candidateKey(ci.point_base));
-        region.centroid += ci.point_base;
-        region.earliest_sweep_time_s =
-            std::min(region.earliest_sweep_time_s, ci.sweep_time_s);
-        if (region.anchor_index < 0 ||
-            betterViolation(
-                ci, candidates[static_cast<std::size_t>(region.anchor_index)]))
-          region.anchor_index = i;
+        diameter = std::max(
+            diameter,
+            (candidates[static_cast<std::size_t>(members[a])].point_base -
+             candidates[static_cast<std::size_t>(members[b])].point_base).norm());
+      }
+    }
+    return diameter;
+  }
 
-        for (int j = 0; j < n; ++j)
+  SpatialRegion finalizeRegion(
+      const std::vector<int>& members,
+      const std::vector<Candidate>& candidates) const
+  {
+    SpatialRegion region;
+    region.member_indices = members;
+    std::set<std::string> links;
+    for (const int idx : members)
+    {
+      const Candidate& c = candidates[static_cast<std::size_t>(idx)];
+      region.centroid += c.point_base;
+      links.insert(c.link_name);
+    }
+    if (!members.empty())
+      region.centroid /= static_cast<double>(members.size());
+    region.diameter_m = regionDiameter(members, candidates);
+    region.distinct_link_count = static_cast<int>(links.size());
+    return region;
+  }
+
+  std::vector<SpatialRegion> clusterSpatially(
+      const std::vector<int>& layer_members,
+      const std::vector<Candidate>& candidates) const
+  {
+    std::vector<std::vector<int>> clusters;
+    clusters.reserve(layer_members.size());
+    for (const int idx : layer_members) clusters.push_back({idx});
+
+    while (true)
+    {
+      int best_a = -1;
+      int best_b = -1;
+      double best_centroid_distance = std::numeric_limits<double>::infinity();
+
+      std::vector<Eigen::Vector3d> centroids(
+          clusters.size(), Eigen::Vector3d::Zero());
+      for (std::size_t i = 0; i < clusters.size(); ++i)
+      {
+        for (const int idx : clusters[i])
+          centroids[i] += candidates[static_cast<std::size_t>(idx)].point_base;
+        centroids[i] /= static_cast<double>(clusters[i].size());
+      }
+
+      for (int a = 0; a < static_cast<int>(clusters.size()); ++a)
+      {
+        for (int b = a + 1; b < static_cast<int>(clusters.size()); ++b)
         {
-          if (visited[static_cast<std::size_t>(j)] ||
-              !isViolation(candidates[static_cast<std::size_t>(j)]))
+          std::vector<int> merged = clusters[static_cast<std::size_t>(a)];
+          merged.insert(
+              merged.end(),
+              clusters[static_cast<std::size_t>(b)].begin(),
+              clusters[static_cast<std::size_t>(b)].end());
+          if (regionDiameter(merged, candidates) > region_max_diameter_m_ + 1e-9)
             continue;
-          const Candidate& cj = candidates[static_cast<std::size_t>(j)];
-          if (groupFor(cj, first_sweep_time_s) != region.group) continue;
-          if (!regionConnected(ci, cj)) continue;
-          visited[static_cast<std::size_t>(j)] = true;
-          frontier.push(j);
+          const double d =
+              (centroids[static_cast<std::size_t>(a)] -
+               centroids[static_cast<std::size_t>(b)]).norm();
+          if (d < best_centroid_distance)
+          {
+            best_centroid_distance = d;
+            best_a = a;
+            best_b = b;
+          }
         }
       }
 
-      if (!region.member_indices.empty())
-      {
-        region.centroid /= static_cast<double>(region.member_indices.size());
-        std::set<std::string> links;
-        for (const int idx : region.member_indices)
-          links.insert(candidates[static_cast<std::size_t>(idx)].link_name);
-        region.distinct_link_count = static_cast<int>(links.size());
-        regions.push_back(region);
-      }
+      if (best_a < 0 || best_b < 0) break;
+      clusters[static_cast<std::size_t>(best_a)].insert(
+          clusters[static_cast<std::size_t>(best_a)].end(),
+          clusters[static_cast<std::size_t>(best_b)].begin(),
+          clusters[static_cast<std::size_t>(best_b)].end());
+      clusters.erase(clusters.begin() + best_b);
     }
+
+    std::vector<SpatialRegion> regions;
+    regions.reserve(clusters.size());
+    for (const auto& members : clusters)
+      regions.push_back(finalizeRegion(members, candidates));
     return regions;
   }
 
-  int overlapCount(
-      const RiskRegion& region,
-      const std::vector<CandidateKey>& old_keys) const
-  {
-    int count = 0;
-    for (const auto& key : region.member_keys)
-      if (std::find(old_keys.begin(), old_keys.end(), key) != old_keys.end())
-        ++count;
-    return count;
-  }
-
-  int findPreviousRegion(
-      const std::vector<RiskRegion>& regions,
-      FrontierGroup desired_group) const
-  {
-    if (!has_selected_region_) return -1;
-
-    int best_index = -1;
-    int best_overlap = 0;
-    double best_distance = std::numeric_limits<double>::infinity();
-    for (int i = 0; i < static_cast<int>(regions.size()); ++i)
-    {
-      const auto& region = regions[static_cast<std::size_t>(i)];
-      if (region.group != desired_group) continue;
-      const int overlap = overlapCount(region, selected_region_keys_);
-      const double distance = (region.centroid - selected_region_centroid_).norm();
-      if (overlap > best_overlap ||
-          (overlap == best_overlap && overlap > 0 && distance < best_distance))
-      {
-        best_index = i;
-        best_overlap = overlap;
-        best_distance = distance;
-      }
-    }
-    if (best_overlap > 0) return best_index;
-
-    best_index = -1;
-    best_distance = region_match_radius_m_;
-    for (int i = 0; i < static_cast<int>(regions.size()); ++i)
-    {
-      const auto& region = regions[static_cast<std::size_t>(i)];
-      if (region.group != desired_group) continue;
-      const double distance = (region.centroid - selected_region_centroid_).norm();
-      if (distance <= best_distance)
-      {
-        best_index = i;
-        best_distance = distance;
-      }
-    }
-    return best_index;
-  }
-
-  bool betterRegion(
-      const RiskRegion& a,
-      const RiskRegion& b,
+  std::vector<TemporalLayer> buildTemporalLayers(
       const std::vector<Candidate>& candidates) const
   {
-    const Candidate& ca = candidates[static_cast<std::size_t>(a.anchor_index)];
-    const Candidate& cb = candidates[static_cast<std::size_t>(b.anchor_index)];
-    if (betterViolation(ca, cb)) return true;
-    if (betterViolation(cb, ca)) return false;
-    return a.member_indices.size() > b.member_indices.size();
-  }
-
-  const Candidate* findCandidateByKey(
-      const RiskRegion& region,
-      const std::vector<Candidate>& candidates,
-      const CandidateKey& key) const
-  {
-    for (const int idx : region.member_indices)
+    std::map<int, std::vector<int>> by_sweep_timestep;
+    for (int i = 0; i < static_cast<int>(candidates.size()); ++i)
     {
-      const Candidate& c = candidates[static_cast<std::size_t>(idx)];
-      if (candidateKey(c.point_base) == key) return &c;
+      if (!isViolation(candidates[static_cast<std::size_t>(i)])) continue;
+      by_sweep_timestep[
+          candidates[static_cast<std::size_t>(i)].sweep_eval_timestep].push_back(i);
     }
-    return nullptr;
-  }
 
-  const Candidate* regionMedoid(
-      const RiskRegion& region,
-      const std::vector<Candidate>& candidates) const
-  {
-    const Candidate* best = nullptr;
-    double best_dist = std::numeric_limits<double>::infinity();
-    for (const int idx : region.member_indices)
+    std::vector<TemporalLayer> layers;
+    layers.reserve(by_sweep_timestep.size());
+    for (const auto& kv : by_sweep_timestep)
     {
-      const Candidate& c = candidates[static_cast<std::size_t>(idx)];
-      const double d = (c.point_base - region.centroid).norm();
-      if (!best || d < best_dist)
-      {
-        best = &c;
-        best_dist = d;
-      }
+      TemporalLayer layer;
+      layer.sweep_eval_timestep = kv.first;
+      layer.member_indices = kv.second;
+      layer.sweep_time_s = std::numeric_limits<double>::infinity();
+      for (const int idx : layer.member_indices)
+        layer.sweep_time_s = std::min(
+            layer.sweep_time_s,
+            candidates[static_cast<std::size_t>(idx)].sweep_time_s);
+      layer.regions = clusterSpatially(layer.member_indices, candidates);
+      layers.push_back(layer);
     }
-    return best;
+    return layers;
   }
 
-  std::vector<const Candidate*> regionRepresentatives(
-      const RiskRegion& region,
+  const Candidate* chooseDiagnosticRepresentative(
+      const TemporalLayer& active_layer,
       const std::vector<Candidate>& candidates,
-      const Candidate* steering) const
+      std::string* reason)
   {
-    std::vector<const Candidate*> reps;
-    if (!steering) return reps;
-    reps.push_back(steering);
-    const int desired = std::min(
-        region_representative_count_,
-        static_cast<int>(region.member_indices.size()));
-
-    while (static_cast<int>(reps.size()) < desired)
+    if (has_selected_key_)
     {
-      const Candidate* best = nullptr;
-      double best_min_distance = -1.0;
-      for (const int idx : region.member_indices)
+      for (const int idx : active_layer.member_indices)
       {
         const Candidate& c = candidates[static_cast<std::size_t>(idx)];
-        if (std::find(reps.begin(), reps.end(), &c) != reps.end()) continue;
-        double min_distance = std::numeric_limits<double>::infinity();
-        for (const Candidate* r : reps)
-          min_distance = std::min(
-              min_distance, (c.point_base - r->point_base).norm());
-        if (!best || min_distance > best_min_distance)
+        if (candidateKey(c.point_base) == selected_key_)
         {
-          best = &c;
-          best_min_distance = min_distance;
+          if (reason) *reason = "retained_active_layer_rep";
+          return &c;
         }
       }
-      if (!best) break;
-      reps.push_back(best);
     }
-    return reps;
+
+    const Candidate* best = nullptr;
+    for (const int idx : active_layer.member_indices)
+    {
+      const Candidate& c = candidates[static_cast<std::size_t>(idx)];
+      if (!best || betterViolation(c, *best)) best = &c;
+    }
+    if (reason) *reason = "active_layer_rep_new";
+    return best;
   }
 
   void publishCandidateActive(bool active)
@@ -699,55 +608,60 @@ private:
     candidate_active_pub_.publish(msg);
   }
 
-  void publishRegionRepresentatives(
-      const std::vector<const Candidate*>& reps)
+  void publishActiveSet(const std::vector<const Candidate*>& points)
   {
+    std::vector<const Candidate*> ordered = points;
+    std::sort(
+        ordered.begin(), ordered.end(),
+        [this](const Candidate* a, const Candidate* b) {
+          return candidateKey(a->point_base) < candidateKey(b->point_base);
+        });
+
     std_msgs::Float64MultiArray msg;
-    msg.data.reserve(reps.size() * 3);
-    for (const Candidate* c : reps)
+    msg.data.reserve(ordered.size() * 3);
+    for (const Candidate* c : ordered)
     {
       if (!c) continue;
       msg.data.push_back(c->point_base.x());
       msg.data.push_back(c->point_base.y());
       msg.data.push_back(c->point_base.z());
     }
-    selected_region_representatives_pub_.publish(msg);
+    active_set_points_pub_.publish(msg);
   }
 
-  void clearStickySelection()
+  static std::string joinInts(const std::vector<int>& values)
   {
-    has_selected_region_ = false;
-    selected_region_keys_.clear();
-    selected_region_centroid_.setZero();
-    has_selected_steering_key_ = false;
-    selected_group_ = FrontierGroup::Primary;
+    std::ostringstream oss;
+    for (std::size_t i = 0; i < values.size(); ++i)
+    {
+      if (i) oss << ":";
+      oss << values[i];
+    }
+    return oss.str();
   }
 
   void publishNoTargetSummary(
       const std::string& reason,
       const std::string& trajectory_source,
-      int candidate_count,
-      int primary_count,
-      int secondary_count,
-      int primary_violation_count,
-      int secondary_violation_count)
+      int candidate_count)
   {
     publishCandidateActive(false);
-    publishRegionRepresentatives(std::vector<const Candidate*>());
-    clearStickySelection();
+    publishActiveSet({});
+    has_selected_key_ = false;
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=0"
         << " reason=" << reason
         << " trajectory_source=" << trajectory_source
         << " candidate_count=" << candidate_count
-        << " primary_count=" << primary_count
-        << " secondary_count=" << secondary_count
-        << " primary_violation_count=" << primary_violation_count
-        << " secondary_violation_count=" << secondary_violation_count
-        << " violation_count="
-        << primary_violation_count + secondary_violation_count
-        << " region_count=0 primary_region_count=0 secondary_region_count=0"
+        << " primary_count=0 secondary_count=" << candidate_count
+        << " primary_violation_count=0 secondary_violation_count=0"
+        << " violation_count=0"
+        << " temporal_layer_count=0 active_layer_index=-1"
+        << " active_layer_eval_t=-1 active_layer_sweep_time_s=nan"
+        << " active_layer_point_count=0 active_layer_region_count=0"
+        << " active_layer_cross_link_region_count=0 active_set_point_count=0"
+        << " layer_point_counts=none active_region_sizes=none"
         << " min_required_margin_s=" << min_margin_s_;
     std_msgs::String msg;
     msg.data = oss.str();
@@ -755,89 +669,103 @@ private:
   }
 
   void publishSelected(
-      const Candidate& selected,
-      const RiskRegion& selected_region,
-      const std::vector<const Candidate*>& representatives,
+      const Candidate& representative,
+      const TemporalLayer& active_layer,
+      const std::vector<TemporalLayer>& layers,
+      const std::vector<Candidate>& candidates,
       const std::string& selection_reason,
       const std::string& trajectory_source,
-      const ros::Time& trajectory_epoch,
-      int candidate_count,
-      int primary_count,
-      int secondary_count,
-      int primary_violation_count,
-      int secondary_violation_count,
-      int region_count,
-      int primary_region_count,
-      int secondary_region_count)
+      const ros::Time& trajectory_epoch)
   {
     geometry_msgs::PointStamped target_msg;
     target_msg.header.stamp = trajectory_epoch.isZero()
         ? ros::Time::now() : trajectory_epoch;
     target_msg.header.frame_id = base_frame_;
-    target_msg.point.x = selected.point_base.x();
-    target_msg.point.y = selected.point_base.y();
-    target_msg.point.z = selected.point_base.z();
+    target_msg.point.x = representative.point_base.x();
+    target_msg.point.y = representative.point_base.y();
+    target_msg.point.z = representative.point_base.z();
     target_pub_.publish(target_msg);
 
     std_msgs::Float32 sweep_msg;
-    sweep_msg.data = static_cast<float>(selected.sweep_time_s);
+    sweep_msg.data = static_cast<float>(active_layer.sweep_time_s);
     selected_sweep_time_pub_.publish(sweep_msg);
+
     std_msgs::Float32 see_msg;
-    see_msg.data = selected.nominally_visible
-        ? static_cast<float>(selected.see_time_s)
+    see_msg.data = representative.nominally_visible
+        ? static_cast<float>(representative.see_time_s)
         : std::numeric_limits<float>::infinity();
     selected_see_time_pub_.publish(see_msg);
+
     std_msgs::Float32 margin_msg;
-    margin_msg.data = selected.nominally_visible
-        ? static_cast<float>(selected.margin_s)
+    margin_msg.data = representative.nominally_visible
+        ? static_cast<float>(representative.margin_s)
         : -std::numeric_limits<float>::infinity();
     selected_margin_pub_.publish(margin_msg);
-    publishRegionRepresentatives(representatives);
+
+    std::vector<const Candidate*> active_points;
+    active_points.reserve(active_layer.member_indices.size());
+    for (const int idx : active_layer.member_indices)
+      active_points.push_back(&candidates[static_cast<std::size_t>(idx)]);
+    publishActiveSet(active_points);
     publishCandidateActive(true);
+
+    int violation_count = 0;
+    for (const auto& c : candidates)
+      if (isViolation(c)) ++violation_count;
+    const int active_count = static_cast<int>(active_layer.member_indices.size());
+
+    std::vector<int> layer_sizes;
+    layer_sizes.reserve(layers.size());
+    for (const auto& layer : layers)
+      layer_sizes.push_back(static_cast<int>(layer.member_indices.size()));
+
+    std::vector<int> active_region_sizes;
+    int active_cross_link_regions = 0;
+    for (const auto& region : active_layer.regions)
+    {
+      active_region_sizes.push_back(static_cast<int>(region.member_indices.size()));
+      if (region.distinct_link_count > 1) ++active_cross_link_regions;
+    }
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=1"
-        << " reason=selected_region"
+        << " reason=selected_temporal_layer"
         << " trajectory_source=" << trajectory_source
-        << " candidate_count=" << candidate_count
-        << " primary_count=" << primary_count
-        << " secondary_count=" << secondary_count
-        << " primary_violation_count=" << primary_violation_count
-        << " secondary_violation_count=" << secondary_violation_count
-        << " violation_count="
-        << primary_violation_count + secondary_violation_count
-        << " region_count=" << region_count
-        << " primary_region_count=" << primary_region_count
-        << " secondary_region_count=" << secondary_region_count
-        << " selected_group=" << groupName(selected_region.group)
+        << " candidate_count=" << candidates.size()
+        << " primary_count=" << active_count
+        << " secondary_count="
+        << std::max(0, static_cast<int>(candidates.size()) - active_count)
+        << " primary_violation_count=" << active_count
+        << " secondary_violation_count=" << std::max(0, violation_count - active_count)
+        << " violation_count=" << violation_count
+        << " selected_group=primary"
         << " selection_reason=" << selection_reason
-        << " selected_region_size=" << selected_region.member_indices.size()
-        << " selected_region_link_count=" << selected_region.distinct_link_count
-        << " selected_region_cross_link="
-        << static_cast<int>(selected_region.distinct_link_count > 1)
-        << " selected_region_centroid=["
-        << selected_region.centroid.x() << ","
-        << selected_region.centroid.y() << ","
-        << selected_region.centroid.z() << "]"
-        << " selected_region_earliest_sweep_s="
-        << selected_region.earliest_sweep_time_s
-        << " selected_region_rep_count=" << representatives.size()
+        << " temporal_layer_count=" << layers.size()
+        << " active_layer_index=0"
+        << " active_layer_eval_t=" << active_layer.sweep_eval_timestep
+        << " active_layer_sweep_time_s=" << active_layer.sweep_time_s
+        << " active_layer_point_count=" << active_count
+        << " active_layer_region_count=" << active_layer.regions.size()
+        << " active_layer_cross_link_region_count=" << active_cross_link_regions
+        << " active_set_point_count=" << active_count
+        << " layer_point_counts=" << joinInts(layer_sizes)
+        << " active_region_sizes=" << joinInts(active_region_sizes)
         << " min_required_margin_s=" << min_margin_s_
-        << " target=[" << selected.point_base.x() << ","
-        << selected.point_base.y() << ","
-        << selected.point_base.z() << "]"
-        << " confidence=" << selected.confidence
-        << " link=" << selected.link_name
-        << " sample_index=" << selected.sample_index_in_link
-        << " sweep_eval_t=" << selected.sweep_eval_timestep
-        << " sweep_original_t=" << selected.sweep_original_timestep
-        << " sweep_time_s=" << selected.sweep_time_s
-        << " nominally_visible=" << selected.nominally_visible
-        << " see_eval_t=" << selected.see_eval_timestep
-        << " see_original_t=" << selected.see_original_timestep;
-    if (selected.nominally_visible)
-      oss << " see_time_s=" << selected.see_time_s
-          << " margin_s=" << selected.margin_s;
+        << " target=[" << representative.point_base.x() << ","
+        << representative.point_base.y() << ","
+        << representative.point_base.z() << "]"
+        << " confidence=" << representative.confidence
+        << " link=" << representative.link_name
+        << " sample_index=" << representative.sample_index_in_link
+        << " sweep_eval_t=" << representative.sweep_eval_timestep
+        << " sweep_original_t=" << representative.sweep_original_timestep
+        << " sweep_time_s=" << active_layer.sweep_time_s
+        << " nominally_visible=" << representative.nominally_visible
+        << " see_eval_t=" << representative.see_eval_timestep
+        << " see_original_t=" << representative.see_original_timestep;
+    if (representative.nominally_visible)
+      oss << " see_time_s=" << representative.see_time_s
+          << " margin_s=" << representative.margin_s;
     else
       oss << " see_time_s=inf margin_s=-inf";
 
@@ -847,14 +775,12 @@ private:
 
     ROS_WARN_STREAM_THROTTLE(
         1.0,
-        "[trajectory_vbc] " << groupName(selected_region.group)
-            << " risk region size=" << selected_region.member_indices.size()
-            << " links=" << selected_region.distinct_link_count
-            << " target=[" << selected.point_base.x() << " "
-            << selected.point_base.y() << " " << selected.point_base.z() << "]"
-            << " reps=" << representatives.size()
-            << " source=" << trajectory_source
-            << " selection=" << selection_reason);
+        "[trajectory_vbc_layers] layers=" << layers.size()
+            << " active_k=" << active_layer.sweep_eval_timestep
+            << " active_points=" << active_count
+            << " active_regions=" << active_layer.regions.size()
+            << " region_sizes=" << joinInts(active_region_sizes)
+            << " source=" << trajectory_source);
   }
 
   void evaluate(
@@ -863,7 +789,7 @@ private:
   {
     if (!enabled_)
     {
-      publishNoTargetSummary("disabled", trajectory_source, 0, 0, 0, 0, 0);
+      publishNoTargetSummary("disabled", trajectory_source, 0);
       return;
     }
 
@@ -874,7 +800,7 @@ private:
     if (!convertTrajectory(
             traj, &q_traj, &original_indices, &eval_times_s, &error_msg))
     {
-      ROS_WARN_STREAM_THROTTLE(2.0, "[trajectory_vbc] " << error_msg);
+      ROS_WARN_STREAM_THROTTLE(2.0, "[trajectory_vbc_layers] " << error_msg);
       return;
     }
 
@@ -883,7 +809,7 @@ private:
     if (!sample_result.success)
     {
       ROS_WARN_STREAM_THROTTLE(
-          2.0, "[trajectory_vbc] body-sweep FK failed: "
+          2.0, "[trajectory_vbc_layers] body-sweep FK failed: "
                    << sample_result.message);
       return;
     }
@@ -892,7 +818,7 @@ private:
     if (!queryConfidence(sample_result, &confidence_srv))
     {
       ROS_WARN_THROTTLE(
-          2.0, "[trajectory_vbc] confidence query failed or returned invalid sizes");
+          2.0, "[trajectory_vbc_layers] confidence query failed or returned invalid sizes");
       return;
     }
 
@@ -906,6 +832,7 @@ private:
         flat_index += frame.samples.size();
         continue;
       }
+
       for (const auto& sample : frame.samples)
       {
         const bool inside = confidence_srv.response.inside_map[flat_index] != 0;
@@ -955,8 +882,7 @@ private:
     if (candidate_map.empty())
     {
       publishNoTargetSummary(
-          "no_low_confidence_sweep_candidates",
-          trajectory_source, 0, 0, 0, 0, 0);
+          "no_low_confidence_sweep_candidates", trajectory_source, 0);
       return;
     }
 
@@ -968,22 +894,13 @@ private:
               q_traj[k], sensor_frames_, &sensor_poses[k], &error_msg))
       {
         ROS_WARN_STREAM_THROTTLE(
-            2.0, "[trajectory_vbc] sensor FK failed: " << error_msg);
+            2.0, "[trajectory_vbc_layers] sensor FK failed: " << error_msg);
         return;
       }
     }
 
-    double first_sweep_time_s = std::numeric_limits<double>::infinity();
-    for (const auto& kv : candidate_map)
-      first_sweep_time_s = std::min(first_sweep_time_s, kv.second.sweep_time_s);
-
-    int primary_count = 0;
-    int secondary_count = 0;
-    int primary_violation_count = 0;
-    int secondary_violation_count = 0;
     std::vector<Candidate> candidates;
     candidates.reserve(candidate_map.size());
-
     for (const auto& kv : candidate_map)
     {
       Candidate c = kv.second;
@@ -999,130 +916,45 @@ private:
           break;
         }
       }
-      const FrontierGroup group = groupFor(c, first_sweep_time_s);
-      if (group == FrontierGroup::Primary)
-      {
-        ++primary_count;
-        if (isViolation(c)) ++primary_violation_count;
-      }
-      else
-      {
-        ++secondary_count;
-        if (isViolation(c)) ++secondary_violation_count;
-      }
       candidates.push_back(c);
     }
 
-    if (primary_violation_count + secondary_violation_count == 0)
+    const std::vector<TemporalLayer> layers = buildTemporalLayers(candidates);
+    if (layers.empty())
     {
       publishNoTargetSummary(
           "all_low_confidence_points_seen_before_deadline",
           trajectory_source,
-          static_cast<int>(candidates.size()),
-          primary_count, secondary_count,
-          primary_violation_count, secondary_violation_count);
+          static_cast<int>(candidates.size()));
       return;
     }
 
-    std::vector<RiskRegion> regions =
-        buildRiskRegions(candidates, first_sweep_time_s);
-    int primary_region_count = 0;
-    int secondary_region_count = 0;
-    int best_primary = -1;
-    int best_secondary = -1;
-    for (int i = 0; i < static_cast<int>(regions.size()); ++i)
-    {
-      const auto& r = regions[static_cast<std::size_t>(i)];
-      if (r.group == FrontierGroup::Primary)
-      {
-        ++primary_region_count;
-        if (best_primary < 0 || betterRegion(
-                r, regions[static_cast<std::size_t>(best_primary)], candidates))
-          best_primary = i;
-      }
-      else
-      {
-        ++secondary_region_count;
-        if (best_secondary < 0 || betterRegion(
-                r, regions[static_cast<std::size_t>(best_secondary)], candidates))
-          best_secondary = i;
-      }
-    }
-
-    int selected_region_index = best_primary >= 0 ? best_primary : best_secondary;
-    if (selected_region_index < 0)
+    const TemporalLayer& active_layer = layers.front();
+    std::string selection_reason;
+    const Candidate* representative =
+        chooseDiagnosticRepresentative(active_layer, candidates, &selection_reason);
+    if (!representative)
     {
       publishNoTargetSummary(
-          "no_violation_regions", trajectory_source,
-          static_cast<int>(candidates.size()),
-          primary_count, secondary_count,
-          primary_violation_count, secondary_violation_count);
+          "active_layer_has_no_representative",
+          trajectory_source,
+          static_cast<int>(candidates.size()));
       return;
     }
 
-    const FrontierGroup desired_group =
-        best_primary >= 0 ? FrontierGroup::Primary : FrontierGroup::Secondary;
-    std::string selection_reason = "best_new_region";
-    const int previous_region_index = findPreviousRegion(regions, desired_group);
-    if (previous_region_index >= 0)
-    {
-      const auto& previous = regions[static_cast<std::size_t>(previous_region_index)];
-      const auto& best = regions[static_cast<std::size_t>(selected_region_index)];
-      const Candidate& previous_anchor =
-          candidates[static_cast<std::size_t>(previous.anchor_index)];
-      const Candidate& best_anchor =
-          candidates[static_cast<std::size_t>(best.anchor_index)];
-      if (keepCurrentUnderHysteresis(previous_anchor, best_anchor))
-      {
-        selected_region_index = previous_region_index;
-        selection_reason = "retained_region_hysteresis";
-      }
-      else
-      {
-        selection_reason = "region_risk_preempt";
-      }
-    }
-    else if (has_selected_region_)
-    {
-      if (selected_group_ == FrontierGroup::Secondary &&
-          desired_group == FrontierGroup::Primary)
-        selection_reason = "primary_region_preempt";
-      else
-        selection_reason = "previous_region_left_set";
-    }
-
-    const RiskRegion& selected_region =
-        regions[static_cast<std::size_t>(selected_region_index)];
-
-    const Candidate* steering = nullptr;
-    if (has_selected_steering_key_)
-      steering = findCandidateByKey(
-          selected_region, candidates, selected_steering_key_);
-    if (!steering)
-      steering = regionMedoid(selected_region, candidates);
-    if (!steering)
-      steering = &candidates[static_cast<std::size_t>(selected_region.anchor_index)];
-
-    selected_region_keys_ = selected_region.member_keys;
-    selected_region_centroid_ = selected_region.centroid;
-    has_selected_region_ = true;
-    selected_group_ = selected_region.group;
-    selected_steering_key_ = candidateKey(steering->point_base);
-    has_selected_steering_key_ = true;
-
-    const std::vector<const Candidate*> representatives =
-        regionRepresentatives(selected_region, candidates, steering);
+    selected_key_ = candidateKey(representative->point_base);
+    has_selected_key_ = true;
 
     ros::Time epoch = traj.header.stamp;
     if (epoch.isZero()) epoch = ros::Time::now();
     publishSelected(
-        *steering, selected_region, representatives,
-        selection_reason, trajectory_source, epoch,
-        static_cast<int>(candidates.size()),
-        primary_count, secondary_count,
-        primary_violation_count, secondary_violation_count,
-        static_cast<int>(regions.size()),
-        primary_region_count, secondary_region_count);
+        *representative,
+        active_layer,
+        layers,
+        candidates,
+        selection_reason,
+        trajectory_source,
+        epoch);
   }
 
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg)
@@ -1169,7 +1001,7 @@ private:
       {
         ROS_WARN_THROTTLE(
             2.0,
-            "[trajectory_vbc] waiting for bootstrap trajectory on %s",
+            "[trajectory_vbc_layers] waiting for bootstrap trajectory on %s",
             input_trajectory_topic_.c_str());
         return;
       }
@@ -1180,29 +1012,22 @@ private:
   void printSummary() const
   {
     ROS_INFO_STREAM("");
-    ROS_INFO_STREAM("========== trajectory_vbc_selector ==========");
+    ROS_INFO_STREAM("========== trajectory_vbc_selector: temporal-layer mode ==========");
     ROS_INFO_STREAM("enabled: " << enabled_);
     ROS_INFO_STREAM("bootstrap trajectory: " << input_trajectory_topic_);
     ROS_INFO_STREAM("predicted trajectory: " << predicted_trajectory_topic_);
     ROS_INFO_STREAM("prefer predicted: " << prefer_predicted_trajectory_
                     << ", timeout=" << predicted_trajectory_timeout_ << " s");
-    ROS_INFO_STREAM("candidate resolution: " << candidate_resolution_);
-    ROS_INFO_STREAM("primary frontier window: "
-                    << primary_frontier_window_s_ << " s");
-    ROS_INFO_STREAM("region connectivity: spatial<="
-                    << region_spatial_radius_m_ << " m, |dt_sweep|<="
-                    << region_sweep_window_s_ << " s");
-    ROS_INFO_STREAM("region matching radius: " << region_match_radius_m_ << " m");
-    ROS_INFO_STREAM("region representative count: "
-                    << region_representative_count_);
-    ROS_INFO_STREAM("target-switch hysteresis: "
-                    << target_switch_hysteresis_s_ << " s");
+    ROS_INFO_STREAM("candidate resolution: " << candidate_resolution_ << " m");
+    ROS_INFO_STREAM("temporal layers: exact sweep_eval_timestep order (no hand-set time window)");
+    ROS_INFO_STREAM("spatial region maximum diameter: "
+                    << region_max_diameter_m_ << " m");
+    ROS_INFO_STREAM("active set topic: " << active_set_points_topic_);
     ROS_INFO_STREAM("required VBC margin: " << min_margin_s_ << " s");
-    ROS_INFO_STREAM("Rule: audit every candidate; cluster violating candidates "
-                    "by spatiotemporal connectivity within Primary/Secondary; "
-                    "body-link identity is diagnostic, not a hard cluster boundary; "
-                    "steer one sticky representative from the selected risk region.");
-    ROS_INFO_STREAM("=============================================");
+    ROS_INFO_STREAM("Rule: audit every candidate; order violations by t_sweep; "
+                    "cluster each temporal layer spatially; ALL regions and ALL "
+                    "points in the earliest unsafe layer form the steering active set.");
+    ROS_INFO_STREAM("==================================================================");
   }
 
 private:
@@ -1217,7 +1042,7 @@ private:
   ros::Publisher selected_margin_pub_;
   ros::Publisher selected_sweep_time_pub_;
   ros::Publisher selected_see_time_pub_;
-  ros::Publisher selected_region_representatives_pub_;
+  ros::Publisher active_set_points_pub_;
   ros::Timer timer_;
 
   care_confidence_map::TrajectoryRiskEvaluator evaluator_;
@@ -1228,12 +1053,8 @@ private:
   bool has_traj_ = false;
   bool has_predicted_traj_ = false;
 
-  bool has_selected_region_ = false;
-  std::vector<CandidateKey> selected_region_keys_;
-  Eigen::Vector3d selected_region_centroid_ = Eigen::Vector3d::Zero();
-  bool has_selected_steering_key_ = false;
-  CandidateKey selected_steering_key_;
-  FrontierGroup selected_group_ = FrontierGroup::Primary;
+  bool has_selected_key_ = false;
+  CandidateKey selected_key_;
 
   bool enabled_ = true;
   bool prefer_predicted_trajectory_ = false;
@@ -1245,12 +1066,7 @@ private:
   double frontier_confidence_threshold_ = 0.50;
   double candidate_resolution_ = 0.05;
   double min_margin_s_ = 0.30;
-  double primary_frontier_window_s_ = 0.25;
-  double target_switch_hysteresis_s_ = 0.05;
-  double region_spatial_radius_m_ = 0.12;
-  double region_sweep_window_s_ = 0.15;
-  double region_match_radius_m_ = 0.15;
-  int region_representative_count_ = 3;
+  double region_max_diameter_m_ = 0.12;
 
   std::string robot_urdf_file_;
   std::string body_samples_file_;
@@ -1264,8 +1080,8 @@ private:
       "/care_planner/active_sensing/target_candidate_active";
   std::string confidence_query_service_ =
       "/care_planner/confidence_map/query";
-  std::string selected_region_representatives_topic_ =
-      "/care_planner/trajectory_risk/vbc_selected_region_representatives";
+  std::string active_set_points_topic_ =
+      "/care_planner/trajectory_risk/vbc_active_set_points";
 
   std::vector<std::string> ignored_risk_links_;
   std::vector<std::string> sensor_frames_;
@@ -1287,7 +1103,7 @@ int main(int argc, char** argv)
   TrajectoryVbcSelectorNode node;
   if (!node.initialize())
   {
-    ROS_ERROR("[trajectory_vbc] initialization failed.");
+    ROS_ERROR("[trajectory_vbc_layers] initialization failed.");
     return 1;
   }
   ros::spin();
