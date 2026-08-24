@@ -57,6 +57,9 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   recovery_trigger_sub_ = nh_.subscribe(
       recovery_trigger_topic_, 1,
       &VelocityQPMPCWaypoint::recoveryTriggerCallback, this);
+  recovery_clear_sub_ = nh_.subscribe(
+      recovery_clear_topic_, 1,
+      &VelocityQPMPCWaypoint::recoveryClearCallback, this);
   replan_ready_sub_ = nh_.subscribe(
       replan_ready_topic_, 1,
       &VelocityQPMPCWaypoint::replanReadyCallback, this);
@@ -98,6 +101,9 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   ROS_WARN_STREAM("[VelocityQPMPCWaypoint] recovery trigger="
                   << (use_external_recovery_trigger_ ? "external_predicted_vbc" : "deadline")
                   << ", topic=" << recovery_trigger_topic_
+                  << ", recovery_clear="
+                  << (use_external_recovery_clear_ ? "external_global_vbc" : "selected_target_inactive")
+                  << ", clear_topic=" << recovery_clear_topic_
                   << ", recovery_weight="
                   << waypoint_weight_ * recovery_weight_scale_
                   << ", complete=" << recovery_complete_topic_
@@ -212,6 +218,12 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                    use_external_recovery_trigger_, use_external_recovery_trigger_);
   pnh_.param<std::string>("mpc/visibility_waypoint/recovery_trigger_topic",
                           recovery_trigger_topic_, recovery_trigger_topic_);
+  pnh_.param<bool>("mpc/visibility_waypoint/use_external_recovery_clear",
+                   use_external_recovery_clear_, use_external_recovery_clear_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/recovery_clear_topic",
+                          recovery_clear_topic_, recovery_clear_topic_);
+  pnh_.param<double>("mpc/visibility_waypoint/recovery_signal_timeout",
+                     recovery_signal_timeout_, recovery_signal_timeout_);
   pnh_.param<bool>("mpc/visibility_waypoint/recovery_enabled",
                    recovery_enabled_, recovery_enabled_);
   pnh_.param<double>("mpc/visibility_waypoint/recovery_weight_scale",
@@ -260,7 +272,8 @@ bool VelocityQPMPCWaypoint::loadConfig() {
     return false;
   }
   if (waypoint_weight_ < 0.0 || waypoint_timeout_ <= 0.0 ||
-      waypoint_horizon_slack_ < 0.0 || recovery_weight_scale_ <= 0.0) {
+      waypoint_horizon_slack_ < 0.0 || recovery_weight_scale_ <= 0.0 ||
+      recovery_signal_timeout_ <= 0.0) {
     ROS_ERROR("[VelocityQPMPCWaypoint] invalid visibility-waypoint/recovery parameters.");
     return false;
   }
@@ -465,6 +478,15 @@ void VelocityQPMPCWaypoint::recoveryTriggerCallback(
   latest_recovery_trigger_ = msg->data;
   latest_recovery_trigger_received_ = ros::Time::now();
   has_recovery_trigger_ = true;
+}
+
+void VelocityQPMPCWaypoint::recoveryClearCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_recovery_clear_ = msg->data;
+  latest_recovery_clear_received_ = ros::Time::now();
+  has_recovery_clear_ = true;
 }
 
 void VelocityQPMPCWaypoint::replanReadyCallback(
@@ -789,6 +811,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   bool has_recovery_trigger = false;
   bool recovery_trigger = false;
 
+  bool has_recovery_clear = false;
+  bool recovery_clear = false;
+  ros::Time recovery_clear_received;
+
   bool local_recovery_active = false;
   bool local_recovery_hold = false;
   bool local_replan_ready = false;
@@ -824,6 +850,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     has_recovery_trigger = has_recovery_trigger_;
     recovery_trigger = latest_recovery_trigger_;
 
+    has_recovery_clear = has_recovery_clear_;
+    recovery_clear = latest_recovery_clear_;
+    recovery_clear_received = latest_recovery_clear_received_;
+
     local_recovery_active = recovery_active_;
     local_recovery_hold = recovery_hold_;
     local_replan_ready = replan_ready_received_;
@@ -852,6 +882,14 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   const bool verification_hold_active =
       has_verification_hold && verification_hold &&
       verification_hold_age >= 0.0 && verification_hold_age <= waypoint_timeout_;
+
+  const double recovery_clear_age = has_recovery_clear
+      ? (now - recovery_clear_received).toSec()
+      : std::numeric_limits<double>::infinity();
+  const bool external_recovery_clear_active =
+      has_recovery_clear && recovery_clear &&
+      recovery_clear_age >= 0.0 &&
+      recovery_clear_age <= recovery_signal_timeout_;
 
   bool exited_recovery_hold = false;
   if (local_recovery_hold && local_replan_ready && reference_fresh) {
@@ -886,6 +924,9 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   const bool recovery_requested = use_external_recovery_trigger_
       ? (has_recovery_trigger && recovery_trigger)
       : (std::isfinite(deadline_remaining) && deadline_remaining <= 0.0);
+  const bool recovery_clear_requested = use_external_recovery_clear_
+      ? external_recovery_clear_active
+      : (has_wp_active && !wp_active);
 
   bool entered_recovery = false;
   bool completed_recovery = false;
@@ -893,7 +934,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
     if (recovery_active_) {
-      if (has_wp_active && !wp_active) {
+      if (recovery_clear_requested) {
         recovery_active_ = false;
         recovery_hold_ = true;
         replan_ready_received_ = false;
@@ -915,14 +956,16 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
   if (entered_recovery) {
     publishRecoveryActive(true);
-    ROS_ERROR_STREAM("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSEEN via "
+    ROS_ERROR_STREAM("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSAFE via "
                      << (use_external_recovery_trigger_ ? "predicted-VBC trigger" : "deadline")
                      << "; nominal task tracking is suspended.");
   }
   if (completed_recovery) {
     publishRecoveryActive(false);
     publishRecoveryComplete();
-    ROS_WARN("[VelocityQPMPCWaypoint] VISIBILITY RECOVERY COMPLETE: target is seen; holding/decelerating while the original task is replanned from measured q.");
+    ROS_WARN_STREAM("[VelocityQPMPCWaypoint] VISIBILITY RECOVERY EPISODE COMPLETE via "
+                    << (use_external_recovery_clear_ ? "global predicted-VBC safe" : "selected target inactive/seen")
+                    << "; holding/decelerating while the original task is replanned from measured q.");
   }
 
   if (!local_recovery_active && !local_recovery_hold &&
@@ -972,7 +1015,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     control_mode = "recovery";
     waypoint_status = "recovery";
     if (!waypoint_data_fresh || !wp_active || q_vis.size() != dof_) {
-      publishSafeStop("recovery requires fresh active q_vis");
+      publishSafeStop("recovery waiting for fresh active steering q_vis");
       return;
     }
 
@@ -1113,6 +1156,9 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " verification_hold=" << static_cast<int>(verification_hold_active)
       << " recovery_trigger=" << static_cast<int>(has_recovery_trigger && recovery_trigger)
       << " external_recovery_trigger=" << static_cast<int>(use_external_recovery_trigger_)
+      << " recovery_clear=" << static_cast<int>(has_recovery_clear && recovery_clear)
+      << " external_recovery_clear=" << static_cast<int>(use_external_recovery_clear_)
+      << " recovery_clear_age=" << recovery_clear_age
       << " recovery_active=" << static_cast<int>(local_recovery_active)
       << " recovery_hold=" << static_cast<int>(local_recovery_hold)
       << " tracking_inf=" << tracking_inf
