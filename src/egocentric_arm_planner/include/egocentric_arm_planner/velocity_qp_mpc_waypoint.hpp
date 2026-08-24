@@ -41,6 +41,12 @@ namespace egocentric_arm_planner {
  * C4.2 can instead use a direct predicted-VBC Bool trigger. The physical
  * deadline then remains only a timing input for the soft q_vis objective.
  *
+ * C4.3 additionally supports an external global-set Recovery-clear Bool. In
+ * that mode RECOVERY entry and exit are both owned by global predicted VBC
+ * safety, while q_vis remains only the current single-target steering input.
+ * This allows q_vis targets to switch inside one Recovery episode without a
+ * transient waypoint handoff being mistaken for Recovery completion.
+ *
  * Task position/terminal tracking and nominal velocity tracking are removed in
  * VERIFICATION_HOLD and RECOVERY. Hard position/velocity/acceleration
  * constraints are unchanged. VERIFICATION_HOLD is only a transient Bool input;
@@ -60,6 +66,7 @@ private:
   void waypointDeadlineCallback(const std_msgs::Float64ConstPtr& msg);
   void verificationHoldCallback(const std_msgs::BoolConstPtr& msg);
   void recoveryTriggerCallback(const std_msgs::BoolConstPtr& msg);
+  void recoveryClearCallback(const std_msgs::BoolConstPtr& msg);
   void replanReadyCallback(const std_msgs::BoolConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
@@ -127,6 +134,7 @@ private:
   ros::Subscriber waypoint_deadline_sub_;
   ros::Subscriber verification_hold_sub_;
   ros::Subscriber recovery_trigger_sub_;
+  ros::Subscriber recovery_clear_sub_;
   ros::Subscriber replan_ready_sub_;
 
   ros::Publisher velocity_command_pub_;
@@ -163,6 +171,12 @@ private:
   bool latest_recovery_trigger_ = false;
   bool has_recovery_trigger_ = false;
   ros::Time latest_recovery_trigger_received_;
+
+  bool use_external_recovery_clear_ = false;
+  bool latest_recovery_clear_ = false;
+  bool has_recovery_clear_ = false;
+  ros::Time latest_recovery_clear_received_;
+  double recovery_signal_timeout_ = 0.25;
 
   bool recovery_enabled_ = true;
   bool recovery_active_ = false;
@@ -223,6 +237,8 @@ private:
       "/care_planner/execution/predicted_vbc_verification_hold";
   std::string recovery_trigger_topic_ =
       "/care_planner/execution/predicted_vbc_recovery_triggered";
+  std::string recovery_clear_topic_ =
+      "/care_planner/execution/predicted_vbc_recovery_clear";
   std::string recovery_active_topic_ =
       "/care_planner/execution/visibility_recovery_active";
   std::string recovery_complete_topic_ =
