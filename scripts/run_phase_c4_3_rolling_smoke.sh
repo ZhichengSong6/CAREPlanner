@@ -111,6 +111,7 @@ setsid roslaunch egocentric_arm_planner phaseB2_vbc_waypoint_controlled.launch \
   enable_predicted_vbc_auditor:=true \
   predicted_vbc_audit_warn_ms:="${AUDIT_WARN_MS}" \
   predicted_vbc_recovery_enabled:=true \
+  predicted_vbc_recovery_use_global_selector:=true \
   predicted_vbc_recovery_consecutive_violations:="${C4_STREAK}" \
   predicted_vbc_recovery_input_timeout:="${C4_INPUT_TIMEOUT}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
@@ -179,6 +180,12 @@ fi
 echo "[RUN] ${CASE_ID}: C4.3 rolling Primary/Secondary VBC for ${RUN_SECONDS}s"
 sleep "${RUN_SECONDS}"
 
+# Freeze the experiment first, then stop all recorders.  This gives every topic
+# trace the same effective end time instead of letting later recorders observe
+# extra Recovery/replan events while earlier recorders are already stopped.
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+sleep 0.2
 for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
 REC_PIDS=()
 
@@ -199,7 +206,10 @@ def records(path):
             di=h.index('field.data') if 'field.data' in h else 1
             for row in rd:
                 if len(row)<=di: continue
-                tok=dict(TOKEN_RE.findall(row[di]))
+                # rostopic -p does not quote commas embedded inside String data.
+                # Reconstruct field.data before tokenizing target=[x,y,z] etc.
+                message=','.join(row[di:])
+                tok=dict(TOKEN_RE.findall(message))
                 if tok: ans.append(tok)
     except Exception:
         return []
@@ -235,15 +245,20 @@ for r in broker:
     t=r.get('target')
     if t and (not raw_targets or raw_targets[-1]!=t): raw_targets.append(t)
 
+# This auditor follows only the selected steering target in C4.3. It is kept as
+# a diagnostic and is no longer the Recovery safety source.
 active_audit=[r for r in audit if r.get('status') not in ('inactive','waiting_target')]
-viol=[r for r in active_audit if r.get('violation')=='1']
+selected_target_viol=[r for r in active_audit if r.get('violation')=='1']
 audit_status=Counter(r.get('status','unknown') for r in active_audit)
 
+global_guard=[r for r in guard if r.get('mode')=='global_set']
+global_violation_records=[r for r in global_guard if r.get('violation')=='1']
 max_trigger=max([i(r.get('trigger_count_total')) for r in guard] or [0])
 replan_requested=max([i(r.get('replan_count')) for r in broker] or [0])
 replan_installed=max([i(r.get('replan_count')) for r in gate] or [0])
 lock_records=sum(i(r.get('target_lock'))==1 for r in broker)
 hold_records=sum(i(r.get('verification_hold'))==1 for r in guard)
+stale_hold_records=sum(r.get('routing')=='global_summary_stale_verification_hold' for r in guard)
 prediction_stale_records=sum(i(r.get('prediction_fresh'),1)==0 for r in broker if r.get('released')=='1')
 
 text=open(controlled,errors='replace').read() if os.path.isfile(controlled) else ''
@@ -268,9 +283,12 @@ payload={
   'waypoint_generation_trace_count':len(glob.glob(os.path.join(out,'projector_traces','vbc_visibility_waypoint_*.json'))),
   'waypoint_records':len(waypoint),
   'waypoint_predicted_source_observed':any(r.get('trajectory_source')=='predicted' for r in waypoint),
-  'num_active_audits':len(active_audit),
-  'num_violation_audits':len(viol),
-  'audit_status_counts':dict(audit_status),
+  'selected_target_audit_records':len(active_audit),
+  'selected_target_violation_audits':len(selected_target_viol),
+  'selected_target_audit_status_counts':dict(audit_status),
+  'global_guard_records':len(global_guard),
+  'global_guard_violation_records':len(global_violation_records),
+  'global_guard_mode_observed':bool(global_guard),
   'guard_trigger_count_total':max_trigger,
   'recovery_entry_log_count':recovery_entries,
   'replan_requested_count':replan_requested,
@@ -280,8 +298,11 @@ payload={
   'target_unlock_log_count':unlock_logs,
   'prediction_stale_broker_records':prediction_stale_records,
   'verification_hold_summary_records':hold_records,
+  'global_stale_verification_hold_records':stale_hold_records,
   'gate_released_observed':any(r.get('released')=='1' for r in gate),
   'final_guard_routing':guard[-1].get('routing') if guard else None,
+  'final_guard_status':guard[-1].get('status') if guard else None,
+  'final_guard_episode_armed':guard[-1].get('episode_armed') if guard else None,
 }
 json.dump(payload,open(os.path.join(out,'c4_3_rolling_summary.json'),'w'),indent=2)
 print(json.dumps(payload,indent=2))
@@ -291,5 +312,5 @@ echo "[RESULT]   ${OUT}/c4_3_rolling_summary.json"
 echo "[SELECTOR] ${OUT}/selector_summary.csv"
 echo "[BROKER]   ${OUT}/broker_summary.csv"
 echo "[WAYPOINT] ${OUT}/waypoint_summary.csv"
-echo "[AUDIT]    ${OUT}/predicted_vbc_audit.csv"
-echo "[GUARD]    ${OUT}/predicted_vbc_recovery_guard.csv"
+echo "[AUDIT]    ${OUT}/predicted_vbc_audit.csv  (selected-target diagnostic only)"
+echo "[GUARD]    ${OUT}/predicted_vbc_recovery_guard.csv  (global-set Recovery source)"
