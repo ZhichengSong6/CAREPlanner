@@ -60,9 +60,11 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   recovery_clear_sub_ = nh_.subscribe(
       recovery_clear_topic_, 1,
       &VelocityQPMPCWaypoint::recoveryClearCallback, this);
-  replan_ready_sub_ = nh_.subscribe(
-      replan_ready_topic_, 1,
-      &VelocityQPMPCWaypoint::replanReadyCallback, this);
+  if (!planner_mode_semantics_) {
+    replan_ready_sub_ = nh_.subscribe(
+        replan_ready_topic_, 1,
+        &VelocityQPMPCWaypoint::replanReadyCallback, this);
+  }
 
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       velocity_command_topic_, 1);
@@ -106,9 +108,16 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                   << ", clear_topic=" << recovery_clear_topic_
                   << ", recovery_weight="
                   << waypoint_weight_ * recovery_weight_scale_
+                  << ", planner_mode_semantics="
+                  << static_cast<int>(planner_mode_semantics_)
                   << ", complete=" << recovery_complete_topic_
                   << ", replan_ready=" << replan_ready_topic_);
-  ROS_INFO("[VelocityQPMPCWaypoint] Recovery removes nominal q/terminal/u-reference tracking but preserves hard joint-position, velocity, and acceleration constraints plus effort/smoothness regularization.");
+  if (planner_mode_semantics_) {
+    ROS_WARN("[VelocityQPMPCWaypoint] PLANNER MODE SEMANTICS ENABLED: REPAIR/NORMAL only select the next-candidate objective. Clear never enters recovery_hold, never publishes recovery_complete, and never waits for replan_ready. The committed execution trajectory is owned downstream and is untouched by this mode switch.");
+  } else {
+    ROS_INFO("[VelocityQPMPCWaypoint] Legacy Recovery lifecycle enabled: clear may enter recovery_hold and wait for replan_ready.");
+  }
+  ROS_INFO("[VelocityQPMPCWaypoint] Recovery/REPAIR removes nominal q/terminal/u-reference tracking but preserves hard joint-position, velocity, and acceleration constraints plus effort/smoothness regularization.");
   return true;
 }
 
@@ -226,6 +235,8 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                      recovery_signal_timeout_, recovery_signal_timeout_);
   pnh_.param<bool>("mpc/visibility_waypoint/recovery_enabled",
                    recovery_enabled_, recovery_enabled_);
+  pnh_.param<bool>("mpc/visibility_waypoint/planner_mode_semantics",
+                   planner_mode_semantics_, planner_mode_semantics_);
   pnh_.param<double>("mpc/visibility_waypoint/recovery_weight_scale",
                      recovery_weight_scale_, recovery_weight_scale_);
   pnh_.param<std::string>("mpc/visibility_waypoint/recovery_active_topic",
@@ -892,7 +903,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       recovery_clear_age <= recovery_signal_timeout_;
 
   bool exited_recovery_hold = false;
-  if (local_recovery_hold && local_replan_ready && reference_fresh) {
+  if (!planner_mode_semantics_ &&
+      local_recovery_hold && local_replan_ready && reference_fresh) {
     std::lock_guard<std::mutex> lock(data_mutex_);
     recovery_hold_ = false;
     replan_ready_received_ = false;
@@ -930,21 +942,33 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
   bool entered_recovery = false;
   bool completed_recovery = false;
+  bool exited_repair_objective = false;
   if (waypoint_enabled_ && waypoint_weight_ > 0.0 && recovery_enabled_) {
     std::lock_guard<std::mutex> lock(data_mutex_);
 
     if (recovery_active_) {
       if (recovery_clear_requested) {
         recovery_active_ = false;
-        recovery_hold_ = true;
-        replan_ready_received_ = false;
-        completed_recovery = true;
-        if (!recovery_complete_published_) {
-          recovery_complete_published_ = true;
+        if (planner_mode_semantics_) {
+          // C4.4 planner semantics: changing candidate objective must not alter
+          // the already committed execution plan or request a new task plan.
+          recovery_hold_ = false;
+          replan_ready_received_ = false;
+          recovery_complete_published_ = false;
+          exited_repair_objective = true;
+        } else {
+          // Legacy controller semantics kept for frozen C4.2/C4.3 experiments.
+          recovery_hold_ = true;
+          replan_ready_received_ = false;
+          completed_recovery = true;
+          if (!recovery_complete_published_) {
+            recovery_complete_published_ = true;
+          }
         }
       }
-    } else if (!recovery_hold_ && !verification_hold_active &&
-               waypoint_data_fresh && wp_active && recovery_requested) {
+    } else if ((planner_mode_semantics_ || !recovery_hold_) &&
+               !verification_hold_active && waypoint_data_fresh && wp_active &&
+               recovery_requested) {
       recovery_active_ = true;
       recovery_complete_published_ = false;
       entered_recovery = true;
@@ -956,9 +980,19 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
   if (entered_recovery) {
     publishRecoveryActive(true);
-    ROS_ERROR_STREAM("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSAFE via "
-                     << (use_external_recovery_trigger_ ? "predicted-VBC trigger" : "deadline")
-                     << "; nominal task tracking is suspended.");
+    if (planner_mode_semantics_) {
+      ROS_WARN_STREAM("[VelocityQPMPCWaypoint] REPAIR CANDIDATE OBJECTIVE ACTIVE via "
+                      << (use_external_recovery_trigger_ ? "verified-regime trigger" : "deadline")
+                      << "; committed execution trajectory remains owned by the verify/commit layer.");
+    } else {
+      ROS_ERROR_STREAM("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSAFE via "
+                       << (use_external_recovery_trigger_ ? "predicted-VBC trigger" : "deadline")
+                       << "; nominal task tracking is suspended.");
+    }
+  }
+  if (exited_repair_objective) {
+    publishRecoveryActive(false);
+    ROS_WARN("[VelocityQPMPCWaypoint] REPAIR CANDIDATE OBJECTIVE CLEARED -> NORMAL candidate objective. No recovery_hold, no recovery_complete/replan_ready handshake, and the current committed trajectory is unchanged.");
   }
   if (completed_recovery) {
     publishRecoveryActive(false);
@@ -1153,6 +1187,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " primal=" << primal
       << " dual=" << dual
       << " control_mode=" << control_mode
+      << " planner_mode_semantics=" << static_cast<int>(planner_mode_semantics_)
       << " verification_hold=" << static_cast<int>(verification_hold_active)
       << " recovery_trigger=" << static_cast<int>(has_recovery_trigger && recovery_trigger)
       << " external_recovery_trigger=" << static_cast<int>(use_external_recovery_trigger_)
