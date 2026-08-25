@@ -119,10 +119,12 @@ target_link_libraries(velocity_qp_mpc_node
   ${catkin_LIBRARIES}
 )
 
-# Experimental Visibility-Before-Contact deadline-waypoint MPC. Kept separate
-# from the validated Phase-A/B.2 executable for clean regression/ablation runs.
+# Experimental Visibility-Before-Contact deadline-waypoint MPC. In the
+# planner/controller split the executable also listens to the final actuator
+# command so the first-step acceleration and smoothness boundary is anchored to
+# what was ACTUALLY executed, not to a possibly rejected raw candidate.
 add_executable(velocity_qp_mpc_waypoint_node
-  src/velocity_qp_mpc_waypoint_node.cpp
+  src/velocity_qp_mpc_waypoint_execution_anchored_node.cpp
   src/velocity_qp_mpc_waypoint.cpp
 )
 add_dependencies(velocity_qp_mpc_waypoint_node
@@ -138,30 +140,6 @@ target_compile_definitions(velocity_qp_mpc_waypoint_node PRIVATE
   NDEBUG
 )
 target_link_libraries(velocity_qp_mpc_waypoint_node
-  ${catkin_LIBRARIES}
-)
-
-# Planner/controller split variant. The QP implementation is unchanged, but the
-# first-step acceleration/smoothness anchor is refreshed from the command that
-# the low-level controller actually sent to the actuator. This is essential once
-# unsafe raw candidates can be rejected before execution.
-add_executable(velocity_qp_mpc_waypoint_execution_anchored_node
-  src/velocity_qp_mpc_waypoint_execution_anchored_node.cpp
-  src/velocity_qp_mpc_waypoint.cpp
-)
-add_dependencies(velocity_qp_mpc_waypoint_execution_anchored_node
-  ${catkin_EXPORTED_TARGETS}
-)
-target_include_directories(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
-  ${PIQP_INCLUDE_DIR}
-)
-target_compile_options(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
-  -O3
-)
-target_compile_definitions(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
-  NDEBUG
-)
-target_link_libraries(velocity_qp_mpc_waypoint_execution_anchored_node
   ${catkin_LIBRARIES}
 )
 
