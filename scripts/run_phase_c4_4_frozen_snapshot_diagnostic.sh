@@ -4,6 +4,8 @@ set -u -o pipefail
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-8.0}"
+CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
+SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
 CONFIG_FILE="${CONFIG_FILE:-${REPO}/src/egocentric_arm_planner/config/planner_phase1_c4_3_planner.yaml}"
 BASE_OUT="${OUT:-${REPO}/outputs/phase_c4_4_frozen_snapshot_diagnostic/${CASE_ID}}"
 BASE_LOG="${LOG:-${REPO}/logs/phase_c4_4_frozen_snapshot_diagnostic/${CASE_ID}}"
@@ -17,6 +19,8 @@ source devel/setup.bash
 # and BASE_LOG at startup, so do not create diagnostic files until it is ready.
 CASE_ID="${CASE_ID}" \
 RUN_SECONDS="${RUN_SECONDS}" \
+CARE_WEIGHT="${CARE_WEIGHT}" \
+SAFETY_MARGIN="${SAFETY_MARGIN}" \
 CONFIG_FILE="${CONFIG_FILE}" \
 OUT="${BASE_OUT}" \
 LOG="${BASE_LOG}" \
@@ -56,6 +60,8 @@ mkdir -p "${DIAG_OUT}" "${BASE_LOG}"
 setsid roslaunch egocentric_arm_planner c4_4_frozen_snapshot_repair_diagnostic.launch \
   config_file:="${CONFIG_FILE}" \
   output_dir:="${DIAG_OUT}" \
+  waypoint_weight:="${CARE_WEIGHT}" \
+  vbc_min_margin_s:="${SAFETY_MARGIN}" \
   > "${DIAG_LOG}" 2>&1 &
 DIAG_PID=$!
 
@@ -80,6 +86,7 @@ fi
 
 echo "[DIAG] frozen snapshot diagnostic armed at first actual REPAIR MPC cycle"
 echo "[DIAG] horizons: 0.5, 1.0, 1.5, 2.0 s; same dt/limits/PIQP repair objective"
+echo "[DIAG] mirrored runtime: waypoint_weight=${CARE_WEIGHT}, vbc_margin=${SAFETY_MARGIN}s"
 
 RESULT="${DIAG_OUT}/frozen_snapshot_repair_results.json"
 while kill -0 "${RUNNER_PID}" 2>/dev/null; do
