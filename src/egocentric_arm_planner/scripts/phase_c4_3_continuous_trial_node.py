@@ -7,11 +7,42 @@ Recovery completion does not re-publish the EE goal, does not request a
 measured-state task replan, and does not hard-lock the rolling target lifecycle.
 The nominal task reference remains an upstream objective while CAREPlanner's
 optimized trajectory is continuously tracked downstream.
+
+catkin_install_python creates relay wrappers in devel/lib.  Importing
+``phase_b2_controlled_trial_node`` by module name from another installed script
+therefore resolves to the relay wrapper rather than to the source file that
+contains PhaseB2ControlledTrialNode.  Load the source module explicitly from the
+ROS package path so this subclass works both from source and from catkin's devel
+space.
 """
 
+from pathlib import Path
+import importlib.util
+
+import rospkg
 import rospy
 
-from phase_b2_controlled_trial_node import PhaseB2ControlledTrialNode
+
+def _load_base_class():
+    package_dir = Path(rospkg.RosPack().get_path("egocentric_arm_planner")).resolve()
+    source_path = package_dir / "scripts" / "phase_b2_controlled_trial_node.py"
+    if not source_path.is_file():
+        raise ImportError(
+            "cannot locate PhaseB2ControlledTrialNode source at {}".format(source_path)
+        )
+    spec = importlib.util.spec_from_file_location(
+        "care_phase_b2_controlled_trial_source", str(source_path))
+    if spec is None or spec.loader is None:
+        raise ImportError("failed to create module spec for {}".format(source_path))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not hasattr(module, "PhaseB2ControlledTrialNode"):
+        raise ImportError(
+            "PhaseB2ControlledTrialNode missing from {}".format(source_path))
+    return module.PhaseB2ControlledTrialNode
+
+
+PhaseB2ControlledTrialNode = _load_base_class()
 
 
 class PhaseC43ContinuousTrialNode(PhaseB2ControlledTrialNode):
