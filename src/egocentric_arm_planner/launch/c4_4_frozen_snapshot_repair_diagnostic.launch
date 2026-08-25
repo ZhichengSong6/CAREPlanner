@@ -3,6 +3,7 @@
        default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
   <arg name="base_frame" default="base_link" />
   <arg name="output_dir" default="/tmp/careplanner_frozen_snapshot" />
+  <arg name="waypoint_weight" default="3000.0" />
   <arg name="vbc_min_margin_s" default="0.30" />
   <arg name="predicted_trajectory_timeout" default="0.30" />
   <arg name="candidate_topic" default="/care_planner/diagnostic/frozen_candidate" />
@@ -18,6 +19,8 @@
     <rosparam param="horizons_s">[0.5, 1.0, 1.5, 2.0]</rosparam>
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="output_dir" value="$(arg output_dir)" />
+    <!-- Mirror the runtime C4.4 repair weight, not only the YAML default. -->
+    <param name="mpc/visibility_waypoint/weight" value="$(arg waypoint_weight)" />
     <param name="joint_state_topic" value="/care_arm/joint_states" />
     <param name="actuator_topic" value="/care_arm/arm_group_velocity_controller/command" />
     <param name="q_vis_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
