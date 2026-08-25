@@ -58,6 +58,25 @@ public:
 
   bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
 
+  // Planner/controller split support.  In verified-commit mode an MPC raw
+  // candidate may be rejected and never executed, so the first-step
+  // acceleration/smoothness anchor must come from the command that the
+  // low-level controller actually sent to the robot, not from the previous raw
+  // MPC solution.  A thin execution-anchored node calls this callback from the
+  // final actuator-command topic before the next 20 Hz MPC solve.
+  void setExecutedCommandAnchor(
+      const std_msgs::Float64MultiArrayConstPtr& msg) {
+    if (!msg || msg->data.size() != static_cast<std::size_t>(dof_)) return;
+    Eigen::VectorXd command(dof_);
+    for (int i = 0; i < dof_; ++i) {
+      const double value = msg->data[static_cast<std::size_t>(i)];
+      if (!std::isfinite(value)) return;
+      command[i] = value;
+    }
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    previous_command_ = command;
+  }
+
 private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void referenceCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
