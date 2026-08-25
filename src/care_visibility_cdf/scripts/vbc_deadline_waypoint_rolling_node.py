@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """C4.3 entry point for the rolling visibility waypoint generator.
 
-The implementation lives in ``vbc_deadline_waypoint_rolling_impl.py``.  C4.3
-now defaults to all-point active-set steering.  Passing ``_use_active_set:=false``
-explicitly retains the previous single-target rolling ablation.
+The default C4.3 path uses all-point shared steering plus short-horizon
+spatial-region persistence and same-patch q_vis warm starts.  Passing
+``_use_active_set:=false`` still retains the previous single-target rolling
+ablation.
 """
 
 import rospy
 
-from vbc_deadline_waypoint_rolling_impl import RollingVbcDeadlineWaypointNode
+from vbc_deadline_waypoint_rolling_persistent_impl import (
+    PersistentRollingVbcDeadlineWaypointNode,
+)
 
 
 def main() -> None:
@@ -16,7 +19,7 @@ def main() -> None:
     if not rospy.has_param("~use_active_set"):
         rospy.set_param("~use_active_set", True)
     try:
-        RollingVbcDeadlineWaypointNode()
+        PersistentRollingVbcDeadlineWaypointNode()
     except Exception as exc:
         rospy.logfatal(
             "[vbc_waypoint_rolling] initialization failed: %s", exc)
