@@ -15,14 +15,14 @@ Candidate VBC:
 Execution VBC:
   * independently audits the trajectory actually published to the low-level
     tracker.
-  * a confirmed unsafe committed trajectory is an execution safety event and
+  * a confirmed unsafe committed trajectory is one execution-safety episode and
     immediately requests REPAIR from any state.
 
-The legacy MPC still consumes Bool recovery_trigger/recovery_clear inputs.  A
+The legacy MPC still consumes Bool recovery_trigger/recovery_clear inputs. A
 short clear pulse is used only as a compatibility transition from its RECOVERY
 mode to normal-objective probing; it is no longer interpreted as "the problem is
-gone".  Unsafe candidate rejection and execution safety are deliberately kept
-as separate counters/diagnostics.
+gone". Unsafe candidate rejection and execution safety are deliberately kept as
+separate counters/diagnostics.
 """
 
 import math
@@ -125,6 +125,7 @@ class C44VerifiedRegimeManager:
         self.execution_summary_time = None
         self.execution_last_unsafe = False
         self.execution_unsafe_streak = 0
+        self.execution_event_latched = False
         self.execution_safety_event_count = 0
         self.execution_safe_count = 0
 
@@ -229,6 +230,7 @@ class C44VerifiedRegimeManager:
                 self.state = self.NORMAL
                 self.candidate_unsafe_streak = 0
                 self.execution_unsafe_streak = 0
+                self.execution_event_latched = False
                 self.probe_safe_commit_streak = 0
                 self.clear_until = None
                 self.probe_ignore_until = None
@@ -288,8 +290,6 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
-        # execution selector can report predicted or cached/bootstrap committed
-        # data; freshness of the actual committed stream is checked separately.
         unsafe = _as_bool(f.get("has_violation"))
         if unsafe is None:
             return
@@ -302,9 +302,12 @@ class C44VerifiedRegimeManager:
             else:
                 self.execution_safe_count += 1
                 self.execution_unsafe_streak = 0
+                self.execution_event_latched = False
 
             if (self.execution_ready and unsafe and
-                    self.execution_unsafe_streak >= self.execution_unsafe_required):
+                    self.execution_unsafe_streak >= self.execution_unsafe_required and
+                    not self.execution_event_latched):
+                self.execution_event_latched = True
                 self.execution_safety_event_count += 1
                 if self.state != self.REPAIR:
                     self._transition_locked(
@@ -328,8 +331,6 @@ class C44VerifiedRegimeManager:
                 return
 
             if self.state == self.REPAIR:
-                # One genuinely verified/committed repaired plan is enough to
-                # test whether the normal objective can now remain safe.
                 self._transition_locked(
                     self.PROBE_NORMAL, "safe_repair_commit", now)
             elif self.state == self.PROBE_NORMAL:
@@ -354,9 +355,9 @@ class C44VerifiedRegimeManager:
                 self.execution_ready and self.state == self.PROBE_NORMAL and
                 self.clear_until is not None and now <= self.clear_until)
 
-            # Candidate-verifier staleness must not stop an already verified
-            # committed execution. Execution-audit / committed-stream staleness
-            # is the fail-safe condition.
+            # Candidate-verifier staleness does not invalidate an already-safe
+            # committed execution. Only execution-audit / committed-stream
+            # staleness requests the MPC verification hold.
             exec_summary_fresh = self._fresh_locked(
                 self.execution_summary_time, now, self.input_timeout)
             committed_fresh = self._fresh_locked(
@@ -368,7 +369,6 @@ class C44VerifiedRegimeManager:
             hold = bool(
                 self.execution_ready and not startup_grace and
                 (not exec_summary_fresh or not committed_fresh))
-
             deadline = self.physical_deadline_abs
 
         self.trigger_pub.publish(Bool(data=trigger))
@@ -396,6 +396,7 @@ class C44VerifiedRegimeManager:
                 "candidate_safe_count={}".format(self.candidate_safe_count),
                 "execution_last_unsafe={}".format(int(self.execution_last_unsafe)),
                 "execution_unsafe_streak={}".format(self.execution_unsafe_streak),
+                "execution_event_latched={}".format(int(self.execution_event_latched)),
                 "execution_safety_event_count={}".format(self.execution_safety_event_count),
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
