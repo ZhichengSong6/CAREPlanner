@@ -1,0 +1,221 @@
+<launch>
+  <!-- Continuous C4.3 CAREPlanner: planner outputs a committed optimized
+       trajectory; TrajectoryExecutionManager is the sole low-level controller. -->
+  <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="waypoint_weight" default="3000.0" />
+  <arg name="waypoint_timeout" default="0.20" />
+  <arg name="waypoint_horizon_slack" default="0.025" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+  <arg name="predicted_vbc_recovery_consecutive_violations" default="2" />
+  <arg name="predicted_vbc_recovery_consecutive_safe" default="2" />
+  <arg name="predicted_vbc_recovery_input_timeout" default="0.25" />
+  <arg name="selector_predicted_trajectory_timeout" default="0.20" />
+  <arg name="rolling_safe_clear_consecutive" default="2" />
+  <arg name="rolling_target_cell_resolution" default="0.05" />
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+  <arg name="trial_label" default="c4_3_continuous" />
+  <arg name="log_output_root" default="$(find egocentric_arm_planner)/../../outputs/phase_c4_3_continuous" />
+
+  <arg name="raw_mpc_trajectory_topic" default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="optimized_trajectory_topic" default="/care_planner/optimized_trajectory" />
+  <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
+  <arg name="gated_command_topic" default="/care_planner/command_trajectory_vbc_gated" />
+  <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
+  <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_active_topic" default="/care_planner/active_sensing/target_candidate_active" />
+  <arg name="candidate_sweep_time_topic" default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
+  <arg name="frozen_target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="frozen_sweep_time_topic" default="/care_planner/active_sensing/frozen_sweep_time_s" />
+  <arg name="rolling_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_rolling" />
+  <arg name="execution_ready_topic" default="/care_planner/execution/ready" />
+  <arg name="execution_start_topic" default="/care_planner/execution/start_time" />
+  <arg name="recovery_trigger_topic" default="/care_planner/execution/predicted_vbc_recovery_triggered" />
+  <arg name="recovery_clear_topic" default="/care_planner/execution/predicted_vbc_recovery_clear" />
+  <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
+  <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
+  <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
+  <arg name="effective_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_effective" />
+
+  <!-- High-level nominal task source. No low-level execution manager here. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="false" />
+  </include>
+
+  <!-- Initial T0/reference gate only.  Recovery complete is deliberately routed
+       to an unused topic so the gate never freezes nominal progress for a replan. -->
+  <node pkg="egocentric_arm_planner" type="vbc_execution_reference_gate_node.py"
+        name="vbc_execution_reference_gate" output="screen">
+    <param name="input_reference_topic" value="$(arg upstream_command_topic)" />
+    <param name="output_reference_topic" value="$(arg gated_command_topic)" />
+    <param name="task_trajectory_topic" value="/care_planner/task_trajectory" />
+    <param name="vbc_summary_topic" value="/care_planner/trajectory_risk/vbc_summary" />
+    <param name="waypoint_summary_topic" value="/care_planner/active_sensing/visibility_waypoint_summary" />
+    <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="recovery_complete_topic" value="/care_planner/execution/legacy_gate_recovery_complete_unused" />
+    <param name="replan_ready_topic" value="/care_planner/execution/legacy_gate_replan_ready_unused" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
+    <param name="synced_deadline_topic" value="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+    <param name="publish_rate" value="20.0" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="decision_stability_count" value="2" />
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="output_root" value="$(arg log_output_root)" />
+  </node>
+
+  <!-- Raw MPC solution -> committed optimized trajectory with short plan memory. -->
+  <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
+        name="optimized_trajectory_continuity" output="screen">
+    <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
+    <param name="output_topic" value="$(arg optimized_trajectory_topic)" />
+    <param name="summary_topic" value="/care_planner/optimized_trajectory_summary" />
+    <param name="rate" value="20.0" />
+    <param name="continuation_start_delay_s" value="0.065" />
+    <param name="continuation_timeout_s" value="0.50" />
+  </node>
+
+  <node pkg="egocentric_arm_planner" type="predicted_vbc_recovery_guard_node.py"
+        name="predicted_vbc_recovery_guard" output="screen">
+    <param name="enabled" value="true" />
+    <param name="rate" value="20.0" />
+    <param name="input_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
+    <param name="consecutive_violations_required" value="$(arg predicted_vbc_recovery_consecutive_violations)" />
+    <param name="consecutive_safe_required" value="$(arg predicted_vbc_recovery_consecutive_safe)" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="use_global_summary_input" value="true" />
+    <param name="episode_rearm_enabled" value="true" />
+    <param name="global_summary_topic" value="/care_planner/trajectory_risk/vbc_summary" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="violation_topic" value="/care_planner/execution/predicted_vbc_violation" />
+    <param name="physical_deadline_topic" value="$(arg rolling_deadline_topic)" />
+    <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="summary_topic" value="/care_planner/execution/predicted_vbc_recovery_summary" />
+    <param name="triggered_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="recovery_clear_topic" value="$(arg recovery_clear_topic)" />
+  </node>
+
+  <node pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
+        name="velocity_qp_mpc_waypoint_node" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="mpc/reference_trajectory" value="$(arg gated_command_topic)" />
+    <param name="mpc/visibility_waypoint/enabled" value="true" />
+    <param name="mpc/visibility_waypoint/weight" value="$(arg waypoint_weight)" />
+    <param name="mpc/visibility_waypoint/timeout" value="$(arg waypoint_timeout)" />
+    <param name="mpc/visibility_waypoint/horizon_slack" value="$(arg waypoint_horizon_slack)" />
+    <param name="mpc/visibility_waypoint/active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="mpc/visibility_waypoint/q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
+    <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_trigger" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_trigger_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_clear" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_clear_topic" value="$(arg recovery_clear_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_signal_timeout" value="$(arg predicted_vbc_recovery_input_timeout)" />
+    <param name="mpc/visibility_waypoint/recovery_enabled" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_weight_scale" value="1.0" />
+    <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
+  </node>
+
+  <!-- Translate the legacy internal recovery-hold boundary into a next-cycle
+       continuous planner acknowledgement. -->
+  <node pkg="egocentric_arm_planner" type="c4_3_planner_regime_handoff_node.py"
+        name="c4_3_planner_regime_handoff" output="screen">
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="delay_s" value="0.005" />
+  </node>
+
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="active_sensing_target_topic" value="/care_planner/active_sensing/legacy_target_candidate" />
+    <arg name="show_full_trajectory_markers" value="false" />
+    <arg name="show_worst_timestep_markers" value="false" />
+    <arg name="show_attribution_markers" value="false" />
+  </include>
+
+  <!-- Safety audit and steering selection operate on the same committed
+       trajectory that the low-level controller tracks. -->
+  <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+    <arg name="predicted_trajectory_topic" value="$(arg optimized_trajectory_topic)" />
+    <arg name="prefer_predicted_trajectory" value="true" />
+    <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+    <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
+    <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+    <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="temporal_layer_mpc_steps" value="2" />
+    <arg name="region_max_diameter_m" value="0.12" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/predicted_vbc_auditor.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="prediction_topic" value="$(arg optimized_trajectory_topic)" />
+    <arg name="target_topic" value="$(arg frozen_target_topic)" />
+    <arg name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <arg name="min_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="require_active" value="true" />
+    <arg name="audit_warn_ms" value="5.0" />
+  </include>
+
+  <node pkg="egocentric_arm_planner" type="phase_c4_3_continuous_trial_node.py"
+        name="phase_b2_controlled_trial" output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="goal_topic" value="/care_planner/ee_target_pose" />
+    <param name="candidate_topic" value="$(arg candidate_target_topic)" />
+    <param name="candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="candidate_sweep_time_topic" value="$(arg candidate_sweep_time_topic)" />
+    <param name="predicted_trajectory_topic" value="$(arg optimized_trajectory_topic)" />
+    <param name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+    <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
+    <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="selected_active_topic" value="/care_planner/active_sensing/target_selection_active" />
+    <param name="rolling_deadline_topic" value="$(arg rolling_deadline_topic)" />
+    <param name="rolling_target_mode" value="true" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="safe_clear_consecutive_required" value="$(arg rolling_safe_clear_consecutive)" />
+    <param name="target_cell_resolution" value="$(arg rolling_target_cell_resolution)" />
+    <param name="recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
+    <param name="require_initial_prior_ready" value="true" />
+    <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+    <param name="publish_rate" value="20.0" />
+    <param name="goal_delay" value="$(arg goal_delay)" />
+    <param name="goal/x" value="$(arg goal_x)" />
+    <param name="goal/y" value="$(arg goal_y)" />
+    <param name="goal/z" value="$(arg goal_z)" />
+    <param name="goal/qx" value="$(arg goal_qx)" />
+    <param name="goal/qy" value="$(arg goal_qy)" />
+    <param name="goal/qz" value="$(arg goal_qz)" />
+    <param name="goal/qw" value="$(arg goal_qw)" />
+  </node>
+</launch>
