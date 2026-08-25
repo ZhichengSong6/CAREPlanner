@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Serialize candidate VBC verification and publish only committed trajectories.
 
-CAREPlanner's MPC produces raw receding-horizon candidates.  A raw candidate is
-NOT an execution reference until the global VBC selector has evaluated it.
-This node therefore separates three streams:
+C4.4 verification protocol
+--------------------------
+The C++ VBC selector runs on its own periodic timer and may publish repeated
+summaries for the same cached trajectory.  A millisecond delay is therefore not
+a reliable way to associate a selector verdict with a newly published candidate.
 
-  raw MPC candidate
-      -> one-at-a-time verification candidate
-      -> committed trajectory (only if global VBC safe)
+This node uses an explicit selector-cycle barrier instead:
 
-At most one verification candidate is outstanding.  This makes the existing
-selector summary unambiguous without changing the C++ selector protocol: every
-fresh ``trajectory_source=predicted`` summary received while a candidate is
-outstanding belongs to that candidate.  After a result is consumed, one selector
-period is deliberately left empty before the next candidate is dispatched so a
-late repeated summary cannot be mistaken for the next candidate.
+  selector cycle k finishes and publishes a summary
+      -> a new candidate may be dispatched immediately after that cycle
+      -> only selector cycle k+1 (or later) may decide that candidate
+
+At most one candidate is outstanding.  Each dispatched candidate also receives a
+monotone ``header.seq`` for diagnostics.  Every completed unique verification
+publishes exactly one event on ``verification_event_topic``.  The C4.4 regime
+manager consumes those events rather than repeated selector summaries.
 
 Unsafe candidates are never published to the low-level controller.  While a new
 safe candidate is being generated / verified, the remaining suffix of the last
@@ -62,6 +64,8 @@ class OptimizedTrajectoryContinuityNode:
             "~global_summary_topic", "/care_planner/trajectory_risk/vbc_summary"))
         self.summary_topic = str(rospy.get_param(
             "~summary_topic", "/care_planner/optimized_trajectory_summary"))
+        self.verification_event_topic = str(rospy.get_param(
+            "~verification_event_topic", "/care_planner/verification_outcome"))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_start_delay_s = float(rospy.get_param(
@@ -70,10 +74,6 @@ class OptimizedTrajectoryContinuityNode:
             "~continuation_timeout_s", 0.50))
         self.verification_timeout_s = float(rospy.get_param(
             "~verification_timeout_s", 0.25))
-        self.verification_rearm_delay_s = float(rospy.get_param(
-            "~verification_rearm_delay_s", 0.055))
-        self.verification_min_response_delay_s = float(rospy.get_param(
-            "~verification_min_response_delay_s", 0.002))
 
         if self.rate <= 0.0:
             raise ValueError("~rate must be positive")
@@ -83,10 +83,6 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~continuation_timeout_s must exceed start delay")
         if self.verification_timeout_s <= 0.0:
             raise ValueError("~verification_timeout_s must be positive")
-        if self.verification_rearm_delay_s < 0.0:
-            raise ValueError("~verification_rearm_delay_s must be non-negative")
-        if self.verification_min_response_delay_s < 0.0:
-            raise ValueError("~verification_min_response_delay_s must be non-negative")
 
         self._pending_raw = None
         self._pending_raw_received = None
@@ -94,9 +90,19 @@ class OptimizedTrajectoryContinuityNode:
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
 
+        # Selector-cycle handshake state.  _selector_barrier_ready becomes true
+        # only after a predicted selector summary has completed a cycle.  A
+        # dispatch consumes that barrier; the next selector cycle is then the
+        # earliest cycle allowed to decide the outstanding candidate.
+        self._selector_cycle_count = 0
+        self._selector_barrier_ready = False
+        self._last_selector_cycle_time = None
+
         self._outstanding = None
         self._outstanding_sent = None
-        self._next_verification_not_before = rospy.Time(0)
+        self._outstanding_seq = 0
+        self._outstanding_dispatch_cycle = -1
+        self._next_verification_seq = 1
 
         self._committed_master = None
         self._committed_received = None
@@ -106,6 +112,7 @@ class OptimizedTrajectoryContinuityNode:
         self._verification_safe_count = 0
         self._verification_unsafe_count = 0
         self._verification_timeout_count = 0
+        self._verification_outcome_count = 0
         self._commit_count = 0
         self._committed_publish_count = 0
         self._continuation_count = 0
@@ -113,6 +120,8 @@ class OptimizedTrajectoryContinuityNode:
         self._last_source = "waiting_raw_candidate"
         self._last_committed_age_s = math.nan
         self._last_verification_age_s = math.nan
+        self._last_verification_seq = 0
+        self._last_verification_result = "none"
 
         self.verification_pub = rospy.Publisher(
             self.verification_topic, JointTrajectory, queue_size=1)
@@ -120,6 +129,8 @@ class OptimizedTrajectoryContinuityNode:
             self.committed_topic, JointTrajectory, queue_size=1)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
+        self.verification_event_pub = rospy.Publisher(
+            self.verification_event_topic, String, queue_size=20, latch=False)
 
         self.raw_sub = rospy.Subscriber(
             self.input_topic, JointTrajectory, self._raw_cb, queue_size=1)
@@ -130,12 +141,12 @@ class OptimizedTrajectoryContinuityNode:
 
         self._publish_summary()
         rospy.logwarn(
-            "[optimized_trajectory_continuity] VERIFY-BEFORE-COMMIT raw=%s "
-            "verify=%s committed=%s selector_summary=%s rate=%.1fHz "
-            "verify_timeout=%.3fs rearm_delay=%.3fs continuation_timeout=%.3fs",
+            "[optimized_trajectory_continuity] CYCLE-CORRELATED VERIFY raw=%s "
+            "verify=%s committed=%s selector_summary=%s event=%s rate=%.1fHz "
+            "verify_timeout=%.3fs continuation_timeout=%.3fs",
             self.input_topic, self.verification_topic, self.committed_topic,
-            self.global_summary_topic, self.rate, self.verification_timeout_s,
-            self.verification_rearm_delay_s, self.continuation_timeout_s)
+            self.global_summary_topic, self.verification_event_topic,
+            self.rate, self.verification_timeout_s, self.continuation_timeout_s)
 
     @staticmethod
     def _duration(msg: JointTrajectory) -> float:
@@ -235,7 +246,7 @@ class OptimizedTrajectoryContinuityNode:
     def _dispatch_pending_locked(self, now):
         if self._outstanding is not None or self._pending_raw is None:
             return None
-        if now < self._next_verification_not_before:
+        if not self._selector_barrier_ready:
             return None
 
         raw = self._pending_raw
@@ -248,9 +259,16 @@ class OptimizedTrajectoryContinuityNode:
             self._last_source = "discarded_expired_raw_candidate"
             return None
 
+        seq = self._next_verification_seq
+        self._next_verification_seq += 1
+        candidate.header.seq = seq
         candidate.header.stamp = now
+
         self._outstanding = copy.deepcopy(candidate)
         self._outstanding_sent = now
+        self._outstanding_seq = seq
+        self._outstanding_dispatch_cycle = self._selector_cycle_count
+        self._selector_barrier_ready = False
         self._verification_publish_count += 1
         self._last_source = "candidate_sent_for_verification"
         self._publish_summary_locked()
@@ -268,6 +286,22 @@ class OptimizedTrajectoryContinuityNode:
             self._last_committed_age_s = float(age_s)
             self._publish_summary_locked()
 
+    def _make_verification_event(self, seq, result, committed, age_s):
+        msg = String()
+        msg.data = (
+            "seq={} result={} committed={} verification_age_s={:.6f} "
+            "outcome_count={} safe_count={} unsafe_count={} timeout_count={} "
+            "commit_count={}"
+        ).format(
+            int(seq), result, int(bool(committed)), float(age_s),
+            self._verification_outcome_count,
+            self._verification_safe_count,
+            self._verification_unsafe_count,
+            self._verification_timeout_count,
+            self._commit_count,
+        )
+        return msg
+
     def _global_summary_cb(self, msg):
         if msg is None:
             return
@@ -280,27 +314,51 @@ class OptimizedTrajectoryContinuityNode:
 
         now = rospy.Time.now()
         committed_to_publish = None
+        event_to_publish = None
         with self._lock:
+            # Every predicted summary marks completion of exactly one selector
+            # timer cycle.  If no candidate is outstanding, this cycle is a
+            # barrier after which a new candidate may be dispatched.
+            self._selector_cycle_count += 1
+            self._last_selector_cycle_time = now
+
             if self._outstanding is None or self._outstanding_sent is None:
-                return
-            verification_age = (now - self._outstanding_sent).to_sec()
-            if verification_age < self.verification_min_response_delay_s:
+                self._selector_barrier_ready = True
+                self._last_source = "selector_cycle_barrier_ready"
+                self._publish_summary_locked()
                 return
 
+            # The summary from the same selector cycle that preceded dispatch
+            # can never decide the candidate.  Only a strictly later cycle may.
+            if self._selector_cycle_count <= self._outstanding_dispatch_cycle:
+                return
+
+            verification_age = max(0.0, (now - self._outstanding_sent).to_sec())
             candidate = copy.deepcopy(self._outstanding)
+            seq = int(self._outstanding_seq)
             self._outstanding = None
             self._outstanding_sent = None
-            self._next_verification_not_before = (
-                now + rospy.Duration(self.verification_rearm_delay_s))
+            self._outstanding_seq = 0
+            self._outstanding_dispatch_cycle = -1
+            # This just-completed cycle itself is the barrier for the next
+            # dispatch; the next selector cycle will then evaluate that candidate.
+            self._selector_barrier_ready = True
             self._last_verification_age_s = verification_age
+            self._last_verification_seq = seq
+            self._verification_outcome_count += 1
 
             if violation:
                 self._verification_unsafe_count += 1
+                self._last_verification_result = "unsafe"
                 self._last_source = "candidate_rejected_vbc_unsafe"
+                event_to_publish = self._make_verification_event(
+                    seq, "unsafe", False, verification_age)
             else:
                 self._verification_safe_count += 1
+                self._last_verification_result = "safe"
                 committed = self._suffix_from_phase(candidate, verification_age)
                 if committed is not None and committed.points:
+                    committed.header.seq = seq
                     committed.header.stamp = now
                     self._committed_master = copy.deepcopy(committed)
                     self._committed_received = now
@@ -308,29 +366,49 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_committed_age_s = 0.0
                     self._last_source = "candidate_verified_safe_committed"
                     committed_to_publish = copy.deepcopy(committed)
+                    event_to_publish = self._make_verification_event(
+                        seq, "safe", True, verification_age)
+                else:
+                    # A nominally safe candidate that expired before commit is
+                    # treated as a timeout/reject event, never as a safe commit.
+                    self._verification_timeout_count += 1
+                    self._last_verification_result = "expired_safe"
+                    self._last_source = "candidate_safe_but_expired_before_commit"
+                    event_to_publish = self._make_verification_event(
+                        seq, "timeout", False, verification_age)
             self._publish_summary_locked()
 
         if committed_to_publish is not None:
             self._publish_committed(
                 committed_to_publish, "candidate_verified_safe_committed", 0.0)
+        if event_to_publish is not None:
+            self.verification_event_pub.publish(event_to_publish)
 
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         verification_to_publish = None
         continuation_to_publish = None
+        timeout_event = None
         continuation_age = math.nan
 
         with self._lock:
             if self._outstanding is not None and self._outstanding_sent is not None:
                 age = (now - self._outstanding_sent).to_sec()
                 if age > self.verification_timeout_s:
+                    seq = int(self._outstanding_seq)
                     self._outstanding = None
                     self._outstanding_sent = None
+                    self._outstanding_seq = 0
+                    self._outstanding_dispatch_cycle = -1
+                    self._selector_barrier_ready = False
                     self._verification_timeout_count += 1
-                    self._next_verification_not_before = (
-                        now + rospy.Duration(self.verification_rearm_delay_s))
+                    self._verification_outcome_count += 1
+                    self._last_verification_seq = seq
+                    self._last_verification_result = "timeout"
                     self._last_source = "verification_timeout_candidate_rejected"
                     self._last_verification_age_s = age
+                    timeout_event = self._make_verification_event(
+                        seq, "timeout", False, age)
 
             verification_to_publish = self._dispatch_pending_locked(now)
 
@@ -350,6 +428,8 @@ class OptimizedTrajectoryContinuityNode:
         if continuation_to_publish is not None:
             self._publish_committed(
                 continuation_to_publish, "committed_continuation", continuation_age)
+        if timeout_event is not None:
+            self.verification_event_pub.publish(timeout_event)
 
     def _publish_summary_locked(self):
         msg = String()
@@ -358,11 +438,17 @@ class OptimizedTrajectoryContinuityNode:
             "raw_input_count={}".format(self._raw_input_count),
             "pending_candidate={}".format(int(self._pending_raw is not None)),
             "pending_replace_count={}".format(self._pending_replace_count),
+            "selector_cycle_count={}".format(self._selector_cycle_count),
+            "selector_barrier_ready={}".format(int(self._selector_barrier_ready)),
             "verification_outstanding={}".format(int(self._outstanding is not None)),
+            "outstanding_seq={}".format(int(self._outstanding_seq)),
             "verification_publish_count={}".format(self._verification_publish_count),
+            "verification_outcome_count={}".format(self._verification_outcome_count),
             "verification_safe_count={}".format(self._verification_safe_count),
             "verification_unsafe_count={}".format(self._verification_unsafe_count),
             "verification_timeout_count={}".format(self._verification_timeout_count),
+            "last_verification_seq={}".format(self._last_verification_seq),
+            "last_verification_result={}".format(self._last_verification_result),
             "commit_count={}".format(self._commit_count),
             "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
