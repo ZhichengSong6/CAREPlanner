@@ -22,7 +22,7 @@
 namespace egocentric_arm_planner {
 
 /**
- * CAREPlanner VBC deadline-waypoint controller.
+ * CAREPlanner VBC deadline-waypoint candidate planner.
  *
  * NORMAL:
  *   J = J_task + J_control + J_smooth
@@ -34,19 +34,19 @@ namespace egocentric_arm_planner {
  * VERIFICATION_HOLD (C4 audit temporarily unavailable):
  *   J = J_control_effort + J_smooth
  *
- * RECOVERY:
+ * RECOVERY / REPAIR:
  *   J = J_control_effort + J_smooth
  *       + w_vis ||q_K - q_vis||^2
  *
- * Legacy experiments enter RECOVERY when the waypoint deadline expires.
- * C4.2 can instead use a direct predicted-VBC Bool trigger. The physical
- * deadline then remains only a timing input for the soft q_vis objective.
+ * Legacy experiments treat RECOVERY as a controller episode: clearing it enters
+ * RECOVERY_HOLD, publishes recovery_complete, and waits for replan_ready.
  *
- * C4.3 additionally supports an external global-set Recovery-clear Bool. In
- * that mode RECOVERY entry and exit are both owned by global predicted VBC
- * safety, while q_vis remains only the current single-target steering input.
- * This allows q_vis targets to switch inside one Recovery episode without a
- * transient waypoint handoff being mistaken for Recovery completion.
+ * C4.4 can enable ``planner_mode_semantics``. In that mode RECOVERY is only a
+ * candidate-generation objective (REPAIR): trigger selects the repair objective
+ * and clear selects the normal objective. Switching objective never creates a
+ * hold, never requests a measured-state replan, and never changes the currently
+ * committed execution trajectory; commit/reject is owned downstream by the
+ * verified-commit layer.
  *
  * Task position/terminal tracking and nominal velocity tracking are removed in
  * VERIFICATION_HOLD and RECOVERY. Hard position/velocity/acceleration
@@ -197,6 +197,9 @@ private:
   double recovery_signal_timeout_ = 0.25;
 
   bool recovery_enabled_ = true;
+  // C4.4: when true, RECOVERY is only a candidate-planning objective selector.
+  // Clearing it never enters recovery_hold or emits replan handshakes.
+  bool planner_mode_semantics_ = false;
   bool recovery_active_ = false;
   bool recovery_hold_ = false;
   bool recovery_complete_published_ = false;
