@@ -44,16 +44,14 @@
     <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
       <arg name="base_frame" value="$(arg base_frame)" />
       <!--
-        The normal task trajectory is a one-shot, non-latched bootstrap message and
-        this diagnostic starts after the main C4.4 system is already running.  A
-        late frozen selector can therefore miss it forever.  The frozen selector
-        only needs a valid bootstrap before it is willing to evaluate a predicted
-        trajectory, so use the isolated frozen candidate topic for BOTH inputs.
-        Each dispatched frozen candidate then bootstraps and is immediately
-        evaluated as the preferred predicted trajectory.  This remains completely
-        outside the real candidate/commit/execution path.
+        The task trajectory is one-shot/non-latched, while this diagnostic starts
+        after the main system.  Use the live main-MPC predicted stream only as the
+        selector bootstrap source so selector cycles continue before the first
+        frozen candidate is dispatched.  The trajectory that is actually judged
+        for the frozen experiment remains the isolated frozen candidate below;
+        prefer_predicted_trajectory makes it override this bootstrap stream.
       -->
-      <arg name="input_trajectory_topic" value="$(arg candidate_topic)" />
+      <arg name="input_trajectory_topic" value="/care_planner/mpc/predicted_trajectory" />
       <arg name="predicted_trajectory_topic" value="$(arg candidate_topic)" />
       <arg name="prefer_predicted_trajectory" value="true" />
       <arg name="predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
