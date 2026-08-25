@@ -13,6 +13,7 @@
 #include <Eigen/Dense>
 #include <piqp/piqp.hpp>
 
+#include <cmath>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -58,12 +59,10 @@ public:
 
   bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
 
-  // Planner/controller split support.  In verified-commit mode an MPC raw
-  // candidate may be rejected and never executed, so the first-step
-  // acceleration/smoothness anchor must come from the command that the
-  // low-level controller actually sent to the robot, not from the previous raw
-  // MPC solution.  A thin execution-anchored node calls this callback from the
-  // final actuator-command topic before the next 20 Hz MPC solve.
+  // Planner/controller split support. In verified-commit mode a raw candidate
+  // may be rejected and never executed, so the first-step acceleration and
+  // smoothness anchor must come from the command that the low-level controller
+  // actually sent to the robot, not from the previous raw MPC solution.
   void setExecutedCommandAnchor(
       const std_msgs::Float64MultiArrayConstPtr& msg) {
     if (!msg || msg->data.size() != static_cast<std::size_t>(dof_)) return;
