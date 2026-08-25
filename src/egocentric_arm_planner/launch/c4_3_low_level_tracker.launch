@@ -5,14 +5,20 @@
   <arg name="ee_frame" default="EE_link" />
   <arg name="input_trajectory"
        default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="output_velocity_command"
+       default="/care_arm/arm_group_velocity_controller/command" />
+  <arg name="use_acceleration_limiter" default="false" />
+  <arg name="rate_limiter_output_velocity_command"
+       default="/care_arm/arm_group_velocity_controller/command" />
 
   <!--
     C4.3 planner/controller split.
 
     CAREPlanner/MPC publishes a complete optimized receding-horizon trajectory.
-    This node is the sole low-level velocity owner and tracks the first short
-    segment of every fresh optimized horizon with feed-forward velocity plus
-    position feedback. It performs no visibility/VBC planning itself.
+    TrajectoryExecutionManager tracks the first short segment with feed-forward
+    velocity plus position feedback.  In verified-commit mode its desired
+    velocity is passed through a final per-joint acceleration/velocity envelope
+    before the actuator; neither low-level node performs visibility/VBC planning.
   -->
   <node pkg="egocentric_arm_planner"
         type="trajectory_execution_manager_node"
@@ -22,5 +28,19 @@
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
     <param name="execution/input_trajectory" value="$(arg input_trajectory)" />
+    <param name="execution/output_velocity_command" value="$(arg output_velocity_command)" />
+  </node>
+
+  <node if="$(arg use_acceleration_limiter)"
+        pkg="egocentric_arm_planner"
+        type="joint_velocity_rate_limiter_node.py"
+        name="joint_velocity_rate_limiter"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="rate" value="100.0" />
+    <param name="input_topic" value="$(arg output_velocity_command)" />
+    <param name="output_topic" value="$(arg rate_limiter_output_velocity_command)" />
+    <param name="summary_topic" value="/care_planner/execution/rate_limiter_summary" />
+    <param name="input_timeout" value="0.10" />
   </node>
 </launch>
