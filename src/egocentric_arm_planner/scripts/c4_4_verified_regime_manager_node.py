@@ -4,25 +4,14 @@
 Separates planner-candidate safety from committed-execution safety and owns the
 NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL state machine.
 
-Candidate VBC:
-  * unsafe candidate: reject is handled by the verify/commit node; this manager
-    only changes planner regime.
-  * a new safe commit while REPAIR proves a repaired plan exists and releases
-    the MPC into PROBE_NORMAL.
-  * PROBE_NORMAL requires several consecutive *safe commits* before declaring
-    NORMAL. Any unsafe probe candidate returns to REPAIR.
+Candidate-side transitions are driven only by unique verification-outcome events
+emitted by ``optimized_trajectory_continuity_node``.  Repeated 20 Hz selector
+summaries for the same cached candidate therefore cannot create fake consecutive
+unsafe candidates.
 
-Execution VBC:
-  * independently audits the trajectory actually published to the low-level
-    tracker.
-  * a confirmed unsafe committed trajectory is one execution-safety episode and
-    immediately requests REPAIR from any state.
-
-The legacy MPC still consumes Bool recovery_trigger/recovery_clear inputs. A
-short clear pulse is used only as a compatibility transition from its RECOVERY
-mode to normal-objective probing; it is no longer interpreted as "the problem is
-gone". Unsafe candidate rejection and execution safety are deliberately kept as
-separate counters/diagnostics.
+Execution VBC remains a continuous audit of the trajectory actually published to
+the low-level tracker.  A confirmed unsafe committed trajectory is one execution
+safety episode and immediately requests REPAIR from any planner state.
 """
 
 import math
@@ -86,12 +75,10 @@ class C44VerifiedRegimeManager:
                self.clear_pulse_s, self.probe_ignore_s) <= 0.0:
             raise ValueError("timeouts/pulses must be positive")
 
-        self.candidate_summary_topic = str(rospy.get_param(
-            "~candidate_summary_topic", "/care_planner/candidate_vbc/summary"))
+        self.candidate_outcome_topic = str(rospy.get_param(
+            "~candidate_outcome_topic", "/care_planner/verification_outcome"))
         self.execution_summary_topic = str(rospy.get_param(
             "~execution_summary_topic", "/care_planner/execution_vbc/summary"))
-        self.commit_summary_topic = str(rospy.get_param(
-            "~commit_summary_topic", "/care_planner/optimized_trajectory_summary"))
         self.committed_trajectory_topic = str(rospy.get_param(
             "~committed_trajectory_topic", "/care_planner/committed_trajectory"))
         self.execution_ready_topic = str(rospy.get_param(
@@ -116,12 +103,18 @@ class C44VerifiedRegimeManager:
         self.execution_ready = False
         self.execution_ready_time = None
 
-        self.candidate_summary_time = None
+        # Unique candidate-verification events.
+        self.candidate_outcome_time = None
+        self.last_candidate_seq = 0
+        self.last_candidate_result = "none"
         self.candidate_last_unsafe = False
         self.candidate_unsafe_streak = 0
         self.candidate_unsafe_count = 0
         self.candidate_safe_count = 0
+        self.candidate_timeout_count = 0
+        self.candidate_event_count = 0
 
+        # Continuous committed-execution audit.
         self.execution_summary_time = None
         self.execution_last_unsafe = False
         self.execution_unsafe_streak = 0
@@ -158,13 +151,10 @@ class C44VerifiedRegimeManager:
             self.summary_topic, String, queue_size=1, latch=True)
 
         rospy.Subscriber(
-            self.candidate_summary_topic, String, self._candidate_summary_cb,
-            queue_size=1)
+            self.candidate_outcome_topic, String, self._candidate_outcome_cb,
+            queue_size=20)
         rospy.Subscriber(
             self.execution_summary_topic, String, self._execution_summary_cb,
-            queue_size=1)
-        rospy.Subscriber(
-            self.commit_summary_topic, String, self._commit_summary_cb,
             queue_size=1)
         rospy.Subscriber(
             self.committed_trajectory_topic, rospy.AnyMsg,
@@ -183,9 +173,9 @@ class C44VerifiedRegimeManager:
         self._publish_summary()
 
         rospy.logwarn(
-            "[c4_4_regime] NORMAL->REPAIR->PROBE_NORMAL->NORMAL; "
-            "candidate=%s execution=%s probe_safe_commits=%d",
-            self.candidate_summary_topic, self.execution_summary_topic,
+            "[c4_4_regime] UNIQUE-EVENT NORMAL->REPAIR->PROBE_NORMAL->NORMAL; "
+            "candidate_outcome=%s execution=%s probe_safe_commits=%d",
+            self.candidate_outcome_topic, self.execution_summary_topic,
             self.probe_safe_commits_required)
 
     def _transition_locked(self, new_state, reason, now):
@@ -250,41 +240,74 @@ class C44VerifiedRegimeManager:
         with self._lock:
             self.last_committed_trajectory_time = rospy.Time.now()
 
-    def _candidate_summary_cb(self, msg):
+    def _candidate_outcome_cb(self, msg):
         if msg is None:
             return
         f = _tokens(msg.data)
-        if f.get("trajectory_source") != "predicted":
+        seq = _as_int(f.get("seq"), 0)
+        result = f.get("result", "")
+        committed = _as_bool(f.get("committed"))
+        if seq <= 0 or result not in ("safe", "unsafe", "timeout"):
             return
-        unsafe = _as_bool(f.get("has_violation"))
-        if unsafe is None:
-            return
+
         now = rospy.Time.now()
         with self._lock:
-            self.candidate_summary_time = now
-            self.candidate_last_unsafe = bool(unsafe)
-            if unsafe:
+            # Strictly monotone seq makes this callback idempotent even if ROS
+            # ever duplicates an event delivery.
+            if seq <= self.last_candidate_seq:
+                return
+            self.last_candidate_seq = seq
+            self.last_candidate_result = result
+            self.candidate_outcome_time = now
+            self.candidate_event_count += 1
+
+            if result == "unsafe":
+                self.candidate_last_unsafe = True
                 self.candidate_unsafe_count += 1
                 self.candidate_unsafe_streak += 1
-            else:
+            elif result == "safe":
+                self.candidate_last_unsafe = False
                 self.candidate_safe_count += 1
+                self.candidate_unsafe_streak = 0
+            else:
+                # Timeout is a rejected candidate but not evidence that the
+                # geometric VBC condition itself is unsafe.
+                self.candidate_timeout_count += 1
                 self.candidate_unsafe_streak = 0
 
             if not self.execution_ready:
                 return
 
             if self.state == self.NORMAL:
-                if unsafe and self.candidate_unsafe_streak >= self.candidate_unsafe_required:
+                if (result == "unsafe" and
+                        self.candidate_unsafe_streak >= self.candidate_unsafe_required):
                     self._transition_locked(
-                        self.REPAIR, "candidate_unsafe_confirmed", now)
-            elif self.state == self.PROBE_NORMAL:
+                        self.REPAIR, "candidate_unique_unsafe_confirmed", now)
+                return
+
+            if self.state == self.REPAIR:
+                if result == "safe" and committed is True:
+                    self.last_commit_count += 1
+                    self.last_commit_event_time = now
+                    self._transition_locked(
+                        self.PROBE_NORMAL, "safe_repair_commit", now)
+                return
+
+            if self.state == self.PROBE_NORMAL:
                 if self.probe_ignore_until is not None and now < self.probe_ignore_until:
                     return
-                if unsafe and self.candidate_unsafe_streak >= self.candidate_unsafe_required:
+                if result == "unsafe":
                     self.probe_failure_count += 1
                     self._transition_locked(
-                        self.REPAIR, "candidate_probe_unsafe", now)
-            # REPAIR exit is intentionally commit-driven, not summary-driven.
+                        self.REPAIR, "candidate_probe_unique_unsafe", now)
+                    return
+                if result == "safe" and committed is True:
+                    self.last_commit_count += 1
+                    self.last_commit_event_time = now
+                    self.probe_safe_commit_streak += 1
+                    if self.probe_safe_commit_streak >= self.probe_safe_commits_required:
+                        self._transition_locked(
+                            self.NORMAL, "probe_normal_safe_commits", now)
 
     def _execution_summary_cb(self, msg):
         if msg is None:
@@ -312,34 +335,6 @@ class C44VerifiedRegimeManager:
                 if self.state != self.REPAIR:
                     self._transition_locked(
                         self.REPAIR, "execution_committed_unsafe", now)
-
-    def _commit_summary_cb(self, msg):
-        if msg is None:
-            return
-        f = _tokens(msg.data)
-        commit_count = _as_int(f.get("commit_count"), self.last_commit_count)
-        source = f.get("source", "")
-        now = rospy.Time.now()
-        with self._lock:
-            if commit_count <= self.last_commit_count:
-                return
-            delta = commit_count - self.last_commit_count
-            self.last_commit_count = commit_count
-            self.last_commit_event_time = now
-
-            if source != "candidate_verified_safe_committed":
-                return
-
-            if self.state == self.REPAIR:
-                self._transition_locked(
-                    self.PROBE_NORMAL, "safe_repair_commit", now)
-            elif self.state == self.PROBE_NORMAL:
-                if self.probe_ignore_until is not None and now < self.probe_ignore_until:
-                    return
-                self.probe_safe_commit_streak += delta
-                if self.probe_safe_commit_streak >= self.probe_safe_commits_required:
-                    self._transition_locked(
-                        self.NORMAL, "probe_normal_safe_commits", now)
 
     def _fresh_locked(self, stamp, now, timeout):
         if stamp is None:
@@ -381,19 +376,25 @@ class C44VerifiedRegimeManager:
     def _publish_summary(self):
         with self._lock:
             now = rospy.Time.now()
+
             def age(stamp):
                 if stamp is None:
                     return math.nan
                 return max(0.0, (now - stamp).to_sec())
+
             msg = String()
             msg.data = " ".join([
                 "state={}".format(self.state),
                 "reason={}".format(self.last_transition_reason),
                 "execution_ready={}".format(int(self.execution_ready)),
+                "last_candidate_seq={}".format(self.last_candidate_seq),
+                "last_candidate_result={}".format(self.last_candidate_result),
+                "candidate_event_count={}".format(self.candidate_event_count),
                 "candidate_last_unsafe={}".format(int(self.candidate_last_unsafe)),
                 "candidate_unsafe_streak={}".format(self.candidate_unsafe_streak),
                 "candidate_unsafe_count={}".format(self.candidate_unsafe_count),
                 "candidate_safe_count={}".format(self.candidate_safe_count),
+                "candidate_timeout_count={}".format(self.candidate_timeout_count),
                 "execution_last_unsafe={}".format(int(self.execution_last_unsafe)),
                 "execution_unsafe_streak={}".format(self.execution_unsafe_streak),
                 "execution_event_latched={}".format(int(self.execution_event_latched)),
@@ -406,7 +407,7 @@ class C44VerifiedRegimeManager:
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
                 "normal_entry_count={}".format(self.normal_entry_count),
                 "commit_count={}".format(self.last_commit_count),
-                "candidate_summary_age_s={:.6f}".format(age(self.candidate_summary_time)),
+                "candidate_outcome_age_s={:.6f}".format(age(self.candidate_outcome_time)),
                 "execution_summary_age_s={:.6f}".format(age(self.execution_summary_time)),
                 "committed_trajectory_age_s={:.6f}".format(age(self.last_committed_trajectory_time)),
             ])
