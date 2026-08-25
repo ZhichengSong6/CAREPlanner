@@ -17,6 +17,7 @@ catkin_install_python(PROGRAMS
   scripts/vbc_deadline_waypoint_node.py
   scripts/vbc_deadline_waypoint_rolling_node.py
   scripts/vbc_deadline_waypoint_rolling_impl.py
+  scripts/vbc_deadline_waypoint_rolling_persistent_impl.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
