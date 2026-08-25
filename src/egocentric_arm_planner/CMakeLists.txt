@@ -141,6 +141,30 @@ target_link_libraries(velocity_qp_mpc_waypoint_node
   ${catkin_LIBRARIES}
 )
 
+# Planner/controller split variant. The QP implementation is unchanged, but the
+# first-step acceleration/smoothness anchor is refreshed from the command that
+# the low-level controller actually sent to the actuator. This is essential once
+# unsafe raw candidates can be rejected before execution.
+add_executable(velocity_qp_mpc_waypoint_execution_anchored_node
+  src/velocity_qp_mpc_waypoint_execution_anchored_node.cpp
+  src/velocity_qp_mpc_waypoint.cpp
+)
+add_dependencies(velocity_qp_mpc_waypoint_execution_anchored_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_include_directories(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
+  ${PIQP_INCLUDE_DIR}
+)
+target_compile_options(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
+  -O3
+)
+target_compile_definitions(velocity_qp_mpc_waypoint_execution_anchored_node PRIVATE
+  NDEBUG
+)
+target_link_libraries(velocity_qp_mpc_waypoint_execution_anchored_node
+  ${catkin_LIBRARIES}
+)
+
 add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
@@ -157,6 +181,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_c4_3_continuous_trial_node.py
   scripts/c4_3_planner_regime_handoff_node.py
   scripts/optimized_trajectory_continuity_node.py
+  scripts/joint_velocity_rate_limiter_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
   scripts/phase_b2_steering_logger_node.py
