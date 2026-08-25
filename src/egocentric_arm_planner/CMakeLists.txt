@@ -143,6 +143,28 @@ target_link_libraries(velocity_qp_mpc_waypoint_node
   ${catkin_LIBRARIES}
 )
 
+# One-shot C4.4 diagnostic: freeze the first actual REPAIR snapshot and solve
+# the exact repair-QP form at several horizons. The generated trajectories are
+# published only on a diagnostic topic and never enter the commit/execution path.
+add_executable(frozen_snapshot_repair_diagnostic_node
+  src/frozen_snapshot_repair_diagnostic_node.cpp
+)
+add_dependencies(frozen_snapshot_repair_diagnostic_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_include_directories(frozen_snapshot_repair_diagnostic_node PRIVATE
+  ${PIQP_INCLUDE_DIR}
+)
+target_compile_options(frozen_snapshot_repair_diagnostic_node PRIVATE
+  -O3
+)
+target_compile_definitions(frozen_snapshot_repair_diagnostic_node PRIVATE
+  NDEBUG
+)
+target_link_libraries(frozen_snapshot_repair_diagnostic_node
+  ${catkin_LIBRARIES}
+)
+
 add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
