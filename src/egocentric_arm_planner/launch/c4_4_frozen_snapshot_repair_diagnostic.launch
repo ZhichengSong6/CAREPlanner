@@ -1,0 +1,57 @@
+<launch>
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="output_dir" default="/tmp/careplanner_frozen_snapshot" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+  <arg name="predicted_trajectory_timeout" default="0.30" />
+  <arg name="candidate_topic" default="/care_planner/diagnostic/frozen_candidate" />
+  <arg name="vbc_summary_topic" default="/care_planner/diagnostic/frozen_vbc_summary" />
+  <arg name="summary_topic" default="/care_planner/diagnostic/frozen_snapshot_summary" />
+
+  <!-- This node never publishes to the real MPC candidate or committed topics. -->
+  <node pkg="egocentric_arm_planner"
+        type="frozen_snapshot_repair_diagnostic_node"
+        name="frozen_snapshot_repair_diagnostic"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <rosparam param="horizons_s">[0.5, 1.0, 1.5, 2.0]</rosparam>
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="output_dir" value="$(arg output_dir)" />
+    <param name="joint_state_topic" value="/care_arm/joint_states" />
+    <param name="actuator_topic" value="/care_arm/arm_group_velocity_controller/command" />
+    <param name="q_vis_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
+    <param name="reference_topic" value="/care_planner/command_trajectory_vbc_gated" />
+    <param name="mpc_summary_topic" value="/velocity_qp_mpc_waypoint_node/summary" />
+    <param name="candidate_topic" value="$(arg candidate_topic)" />
+    <param name="vbc_summary_topic" value="$(arg vbc_summary_topic)" />
+    <param name="summary_topic" value="$(arg summary_topic)" />
+  </node>
+
+  <!-- Independent VBC checker used only for the four frozen candidates. -->
+  <group ns="frozen_snapshot_vbc">
+    <remap from="/care_planner/trajectory_risk/vbc_summary"
+           to="$(arg vbc_summary_topic)" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_margin_s"
+           to="/care_planner/diagnostic/frozen_selected_margin_s" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_sweep_time_s"
+           to="/care_planner/diagnostic/frozen_selected_sweep_time_s" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_see_time_s"
+           to="/care_planner/diagnostic/frozen_selected_see_time_s" />
+    <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+      <arg name="predicted_trajectory_topic" value="$(arg candidate_topic)" />
+      <arg name="prefer_predicted_trajectory" value="true" />
+      <arg name="predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+      <arg name="output_target_topic" value="/care_planner/diagnostic/frozen_target_unused" />
+      <arg name="candidate_active_topic" value="/care_planner/diagnostic/frozen_active_unused" />
+      <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+      <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+      <arg name="temporal_layer_mpc_steps" value="2" />
+      <arg name="region_max_diameter_m" value="0.12" />
+      <arg name="active_set_points_topic"
+           value="/care_planner/diagnostic/frozen_active_set_unused" />
+    </include>
+  </group>
+</launch>
