@@ -39,7 +39,7 @@ for _ in $(seq 1 400); do
   NODES="$(rosnode list 2>/dev/null || true)"
   if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$' && \
      echo "${NODES}" | grep -q '^/c4_4_verified_regime_manager$' && \
-     rostopic list 2>/dev/null | grep -q '^/care_planner/confidence_map'; then
+     rosservice list 2>/dev/null | grep -q '^/care_planner/confidence_map/query$'; then
     READY=1
     break
   fi
