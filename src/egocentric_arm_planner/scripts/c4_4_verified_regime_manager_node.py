@@ -5,13 +5,14 @@ Separates planner-candidate safety from committed-execution safety and owns the
 NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL state machine.
 
 Candidate-side transitions are driven only by unique verification-outcome events
-emitted by ``optimized_trajectory_continuity_node``.  Repeated 20 Hz selector
+emitted by ``optimized_trajectory_continuity_node``. Repeated 20 Hz selector
 summaries for the same cached candidate therefore cannot create fake consecutive
 unsafe candidates.
 
 Execution VBC remains a continuous audit of the trajectory actually published to
-the low-level tracker.  A confirmed unsafe committed trajectory is one execution
-safety episode and immediately requests REPAIR from any planner state.
+the low-level tracker. Bootstrap/fallback selector summaries are ignored: an
+execution-safety event can only be formed after a committed trajectory exists and
+the execution selector reports ``trajectory_source=predicted``.
 """
 
 import math
@@ -103,7 +104,6 @@ class C44VerifiedRegimeManager:
         self.execution_ready = False
         self.execution_ready_time = None
 
-        # Unique candidate-verification events.
         self.candidate_outcome_time = None
         self.last_candidate_seq = 0
         self.last_candidate_result = "none"
@@ -114,7 +114,6 @@ class C44VerifiedRegimeManager:
         self.candidate_timeout_count = 0
         self.candidate_event_count = 0
 
-        # Continuous committed-execution audit.
         self.execution_summary_time = None
         self.execution_last_unsafe = False
         self.execution_unsafe_streak = 0
@@ -252,8 +251,6 @@ class C44VerifiedRegimeManager:
 
         now = rospy.Time.now()
         with self._lock:
-            # Strictly monotone seq makes this callback idempotent even if ROS
-            # ever duplicates an event delivery.
             if seq <= self.last_candidate_seq:
                 return
             self.last_candidate_seq = seq
@@ -270,8 +267,6 @@ class C44VerifiedRegimeManager:
                 self.candidate_safe_count += 1
                 self.candidate_unsafe_streak = 0
             else:
-                # Timeout is a rejected candidate but not evidence that the
-                # geometric VBC condition itself is unsafe.
                 self.candidate_timeout_count += 1
                 self.candidate_unsafe_streak = 0
 
@@ -313,11 +308,18 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
+        # The execution selector has a bootstrap fallback. It is not an
+        # execution audit until an actual committed plan exists and the selector
+        # is using that predicted/committed stream.
+        if f.get("trajectory_source") != "predicted":
+            return
         unsafe = _as_bool(f.get("has_violation"))
         if unsafe is None:
             return
         now = rospy.Time.now()
         with self._lock:
+            if self.last_committed_trajectory_time is None:
+                return
             self.execution_summary_time = now
             self.execution_last_unsafe = bool(unsafe)
             if unsafe:
@@ -350,9 +352,6 @@ class C44VerifiedRegimeManager:
                 self.execution_ready and self.state == self.PROBE_NORMAL and
                 self.clear_until is not None and now <= self.clear_until)
 
-            # Candidate-verifier staleness does not invalidate an already-safe
-            # committed execution. Only execution-audit / committed-stream
-            # staleness requests the MPC verification hold.
             exec_summary_fresh = self._fresh_locked(
                 self.execution_summary_time, now, self.input_timeout)
             committed_fresh = self._fresh_locked(
@@ -361,8 +360,12 @@ class C44VerifiedRegimeManager:
             startup_grace = (
                 self.execution_ready_time is not None and
                 (now - self.execution_ready_time).to_sec() < self.input_timeout)
+            # Before the first safe commit, there is no execution trajectory to
+            # audit. Candidate verification, not execution freshness, owns that
+            # startup phase.
+            has_committed = self.last_committed_trajectory_time is not None
             hold = bool(
-                self.execution_ready and not startup_grace and
+                self.execution_ready and has_committed and not startup_grace and
                 (not exec_summary_fresh or not committed_fresh))
             deadline = self.physical_deadline_abs
 
