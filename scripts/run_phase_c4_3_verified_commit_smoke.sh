@@ -7,8 +7,6 @@ CONFIG_FILE="${CONFIG_FILE:-${REPO}/src/egocentric_arm_planner/config/planner_ph
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-8.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
-# This experiment intentionally keeps the previous CPU runtime and changes only
-# startup warm-up. Override manually only for a later dedicated CPU/GPU study.
 NCDF_DEVICE="${NCDF_DEVICE:-cpu}"
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
@@ -22,6 +20,7 @@ LOG="${LOG:-${REPO}/logs/phase_c4_3_verified_commit_smoke/${CASE_ID}}"
 RAW_MPC_TOPIC="/care_planner/mpc/predicted_trajectory"
 VERIFY_TOPIC="/care_planner/optimized_trajectory"
 COMMITTED_TOPIC="/care_planner/committed_trajectory"
+TRACKER_DESIRED_TOPIC="/care_planner/execution/tracker_velocity_desired"
 ACTUATOR_TOPIC="/care_arm/arm_group_velocity_controller/command"
 
 cd "${REPO}" || exit 1
@@ -85,14 +84,18 @@ for _ in $(seq 1 120); do
 done
 [ "${READY}" = "1" ] || { echo "[ERROR] Gazebo joint state timeout"; exit 1; }
 
-# The low-level controller sees ONLY globally verified committed trajectories.
+# Low-level tracking is now two-stage: trajectory tracking produces a desired
+# velocity and a final rate limiter is the sole actuator owner.
 setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   config_file:="${CONFIG_FILE}" input_trajectory:="${COMMITTED_TOPIC}" \
+  output_velocity_command:="${TRACKER_DESIRED_TOPIC}" \
+  use_acceleration_limiter:=true \
+  rate_limiter_output_velocity_command:="${ACTUATOR_TOPIC}" \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-# The waypoint generator reasons about the serialized candidate under VBC audit,
-# never about an unassociated newer raw MPC horizon.
+# Serialized candidate verification; CPU is intentionally retained for this
+# experiment so only the startup warm-up changes the NCDF runtime path.
 setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=false _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
@@ -128,6 +131,7 @@ for _ in $(seq 1 300); do
   NODES="$(rosnode list 2>/dev/null || true)"
   if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$' && \
      echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
+     echo "${NODES}" | grep -q '^/joint_velocity_rate_limiter$' && \
      echo "${NODES}" | grep -q '^/optimized_trajectory_continuity$' && \
      echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$' && \
      echo "${NODES}" | grep -q '^/phase_b2_controlled_trial$' && \
@@ -139,17 +143,39 @@ if [ "${READY}" != "1" ]; then
   echo "[ERROR] verified-commit planner nodes did not all start"
   rosnode list 2>/dev/null || true
   tail -n 220 "${LOG}/controlled.log" || true
+  tail -n 120 "${LOG}/low_level_tracker.log" || true
   exit 1
 fi
 
 rosnode info /velocity_qp_mpc_waypoint_node > "${OUT}/mpc_node_info.txt" 2>&1 || true
 rosnode info /trajectory_execution_manager_node > "${OUT}/tracker_node_info.txt" 2>&1 || true
+rosnode info /joint_velocity_rate_limiter > "${OUT}/rate_limiter_node_info.txt" 2>&1 || true
 rosnode info /optimized_trajectory_continuity > "${OUT}/commit_node_info.txt" 2>&1 || true
-if grep -Fq "* ${ACTUATOR_TOPIC} " "${OUT}/mpc_node_info.txt"; then
-  echo "[ERROR] MPC still owns actuator command"; exit 1
+
+publication_block() {
+  awk '/^Publications:/{on=1;next} /^Subscriptions:/{on=0} on{print}' "$1"
+}
+subscription_block() {
+  awk '/^Subscriptions:/{on=1;next} /^Services:/{on=0} on{print}' "$1"
+}
+
+if publication_block "${OUT}/mpc_node_info.txt" | grep -Fq "* ${ACTUATOR_TOPIC} "; then
+  echo "[ERROR] MPC still publishes actuator command"; exit 1
 fi
-if ! grep -Fq "* ${ACTUATOR_TOPIC} " "${OUT}/tracker_node_info.txt"; then
-  echo "[ERROR] low-level tracker does not own actuator command"; exit 1
+if ! subscription_block "${OUT}/mpc_node_info.txt" | grep -Fq "* ${ACTUATOR_TOPIC} "; then
+  echo "[ERROR] MPC is not anchored to actual actuator command"; exit 1
+fi
+if publication_block "${OUT}/tracker_node_info.txt" | grep -Fq "* ${ACTUATOR_TOPIC} "; then
+  echo "[ERROR] tracker bypasses acceleration limiter"; exit 1
+fi
+if ! publication_block "${OUT}/tracker_node_info.txt" | grep -Fq "* ${TRACKER_DESIRED_TOPIC} "; then
+  echo "[ERROR] tracker does not publish desired velocity topic"; exit 1
+fi
+if ! subscription_block "${OUT}/rate_limiter_node_info.txt" | grep -Fq "* ${TRACKER_DESIRED_TOPIC} "; then
+  echo "[ERROR] acceleration limiter does not subscribe tracker desired velocity"; exit 1
+fi
+if ! publication_block "${OUT}/rate_limiter_node_info.txt" | grep -Fq "* ${ACTUATOR_TOPIC} "; then
+  echo "[ERROR] acceleration limiter does not own actuator command"; exit 1
 fi
 if ! grep -Fq "* ${RAW_MPC_TOPIC} " "${OUT}/commit_node_info.txt" || \
    ! grep -Fq "* ${VERIFY_TOPIC} " "${OUT}/commit_node_info.txt" || \
@@ -159,7 +185,7 @@ if ! grep -Fq "* ${RAW_MPC_TOPIC} " "${OUT}/commit_node_info.txt" || \
   exit 1
 fi
 
-echo "[ARCH] raw MPC candidate -> serialized VBC verification -> committed trajectory -> low-level tracker"
+echo "[ARCH] actual actuator velocity -> MPC dynamics anchor; raw candidate -> VBC verify -> committed trajectory -> tracker -> acceleration limiter -> actuator"
 
 record_topic() {
   local topic="$1"; local path="$2"
@@ -174,11 +200,11 @@ record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
 record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
 record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
 record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
 record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
 record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 
-# Do not wait on one-shot /task_trajectory. The upstream command trajectory is
-# persistent and is the correct startup milestone after the initial EE goal.
 TASK_READY=0
 for _ in $(seq 1 160); do
   if timeout 1 rostopic echo -n 1 /care_planner/command_trajectory_candidate >/dev/null 2>&1; then TASK_READY=1; break; fi
@@ -202,7 +228,7 @@ if [ "${RELEASED}" != "1" ]; then
   exit 1
 fi
 
-echo "[RUN] ${CASE_ID}: verified-commit CAREPlanner for ${RUN_SECONDS}s"
+echo "[RUN] ${CASE_ID}: execution-anchored verified-commit CAREPlanner for ${RUN_SECONDS}s"
 sleep "${RUN_SECONDS}"
 
 kill_group "${CONTROL_PID}"; CONTROL_PID=""
@@ -236,6 +262,7 @@ def num(x):
  except:return math.nan
 mpc=records('mpc_summary.csv'); guard=records('predicted_vbc_recovery_guard.csv')
 commit=records('commit_summary.csv'); sel=records('selector_summary.csv'); broker=records('broker_summary.csv')
+lim=records('rate_limiter_summary.csv')
 solves=[num(r.get('solve','nan')) for r in mpc]; solves=[x for x in solves if math.isfinite(x)]
 traces=[]
 for p in glob.glob(os.path.join(out,'projector_traces','*.json')):
@@ -244,10 +271,14 @@ for p in glob.glob(os.path.join(out,'projector_traces','*.json')):
   if x is not None and math.isfinite(float(x)): traces.append(float(x))
  except: pass
 last=commit[-1] if commit else {}
+last_lim=lim[-1] if lim else {}
 text=open(log,errors='replace').read() if os.path.isfile(log) else ''
 payload={
  'case_id':cid,
- 'architecture':'raw candidate -> serialized global VBC verification -> committed trajectory -> low-level tracker',
+ 'architecture':'execution-anchored MPC -> raw candidate -> serialized VBC verification -> committed trajectory -> tracker -> acceleration limiter -> actuator',
+ 'mpc_horizon_duration_s':1.0,
+ 'mpc_num_intervals':20,
+ 'mpc_dt_s':0.05,
  'selector_records':len(sel),
  'selector_no_violation_records':sum(r.get('has_violation')=='0' for r in sel),
  'mpc_summary_records':len(mpc),
@@ -265,10 +296,14 @@ payload={
  'committed_publish_count':int(last.get('committed_publish_count','0')) if last else 0,
  'continuation_count':int(last.get('continuation_count','0')) if last else 0,
  'max_raw_mpc_input_gap_s':num(last.get('max_input_gap_s','0')) if last else 0.0,
+ 'rate_limiter_output_count':int(last_lim.get('output_count','0')) if last_lim else 0,
+ 'rate_limiter_limited_cycle_count':int(last_lim.get('limited_cycle_count','0')) if last_lim else 0,
+ 'rate_limiter_max_accel_ratio':num(last_lim.get('max_accel_ratio','nan')) if last_lim else None,
  'guard_trigger_count_total':max([int(r.get('trigger_count_total','0')) for r in guard] or [0]),
  'guard_clear_count_total':max([int(r.get('clear_count_total','0')) for r in guard] or [0]),
  'broker_replan_requested_count':max([int(r.get('replan_count','0')) for r in broker] or [0]),
  'measured_state_replan_logs':len(re.findall(r'RECOVERY EPISODE COMPLETE -> measured-state replan',text)),
+ 'execution_anchor_log_present':'ACTUALLY EXECUTED command topic' in text,
  'final_guard_status':guard[-1].get('status') if guard else None,
  'final_guard_routing':guard[-1].get('routing') if guard else None,
 }
@@ -278,5 +313,6 @@ PY
 
 echo "[RESULT] ${OUT}/c4_3_verified_commit_summary.json"
 echo "[VERIFY/COMMIT] ${OUT}/commit_summary.csv"
+echo "[DYNAMICS] ${OUT}/rate_limiter_summary.csv + tracker_desired_velocity.csv + actuator_command.csv"
 echo "[TIMING] ${OUT}/mpc_summary.csv + projector_traces/*.json"
-echo "[TRACKING] ${OUT}/joint_states.csv + low_level_reference_state.csv + actuator_command.csv"
+echo "[TRACKING] ${OUT}/joint_states.csv + low_level_reference_state.csv"
