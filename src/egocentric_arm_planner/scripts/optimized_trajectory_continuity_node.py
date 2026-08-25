@@ -4,7 +4,7 @@
 C4.4 verification protocol
 --------------------------
 The C++ VBC selector runs on its own periodic timer and may publish repeated
-summaries for the same cached trajectory.  A millisecond delay is therefore not
+summaries for the same cached trajectory. A millisecond delay is therefore not
 a reliable way to associate a selector verdict with a newly published candidate.
 
 This node uses an explicit selector-cycle barrier instead:
@@ -13,12 +13,12 @@ This node uses an explicit selector-cycle barrier instead:
       -> a new candidate may be dispatched immediately after that cycle
       -> only selector cycle k+1 (or later) may decide that candidate
 
-At most one candidate is outstanding.  Each dispatched candidate also receives a
-monotone ``header.seq`` for diagnostics.  Every completed unique verification
-publishes exactly one event on ``verification_event_topic``.  The C4.4 regime
+At most one candidate is outstanding. Each dispatched candidate also receives a
+monotone ``header.seq`` for diagnostics. Every completed unique verification
+publishes exactly one event on ``verification_event_topic``. The C4.4 regime
 manager consumes those events rather than repeated selector summaries.
 
-Unsafe candidates are never published to the low-level controller.  While a new
+Unsafe candidates are never published to the low-level controller. While a new
 safe candidate is being generated / verified, the remaining suffix of the last
 committed trajectory is re-timed and republished for bounded plan memory.
 """
@@ -90,10 +90,6 @@ class OptimizedTrajectoryContinuityNode:
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
 
-        # Selector-cycle handshake state.  _selector_barrier_ready becomes true
-        # only after a predicted selector summary has completed a cycle.  A
-        # dispatch consumes that barrier; the next selector cycle is then the
-        # earliest cycle allowed to decide the outstanding candidate.
         self._selector_cycle_count = 0
         self._selector_barrier_ready = False
         self._last_selector_cycle_time = None
@@ -160,10 +156,8 @@ class OptimizedTrajectoryContinuityNode:
             return []
         if len(a) != len(b):
             return list(a) if alpha < 0.5 else list(b)
-        return [
-            (1.0 - alpha) * float(a[i]) + alpha * float(b[i])
-            for i in range(len(a))
-        ]
+        return [(1.0 - alpha) * float(a[i]) + alpha * float(b[i])
+                for i in range(len(a))]
 
     @classmethod
     def _interpolate_point(cls, p0, p1, alpha):
@@ -263,7 +257,6 @@ class OptimizedTrajectoryContinuityNode:
         self._next_verification_seq += 1
         candidate.header.seq = seq
         candidate.header.stamp = now
-
         self._outstanding = copy.deepcopy(candidate)
         self._outstanding_sent = now
         self._outstanding_seq = seq
@@ -294,19 +287,17 @@ class OptimizedTrajectoryContinuityNode:
             "commit_count={}"
         ).format(
             int(seq), result, int(bool(committed)), float(age_s),
-            self._verification_outcome_count,
-            self._verification_safe_count,
-            self._verification_unsafe_count,
-            self._verification_timeout_count,
-            self._commit_count,
-        )
+            self._verification_outcome_count, self._verification_safe_count,
+            self._verification_unsafe_count, self._verification_timeout_count,
+            self._commit_count)
         return msg
 
     def _global_summary_cb(self, msg):
         if msg is None:
             return
         fields = _tokens(msg.data)
-        if fields.get("trajectory_source") != "predicted":
+        source = fields.get("trajectory_source", "")
+        if source not in ("bootstrap", "predicted"):
             return
         violation = _as_bool(fields.get("has_violation"))
         if violation is None:
@@ -316,9 +307,9 @@ class OptimizedTrajectoryContinuityNode:
         committed_to_publish = None
         event_to_publish = None
         with self._lock:
-            # Every predicted summary marks completion of exactly one selector
-            # timer cycle.  If no candidate is outstanding, this cycle is a
-            # barrier after which a new candidate may be dispatched.
+            # Bootstrap cycles are allowed to establish the very first barrier.
+            # Once a candidate is outstanding, however, only a later *predicted*
+            # cycle may decide it.
             self._selector_cycle_count += 1
             self._last_selector_cycle_time = now
 
@@ -328,8 +319,8 @@ class OptimizedTrajectoryContinuityNode:
                 self._publish_summary_locked()
                 return
 
-            # The summary from the same selector cycle that preceded dispatch
-            # can never decide the candidate.  Only a strictly later cycle may.
+            if source != "predicted":
+                return
             if self._selector_cycle_count <= self._outstanding_dispatch_cycle:
                 return
 
@@ -340,8 +331,6 @@ class OptimizedTrajectoryContinuityNode:
             self._outstanding_sent = None
             self._outstanding_seq = 0
             self._outstanding_dispatch_cycle = -1
-            # This just-completed cycle itself is the barrier for the next
-            # dispatch; the next selector cycle will then evaluate that candidate.
             self._selector_barrier_ready = True
             self._last_verification_age_s = verification_age
             self._last_verification_seq = seq
@@ -354,10 +343,10 @@ class OptimizedTrajectoryContinuityNode:
                 event_to_publish = self._make_verification_event(
                     seq, "unsafe", False, verification_age)
             else:
-                self._verification_safe_count += 1
-                self._last_verification_result = "safe"
                 committed = self._suffix_from_phase(candidate, verification_age)
                 if committed is not None and committed.points:
+                    self._verification_safe_count += 1
+                    self._last_verification_result = "safe"
                     committed.header.seq = seq
                     committed.header.stamp = now
                     self._committed_master = copy.deepcopy(committed)
@@ -369,8 +358,6 @@ class OptimizedTrajectoryContinuityNode:
                     event_to_publish = self._make_verification_event(
                         seq, "safe", True, verification_age)
                 else:
-                    # A nominally safe candidate that expired before commit is
-                    # treated as a timeout/reject event, never as a safe commit.
                     self._verification_timeout_count += 1
                     self._last_verification_result = "expired_safe"
                     self._last_source = "candidate_safe_but_expired_before_commit"
