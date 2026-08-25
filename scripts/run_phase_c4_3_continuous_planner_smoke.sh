@@ -124,6 +124,9 @@ setsid roslaunch egocentric_arm_planner phaseC4_3_continuous_planner.launch \
   > "${LOG}/controlled.log" 2>&1 &
 CONTROL_PID=$!
 
+# Startup is only valid when every bootstrap-critical node is alive.  The old
+# runner checked the downstream planning nodes but missed the trial broker, so a
+# broker import crash degraded into a misleading 40 s gate timeout.
 READY=0
 for _ in $(seq 1 250); do
   NODES="$(rosnode list 2>/dev/null || true)"
@@ -131,12 +134,45 @@ for _ in $(seq 1 250); do
      echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
      echo "${NODES}" | grep -q '^/optimized_trajectory_continuity$' && \
      echo "${NODES}" | grep -q '^/c4_3_planner_regime_handoff$' && \
-     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$'; then READY=1; break; fi
+     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$' && \
+     echo "${NODES}" | grep -q '^/phase_b2_controlled_trial$' && \
+     echo "${NODES}" | grep -q '^/initial_body_prior_initializer$' && \
+     echo "${NODES}" | grep -q '^/confidence_map_node$' && \
+     echo "${NODES}" | grep -q '^/vbc_execution_reference_gate$' && \
+     echo "${NODES}" | grep -q '^/receding_horizon_planner_node$'; then READY=1; break; fi
   sleep 0.1
 done
 if [ "${READY}" != "1" ]; then
-  echo "[ERROR] continuous planner nodes did not start"
-  tail -n 180 "${LOG}/controlled.log" || true
+  echo "[ERROR] continuous planner bootstrap nodes did not all start"
+  echo "[NODES]"
+  rosnode list 2>/dev/null || true
+  echo "[CONTROLLED TAIL]"
+  tail -n 220 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+# Fail fast on the two bootstrap milestones that must precede any MPC output:
+# the one-shot trusted-free prior and the first nominal task trajectory.
+PRIOR_READY=0
+for _ in $(seq 1 100); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/confidence_map/initial_prior_ready 2>/dev/null || true)"
+  if echo "${S}" | grep -q 'data: True'; then PRIOR_READY=1; break; fi
+  sleep 0.05
+done
+if [ "${PRIOR_READY}" != "1" ]; then
+  echo "[ERROR] initial trusted-free prior did not become ready"
+  grep -E 'initial_body_prior|confidence_map' "${LOG}/controlled.log" | tail -n 100 || true
+  exit 1
+fi
+
+TASK_READY=0
+for _ in $(seq 1 200); do
+  if timeout 1 rostopic echo -n 1 /care_planner/task_trajectory >/dev/null 2>&1; then TASK_READY=1; break; fi
+  sleep 0.05
+done
+if [ "${TASK_READY}" != "1" ]; then
+  echo "[ERROR] initial EE goal did not produce /care_planner/task_trajectory"
+  grep -E 'phase_b2_trial|phase_c4_3_trial|RecedingHorizonPlanner|Traceback|ImportError' "${LOG}/controlled.log" | tail -n 160 || true
   exit 1
 fi
 
@@ -180,8 +216,8 @@ for _ in $(seq 1 400); do
   sleep 0.1
 done
 if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 180 "${LOG}/controlled.log" || true
+  echo "[ERROR] initial gate release timeout after prior+task trajectory were ready"
+  grep -E 'vbc_execution_reference_gate|trajectory_vbc|waypoint|phase_b2_trial|phase_c4_3_trial' "${LOG}/controlled.log" | tail -n 200 || true
   exit 1
 fi
 
