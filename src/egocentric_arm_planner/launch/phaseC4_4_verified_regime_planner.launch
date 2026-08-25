@@ -35,6 +35,7 @@
   <arg name="verification_trajectory_topic" default="/care_planner/optimized_trajectory" />
   <arg name="committed_trajectory_topic" default="/care_planner/committed_trajectory" />
   <arg name="candidate_vbc_summary_topic" default="/care_planner/candidate_vbc/summary" />
+  <arg name="candidate_outcome_topic" default="/care_planner/verification_outcome" />
   <arg name="execution_vbc_summary_topic" default="/care_planner/execution_vbc/summary" />
   <arg name="regime_summary_topic" default="/care_planner/c4_4/regime_summary" />
 
@@ -53,6 +54,8 @@
   <arg name="recovery_trigger_topic" default="/care_planner/execution/predicted_vbc_recovery_triggered" />
   <arg name="recovery_clear_topic" default="/care_planner/execution/predicted_vbc_recovery_clear" />
   <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
+  <!-- Kept only for legacy subscribers/diagnostics. C4.4 planner semantics do not
+       publish recovery_complete or consume replan_ready. -->
   <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
   <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
 
@@ -105,13 +108,14 @@
     <param name="committed_output_topic" value="$(arg committed_trajectory_topic)" />
     <param name="global_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
     <param name="summary_topic" value="/care_planner/optimized_trajectory_summary" />
+    <param name="verification_event_topic" value="$(arg candidate_outcome_topic)" />
     <param name="rate" value="20.0" />
     <param name="continuation_start_delay_s" value="0.065" />
     <param name="continuation_timeout_s" value="0.50" />
   </node>
 
-  <!-- C4.4 owns planner regime; the legacy predicted_vbc_recovery_guard is not
-       launched here, so there is exactly one trigger/clear owner. -->
+  <!-- C4.4 owns planner regime; candidate transitions consume only unique
+       verification outcomes, while execution safety consumes committed audit. -->
   <node pkg="egocentric_arm_planner" type="c4_4_verified_regime_manager_node.py"
         name="c4_4_verified_regime_manager" output="screen">
     <param name="rate" value="20.0" />
@@ -122,9 +126,8 @@
     <param name="committed_trajectory_timeout" value="0.30" />
     <param name="clear_pulse_s" value="0.12" />
     <param name="probe_ignore_s" value="0.16" />
-    <param name="candidate_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
+    <param name="candidate_outcome_topic" value="$(arg candidate_outcome_topic)" />
     <param name="execution_summary_topic" value="$(arg execution_vbc_summary_topic)" />
-    <param name="commit_summary_topic" value="/care_planner/optimized_trajectory_summary" />
     <param name="committed_trajectory_topic" value="$(arg committed_trajectory_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
     <param name="physical_deadline_topic" value="$(arg rolling_deadline_topic)" />
@@ -153,20 +156,17 @@
     <param name="mpc/visibility_waypoint/recovery_clear_topic" value="$(arg recovery_clear_topic)" />
     <param name="mpc/visibility_waypoint/recovery_signal_timeout" value="$(arg regime_input_timeout)" />
     <param name="mpc/visibility_waypoint/recovery_enabled" value="true" />
+    <!-- Critical C4.4 semantic switch: REPAIR/NORMAL are candidate-objective
+         modes only. No RECOVERY_HOLD or task-replan handshake is allowed. -->
+    <param name="mpc/visibility_waypoint/planner_mode_semantics" value="true" />
     <param name="mpc/visibility_waypoint/recovery_weight_scale" value="1.0" />
     <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
     <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
   </node>
 
-  <!-- Legacy MPC still has a short RECOVERY_HOLD compatibility state. This
-       acknowledgement releases it without a measured-state task replan. -->
-  <node pkg="egocentric_arm_planner" type="c4_3_planner_regime_handoff_node.py"
-        name="c4_3_planner_regime_handoff" output="screen">
-    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
-    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
-    <param name="delay_s" value="0.005" />
-  </node>
+  <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
+       RECOVERY_HOLD in planner-mode semantics, so there is nothing to ack. -->
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
@@ -258,6 +258,8 @@
     <param name="safe_clear_consecutive_required" value="$(arg rolling_safe_clear_consecutive)" />
     <param name="target_cell_resolution" value="$(arg rolling_target_cell_resolution)" />
     <param name="recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <!-- Legacy callbacks remain subscribed for backwards-compatible node code,
+         but C4.4 planner-mode MPC never emits the complete/replan handshake. -->
     <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
