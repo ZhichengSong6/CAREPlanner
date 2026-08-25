@@ -154,6 +154,9 @@ target_link_libraries(ee_interactive_marker_node
 
 catkin_install_python(PROGRAMS
   scripts/phase_b2_controlled_trial_node.py
+  scripts/phase_c4_3_continuous_trial_node.py
+  scripts/c4_3_planner_regime_handoff_node.py
+  scripts/optimized_trajectory_continuity_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
   scripts/phase_b2_steering_logger_node.py
