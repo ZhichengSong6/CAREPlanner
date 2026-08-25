@@ -165,6 +165,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_b2_steering_logger_node.py
   scripts/phase_b2_vbc_waypoint_logger_node.py
   scripts/vbc_execution_reference_gate_node.py
+  scripts/vbc_progress_reference_gate_node.py
   scripts/vbc_robustness_prescreen_node.py
   scripts/predictive_recovery_guard_node.py
   scripts/predicted_vbc_recovery_guard_node.py
