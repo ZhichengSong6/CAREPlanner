@@ -33,7 +33,7 @@ from std_msgs.msg import String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
-_TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+_TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 
 def _tokens(text):
@@ -52,8 +52,6 @@ class OptimizedTrajectoryContinuityNode:
     def __init__(self) -> None:
         self._lock = threading.RLock()
 
-        # Backward-compatible launch naming: output_topic is now explicitly the
-        # serialized candidate stream consumed by the VBC selector.
         self.input_topic = str(rospy.get_param(
             "~input_topic", "/care_planner/mpc/predicted_trajectory"))
         self.verification_topic = str(rospy.get_param(
@@ -90,20 +88,16 @@ class OptimizedTrajectoryContinuityNode:
         if self.verification_min_response_delay_s < 0.0:
             raise ValueError("~verification_min_response_delay_s must be non-negative")
 
-        # Latest raw candidate replaces any older candidate that has not yet
-        # been dispatched for verification.
         self._pending_raw = None
         self._pending_raw_received = None
         self._last_raw_received = None
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
 
-        # Exactly one candidate can be visible to the selector at once.
         self._outstanding = None
         self._outstanding_sent = None
         self._next_verification_not_before = rospy.Time(0)
 
-        # Last VBC-safe execution plan and its commit epoch.
         self._committed_master = None
         self._committed_received = None
 
@@ -165,8 +159,7 @@ class OptimizedTrajectoryContinuityNode:
         out = JointTrajectoryPoint()
         out.positions = cls._lerp_array(p0.positions, p1.positions, alpha)
         out.velocities = cls._lerp_array(p0.velocities, p1.velocities, alpha)
-        out.accelerations = cls._lerp_array(
-            p0.accelerations, p1.accelerations, alpha)
+        out.accelerations = cls._lerp_array(p0.accelerations, p1.accelerations, alpha)
         out.effort = cls._lerp_array(p0.effort, p1.effort, alpha)
         out.time_from_start = rospy.Duration(0.0)
         return out
@@ -287,7 +280,6 @@ class OptimizedTrajectoryContinuityNode:
 
         now = rospy.Time.now()
         committed_to_publish = None
-        verification_age = math.nan
         with self._lock:
             if self._outstanding is None or self._outstanding_sent is None:
                 return
@@ -307,8 +299,6 @@ class OptimizedTrajectoryContinuityNode:
                 self._last_source = "candidate_rejected_vbc_unsafe"
             else:
                 self._verification_safe_count += 1
-                # The selector evaluated the outstanding candidate from its send
-                # epoch.  Shift by the audit latency before making it executable.
                 committed = self._suffix_from_phase(candidate, verification_age)
                 if committed is not None and committed.points:
                     committed.header.stamp = now
@@ -359,27 +349,22 @@ class OptimizedTrajectoryContinuityNode:
             self.verification_pub.publish(verification_to_publish)
         if continuation_to_publish is not None:
             self._publish_committed(
-                continuation_to_publish,
-                "committed_continuation",
-                continuation_age)
+                continuation_to_publish, "committed_continuation", continuation_age)
 
     def _publish_summary_locked(self):
-        pending = int(self._pending_raw is not None)
-        outstanding = int(self._outstanding is not None)
-        committed = int(self._committed_master is not None)
         msg = String()
         msg.data = " ".join([
             "source={}".format(self._last_source),
             "raw_input_count={}".format(self._raw_input_count),
-            "pending_candidate={}".format(pending),
+            "pending_candidate={}".format(int(self._pending_raw is not None)),
             "pending_replace_count={}".format(self._pending_replace_count),
-            "verification_outstanding={}".format(outstanding),
+            "verification_outstanding={}".format(int(self._outstanding is not None)),
             "verification_publish_count={}".format(self._verification_publish_count),
             "verification_safe_count={}".format(self._verification_safe_count),
             "verification_unsafe_count={}".format(self._verification_unsafe_count),
             "verification_timeout_count={}".format(self._verification_timeout_count),
             "commit_count={}".format(self._commit_count),
-            "has_committed_plan={}".format(committed),
+            "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
             "continuation_count={}".format(self._continuation_count),
             "verification_age_s={}".format(
