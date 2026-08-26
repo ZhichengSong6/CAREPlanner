@@ -97,7 +97,7 @@ class OnlinePersistentWaypointNode(
 
 
 class OnlineDeadlineSequentialWaypointNode(
-        _OnlineRuntimeMixin, DeadlineSequentialRollingVbcWaypointNode):
+        _OnlineRuntimeMixin, DeadlineSequentialRollingVbcDeadlineWaypointNode):
     def __init__(self):
         super().__init__()
         self._run_model_warmup()
@@ -208,23 +208,31 @@ class OnlineVisibilityAcquisitionWaypointNode(
         self._run_model_warmup()
 
     def _process_new_active_set(self) -> None:
-        # Reuse the tested retry/synchronization implementation.  Dynamic
-        # dispatch intentionally calls C4.7's _publish_schedule at the end.
         return OnlineAccumulatedMultiDeadlineWaypointNode._process_new_active_set(self)
 
 
-def _configure_mpc_mode(mode: str) -> None:
-    """Set MPC private params before the planner launches the C++ node."""
-    prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
+def _configure_runtime_mode(mode: str) -> None:
+    """Set C++ MPC and regime-manager private params before planner launch."""
+    mpc_prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
     multi = mode == "accumulated_multi_deadline"
-    rospy.set_param(prefix + "/multi_deadline_enabled", bool(multi))
+    rospy.set_param(mpc_prefix + "/multi_deadline_enabled", bool(multi))
     rospy.set_param(
-        prefix + "/schedule_topic",
+        mpc_prefix + "/schedule_topic",
         "/care_planner/active_sensing/visibility_waypoint_schedule")
-    rospy.set_param(prefix + "/max_repair_waypoints", 8)
+    rospy.set_param(mpc_prefix + "/max_repair_waypoints", 8)
+
+    manager_prefix = "/c4_4_verified_regime_manager"
+    acquisition = mode == "visibility_acquisition"
+    rospy.set_param(
+        manager_prefix + "/repair_completion_gate_enabled", bool(acquisition))
+    rospy.set_param(
+        manager_prefix + "/repair_completion_topic",
+        "/care_planner/active_sensing/visibility_acquisition_complete")
+
     rospy.logwarn(
-        "[vbc_waypoint_online] preconfigured MPC: multi_deadline_enabled=%d",
-        int(multi))
+        "[vbc_waypoint_online] preconfigured runtime: multi_deadline=%d "
+        "repair_completion_gate=%d",
+        int(multi), int(acquisition))
 
 
 def main():
@@ -240,7 +248,7 @@ def main():
         raise ValueError(
             "~region_schedule_mode must be visibility_acquisition, accumulated_multi_deadline, deadline_sequential, or shared_persistent")
 
-    _configure_mpc_mode(mode)
+    _configure_runtime_mode(mode)
 
     if mode == "visibility_acquisition":
         rospy.logwarn(
