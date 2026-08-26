@@ -34,14 +34,23 @@ namespace egocentric_arm_planner {
  * VERIFICATION_HOLD (C4 audit temporarily unavailable):
  *   J = J_control_effort + J_smooth
  *
- * RECOVERY / REPAIR:
+ * REPAIR, legacy single-waypoint mode:
  *   J = J_control_effort + J_smooth
  *       + w_vis ||q_K - q_vis||^2
+ *
+ * C4.6 accumulated multi-deadline REPAIR:
+ *   J = J_control_effort + J_smooth
+ *       + sum_r w_vis ||q_{k_r} - q_vis^(r)||^2
+ *
+ * where k_r is computed from each obligation's absolute VBC deadline.  Expired
+ * obligations are applied at k=1 (act immediately); obligations beyond the
+ * current horizon are applied at k=K.  The exact VBC verifier remains the hard
+ * commit authority, so these waypoint costs only shape candidate generation.
  *
  * Legacy experiments treat RECOVERY as a controller episode: clearing it enters
  * RECOVERY_HOLD, publishes recovery_complete, and waits for replan_ready.
  *
- * C4.4 can enable ``planner_mode_semantics``. In that mode RECOVERY is only a
+ * C4.4+ can enable ``planner_mode_semantics``. In that mode RECOVERY is only a
  * candidate-generation objective (REPAIR): trigger selects the repair objective
  * and clear selects the normal objective. Switching objective never creates a
  * hold, never requests a measured-state replan, and never changes the currently
@@ -49,9 +58,8 @@ namespace egocentric_arm_planner {
  * verified-commit layer.
  *
  * Task position/terminal tracking and nominal velocity tracking are removed in
- * VERIFICATION_HOLD and RECOVERY. Hard position/velocity/acceleration
- * constraints are unchanged. VERIFICATION_HOLD is only a transient Bool input;
- * it does not add another persistent controller state.
+ * VERIFICATION_HOLD and REPAIR. Hard position/velocity/acceleration constraints
+ * are unchanged.
  */
 class VelocityQPMPCWaypoint {
 public:
@@ -77,11 +85,18 @@ public:
   }
 
 private:
+  struct DeadlineWaypoint {
+    long long id = -1;
+    double deadline_abs_s = 0.0;
+    Eigen::VectorXd q;
+  };
+
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void referenceCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void waypointActiveCallback(const std_msgs::BoolConstPtr& msg);
   void waypointQCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void waypointDeadlineCallback(const std_msgs::Float64ConstPtr& msg);
+  void waypointScheduleCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
   void verificationHoldCallback(const std_msgs::BoolConstPtr& msg);
   void recoveryTriggerCallback(const std_msgs::BoolConstPtr& msg);
   void recoveryClearCallback(const std_msgs::BoolConstPtr& msg);
@@ -150,6 +165,7 @@ private:
   ros::Subscriber waypoint_active_sub_;
   ros::Subscriber waypoint_q_sub_;
   ros::Subscriber waypoint_deadline_sub_;
+  ros::Subscriber waypoint_schedule_sub_;
   ros::Subscriber verification_hold_sub_;
   ros::Subscriber recovery_trigger_sub_;
   ros::Subscriber recovery_clear_sub_;
@@ -180,6 +196,16 @@ private:
   ros::Time latest_waypoint_deadline_received_;
   Eigen::VectorXd latest_waypoint_q_;
   double latest_waypoint_deadline_abs_s_ = 0.0;
+
+  // C4.6 schedule message format is a flat sequence of 9 doubles per record:
+  //   [obligation_id, absolute_deadline_ros_s, q1, ..., q7]
+  // The schedule producer accumulates obligations across rejected candidates and
+  // clears them only after an exact predicted-VBC SAFE verdict.
+  bool multi_deadline_enabled_ = false;
+  bool has_waypoint_schedule_ = false;
+  ros::Time latest_waypoint_schedule_received_;
+  std::vector<DeadlineWaypoint> latest_waypoint_schedule_;
+  int max_repair_waypoints_ = 8;
 
   bool latest_verification_hold_ = false;
   bool has_verification_hold_ = false;
@@ -254,6 +280,8 @@ private:
       "/care_planner/active_sensing/visibility_waypoint_q";
   std::string waypoint_deadline_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_deadline";
+  std::string waypoint_schedule_topic_ =
+      "/care_planner/active_sensing/visibility_waypoint_schedule";
   std::string verification_hold_topic_ =
       "/care_planner/execution/predicted_vbc_verification_hold";
   std::string recovery_trigger_topic_ =
