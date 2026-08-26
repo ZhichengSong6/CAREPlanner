@@ -14,6 +14,8 @@ PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT:-0.20}"
 CANDIDATE_UNSAFE_REQUIRED="${CANDIDATE_UNSAFE_REQUIRED:-2}"
 EXECUTION_UNSAFE_REQUIRED="${EXECUTION_UNSAFE_REQUIRED:-2}"
 PROBE_SAFE_COMMITS="${PROBE_SAFE_COMMITS:-3}"
+# Preserve C4.4 behavior by default. C4.5/C4.6 wrappers override this explicitly.
+REGION_SCHEDULE_MODE="${REGION_SCHEDULE_MODE:-shared_persistent}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
@@ -25,6 +27,8 @@ EXECUTION_VBC_TOPIC="/care_planner/execution_vbc/summary"
 REGIME_TOPIC="/care_planner/c4_4/regime_summary"
 TRACKER_DESIRED_TOPIC="/care_planner/execution/tracker_velocity_desired"
 ACTUATOR_TOPIC="/care_arm/arm_group_velocity_controller/command"
+SCHEDULE_TOPIC="/care_planner/active_sensing/visibility_waypoint_schedule"
+SCHEDULE_SUMMARY_TOPIC="/care_planner/active_sensing/visibility_waypoint_schedule_summary"
 
 cd "${REPO}" || exit 1
 source devel/setup.bash
@@ -93,7 +97,7 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=false _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=false _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -108,6 +112,8 @@ if [ "${READY}" != "1" ]; then
   tail -n 160 "${LOG}/waypoint_generator.log" || true
   exit 1
 fi
+
+echo "[MODE] region_schedule_mode=${REGION_SCHEDULE_MODE}"
 
 setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch \
   config_file:="${CONFIG_FILE}" waypoint_weight:="${CARE_WEIGHT}" \
@@ -143,8 +149,6 @@ if [ "${READY}" != "1" ]; then
   exit 1
 fi
 
-# Ensure the legacy global Recovery guard is absent and the C4.4 manager is the
-# sole owner of trigger/clear semantics.
 if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
   echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
   exit 1
@@ -161,6 +165,8 @@ record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
 record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
 record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
 record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
 record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
 record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
 record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
@@ -182,9 +188,9 @@ if [ "${RELEASED}" != "1" ]; then
   exit 1
 fi
 
-echo "[ARCH] C4.4 candidate verifier != committed execution auditor"
+echo "[ARCH] candidate verifier != committed execution auditor"
 echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: C4.4 verified-regime CAREPlanner for ${RUN_SECONDS}s"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
 sleep "${RUN_SECONDS}"
 
 kill_group "${CONTROL_PID}"; CONTROL_PID=""
@@ -194,9 +200,9 @@ sleep 0.2
 for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
 REC_PIDS=()
 
-python3 - "${CASE_ID}" "${OUT}" <<'PY'
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
 import csv,json,math,os,re,statistics,sys
-cid,out=sys.argv[1:]
+cid,out,mode=sys.argv[1:]
 TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
 def recs(name):
  p=os.path.join(out,name); a=[]
@@ -216,11 +222,13 @@ def recs(name):
 def f(x):
  try:return float(str(x).replace('ms',''))
  except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
 sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
 payload={
  'case_id':cid,
+ 'region_schedule_mode':mode,
  'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
  'candidate_vbc_records':len(cand),
  'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
@@ -243,6 +251,10 @@ payload={
  'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
  'mpc_solve_ms_median':statistics.median(sol) if sol else None,
  'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
 }
 json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
 print(json.dumps(payload,indent=2))
@@ -252,3 +264,4 @@ echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
 echo "[REGIME]    ${OUT}/regime_summary.csv"
 echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
 echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
