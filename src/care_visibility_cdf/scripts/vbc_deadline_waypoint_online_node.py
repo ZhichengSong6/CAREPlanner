@@ -2,7 +2,12 @@
 """Online CAREPlanner visibility waypoint generator.
 
 Modes:
-  accumulated_multi_deadline (C4.6 default)
+  visibility_acquisition (C4.7)
+      REPAIR abandons nominal deadlines. Persist learned visibility goals until
+      the real confidence map confirms they were seen. Safe repair candidates may
+      be committed/executed without forcing an immediate NORMAL probe.
+
+  accumulated_multi_deadline (C4.6 baseline)
       Accumulate spatial visibility obligations across rejected candidates,
       generate each q_vis from measured q, and publish a multi-deadline schedule.
 
@@ -32,6 +37,9 @@ from vbc_deadline_waypoint_sequential_impl import (
 from vbc_multi_deadline_obligation_impl import (
     AccumulatedMultiDeadlineWaypointNode,
 )
+from vbc_visibility_acquisition_impl import (
+    VisibilityAcquisitionWaypointNode,
+)
 
 
 class _OnlineRuntimeMixin:
@@ -58,7 +66,7 @@ class _OnlineRuntimeMixin:
         if msg is not None and not bool(msg.data):
             rospy.loginfo_throttle(
                 0.5,
-                "[vbc_waypoint_online] steering inactive; memory retained until exact predicted-VBC SAFE")
+                "[vbc_waypoint_online] steering inactive; mode-specific memory retained")
 
     def _generate_active_set_waypoint(
             self, points_xyz, trajectory, sweep_time_s, trajectory_received):
@@ -97,14 +105,7 @@ class OnlineDeadlineSequentialWaypointNode(
 
 class OnlineAccumulatedMultiDeadlineWaypointNode(
         _OnlineRuntimeMixin, AccumulatedMultiDeadlineWaypointNode):
-    """Runtime-safe wrapper around the C4.6 obligation implementation.
-
-    RollingVbcDeadlineWaypointNode creates its timer inside the parent
-    constructor.  ROS can therefore call virtual timer methods before the C4.6
-    publishers/subscribers are fully initialized.  The ready guard prevents that
-    startup race.  We also retry an active-set update until sweep/trajectory and
-    measured q are all available, instead of consuming the serial too early.
-    """
+    """Runtime-safe wrapper around the C4.6 obligation implementation."""
 
     def __init__(self):
         self._c46_ready = False
@@ -123,9 +124,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
                 return
             raw = self._raw_active_set.copy()
 
-        # Empty active set from one hypothetical candidate is a valid processed
-        # update but does NOT clear accumulated obligations. Exact predicted SAFE
-        # is the only clear condition.
         if raw.shape[0] == 0:
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
@@ -138,8 +136,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
                 self._preferred_trajectory_locked())
         if (sweep is None or trajectory is None or
                 self._latest_measured_q is None):
-            # Do not consume this update. The 50 Hz timer retries it once all
-            # synchronized inputs arrive.
             return
 
         regions = self._cluster_regions(raw)
@@ -184,9 +180,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
 
         if all_regions_handled:
             with self._obligation_lock:
-                # A newer callback may have arrived during learned projection.
-                # Mark only the snapshot serial processed; the newer serial will
-                # remain pending for the next timer tick.
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
         self._publish_schedule()
@@ -201,6 +194,23 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
         if not self._c46_ready:
             return
         AccumulatedMultiDeadlineWaypointNode._publish_state(self)
+
+
+class OnlineVisibilityAcquisitionWaypointNode(
+        _OnlineRuntimeMixin, VisibilityAcquisitionWaypointNode):
+    """Runtime-safe C4.7 wrapper; reuses C4.6 robust active-set processing."""
+
+    def __init__(self):
+        self._c46_ready = False
+        super().__init__()
+        self._c46_ready = True
+        self._publish_schedule()
+        self._run_model_warmup()
+
+    def _process_new_active_set(self) -> None:
+        # Reuse the tested retry/synchronization implementation.  Dynamic
+        # dispatch intentionally calls C4.7's _publish_schedule at the end.
+        return OnlineAccumulatedMultiDeadlineWaypointNode._process_new_active_set(self)
 
 
 def _configure_mpc_mode(mode: str) -> None:
@@ -225,14 +235,18 @@ def main():
     mode = str(rospy.get_param(
         "~region_schedule_mode", "accumulated_multi_deadline")).strip().lower()
     if mode not in (
-            "accumulated_multi_deadline", "deadline_sequential",
-            "shared_persistent"):
+            "visibility_acquisition", "accumulated_multi_deadline",
+            "deadline_sequential", "shared_persistent"):
         raise ValueError(
-            "~region_schedule_mode must be accumulated_multi_deadline, deadline_sequential, or shared_persistent")
+            "~region_schedule_mode must be visibility_acquisition, accumulated_multi_deadline, deadline_sequential, or shared_persistent")
 
     _configure_mpc_mode(mode)
 
-    if mode == "accumulated_multi_deadline":
+    if mode == "visibility_acquisition":
+        rospy.logwarn(
+            "[vbc_waypoint_online] C4.7 region_schedule_mode=visibility_acquisition")
+        OnlineVisibilityAcquisitionWaypointNode()
+    elif mode == "accumulated_multi_deadline":
         rospy.logwarn(
             "[vbc_waypoint_online] C4.6 region_schedule_mode=accumulated_multi_deadline")
         OnlineAccumulatedMultiDeadlineWaypointNode()
