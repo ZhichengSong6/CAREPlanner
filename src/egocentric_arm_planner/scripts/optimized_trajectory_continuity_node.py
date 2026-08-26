@@ -4,20 +4,26 @@
 C4.4 verification protocol
 --------------------------
 The C++ VBC selector runs on its own periodic timer and may publish repeated
-summaries for the same cached trajectory. A millisecond delay is therefore not
-a reliable way to associate a selector verdict with a newly published candidate.
+summaries for the same cached trajectory. Verification is synchronized to
+selector cycles: a candidate dispatched after cycle k may only be decided by a
+strictly later predicted cycle.
 
-Verification is synchronized to selector cycles. A candidate is dispatched
-*directly from the selector-summary callback*, immediately after cycle k has
-finished. Only a later predicted cycle may decide it. This gives the selector
-almost a full evaluation period to consume the new trajectory and removes the
-old timing window where a repeated verdict could arrive a few milliseconds after
-an unrelated candidate was dispatched.
+C4.8 reactive-repair verification
+---------------------------------
+NORMAL candidates still expose their full MPC prediction to exact VBC.
 
-At most one candidate is outstanding. Each candidate receives a monotone
-``header.seq`` for diagnostics. Every completed unique verification publishes
-exactly one event on ``verification_event_topic``; C4.4 regime transitions use
-those events, never repeated selector summaries.
+When ``repair_prefix_verification_enabled`` is true and the planner is in REPAIR,
+the verifier does NOT require the whole 1 s hypothetical q_vis prediction to be
+VBC-safe before allowing the first reactive step. Instead it creates a committed
+execution view consisting of:
+
+    short MPC prefix + dynamically feasible braking tail + hold tail
+
+Exact VBC audits that entire executable view. If it is safe, that same view is
+committed. The next MPC cycle replans from measured state. Thus no unverified
+future motion is executed, but a low-confidence sweep farther out in the 1 s
+optimization horizon cannot unnecessarily block a safe local step toward the
+visibility goal.
 """
 
 from __future__ import annotations
@@ -28,7 +34,7 @@ import re
 import threading
 
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
@@ -63,6 +69,9 @@ class OptimizedTrajectoryContinuityNode:
             "~summary_topic", "/care_planner/optimized_trajectory_summary"))
         self.verification_event_topic = str(rospy.get_param(
             "~verification_event_topic", "/care_planner/verification_outcome"))
+        self.repair_active_topic = str(rospy.get_param(
+            "~repair_active_topic",
+            "/care_planner/execution/predicted_vbc_recovery_triggered"))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_start_delay_s = float(rospy.get_param(
@@ -72,6 +81,20 @@ class OptimizedTrajectoryContinuityNode:
         self.verification_timeout_s = float(rospy.get_param(
             "~verification_timeout_s", 0.25))
 
+        # C4.8 is opt-in so older baselines remain bit-for-bit semantic baselines.
+        self.repair_prefix_verification_enabled = bool(rospy.get_param(
+            "~repair_prefix_verification_enabled", False))
+        self.repair_execution_prefix_s = float(rospy.get_param(
+            "~repair_execution_prefix_s", 0.15))
+        self.repair_brake_dt_s = float(rospy.get_param(
+            "~repair_brake_dt_s", 0.05))
+        self.repair_hold_s = float(rospy.get_param(
+            "~repair_hold_s", 0.10))
+        self.repair_brake_max_steps = int(rospy.get_param(
+            "~repair_brake_max_steps", 20))
+        self.repair_acceleration_limits = [float(v) for v in rospy.get_param(
+            "~repair_acceleration_limits", [3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0])]
+
         if self.rate <= 0.0:
             raise ValueError("~rate must be positive")
         if self.continuation_start_delay_s <= 0.0:
@@ -80,9 +103,19 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~continuation_timeout_s must exceed start delay")
         if self.verification_timeout_s <= 0.0:
             raise ValueError("~verification_timeout_s must be positive")
+        if self.repair_execution_prefix_s <= 0.0:
+            raise ValueError("~repair_execution_prefix_s must be positive")
+        if self.repair_brake_dt_s <= 0.0 or self.repair_hold_s < 0.0:
+            raise ValueError("repair brake dt must be positive and hold must be non-negative")
+        if self.repair_brake_max_steps < 1:
+            raise ValueError("~repair_brake_max_steps must be >= 1")
+        if any(v <= 0.0 for v in self.repair_acceleration_limits):
+            raise ValueError("~repair_acceleration_limits must be positive")
 
+        self._repair_active = False
         self._pending_raw = None
         self._pending_raw_received = None
+        self._pending_repair = False
         self._last_raw_received = None
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
@@ -94,6 +127,8 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_sent = None
         self._outstanding_seq = 0
         self._outstanding_dispatch_cycle = -1
+        self._outstanding_repair = False
+        self._outstanding_view = "none"
         self._next_verification_seq = 1
 
         self._committed_master = None
@@ -109,11 +144,17 @@ class OptimizedTrajectoryContinuityNode:
         self._committed_publish_count = 0
         self._continuation_count = 0
         self._pending_replace_count = 0
+        self._repair_prefix_build_count = 0
+        self._repair_prefix_safe_count = 0
+        self._repair_prefix_unsafe_count = 0
+        self._last_repair_prefix_duration_s = math.nan
+        self._last_repair_brake_duration_s = math.nan
         self._last_source = "waiting_selector_cycle"
         self._last_committed_age_s = math.nan
         self._last_verification_age_s = math.nan
         self._last_verification_seq = 0
         self._last_verification_result = "none"
+        self._last_verification_view = "none"
 
         self.verification_pub = rospy.Publisher(
             self.verification_topic, JointTrajectory, queue_size=1)
@@ -128,16 +169,26 @@ class OptimizedTrajectoryContinuityNode:
             self.input_topic, JointTrajectory, self._raw_cb, queue_size=1)
         self.summary_sub = rospy.Subscriber(
             self.global_summary_topic, String, self._global_summary_cb, queue_size=1)
+        self.repair_sub = rospy.Subscriber(
+            self.repair_active_topic, Bool, self._repair_active_cb, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
 
         self._publish_summary()
         rospy.logwarn(
             "[optimized_trajectory_continuity] SELECTOR-CYCLE VERIFY raw=%s "
-            "verify=%s committed=%s selector_summary=%s event=%s timeout=%.3fs",
+            "verify=%s committed=%s repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
+            "hold=%.3fs timeout=%.3fs",
             self.input_topic, self.verification_topic, self.committed_topic,
-            self.global_summary_topic, self.verification_event_topic,
-            self.verification_timeout_s)
+            int(self.repair_prefix_verification_enabled),
+            self.repair_execution_prefix_s, self.repair_brake_dt_s,
+            self.repair_hold_s, self.verification_timeout_s)
+
+    def _repair_active_cb(self, msg):
+        if msg is None:
+            return
+        with self._lock:
+            self._repair_active = bool(msg.data)
 
     @staticmethod
     def _duration(msg: JointTrajectory) -> float:
@@ -165,6 +216,31 @@ class OptimizedTrajectoryContinuityNode:
         return out
 
     @classmethod
+    def _point_at_time(cls, msg, t_s):
+        if msg is None or not msg.points:
+            return None
+        t = max(0.0, min(float(t_s), cls._duration(msg)))
+        points = msg.points
+        if len(points) == 1 or t <= points[0].time_from_start.to_sec():
+            out = copy.deepcopy(points[0])
+            out.time_from_start = rospy.Duration(t)
+            return out
+        if t >= points[-1].time_from_start.to_sec():
+            out = copy.deepcopy(points[-1])
+            out.time_from_start = rospy.Duration(t)
+            return out
+        hi = 1
+        while hi < len(points) and points[hi].time_from_start.to_sec() < t:
+            hi += 1
+        lo = hi - 1
+        t0 = points[lo].time_from_start.to_sec()
+        t1 = points[hi].time_from_start.to_sec()
+        alpha = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+        out = cls._interpolate_point(points[lo], points[hi], alpha)
+        out.time_from_start = rospy.Duration(t)
+        return out
+
+    @classmethod
     def _suffix_from_phase(cls, master, phase_s):
         if master is None or not master.points:
             return None
@@ -179,20 +255,9 @@ class OptimizedTrajectoryContinuityNode:
         out.joint_names = list(master.joint_names)
         points = master.points
 
-        if len(points) == 1 or phase <= points[0].time_from_start.to_sec():
-            start_point = copy.deepcopy(points[0])
-        elif phase >= points[-1].time_from_start.to_sec():
-            start_point = copy.deepcopy(points[-1])
-        else:
-            hi = 1
-            while hi < len(points) and points[hi].time_from_start.to_sec() < phase:
-                hi += 1
-            lo = hi - 1
-            t0 = points[lo].time_from_start.to_sec()
-            t1 = points[hi].time_from_start.to_sec()
-            alpha = 0.0 if t1 <= t0 else (phase - t0) / (t1 - t0)
-            start_point = cls._interpolate_point(points[lo], points[hi], alpha)
-
+        start_point = cls._point_at_time(master, phase)
+        if start_point is None:
+            return None
         start_point.time_from_start = rospy.Duration(0.0)
         out.points.append(start_point)
         for point in points:
@@ -213,13 +278,119 @@ class OptimizedTrajectoryContinuityNode:
             out.points.append(endpoint)
         return out
 
+    def _repair_prefix_with_braking_tail(self, candidate):
+        """Return an executable short-horizon repair view for exact VBC.
+
+        The prefix follows the MPC prediction. At its endpoint, velocity is driven
+        monotonically to zero using per-joint acceleration limits and trapezoidal
+        position integration. A final hold point makes the fallback state explicit.
+        """
+        if candidate is None or not candidate.points:
+            return None
+        duration = self._duration(candidate)
+        if duration <= 0.0:
+            return None
+        prefix_t = min(self.repair_execution_prefix_s, duration)
+        endpoint = self._point_at_time(candidate, prefix_t)
+        if endpoint is None or not endpoint.positions:
+            return None
+
+        n = len(candidate.joint_names)
+        if n == 0:
+            n = len(endpoint.positions)
+        if len(endpoint.positions) != n:
+            return None
+        if len(self.repair_acceleration_limits) != n:
+            rospy.logerr_throttle(
+                1.0,
+                "[optimized_trajectory_continuity] repair acceleration-limit size %d != dof %d",
+                len(self.repair_acceleration_limits), n)
+            return None
+
+        out = JointTrajectory()
+        out.header = copy.deepcopy(candidate.header)
+        out.header.stamp = rospy.Time.now()
+        out.joint_names = list(candidate.joint_names)
+
+        # Preserve all MPC samples strictly before the prefix endpoint.
+        for p in candidate.points:
+            t = p.time_from_start.to_sec()
+            if t < prefix_t - 1e-9:
+                out.points.append(copy.deepcopy(p))
+        endpoint = copy.deepcopy(endpoint)
+        endpoint.time_from_start = rospy.Duration(prefix_t)
+        out.points.append(endpoint)
+
+        q = [float(v) for v in endpoint.positions]
+        if len(endpoint.velocities) == n:
+            vel = [float(v) for v in endpoint.velocities]
+        elif len(out.points) >= 2:
+            p0 = out.points[-2]
+            dt = prefix_t - p0.time_from_start.to_sec()
+            if dt > 1e-9 and len(p0.positions) == n:
+                vel = [(q[j] - float(p0.positions[j])) / dt for j in range(n)]
+            else:
+                vel = [0.0] * n
+        else:
+            vel = [0.0] * n
+
+        t = prefix_t
+        brake_start = t
+        for _ in range(self.repair_brake_max_steps):
+            if max(abs(v) for v in vel) <= 1e-6:
+                break
+            dt = self.repair_brake_dt_s
+            next_vel = []
+            accel = []
+            for j, v in enumerate(vel):
+                max_dv = self.repair_acceleration_limits[j] * dt
+                if v > max_dv:
+                    vn = v - max_dv
+                elif v < -max_dv:
+                    vn = v + max_dv
+                else:
+                    vn = 0.0
+                next_vel.append(vn)
+                accel.append((vn - v) / dt)
+            q = [q[j] + 0.5 * (vel[j] + next_vel[j]) * dt
+                 for j in range(n)]
+            t += dt
+            p = JointTrajectoryPoint()
+            p.positions = list(q)
+            p.velocities = list(next_vel)
+            p.accelerations = list(accel)
+            p.time_from_start = rospy.Duration(t)
+            out.points.append(p)
+            vel = next_vel
+
+        if max(abs(v) for v in vel) > 1e-5:
+            rospy.logwarn_throttle(
+                1.0,
+                "[optimized_trajectory_continuity] braking tail hit max steps; max|v|=%.4f",
+                max(abs(v) for v in vel))
+            return None
+
+        if self.repair_hold_s > 1e-9:
+            t += self.repair_hold_s
+            hold = JointTrajectoryPoint()
+            hold.positions = list(q)
+            hold.velocities = [0.0] * n
+            hold.accelerations = [0.0] * n
+            hold.time_from_start = rospy.Duration(t)
+            out.points.append(hold)
+
+        self._repair_prefix_build_count += 1
+        self._last_repair_prefix_duration_s = prefix_t
+        self._last_repair_brake_duration_s = max(0.0, t - self.repair_hold_s - brake_start)
+        return out
+
     def _raw_cb(self, msg):
         if msg is None or not msg.points:
             return
         now = rospy.Time.now()
         with self._lock:
             if self._last_raw_received is not None:
-                gap = (now - self._last_raw_received).to_sec()
+                gap = (now - self._last_raw_received).toSec()
                 if gap >= 0.0:
                     self._last_input_gap_s = gap
                     self._max_input_gap_s = max(self._max_input_gap_s, gap)
@@ -227,6 +398,7 @@ class OptimizedTrajectoryContinuityNode:
                 self._pending_replace_count += 1
             self._pending_raw = copy.deepcopy(msg)
             self._pending_raw_received = now
+            self._pending_repair = bool(self._repair_active)
             self._last_raw_received = now
             self._raw_input_count += 1
             self._last_source = "raw_candidate_buffered_waiting_selector_cycle"
@@ -238,13 +410,24 @@ class OptimizedTrajectoryContinuityNode:
 
         raw = self._pending_raw
         raw_received = self._pending_raw_received
+        pending_repair = bool(self._pending_repair or self._repair_active)
         self._pending_raw = None
         self._pending_raw_received = None
+        self._pending_repair = False
+
         age = max(0.0, (now - raw_received).to_sec())
         candidate = self._suffix_from_phase(raw, age)
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
             return None
+
+        view = "full_horizon"
+        if self.repair_prefix_verification_enabled and pending_repair:
+            candidate = self._repair_prefix_with_braking_tail(candidate)
+            if candidate is None or not candidate.points:
+                self._last_source = "repair_prefix_build_failed"
+                return None
+            view = "repair_prefix_brake_hold"
 
         seq = self._next_verification_seq
         self._next_verification_seq += 1
@@ -254,8 +437,11 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_sent = now
         self._outstanding_seq = seq
         self._outstanding_dispatch_cycle = self._selector_cycle_count
+        self._outstanding_repair = bool(pending_repair)
+        self._outstanding_view = view
         self._verification_publish_count += 1
         self._last_source = "candidate_sent_on_selector_cycle_boundary"
+        self._last_verification_view = view
         self._publish_summary_locked()
         return candidate
 
@@ -271,14 +457,14 @@ class OptimizedTrajectoryContinuityNode:
             self._last_committed_age_s = float(age_s)
             self._publish_summary_locked()
 
-    def _make_verification_event(self, seq, result, committed, age_s):
+    def _make_verification_event(self, seq, result, committed, age_s, view):
         msg = String()
         msg.data = (
             "seq={} result={} committed={} verification_age_s={:.6f} "
-            "outcome_count={} safe_count={} unsafe_count={} timeout_count={} "
-            "commit_count={}"
+            "verification_view={} outcome_count={} safe_count={} unsafe_count={} "
+            "timeout_count={} commit_count={}"
         ).format(
-            int(seq), result, int(bool(committed)), float(age_s),
+            int(seq), result, int(bool(committed)), float(age_s), view,
             self._verification_outcome_count, self._verification_safe_count,
             self._verification_unsafe_count, self._verification_timeout_count,
             self._commit_count)
@@ -304,15 +490,11 @@ class OptimizedTrajectoryContinuityNode:
             self._last_selector_cycle_time = now
 
             if self._outstanding is None or self._outstanding_sent is None:
-                # Bootstrap is valid here: it establishes the first cycle
-                # boundary. Dispatch immediately, not from an unrelated timer.
                 verification_to_publish = self._dispatch_pending_locked(now)
                 if verification_to_publish is None:
                     self._last_source = "selector_cycle_complete_no_pending_candidate"
                 self._publish_summary_locked()
             else:
-                # Once a candidate is outstanding, bootstrap/cached fallback can
-                # never decide it. Only a strictly later predicted cycle may.
                 if source != "predicted":
                     self._publish_summary_locked()
                 elif self._selector_cycle_count <= self._outstanding_dispatch_cycle:
@@ -322,25 +504,33 @@ class OptimizedTrajectoryContinuityNode:
                         0.0, (now - self._outstanding_sent).to_sec())
                     candidate = copy.deepcopy(self._outstanding)
                     seq = int(self._outstanding_seq)
+                    was_repair = bool(self._outstanding_repair)
+                    view = str(self._outstanding_view)
                     self._outstanding = None
                     self._outstanding_sent = None
                     self._outstanding_seq = 0
                     self._outstanding_dispatch_cycle = -1
+                    self._outstanding_repair = False
+                    self._outstanding_view = "none"
                     self._last_verification_age_s = verification_age
                     self._last_verification_seq = seq
+                    self._last_verification_view = view
                     self._verification_outcome_count += 1
 
                     if violation:
                         self._verification_unsafe_count += 1
+                        if was_repair and view == "repair_prefix_brake_hold":
+                            self._repair_prefix_unsafe_count += 1
                         self._last_verification_result = "unsafe"
                         self._last_source = "candidate_rejected_vbc_unsafe"
                         event_to_publish = self._make_verification_event(
-                            seq, "unsafe", False, verification_age)
+                            seq, "unsafe", False, verification_age, view)
                     else:
-                        committed = self._suffix_from_phase(
-                            candidate, verification_age)
+                        committed = self._suffix_from_phase(candidate, verification_age)
                         if committed is not None and committed.points:
                             self._verification_safe_count += 1
+                            if was_repair and view == "repair_prefix_brake_hold":
+                                self._repair_prefix_safe_count += 1
                             self._last_verification_result = "safe"
                             committed.header.seq = seq
                             committed.header.stamp = now
@@ -351,17 +541,14 @@ class OptimizedTrajectoryContinuityNode:
                             self._last_source = "candidate_verified_safe_committed"
                             committed_to_publish = copy.deepcopy(committed)
                             event_to_publish = self._make_verification_event(
-                                seq, "safe", True, verification_age)
+                                seq, "safe", True, verification_age, view)
                         else:
                             self._verification_timeout_count += 1
                             self._last_verification_result = "expired_safe"
                             self._last_source = "candidate_safe_but_expired_before_commit"
                             event_to_publish = self._make_verification_event(
-                                seq, "timeout", False, verification_age)
+                                seq, "timeout", False, verification_age, view)
 
-                    # The cycle that just produced this verdict is also the next
-                    # dispatch boundary. If a fresh raw candidate is already
-                    # buffered, send it immediately after this selector cycle.
                     verification_to_publish = self._dispatch_pending_locked(now)
                     self._publish_summary_locked()
 
@@ -384,21 +571,23 @@ class OptimizedTrajectoryContinuityNode:
                 age = (now - self._outstanding_sent).to_sec()
                 if age > self.verification_timeout_s:
                     seq = int(self._outstanding_seq)
+                    view = str(self._outstanding_view)
                     self._outstanding = None
                     self._outstanding_sent = None
                     self._outstanding_seq = 0
                     self._outstanding_dispatch_cycle = -1
+                    self._outstanding_repair = False
+                    self._outstanding_view = "none"
                     self._verification_timeout_count += 1
                     self._verification_outcome_count += 1
                     self._last_verification_seq = seq
                     self._last_verification_result = "timeout"
                     self._last_source = "verification_timeout_candidate_rejected"
                     self._last_verification_age_s = age
+                    self._last_verification_view = view
                     timeout_event = self._make_verification_event(
-                        seq, "timeout", False, age)
+                        seq, "timeout", False, age, view)
 
-            # Deliberately do NOT dispatch candidates from this timer. Candidate
-            # dispatch is selector-cycle synchronized in _global_summary_cb.
             if self._committed_master is not None and self._committed_received is not None:
                 continuation_age = (now - self._committed_received).to_sec()
                 if (continuation_age >= self.continuation_start_delay_s and
@@ -424,8 +613,11 @@ class OptimizedTrajectoryContinuityNode:
             "pending_candidate={}".format(int(self._pending_raw is not None)),
             "pending_replace_count={}".format(self._pending_replace_count),
             "selector_cycle_count={}".format(self._selector_cycle_count),
+            "repair_active={}".format(int(self._repair_active)),
+            "repair_prefix_enabled={}".format(int(self.repair_prefix_verification_enabled)),
             "verification_outstanding={}".format(int(self._outstanding is not None)),
             "outstanding_seq={}".format(int(self._outstanding_seq)),
+            "outstanding_view={}".format(self._outstanding_view),
             "verification_publish_count={}".format(self._verification_publish_count),
             "verification_outcome_count={}".format(self._verification_outcome_count),
             "verification_safe_count={}".format(self._verification_safe_count),
@@ -433,6 +625,16 @@ class OptimizedTrajectoryContinuityNode:
             "verification_timeout_count={}".format(self._verification_timeout_count),
             "last_verification_seq={}".format(self._last_verification_seq),
             "last_verification_result={}".format(self._last_verification_result),
+            "last_verification_view={}".format(self._last_verification_view),
+            "repair_prefix_build_count={}".format(self._repair_prefix_build_count),
+            "repair_prefix_safe_count={}".format(self._repair_prefix_safe_count),
+            "repair_prefix_unsafe_count={}".format(self._repair_prefix_unsafe_count),
+            "repair_prefix_duration_s={}".format(
+                "nan" if not math.isfinite(self._last_repair_prefix_duration_s)
+                else "{:.6f}".format(self._last_repair_prefix_duration_s)),
+            "repair_brake_duration_s={}".format(
+                "nan" if not math.isfinite(self._last_repair_brake_duration_s)
+                else "{:.6f}".format(self._last_repair_brake_duration_s)),
             "commit_count={}".format(self._commit_count),
             "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
