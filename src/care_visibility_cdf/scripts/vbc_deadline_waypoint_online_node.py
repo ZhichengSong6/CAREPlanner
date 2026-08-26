@@ -2,16 +2,17 @@
 """Online CAREPlanner visibility waypoint generator.
 
 Modes:
-  deadline_sequential (C4.5 default)
-      Track spatial VBC regions persistently, but expose only one unresolved
-      region at a time to learned q_vis generation.
+  accumulated_multi_deadline (C4.6 default)
+      Accumulate spatial visibility obligations across rejected candidates,
+      generate each q_vis from measured q, and publish a multi-deadline schedule.
+
+  deadline_sequential (C4.5 baseline)
+      Keep one spatial region at a time across planner cycles.
 
   shared_persistent (C4.4 baseline)
-      Union all remembered spatial regions and solve for one shared q_vis.
+      Union remembered regions and solve for one shared q_vis.
 
-Both modes keep the same learned projection/root/ascent machinery and the same
-exact downstream VBC verification.  This makes the scheduler change directly
-comparable without also changing the learned field or safety semantics.
+All modes keep exact candidate VBC downstream as the hard commit authority.
 """
 
 import time
@@ -26,6 +27,9 @@ from vbc_deadline_waypoint_rolling_persistent_impl import (
 )
 from vbc_deadline_waypoint_sequential_impl import (
     DeadlineSequentialRollingVbcWaypointNode,
+)
+from vbc_multi_deadline_obligation_impl import (
+    AccumulatedMultiDeadlineWaypointNode,
 )
 
 
@@ -50,14 +54,13 @@ class _OnlineRuntimeMixin:
 
     def _selection_active_callback(self, msg):
         # In planner-mode semantics, a brief globally-safe/probe interval must
-        # not erase region identity.  Exact future VBC active sets retire solved
-        # regions.  Bypass Persistent/Sequential episode-reset callbacks here.
+        # not erase steering memory. C4.6 clears accumulated obligations only on
+        # an exact predicted-VBC SAFE verdict.
         RollingVbcDeadlineWaypointNode._selection_active_callback(self, msg)
         if msg is not None and not bool(msg.data):
             rospy.loginfo_throttle(
                 0.5,
-                "[vbc_waypoint_online] steering inactive; region/warm-start "
-                "memory retained for future exact-VBC updates")
+                "[vbc_waypoint_online] steering inactive; memory retained until exact predicted-VBC SAFE")
 
     def _generate_active_set_waypoint(
             self, points_xyz, trajectory, sweep_time_s, trajectory_received):
@@ -74,11 +77,9 @@ class _OnlineRuntimeMixin:
         result["oracle_diagnostics_enabled"] = bool(
             self.enable_oracle_diagnostics)
         rospy.logwarn(
-            "[vbc_waypoint_online] generation %.2f ms device=%s "
-            "points=%d oracle_diag=%d mode=%s",
+            "[vbc_waypoint_online] generation %.2f ms device=%s points=%d oracle_diag=%d mode=%s",
             elapsed_ms, str(self.device), int(result["active_set_size"]),
-            int(self.enable_oracle_diagnostics),
-            result["shared_solution_mode"])
+            int(self.enable_oracle_diagnostics), result["shared_solution_mode"])
         return result
 
 
@@ -96,14 +97,25 @@ class OnlineDeadlineSequentialWaypointNode(
         self._run_model_warmup()
 
 
+class OnlineAccumulatedMultiDeadlineWaypointNode(
+        _OnlineRuntimeMixin, AccumulatedMultiDeadlineWaypointNode):
+    def __init__(self):
+        super().__init__()
+        self._run_model_warmup()
+
+
 def main():
     rospy.init_node("vbc_deadline_waypoint_rolling")
     if not rospy.has_param("~use_active_set"):
         rospy.set_param("~use_active_set", True)
 
     mode = str(rospy.get_param(
-        "~region_schedule_mode", "deadline_sequential")).strip().lower()
-    if mode == "deadline_sequential":
+        "~region_schedule_mode", "accumulated_multi_deadline")).strip().lower()
+    if mode == "accumulated_multi_deadline":
+        rospy.logwarn(
+            "[vbc_waypoint_online] C4.6 region_schedule_mode=accumulated_multi_deadline")
+        OnlineAccumulatedMultiDeadlineWaypointNode()
+    elif mode == "deadline_sequential":
         rospy.logwarn(
             "[vbc_waypoint_online] C4.5 region_schedule_mode=deadline_sequential")
         OnlineDeadlineSequentialWaypointNode()
@@ -113,7 +125,7 @@ def main():
         OnlinePersistentWaypointNode()
     else:
         raise ValueError(
-            "~region_schedule_mode must be deadline_sequential or shared_persistent")
+            "~region_schedule_mode must be accumulated_multi_deadline, deadline_sequential, or shared_persistent")
     rospy.spin()
 
 
