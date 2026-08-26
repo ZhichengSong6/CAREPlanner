@@ -44,7 +44,6 @@ from vbc_visibility_acquisition_impl import (
 
 class _OnlineRuntimeMixin:
     def _run_model_warmup(self):
-        """Pay first autograd / kernel initialization cost before online use."""
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         tic = time.perf_counter()
@@ -97,7 +96,7 @@ class OnlinePersistentWaypointNode(
 
 
 class OnlineDeadlineSequentialWaypointNode(
-        _OnlineRuntimeMixin, DeadlineSequentialRollingVbcDeadlineWaypointNode):
+        _OnlineRuntimeMixin, DeadlineSequentialRollingVbcWaypointNode):
     def __init__(self):
         super().__init__()
         self._run_model_warmup()
@@ -105,8 +104,6 @@ class OnlineDeadlineSequentialWaypointNode(
 
 class OnlineAccumulatedMultiDeadlineWaypointNode(
         _OnlineRuntimeMixin, AccumulatedMultiDeadlineWaypointNode):
-    """Runtime-safe wrapper around the C4.6 obligation implementation."""
-
     def __init__(self):
         self._c46_ready = False
         super().__init__()
@@ -117,19 +114,16 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
     def _process_new_active_set(self) -> None:
         if not self._c46_ready:
             return
-
         with self._obligation_lock:
             serial = self._raw_active_set_serial
             if serial == self._processed_active_set_serial:
                 return
             raw = self._raw_active_set.copy()
-
         if raw.shape[0] == 0:
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
             return
-
         with self._lock:
             sweep = self._sweep_time_s
             trajectory, trajectory_received, trajectory_source = (
@@ -158,7 +152,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
                         "[vbc_multi_deadline] max_obligations=%d reached; refusing new region",
                         self.max_obligations)
                     continue
-
             try:
                 new_ob = self._generate_new_obligation(
                     region, trajectory, float(sweep), trajectory_received,
@@ -170,7 +163,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
                     "[vbc_multi_deadline] obligation generation failed; will retry active set: %s",
                     exc)
                 continue
-
             with self._obligation_lock:
                 matched = self._match_existing(region)
                 if (matched is None and
@@ -198,8 +190,6 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
 
 class OnlineVisibilityAcquisitionWaypointNode(
         _OnlineRuntimeMixin, VisibilityAcquisitionWaypointNode):
-    """Runtime-safe C4.7 wrapper; reuses C4.6 robust active-set processing."""
-
     def __init__(self):
         self._c46_ready = False
         super().__init__()
@@ -212,7 +202,6 @@ class OnlineVisibilityAcquisitionWaypointNode(
 
 
 def _configure_runtime_mode(mode: str) -> None:
-    """Set C++ MPC and regime-manager private params before planner launch."""
     mpc_prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
     multi = mode == "accumulated_multi_deadline"
     rospy.set_param(mpc_prefix + "/multi_deadline_enabled", bool(multi))
@@ -230,8 +219,7 @@ def _configure_runtime_mode(mode: str) -> None:
         "/care_planner/active_sensing/visibility_acquisition_complete")
 
     rospy.logwarn(
-        "[vbc_waypoint_online] preconfigured runtime: multi_deadline=%d "
-        "repair_completion_gate=%d",
+        "[vbc_waypoint_online] preconfigured runtime: multi_deadline=%d repair_completion_gate=%d",
         int(multi), int(acquisition))
 
 
