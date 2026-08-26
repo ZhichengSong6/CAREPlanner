@@ -16,11 +16,13 @@ Modes:
   shared_persistent (C4.4 baseline)
       Union remembered regions and solve for one shared q_vis.
 
-The optional C4.8 ``repair_prefix_verification_enabled`` switch configures the
-verify/commit node before launch so only REPAIR uses short prefix+braking VBC
-views. NORMAL candidates continue to receive full-horizon VBC verification.
+C4.8 repair-prefix verification is orthogonal to q_vis generation. It can be
+selected either by private ROS params or by the one-command runner environment
+variables C4_REPAIR_PREFIX_VERIFY, C4_REPAIR_PREFIX_S, C4_REPAIR_BRAKE_DT_S and
+C4_REPAIR_HOLD_S. NORMAL candidates always keep full-horizon VBC verification.
 """
 
+import os
 import time
 
 import numpy as np
@@ -41,6 +43,20 @@ from vbc_multi_deadline_obligation_impl import (
 from vbc_visibility_acquisition_impl import (
     VisibilityAcquisitionWaypointNode,
 )
+
+
+def _env_bool(name, default=False):
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return float(default)
+    return float(raw)
 
 
 class _OnlineRuntimeMixin:
@@ -219,13 +235,19 @@ def _configure_runtime_mode(mode: str) -> None:
         manager_prefix + "/repair_completion_topic",
         "/care_planner/active_sensing/visibility_acquisition_complete")
 
-    # C4.8 is orthogonal to the q_vis generation mode. It shortens only the
-    # verification/commit view during REPAIR; default false preserves C4.7.
+    prefix_default = _env_bool("C4_REPAIR_PREFIX_VERIFY", False)
+    prefix_s_default = _env_float("C4_REPAIR_PREFIX_S", 0.15)
+    brake_dt_default = _env_float("C4_REPAIR_BRAKE_DT_S", 0.05)
+    hold_default = _env_float("C4_REPAIR_HOLD_S", 0.10)
     repair_prefix_enabled = bool(rospy.get_param(
-        "~repair_prefix_verification_enabled", False))
-    repair_prefix_s = float(rospy.get_param("~repair_execution_prefix_s", 0.15))
-    repair_brake_dt_s = float(rospy.get_param("~repair_brake_dt_s", 0.05))
-    repair_hold_s = float(rospy.get_param("~repair_hold_s", 0.10))
+        "~repair_prefix_verification_enabled", prefix_default))
+    repair_prefix_s = float(rospy.get_param(
+        "~repair_execution_prefix_s", prefix_s_default))
+    repair_brake_dt_s = float(rospy.get_param(
+        "~repair_brake_dt_s", brake_dt_default))
+    repair_hold_s = float(rospy.get_param(
+        "~repair_hold_s", hold_default))
+
     continuity_prefix = "/optimized_trajectory_continuity"
     rospy.set_param(
         continuity_prefix + "/repair_prefix_verification_enabled",
