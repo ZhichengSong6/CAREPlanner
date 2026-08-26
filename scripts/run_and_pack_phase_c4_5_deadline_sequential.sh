@@ -18,11 +18,9 @@ echo "[C4.5] branch: $(git branch --show-current)"
 echo "[C4.5] head:   $(git rev-parse HEAD)"
 echo "[C4.5] case=${CASE_ID} run=${RUN_SECONDS}s weight=${CARE_WEIGHT} margin=${SAFETY_MARGIN}s"
 
-# CAREPlanner uses catkin_tools, not catkin_make.
 catkin build
 source devel/setup.bash
 
-# Catch syntax/import-file mistakes before starting Gazebo.
 python3 -m py_compile \
   src/care_visibility_cdf/scripts/vbc_deadline_waypoint_sequential_impl.py \
   src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py
@@ -34,18 +32,17 @@ RUN_SECONDS="${RUN_SECONDS}" \
 CARE_WEIGHT="${CARE_WEIGHT}" \
 SAFETY_MARGIN="${SAFETY_MARGIN}" \
 PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" \
+REGION_SCHEDULE_MODE="deadline_sequential" \
 OUT="${OUT}" \
 LOG="${LOG}" \
 bash scripts/run_phase_c4_4_verified_regime_smoke.sh
 
-# Verify that the default online mode really was the C4.5 scheduler.
 if ! grep -q "region_schedule_mode=deadline_sequential" "${LOG}/waypoint_generator.log"; then
   echo "[ERROR] C4.5 deadline_sequential mode was not observed in waypoint_generator.log"
   tail -n 200 "${LOG}/waypoint_generator.log" || true
   exit 3
 fi
 
-# Keep the exact code/version metadata next to the experiment.
 mkdir -p "${OUT}"
 {
   echo "branch=$(git branch --show-current)"
@@ -61,7 +58,6 @@ mkdir -p "${OUT}"
 python3 - "${OUT}/waypoint_summary.csv" "${OUT}/c4_5_deadline_sequential_summary.json" <<'PY'
 import csv
 import json
-import math
 import os
 import re
 import sys
