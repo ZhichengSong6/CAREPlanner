@@ -81,7 +81,6 @@ class OptimizedTrajectoryContinuityNode:
         self.verification_timeout_s = float(rospy.get_param(
             "~verification_timeout_s", 0.25))
 
-        # C4.8 is opt-in so older baselines remain bit-for-bit semantic baselines.
         self.repair_prefix_verification_enabled = bool(rospy.get_param(
             "~repair_prefix_verification_enabled", False))
         self.repair_execution_prefix_s = float(rospy.get_param(
@@ -279,12 +278,6 @@ class OptimizedTrajectoryContinuityNode:
         return out
 
     def _repair_prefix_with_braking_tail(self, candidate):
-        """Return an executable short-horizon repair view for exact VBC.
-
-        The prefix follows the MPC prediction. At its endpoint, velocity is driven
-        monotonically to zero using per-joint acceleration limits and trapezoidal
-        position integration. A final hold point makes the fallback state explicit.
-        """
         if candidate is None or not candidate.points:
             return None
         duration = self._duration(candidate)
@@ -312,7 +305,6 @@ class OptimizedTrajectoryContinuityNode:
         out.header.stamp = rospy.Time.now()
         out.joint_names = list(candidate.joint_names)
 
-        # Preserve all MPC samples strictly before the prefix endpoint.
         for p in candidate.points:
             t = p.time_from_start.to_sec()
             if t < prefix_t - 1e-9:
@@ -381,7 +373,8 @@ class OptimizedTrajectoryContinuityNode:
 
         self._repair_prefix_build_count += 1
         self._last_repair_prefix_duration_s = prefix_t
-        self._last_repair_brake_duration_s = max(0.0, t - self.repair_hold_s - brake_start)
+        self._last_repair_brake_duration_s = max(
+            0.0, t - self.repair_hold_s - brake_start)
         return out
 
     def _raw_cb(self, msg):
@@ -390,7 +383,7 @@ class OptimizedTrajectoryContinuityNode:
         now = rospy.Time.now()
         with self._lock:
             if self._last_raw_received is not None:
-                gap = (now - self._last_raw_received).toSec()
+                gap = (now - self._last_raw_received).to_sec()
                 if gap >= 0.0:
                     self._last_input_gap_s = gap
                     self._max_input_gap_s = max(self._max_input_gap_s, gap)
