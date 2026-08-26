@@ -53,9 +53,6 @@ class _OnlineRuntimeMixin:
             elapsed_ms, str(self.device))
 
     def _selection_active_callback(self, msg):
-        # In planner-mode semantics, a brief globally-safe/probe interval must
-        # not erase steering memory. C4.6 clears accumulated obligations only on
-        # an exact predicted-VBC SAFE verdict.
         RollingVbcDeadlineWaypointNode._selection_active_callback(self, msg)
         if msg is not None and not bool(msg.data):
             rospy.loginfo_throttle(
@@ -104,6 +101,26 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(
         self._run_model_warmup()
 
 
+def _configure_mpc_mode(mode: str) -> None:
+    """Set MPC private params before the planner launch starts the C++ node.
+
+    The smoke runner starts this Python process first and waits for ONLINE WARMUP
+    READY before launching phaseC4_4_verified_regime_planner.launch, so these
+    parameters are already present when the MPC reads its private namespace.
+    This keeps the old launch file reusable for C4.4/C4.5 baselines.
+    """
+    prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
+    multi = mode == "accumulated_multi_deadline"
+    rospy.set_param(prefix + "/multi_deadline_enabled", bool(multi))
+    rospy.set_param(
+        prefix + "/schedule_topic",
+        "/care_planner/active_sensing/visibility_waypoint_schedule")
+    rospy.set_param(prefix + "/max_repair_waypoints", 8)
+    rospy.logwarn(
+        "[vbc_waypoint_online] preconfigured MPC: multi_deadline_enabled=%d",
+        int(multi))
+
+
 def main():
     rospy.init_node("vbc_deadline_waypoint_rolling")
     if not rospy.has_param("~use_active_set"):
@@ -111,6 +128,14 @@ def main():
 
     mode = str(rospy.get_param(
         "~region_schedule_mode", "accumulated_multi_deadline")).strip().lower()
+    if mode not in (
+            "accumulated_multi_deadline", "deadline_sequential",
+            "shared_persistent"):
+        raise ValueError(
+            "~region_schedule_mode must be accumulated_multi_deadline, deadline_sequential, or shared_persistent")
+
+    _configure_mpc_mode(mode)
+
     if mode == "accumulated_multi_deadline":
         rospy.logwarn(
             "[vbc_waypoint_online] C4.6 region_schedule_mode=accumulated_multi_deadline")
@@ -119,13 +144,10 @@ def main():
         rospy.logwarn(
             "[vbc_waypoint_online] C4.5 region_schedule_mode=deadline_sequential")
         OnlineDeadlineSequentialWaypointNode()
-    elif mode == "shared_persistent":
+    else:
         rospy.logwarn(
             "[vbc_waypoint_online] BASELINE region_schedule_mode=shared_persistent")
         OnlinePersistentWaypointNode()
-    else:
-        raise ValueError(
-            "~region_schedule_mode must be accumulated_multi_deadline, deadline_sequential, or shared_persistent")
     rospy.spin()
 
 
