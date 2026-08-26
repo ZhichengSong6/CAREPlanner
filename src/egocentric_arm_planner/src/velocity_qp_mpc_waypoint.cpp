@@ -51,6 +51,11 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   waypoint_deadline_sub_ = nh_.subscribe(
       waypoint_deadline_topic_, 1,
       &VelocityQPMPCWaypoint::waypointDeadlineCallback, this);
+  if (multi_deadline_enabled_) {
+    waypoint_schedule_sub_ = nh_.subscribe(
+        waypoint_schedule_topic_, 1,
+        &VelocityQPMPCWaypoint::waypointScheduleCallback, this);
+  }
   verification_hold_sub_ = nh_.subscribe(
       verification_hold_topic_, 1,
       &VelocityQPMPCWaypoint::verificationHoldCallback, this);
@@ -82,7 +87,7 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / rate_), &VelocityQPMPCWaypoint::timerCallback, this);
 
-  ROS_WARN("[VelocityQPMPCWaypoint] This node owns the low-level velocity command topic. Do NOT run TrajectoryExecutionManager or another MPC simultaneously.");
+  ROS_WARN("[VelocityQPMPCWaypoint] This node owns the candidate velocity output. Verified commit/execution remains downstream.");
   ROS_INFO_STREAM("[VelocityQPMPCWaypoint] solver=PIQP dense, rate=" << rate_
                   << " Hz, horizon=" << horizon_duration_
                   << " s, K=" << num_intervals_
@@ -97,7 +102,10 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                   << ", timeout=" << waypoint_timeout_
                   << " s, active=" << waypoint_active_topic_
                   << ", q_vis=" << waypoint_q_topic_
-                  << ", deadline=" << waypoint_deadline_topic_);
+                  << ", deadline=" << waypoint_deadline_topic_
+                  << ", multi_deadline=" << static_cast<int>(multi_deadline_enabled_)
+                  << ", schedule=" << waypoint_schedule_topic_
+                  << ", max_repair_waypoints=" << max_repair_waypoints_);
   ROS_INFO_STREAM("[VelocityQPMPCWaypoint] verification hold topic="
                   << verification_hold_topic_);
   ROS_WARN_STREAM("[VelocityQPMPCWaypoint] recovery trigger="
@@ -113,11 +121,11 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                   << ", complete=" << recovery_complete_topic_
                   << ", replan_ready=" << replan_ready_topic_);
   if (planner_mode_semantics_) {
-    ROS_WARN("[VelocityQPMPCWaypoint] PLANNER MODE SEMANTICS ENABLED: REPAIR/NORMAL only select the next-candidate objective. Clear never enters recovery_hold, never publishes recovery_complete, and never waits for replan_ready. The committed execution trajectory is owned downstream and is untouched by this mode switch.");
-  } else {
-    ROS_INFO("[VelocityQPMPCWaypoint] Legacy Recovery lifecycle enabled: clear may enter recovery_hold and wait for replan_ready.");
+    ROS_WARN("[VelocityQPMPCWaypoint] PLANNER MODE SEMANTICS ENABLED: REPAIR/NORMAL only select candidate objectives; committed execution remains downstream.");
   }
-  ROS_INFO("[VelocityQPMPCWaypoint] Recovery/REPAIR removes nominal q/terminal/u-reference tracking but preserves hard joint-position, velocity, and acceleration constraints plus effort/smoothness regularization.");
+  if (multi_deadline_enabled_) {
+    ROS_WARN("[VelocityQPMPCWaypoint] C4.6 MULTI-DEADLINE REPAIR ENABLED: nominal task tracking is removed in REPAIR and every accumulated visibility obligation is applied at its own deadline index.");
+  }
   return true;
 }
 
@@ -221,6 +229,12 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                           waypoint_q_topic_, waypoint_q_topic_);
   pnh_.param<std::string>("mpc/visibility_waypoint/deadline_topic",
                           waypoint_deadline_topic_, waypoint_deadline_topic_);
+  pnh_.param<bool>("mpc/visibility_waypoint/multi_deadline_enabled",
+                   multi_deadline_enabled_, multi_deadline_enabled_);
+  pnh_.param<std::string>("mpc/visibility_waypoint/schedule_topic",
+                          waypoint_schedule_topic_, waypoint_schedule_topic_);
+  pnh_.param<int>("mpc/visibility_waypoint/max_repair_waypoints",
+                  max_repair_waypoints_, max_repair_waypoints_);
   pnh_.param<std::string>("mpc/visibility_waypoint/verification_hold_topic",
                           verification_hold_topic_, verification_hold_topic_);
   pnh_.param<bool>("mpc/visibility_waypoint/use_external_recovery_trigger",
@@ -284,7 +298,7 @@ bool VelocityQPMPCWaypoint::loadConfig() {
   }
   if (waypoint_weight_ < 0.0 || waypoint_timeout_ <= 0.0 ||
       waypoint_horizon_slack_ < 0.0 || recovery_weight_scale_ <= 0.0 ||
-      recovery_signal_timeout_ <= 0.0) {
+      recovery_signal_timeout_ <= 0.0 || max_repair_waypoints_ < 1) {
     ROS_ERROR("[VelocityQPMPCWaypoint] invalid visibility-waypoint/recovery parameters.");
     return false;
   }
@@ -303,7 +317,6 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                             acceleration_limits_)) {
     return false;
   }
-
   for (int i = 0; i < dof_; ++i) {
     if (!(velocity_limits_[i] > 0.0) || !(acceleration_limits_[i] > 0.0)) {
       ROS_ERROR("[VelocityQPMPCWaypoint] velocity/acceleration limits must be positive.");
@@ -471,6 +484,61 @@ void VelocityQPMPCWaypoint::waypointDeadlineCallback(
   latest_waypoint_deadline_abs_s_ = msg->data;
   latest_waypoint_deadline_received_ = ros::Time::now();
   has_waypoint_deadline_ = true;
+}
+
+void VelocityQPMPCWaypoint::waypointScheduleCallback(
+    const std_msgs::Float64MultiArrayConstPtr& msg) {
+  if (!msg) return;
+  constexpr std::size_t kRecord = 9;
+  if (msg->data.size() % kRecord != 0) {
+    ROS_WARN_THROTTLE(
+        1.0,
+        "[VelocityQPMPCWaypoint] ignoring malformed multi-deadline schedule");
+    return;
+  }
+
+  std::vector<DeadlineWaypoint> schedule;
+  const std::size_t n = msg->data.size() / kRecord;
+  schedule.reserve(std::min<std::size_t>(
+      n, static_cast<std::size_t>(max_repair_waypoints_)));
+  for (std::size_t r = 0; r < n; ++r) {
+    const std::size_t off = r * kRecord;
+    const double id_raw = msg->data[off];
+    const double deadline = msg->data[off + 1];
+    if (!std::isfinite(id_raw) || !std::isfinite(deadline) || deadline <= 0.0) {
+      ROS_WARN_THROTTLE(
+          1.0, "[VelocityQPMPCWaypoint] schedule contains invalid id/deadline");
+      return;
+    }
+    DeadlineWaypoint wp;
+    wp.id = static_cast<long long>(std::llround(id_raw));
+    wp.deadline_abs_s = deadline;
+    wp.q = Eigen::VectorXd::Zero(dof_);
+    for (int j = 0; j < dof_; ++j) {
+      wp.q[j] = msg->data[off + 2 + static_cast<std::size_t>(j)];
+    }
+    if (!finiteVector(wp.q)) {
+      ROS_WARN_THROTTLE(
+          1.0, "[VelocityQPMPCWaypoint] schedule contains non-finite q_vis");
+      return;
+    }
+    schedule.push_back(wp);
+  }
+  std::sort(
+      schedule.begin(), schedule.end(),
+      [](const DeadlineWaypoint& a, const DeadlineWaypoint& b) {
+        if (std::fabs(a.deadline_abs_s - b.deadline_abs_s) > 1e-12)
+          return a.deadline_abs_s < b.deadline_abs_s;
+        return a.id < b.id;
+      });
+  if (schedule.size() > static_cast<std::size_t>(max_repair_waypoints_)) {
+    schedule.resize(static_cast<std::size_t>(max_repair_waypoints_));
+  }
+
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_waypoint_schedule_ = schedule;
+  latest_waypoint_schedule_received_ = ros::Time::now();
+  has_waypoint_schedule_ = true;
 }
 
 void VelocityQPMPCWaypoint::verificationHoldCallback(
@@ -815,6 +883,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   Eigen::VectorXd q_vis;
   double deadline_abs_s = 0.0;
 
+  bool has_schedule = false;
+  ros::Time schedule_received;
+  std::vector<DeadlineWaypoint> schedule;
+
   bool has_verification_hold = false;
   bool verification_hold = false;
   ros::Time verification_hold_received;
@@ -853,6 +925,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     wp_deadline_received = latest_waypoint_deadline_received_;
     if (has_waypoint_q_) q_vis = latest_waypoint_q_;
     deadline_abs_s = latest_waypoint_deadline_abs_s_;
+
+    has_schedule = has_waypoint_schedule_;
+    schedule_received = latest_waypoint_schedule_received_;
+    schedule = latest_waypoint_schedule_;
 
     has_verification_hold = has_verification_hold_;
     verification_hold = latest_verification_hold_;
@@ -933,12 +1009,21 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
         waypoint_age <= waypoint_timeout_;
   }
 
+  const double schedule_age = has_schedule
+      ? (now - schedule_received).toSec()
+      : std::numeric_limits<double>::infinity();
+  const bool schedule_fresh =
+      multi_deadline_enabled_ && has_schedule && !schedule.empty() &&
+      schedule_age >= 0.0 && schedule_age <= waypoint_timeout_;
+
   const bool recovery_requested = use_external_recovery_trigger_
       ? (has_recovery_trigger && recovery_trigger)
       : (std::isfinite(deadline_remaining) && deadline_remaining <= 0.0);
   const bool recovery_clear_requested = use_external_recovery_clear_
       ? external_recovery_clear_active
       : (has_wp_active && !wp_active);
+  const bool steering_ready =
+      schedule_fresh || (waypoint_data_fresh && wp_active);
 
   bool entered_recovery = false;
   bool completed_recovery = false;
@@ -950,14 +1035,11 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       if (recovery_clear_requested) {
         recovery_active_ = false;
         if (planner_mode_semantics_) {
-          // C4.4 planner semantics: changing candidate objective must not alter
-          // the already committed execution plan or request a new task plan.
           recovery_hold_ = false;
           replan_ready_received_ = false;
           recovery_complete_published_ = false;
           exited_repair_objective = true;
         } else {
-          // Legacy controller semantics kept for frozen C4.2/C4.3 experiments.
           recovery_hold_ = true;
           replan_ready_received_ = false;
           completed_recovery = true;
@@ -967,7 +1049,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
         }
       }
     } else if ((planner_mode_semantics_ || !recovery_hold_) &&
-               !verification_hold_active && waypoint_data_fresh && wp_active &&
+               !verification_hold_active && steering_ready &&
                recovery_requested) {
       recovery_active_ = true;
       recovery_complete_published_ = false;
@@ -980,26 +1062,17 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
   if (entered_recovery) {
     publishRecoveryActive(true);
-    if (planner_mode_semantics_) {
-      ROS_WARN_STREAM("[VelocityQPMPCWaypoint] REPAIR CANDIDATE OBJECTIVE ACTIVE via "
-                      << (use_external_recovery_trigger_ ? "verified-regime trigger" : "deadline")
-                      << "; committed execution trajectory remains owned by the verify/commit layer.");
-    } else {
-      ROS_ERROR_STREAM("[VelocityQPMPCWaypoint] VBC RECOVERY TRIGGERED WHILE UNSAFE via "
-                       << (use_external_recovery_trigger_ ? "predicted-VBC trigger" : "deadline")
-                       << "; nominal task tracking is suspended.");
-    }
+    ROS_WARN_STREAM("[VelocityQPMPCWaypoint] REPAIR CANDIDATE OBJECTIVE ACTIVE via "
+                    << (use_external_recovery_trigger_ ? "verified-regime trigger" : "deadline")
+                    << "; committed execution remains downstream.");
   }
   if (exited_repair_objective) {
     publishRecoveryActive(false);
-    ROS_WARN("[VelocityQPMPCWaypoint] REPAIR CANDIDATE OBJECTIVE CLEARED -> NORMAL candidate objective. No recovery_hold, no recovery_complete/replan_ready handshake, and the current committed trajectory is unchanged.");
+    ROS_WARN("[VelocityQPMPCWaypoint] REPAIR CLEARED -> NORMAL candidate objective; committed execution unchanged.");
   }
   if (completed_recovery) {
     publishRecoveryActive(false);
     publishRecoveryComplete();
-    ROS_WARN_STREAM("[VelocityQPMPCWaypoint] VISIBILITY RECOVERY EPISODE COMPLETE via "
-                    << (use_external_recovery_clear_ ? "global predicted-VBC safe" : "selected target inactive/seen")
-                    << "; holding/decelerating while the original task is replanned from measured q.");
   }
 
   if (!local_recovery_active && !local_recovery_hold &&
@@ -1040,6 +1113,16 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   double waypoint_hessian_inf = 0.0;
   double applied_waypoint_weight = 0.0;
 
+  int repair_obligation_count = 0;
+  int repair_expired_count = 0;
+  int repair_future_count = 0;
+  int repair_earliest_k = -1;
+  double repair_earliest_deadline_remaining =
+      std::numeric_limits<double>::quiet_NaN();
+  double repair_max_pred_error_inf =
+      std::numeric_limits<double>::quiet_NaN();
+  std::vector<int> repair_k;
+
   if (local_recovery_hold) {
     control_mode = "recovery_hold";
     waypoint_status = "recovery_hold";
@@ -1047,35 +1130,86 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     buildRegularizationCycleQP(q_current, gradient, lower, upper);
   } else if (local_recovery_active) {
     control_mode = "recovery";
-    waypoint_status = "recovery";
-    if (!waypoint_data_fresh || !wp_active || q_vis.size() != dof_) {
-      publishSafeStop("recovery waiting for fresh active steering q_vis");
-      return;
-    }
-
     hessian = H_regularization_;
     buildRegularizationCycleQP(q_current, gradient, lower, upper);
-
-    waypoint_k = num_intervals_;
-    waypoint_grid_time = horizon_duration_;
     applied_waypoint_weight = waypoint_weight_ * recovery_weight_scale_;
-    const Eigen::VectorXd waypoint_offset = q_current - q_vis;
-    const Eigen::MatrixXd H_wp =
-        2.0 * applied_waypoint_weight *
-        S_terminal_.transpose() * S_terminal_;
-    const Eigen::VectorXd g_wp =
-        2.0 * applied_waypoint_weight *
-        S_terminal_.transpose() * waypoint_offset;
-    if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
-      publishSafeStop("invalid recovery visibility cost");
-      return;
+
+    if (multi_deadline_enabled_) {
+      if (!schedule_fresh) {
+        publishSafeStop("recovery waiting for fresh non-empty multi-deadline schedule");
+        return;
+      }
+      waypoint_status = "multi_deadline_repair";
+      repair_obligation_count = static_cast<int>(schedule.size());
+      repair_k.reserve(schedule.size());
+      for (std::size_t r = 0; r < schedule.size(); ++r) {
+        const DeadlineWaypoint& ob = schedule[r];
+        const double remaining = ob.deadline_abs_s - now.toSec();
+        int k = num_intervals_;
+        if (remaining <= dt_) {
+          k = 1;
+          ++repair_expired_count;
+        } else if (remaining > horizon_duration_ + waypoint_horizon_slack_) {
+          k = num_intervals_;
+          ++repair_future_count;
+        } else {
+          k = static_cast<int>(std::floor(remaining / dt_ + 1e-9));
+          k = std::max(1, std::min(num_intervals_, k));
+        }
+        repair_k.push_back(k);
+        if (r == 0) {
+          repair_earliest_k = k;
+          repair_earliest_deadline_remaining = remaining;
+          waypoint_k = k;
+          waypoint_grid_time = k * dt_;
+          q_vis = ob.q;
+          deadline_remaining = remaining;
+        }
+
+        const Eigen::MatrixXd S_k =
+            S_.block((k - 1) * dof_, 0, dof_, n_u_);
+        const Eigen::VectorXd offset = q_current - ob.q;
+        const Eigen::MatrixXd H_wp =
+            2.0 * applied_waypoint_weight * S_k.transpose() * S_k;
+        const Eigen::VectorXd g_wp =
+            2.0 * applied_waypoint_weight * S_k.transpose() * offset;
+        if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
+          publishSafeStop("invalid multi-deadline recovery visibility cost");
+          return;
+        }
+        hessian += H_wp;
+        gradient += g_wp;
+        waypoint_linear_inf = std::max(
+            waypoint_linear_inf, g_wp.lpNorm<Eigen::Infinity>());
+        waypoint_hessian_inf = std::max(
+            waypoint_hessian_inf, H_wp.lpNorm<Eigen::Infinity>());
+      }
+    } else {
+      waypoint_status = "recovery";
+      if (!waypoint_data_fresh || !wp_active || q_vis.size() != dof_) {
+        publishSafeStop("recovery waiting for fresh active steering q_vis");
+        return;
+      }
+      waypoint_k = num_intervals_;
+      waypoint_grid_time = horizon_duration_;
+      const Eigen::VectorXd waypoint_offset = q_current - q_vis;
+      const Eigen::MatrixXd H_wp =
+          2.0 * applied_waypoint_weight *
+          S_terminal_.transpose() * S_terminal_;
+      const Eigen::VectorXd g_wp =
+          2.0 * applied_waypoint_weight *
+          S_terminal_.transpose() * waypoint_offset;
+      if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
+        publishSafeStop("invalid recovery visibility cost");
+        return;
+      }
+      hessian += H_wp;
+      gradient += g_wp;
+      waypoint_linear_inf = g_wp.lpNorm<Eigen::Infinity>();
+      waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
+      waypoint_nominal_error_inf =
+          (q_ref.col(num_intervals_) - q_vis).lpNorm<Eigen::Infinity>();
     }
-    hessian += H_wp;
-    gradient += g_wp;
-    waypoint_linear_inf = g_wp.lpNorm<Eigen::Infinity>();
-    waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
-    waypoint_nominal_error_inf =
-        (q_ref.col(num_intervals_) - q_vis).lpNorm<Eigen::Infinity>();
   } else if (verification_hold_active) {
     control_mode = "verification_hold";
     waypoint_status = "verification_hold";
@@ -1157,8 +1291,18 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   publishPrediction(q_pred, solution,
                     reference_fresh ? reference.header.frame_id : std::string("base_link"));
 
-  if (waypoint_k >= 1 && q_vis.size() == dof_ &&
-      (waypoint_status == "used" || waypoint_status == "recovery")) {
+  if (waypoint_status == "multi_deadline_repair") {
+    double max_error = 0.0;
+    for (std::size_t r = 0; r < schedule.size() && r < repair_k.size(); ++r) {
+      const int k = repair_k[r];
+      max_error = std::max(
+          max_error,
+          (q_pred.col(k) - schedule[r].q).lpNorm<Eigen::Infinity>());
+    }
+    repair_max_pred_error_inf = max_error;
+    waypoint_pred_error_inf = max_error;
+  } else if (waypoint_k >= 1 && q_vis.size() == dof_ &&
+             (waypoint_status == "used" || waypoint_status == "recovery")) {
     waypoint_pred_error_inf =
         (q_pred.col(waypoint_k) - q_vis).lpNorm<Eigen::Infinity>();
   }
@@ -1209,6 +1353,16 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << " waypoint_pred_error_inf=" << waypoint_pred_error_inf
       << " waypoint_linear_inf=" << waypoint_linear_inf
       << " waypoint_hessian_inf=" << waypoint_hessian_inf
+      << " multi_deadline_enabled=" << static_cast<int>(multi_deadline_enabled_)
+      << " schedule_fresh=" << static_cast<int>(schedule_fresh)
+      << " schedule_age=" << schedule_age
+      << " repair_obligation_count=" << repair_obligation_count
+      << " repair_expired_count=" << repair_expired_count
+      << " repair_future_count=" << repair_future_count
+      << " repair_earliest_k=" << repair_earliest_k
+      << " repair_earliest_deadline_remaining="
+      << repair_earliest_deadline_remaining
+      << " repair_max_pred_error_inf=" << repair_max_pred_error_inf
       << " base_grad_inf=" << base_gradient_inf
       << " ref_horizon="
       << (reference_fresh && !reference.points.empty()
