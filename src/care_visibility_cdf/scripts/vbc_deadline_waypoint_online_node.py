@@ -2,10 +2,9 @@
 """Online CAREPlanner visibility waypoint generator.
 
 Modes:
-  visibility_acquisition (C4.7)
+  visibility_acquisition (C4.7/C4.8)
       REPAIR abandons nominal deadlines. Persist learned visibility goals until
-      the real confidence map confirms they were seen. Safe repair candidates may
-      be committed/executed without forcing an immediate NORMAL probe.
+      the real confidence map confirms they were seen.
 
   accumulated_multi_deadline (C4.6 baseline)
       Accumulate spatial visibility obligations across rejected candidates,
@@ -17,7 +16,9 @@ Modes:
   shared_persistent (C4.4 baseline)
       Union remembered regions and solve for one shared q_vis.
 
-All modes keep exact candidate VBC downstream as the hard commit authority.
+The optional C4.8 ``repair_prefix_verification_enabled`` switch configures the
+verify/commit node before launch so only REPAIR uses short prefix+braking VBC
+views. NORMAL candidates continue to receive full-horizon VBC verification.
 """
 
 import time
@@ -218,9 +219,33 @@ def _configure_runtime_mode(mode: str) -> None:
         manager_prefix + "/repair_completion_topic",
         "/care_planner/active_sensing/visibility_acquisition_complete")
 
+    # C4.8 is orthogonal to the q_vis generation mode. It shortens only the
+    # verification/commit view during REPAIR; default false preserves C4.7.
+    repair_prefix_enabled = bool(rospy.get_param(
+        "~repair_prefix_verification_enabled", False))
+    repair_prefix_s = float(rospy.get_param("~repair_execution_prefix_s", 0.15))
+    repair_brake_dt_s = float(rospy.get_param("~repair_brake_dt_s", 0.05))
+    repair_hold_s = float(rospy.get_param("~repair_hold_s", 0.10))
+    continuity_prefix = "/optimized_trajectory_continuity"
+    rospy.set_param(
+        continuity_prefix + "/repair_prefix_verification_enabled",
+        repair_prefix_enabled)
+    rospy.set_param(
+        continuity_prefix + "/repair_execution_prefix_s", repair_prefix_s)
+    rospy.set_param(
+        continuity_prefix + "/repair_brake_dt_s", repair_brake_dt_s)
+    rospy.set_param(
+        continuity_prefix + "/repair_hold_s", repair_hold_s)
+    rospy.set_param(
+        continuity_prefix + "/repair_active_topic",
+        "/care_planner/execution/predicted_vbc_recovery_triggered")
+
     rospy.logwarn(
-        "[vbc_waypoint_online] preconfigured runtime: multi_deadline=%d repair_completion_gate=%d",
-        int(multi), int(acquisition))
+        "[vbc_waypoint_online] preconfigured runtime: multi_deadline=%d "
+        "repair_completion_gate=%d repair_prefix_verify=%d prefix=%.3fs "
+        "brake_dt=%.3fs hold=%.3fs",
+        int(multi), int(acquisition), int(repair_prefix_enabled),
+        repair_prefix_s, repair_brake_dt_s, repair_hold_s)
 
 
 def main():
@@ -240,7 +265,7 @@ def main():
 
     if mode == "visibility_acquisition":
         rospy.logwarn(
-            "[vbc_waypoint_online] C4.7 region_schedule_mode=visibility_acquisition")
+            "[vbc_waypoint_online] C4.7/C4.8 region_schedule_mode=visibility_acquisition")
         OnlineVisibilityAcquisitionWaypointNode()
     elif mode == "accumulated_multi_deadline":
         rospy.logwarn(
