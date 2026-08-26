@@ -17,6 +17,7 @@ All modes keep exact candidate VBC downstream as the hard commit authority.
 
 import time
 
+import numpy as np
 import rospy
 import torch
 
@@ -96,19 +97,114 @@ class OnlineDeadlineSequentialWaypointNode(
 
 class OnlineAccumulatedMultiDeadlineWaypointNode(
         _OnlineRuntimeMixin, AccumulatedMultiDeadlineWaypointNode):
+    """Runtime-safe wrapper around the C4.6 obligation implementation.
+
+    RollingVbcDeadlineWaypointNode creates its timer inside the parent
+    constructor.  ROS can therefore call virtual timer methods before the C4.6
+    publishers/subscribers are fully initialized.  The ready guard prevents that
+    startup race.  We also retry an active-set update until sweep/trajectory and
+    measured q are all available, instead of consuming the serial too early.
+    """
+
     def __init__(self):
+        self._c46_ready = False
         super().__init__()
+        self._c46_ready = True
+        self._publish_schedule()
         self._run_model_warmup()
+
+    def _process_new_active_set(self) -> None:
+        if not self._c46_ready:
+            return
+
+        with self._obligation_lock:
+            serial = self._raw_active_set_serial
+            if serial == self._processed_active_set_serial:
+                return
+            raw = self._raw_active_set.copy()
+
+        # Empty active set from one hypothetical candidate is a valid processed
+        # update but does NOT clear accumulated obligations. Exact predicted SAFE
+        # is the only clear condition.
+        if raw.shape[0] == 0:
+            with self._obligation_lock:
+                self._processed_active_set_serial = max(
+                    self._processed_active_set_serial, serial)
+            return
+
+        with self._lock:
+            sweep = self._sweep_time_s
+            trajectory, trajectory_received, trajectory_source = (
+                self._preferred_trajectory_locked())
+        if (sweep is None or trajectory is None or
+                self._latest_measured_q is None):
+            # Do not consume this update. The 50 Hz timer retries it once all
+            # synchronized inputs arrive.
+            return
+
+        regions = self._cluster_regions(raw)
+        all_regions_handled = True
+        for region in regions:
+            with self._obligation_lock:
+                matched = self._match_existing(region)
+                if matched is not None:
+                    matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
+                    matched["points"] = np.asarray(
+                        region["points"], dtype=np.float64).copy()
+                    matched["keys"] = tuple(region["keys"])
+                    matched["centroid"] = np.asarray(
+                        region["centroid"], dtype=np.float64).copy()
+                    self._schedule_matched_obligations += 1
+                    continue
+                if len(self._obligations) >= self.max_obligations:
+                    rospy.logerr_throttle(
+                        1.0,
+                        "[vbc_multi_deadline] max_obligations=%d reached; refusing new region",
+                        self.max_obligations)
+                    continue
+
+            try:
+                new_ob = self._generate_new_obligation(
+                    region, trajectory, float(sweep), trajectory_received,
+                    trajectory_source)
+            except Exception as exc:
+                self._schedule_generation_failures += 1
+                all_regions_handled = False
+                rospy.logerr(
+                    "[vbc_multi_deadline] obligation generation failed; will retry active set: %s",
+                    exc)
+                continue
+
+            with self._obligation_lock:
+                matched = self._match_existing(region)
+                if (matched is None and
+                        len(self._obligations) < self.max_obligations):
+                    self._obligations.append(new_ob)
+                    self._schedule_new_obligations += 1
+
+        if all_regions_handled:
+            with self._obligation_lock:
+                # A newer callback may have arrived during learned projection.
+                # Mark only the snapshot serial processed; the newer serial will
+                # remain pending for the next timer tick.
+                self._processed_active_set_serial = max(
+                    self._processed_active_set_serial, serial)
+        self._publish_schedule()
+
+    def _maybe_generate(self) -> None:
+        if not self._c46_ready:
+            return
+        self._process_new_active_set()
+        self._publish_schedule()
+
+    def _publish_state(self) -> None:
+        if not self._c46_ready:
+            return
+        AccumulatedMultiDeadlineWaypointNode._publish_state(self)
 
 
 def _configure_mpc_mode(mode: str) -> None:
-    """Set MPC private params before the planner launch starts the C++ node.
-
-    The smoke runner starts this Python process first and waits for ONLINE WARMUP
-    READY before launching phaseC4_4_verified_regime_planner.launch, so these
-    parameters are already present when the MPC reads its private namespace.
-    This keeps the old launch file reusable for C4.4/C4.5 baselines.
-    """
+    """Set MPC private params before the planner launches the C++ node."""
     prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
     multi = mode == "accumulated_multi_deadline"
     rospy.set_param(prefix + "/multi_deadline_enabled", bool(multi))
