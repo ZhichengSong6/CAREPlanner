@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""C4.4 verified planner regime manager.
+"""Verified CAREPlanner candidate/execution regime manager.
 
-Separates planner-candidate safety from committed-execution safety and owns the
-NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL state machine.
+C4.4 baseline semantics:
+    NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL
+and a safe committed REPAIR candidate immediately enters PROBE_NORMAL.
 
-Candidate-side transitions are driven only by unique verification-outcome events
-emitted by ``optimized_trajectory_continuity_node``. Repeated 20 Hz selector
-summaries for the same cached candidate therefore cannot create fake consecutive
-unsafe candidates.
+C4.7 optional visibility-acquisition gate:
+    a safe REPAIR candidate is only permission to execute the active-sensing
+    detour.  It does NOT prove that the visibility objective has been acquired.
+    While the gate is enabled, safe repair candidates may keep committing and the
+    planner stays in REPAIR.  PROBE_NORMAL is entered only after the real
+    confidence/visibility layer reports acquisition_complete=True after first
+    publishing False in the current REPAIR episode.
 
-Execution VBC remains a continuous audit of the trajectory actually published to
-the low-level tracker. Bootstrap/fallback selector summaries are ignored: an
-execution-safety event can only be formed after a committed trajectory exists and
-the execution selector reports ``trajectory_source=predicted``.
+Candidate safety and committed-execution safety remain separate. Candidate-side
+transitions consume unique verification outcome events; execution VBC continuously
+audits only committed trajectories.
 """
 
 import math
@@ -66,6 +69,12 @@ class C44VerifiedRegimeManager:
         self.clear_pulse_s = float(rospy.get_param("~clear_pulse_s", 0.12))
         self.probe_ignore_s = float(rospy.get_param("~probe_ignore_s", 0.16))
 
+        self.repair_completion_gate_enabled = bool(rospy.get_param(
+            "~repair_completion_gate_enabled", False))
+        self.repair_completion_topic = str(rospy.get_param(
+            "~repair_completion_topic",
+            "/care_planner/active_sensing/visibility_acquisition_complete"))
+
         if self.rate <= 0.0:
             raise ValueError("~rate must be positive")
         if self.candidate_unsafe_required < 1 or self.execution_unsafe_required < 1:
@@ -91,7 +100,8 @@ class C44VerifiedRegimeManager:
             "~effective_deadline_topic",
             "/care_planner/active_sensing/visibility_waypoint_deadline_effective"))
         self.trigger_topic = str(rospy.get_param(
-            "~trigger_topic", "/care_planner/execution/predicted_vbc_recovery_triggered"))
+            "~trigger_topic",
+            "/care_planner/execution/predicted_vbc_recovery_triggered"))
         self.clear_topic = str(rospy.get_param(
             "~clear_topic", "/care_planner/execution/predicted_vbc_recovery_clear"))
         self.verification_hold_topic = str(rospy.get_param(
@@ -125,6 +135,7 @@ class C44VerifiedRegimeManager:
         self.last_commit_count = 0
         self.last_commit_event_time = None
         self.probe_safe_commit_streak = 0
+        self.repair_safe_commit_count = 0
 
         self.repair_entry_count = 0
         self.probe_entry_count = 0
@@ -132,6 +143,14 @@ class C44VerifiedRegimeManager:
         self.probe_failure_count = 0
         self.candidate_repair_entry_count = 0
         self.execution_repair_entry_count = 0
+
+        # C4.7: a stale latched True from a previous acquisition episode must not
+        # immediately clear a newly-entered REPAIR.  Each episode arms only after
+        # observing completion=False, then accepts a later False->True.
+        self.repair_completion = False
+        self.repair_completion_armed = False
+        self.repair_completion_time = None
+        self.repair_completion_event_count = 0
 
         self.clear_until = None
         self.probe_ignore_until = None
@@ -164,6 +183,10 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.physical_deadline_topic, Float64, self._deadline_cb,
             queue_size=1)
+        if self.repair_completion_gate_enabled:
+            rospy.Subscriber(
+                self.repair_completion_topic, Bool,
+                self._repair_completion_cb, queue_size=1)
 
         self.trigger_pub.publish(Bool(data=False))
         self.clear_pub.publish(Bool(data=False))
@@ -172,10 +195,12 @@ class C44VerifiedRegimeManager:
         self._publish_summary()
 
         rospy.logwarn(
-            "[c4_4_regime] UNIQUE-EVENT NORMAL->REPAIR->PROBE_NORMAL->NORMAL; "
-            "candidate_outcome=%s execution=%s probe_safe_commits=%d",
+            "[c4_regime] NORMAL->REPAIR->PROBE_NORMAL->NORMAL; candidate=%s "
+            "execution=%s probe_safe_commits=%d completion_gate=%d completion_topic=%s",
             self.candidate_outcome_topic, self.execution_summary_topic,
-            self.probe_safe_commits_required)
+            self.probe_safe_commits_required,
+            int(self.repair_completion_gate_enabled),
+            self.repair_completion_topic)
 
     def _transition_locked(self, new_state, reason, now):
         if new_state == self.state:
@@ -190,6 +215,8 @@ class C44VerifiedRegimeManager:
             self.probe_safe_commit_streak = 0
             self.clear_until = None
             self.probe_ignore_until = None
+            self.repair_completion = False
+            self.repair_completion_armed = False
             if reason.startswith("execution_"):
                 self.execution_repair_entry_count += 1
             else:
@@ -206,7 +233,7 @@ class C44VerifiedRegimeManager:
             self.probe_ignore_until = None
 
         rospy.logwarn(
-            "[c4_4_regime] %s -> %s reason=%s repair_entries=%d probe_entries=%d",
+            "[c4_regime] %s -> %s reason=%s repair_entries=%d probe_entries=%d",
             old, new_state, reason, self.repair_entry_count, self.probe_entry_count)
 
     def _execution_ready_cb(self, msg):
@@ -221,6 +248,8 @@ class C44VerifiedRegimeManager:
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
                 self.probe_safe_commit_streak = 0
+                self.repair_completion = False
+                self.repair_completion_armed = False
                 self.clear_until = None
                 self.probe_ignore_until = None
                 self.last_transition_reason = "execution_not_ready"
@@ -238,6 +267,24 @@ class C44VerifiedRegimeManager:
     def _committed_trajectory_cb(self, _msg):
         with self._lock:
             self.last_committed_trajectory_time = rospy.Time.now()
+
+    def _repair_completion_cb(self, msg):
+        if msg is None or not self.repair_completion_gate_enabled:
+            return
+        value = bool(msg.data)
+        now = rospy.Time.now()
+        with self._lock:
+            self.repair_completion = value
+            self.repair_completion_time = now
+            if self.state != self.REPAIR or not self.execution_ready:
+                return
+            if not value:
+                self.repair_completion_armed = True
+                return
+            if value and self.repair_completion_armed:
+                self.repair_completion_event_count += 1
+                self._transition_locked(
+                    self.PROBE_NORMAL, "actual_visibility_acquisition_complete", now)
 
     def _candidate_outcome_cb(self, msg):
         if msg is None:
@@ -283,9 +330,16 @@ class C44VerifiedRegimeManager:
             if self.state == self.REPAIR:
                 if result == "safe" and committed is True:
                     self.last_commit_count += 1
+                    self.repair_safe_commit_count += 1
                     self.last_commit_event_time = now
-                    self._transition_locked(
-                        self.PROBE_NORMAL, "safe_repair_commit", now)
+                    if self.repair_completion_gate_enabled:
+                        # C4.7: executing a VBC-safe detour is progress toward
+                        # seeing. Stay in REPAIR until real confidence confirms it.
+                        self.last_transition_reason = (
+                            "safe_repair_commit_continue_visibility_acquisition")
+                    else:
+                        self._transition_locked(
+                            self.PROBE_NORMAL, "safe_repair_commit", now)
                 return
 
             if self.state == self.PROBE_NORMAL:
@@ -308,9 +362,6 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
-        # The execution selector has a bootstrap fallback. It is not an
-        # execution audit until an actual committed plan exists and the selector
-        # is using that predicted/committed stream.
         if f.get("trajectory_source") != "predicted":
             return
         unsafe = _as_bool(f.get("has_violation"))
@@ -338,7 +389,8 @@ class C44VerifiedRegimeManager:
                     self._transition_locked(
                         self.REPAIR, "execution_committed_unsafe", now)
 
-    def _fresh_locked(self, stamp, now, timeout):
+    @staticmethod
+    def _fresh(stamp, now, timeout):
         if stamp is None:
             return False
         age = (now - stamp).to_sec()
@@ -352,17 +404,14 @@ class C44VerifiedRegimeManager:
                 self.execution_ready and self.state == self.PROBE_NORMAL and
                 self.clear_until is not None and now <= self.clear_until)
 
-            exec_summary_fresh = self._fresh_locked(
+            exec_summary_fresh = self._fresh(
                 self.execution_summary_time, now, self.input_timeout)
-            committed_fresh = self._fresh_locked(
+            committed_fresh = self._fresh(
                 self.last_committed_trajectory_time, now,
                 self.committed_trajectory_timeout)
             startup_grace = (
                 self.execution_ready_time is not None and
                 (now - self.execution_ready_time).to_sec() < self.input_timeout)
-            # Before the first safe commit, there is no execution trajectory to
-            # audit. Candidate verification, not execution freshness, owns that
-            # startup phase.
             has_committed = self.last_committed_trajectory_time is not None
             hold = bool(
                 self.execution_ready and has_committed and not startup_grace and
@@ -410,9 +459,22 @@ class C44VerifiedRegimeManager:
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
                 "normal_entry_count={}".format(self.normal_entry_count),
                 "commit_count={}".format(self.last_commit_count),
-                "candidate_outcome_age_s={:.6f}".format(age(self.candidate_outcome_time)),
-                "execution_summary_age_s={:.6f}".format(age(self.execution_summary_time)),
-                "committed_trajectory_age_s={:.6f}".format(age(self.last_committed_trajectory_time)),
+                "repair_safe_commit_count={}".format(self.repair_safe_commit_count),
+                "repair_completion_gate_enabled={}".format(
+                    int(self.repair_completion_gate_enabled)),
+                "repair_completion={}".format(int(self.repair_completion)),
+                "repair_completion_armed={}".format(
+                    int(self.repair_completion_armed)),
+                "repair_completion_event_count={}".format(
+                    self.repair_completion_event_count),
+                "candidate_outcome_age_s={:.6f}".format(
+                    age(self.candidate_outcome_time)),
+                "execution_summary_age_s={:.6f}".format(
+                    age(self.execution_summary_time)),
+                "committed_trajectory_age_s={:.6f}".format(
+                    age(self.last_committed_trajectory_time)),
+                "repair_completion_age_s={:.6f}".format(
+                    age(self.repair_completion_time)),
             ])
         self.summary_pub.publish(msg)
 
