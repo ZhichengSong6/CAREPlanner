@@ -19,6 +19,7 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(Eigen3 REQUIRED)
+find_package(Threads REQUIRED)
 
 set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
@@ -143,6 +144,7 @@ target_compile_definitions(velocity_qp_mpc_waypoint_node PRIVATE
 )
 target_link_libraries(velocity_qp_mpc_waypoint_node
   ${catkin_LIBRARIES}
+  ${CMAKE_THREAD_LIBS_INIT}
 )
 
 # One-shot C4.4 diagnostic: freeze the first actual REPAIR snapshot and solve
