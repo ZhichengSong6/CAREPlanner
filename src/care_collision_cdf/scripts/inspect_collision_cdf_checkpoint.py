@@ -10,7 +10,7 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-from collision_cdf_model import MLPRegression, extract_state_dict
+from collision_cdf_model import MLPRegression, extract_state_dict, infer_mlp_architecture
 
 
 def main():
@@ -39,11 +39,23 @@ def main():
     print("state tensors:", len(state))
     print("first tensor keys:", list(state.keys())[:10])
 
+    print("all parameter shapes:")
+    for key, value in state.items():
+        print(" ", key, tuple(value.shape))
+
+    arch = infer_mlp_architecture(state, raw_input_dims=10)
+    print("inferred raw input dims:", arch["input_dims"])
+    print("inferred encoded input dims:", arch["encoded_input_dims"])
+    print("inferred hidden layers:", arch["hidden_layers"])
+    print("inferred output dims:", arch["output_dims"])
+    print("inferred nerf:", arch["nerf"])
+    print("linear dims:", arch["linear_dims"])
+
     model = MLPRegression(
-        input_dims=10,
-        output_dims=1,
-        mlp_layers=[1024, 512, 256, 128, 128],
-        nerf=True,
+        input_dims=arch["input_dims"],
+        output_dims=arch["output_dims"],
+        mlp_layers=arch["hidden_layers"],
+        nerf=arch["nerf"],
     )
     model.load_state_dict(state, strict=True)
     print("architecture load: OK")
