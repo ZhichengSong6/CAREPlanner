@@ -178,28 +178,1313 @@ for _ in $(seq 1 400); do
   BASE_READY=0
   CDF_READY=1
 
-  if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$' && \
-     echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
-     echo "${NODES}" | grep -q '^/joint_velocity_rate_limiter$' && \
-     echo "${NODES}" | grep -q '^/optimized_trajectory_continuity$' && \
-     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$' && \
-     echo "${NODES}" | grep -q '^/execution_vbc_audit/trajectory_vbc_selector_node$' && \
-     echo "${NODES}" | grep -q '^/c4_4_verified_regime_manager$' && \
-     echo "${NODES}" | grep -q '^/phase_b2_controlled_trial$' && \
-     echo "${NODES}" | grep -q '^/vbc_execution_reference_gate$'; then
+  if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/trajectory_execution_manager_node
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/joint_velocity_rate_limiter
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/optimized_trajectory_continuity
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/execution_vbc_audit/trajectory_vbc_selector_node
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/c4_4_verified_regime_manager
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/phase_b2_controlled_trial
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+ && \
+     echo "${NODES}" | grep -q '^/vbc_execution_reference_gate
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+; then
     BASE_READY=1
   fi
 
-  if [ "${CDF_SELECTOR_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/c5_3a_cpp_forbidden_voxel_gpu_shadow$'; then
-      CDF_READY=0
-    fi
+  if [ "${CDF_SELECTOR_ENABLED}" = "true" ] && \
+     ! echo "${NODES}" | grep -q '^/c5_3a_cpp_forbidden_voxel_gpu_shadow
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+; then
+    CDF_READY=0
   fi
 
-  if [ "${CDF_SHADOW_VBC_AUDIT_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/cdf_shadow_vbc/trajectory_vbc_selector_node$'; then
-      CDF_READY=0
-    fi
+  if [ "${CDF_SHADOW_VBC_AUDIT_ENABLED}" = "true" ] && \
+     ! echo "${NODES}" | grep -q '^/cdf_shadow_vbc/trajectory_vbc_selector_node
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+RELEASED=0
+for _ in $(seq 1 400); do
+  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+  sleep 0.05
+done
+if [ "${RELEASED}" != "1" ]; then
+  echo "[ERROR] initial gate release timeout"
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+echo "[ARCH] candidate verifier != committed execution auditor"
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
+sleep "${RUN_SECONDS}"
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+; then
+    CDF_READY=0
   fi
 
   if [ "${BASE_READY}" = "1" ] && [ "${CDF_READY}" = "1" ]; then
@@ -214,1388 +1499,6 @@ if [ "${READY}" != "1" ]; then
   echo "[ERROR] C4.4/C5.3a required nodes did not all start"
   echo "[DEBUG] CDF_SELECTOR_ENABLED=${CDF_SELECTOR_ENABLED}"
   echo "[DEBUG] CDF_SHADOW_VBC_AUDIT_ENABLED=${CDF_SHADOW_VBC_AUDIT_ENABLED}"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/trajectory_execution_manager_nodeif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/joint_velocity_rate_limiterif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/optimized_trajectory_continuityif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_nodeif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/execution_vbc_audit/trajectory_vbc_selector_nodeif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/c4_4_verified_regime_managerif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/phase_b2_controlled_trialif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
- && \
-     echo "${NODES}" | grep -q '^/vbc_execution_reference_gateif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
-; then
-    BASE_READY=1
-  fi
-
-  if [ "${CDF_SELECTOR_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/c5_3a_cpp_forbidden_voxel_gpu_shadowif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
-; then
-      CDF_READY=0
-    fi
-  fi
-  if [ "${CDF_SHADOW_VBC_AUDIT_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/cdf_shadow_vbc/trajectory_vbc_selector_nodeif [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
-  rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
-  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
-  exit 1
-fi
-
-record_topic() {
-  local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
-  REC_PIDS+=("$!")
-}
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
-
-RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
-  tail -n 260 "${LOG}/controlled.log" || true
-  exit 1
-fi
-
-echo "[ARCH] candidate verifier != committed execution auditor"
-echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
-
-kill_group "${CONTROL_PID}"; CONTROL_PID=""
-kill_group "${GEN_PID}"; GEN_PID=""
-kill_group "${TRACKER_PID}"; TRACKER_PID=""
-sleep 0.2
-for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
-REC_PIDS=()
-
-python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
-import csv,json,math,os,re,statistics,sys
-cid,out,mode=sys.argv[1:]
-TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
-def recs(name):
- p=os.path.join(out,name); a=[]
- if not os.path.isfile(p): return a
- with open(p,newline='',errors='replace') as f:
-  rd=csv.reader(f); h=next(rd,[])
-  if not h:return a
-  ti=h.index('%time') if '%time' in h else 0
-  di=h.index('field.data') if 'field.data' in h else 1
-  for r in rd:
-   if len(r)<=di:continue
-   d=dict(TOK.findall(','.join(r[di:])))
-   try:d['_t']=float(r[ti])/1e9
-   except:d['_t']=math.nan
-   if d:a.append(d)
- return a
-def f(x):
- try:return float(str(x).replace('ms',''))
- except:return math.nan
-reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
-lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
-sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
-repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
-payload={
- 'case_id':cid,
- 'region_schedule_mode':mode,
- 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
- 'candidate_vbc_records':len(cand),
- 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
- 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
- 'execution_vbc_records':len(exe),
- 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
- 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
- 'final_regime_state':lastr.get('state') if lastr else None,
- 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
- 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
- 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
- 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
- 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
- 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
- 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
- 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
- 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
- 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
- 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
- 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
- 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
- 'mpc_solve_ms_max':max(sol) if sol else None,
- 'multi_deadline_repair_cycles':len(repair_multi),
- 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
- 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
- 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
-}
-json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
-print(json.dumps(payload,indent=2))
-PY
-
-echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
-echo "[REGIME]    ${OUT}/regime_summary.csv"
-echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
-echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
-echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
-; then
-      CDF_READY=0
-    fi
-  fi
-
-  if [ "${BASE_READY}" = "1" ] && [ "${CDF_READY}" = "1" ]; then
-    READY=1
-    break
-  fi
-  sleep 0.1
-done
-if [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4 nodes did not all start"
   rosnode list 2>/dev/null || true
   tail -n 260 "${LOG}/controlled.log" || true
   exit 1
