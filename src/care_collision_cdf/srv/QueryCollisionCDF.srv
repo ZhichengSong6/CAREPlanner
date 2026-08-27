@@ -1,0 +1,22 @@
+# Batch query for a shared forbidden workspace point set.
+#
+# points: forbidden workspace points p_j in base_link coordinates.
+# q_flat: num_q consecutive 7-DoF configurations:
+#   [q0_0,...,q0_6, q1_0,...,q1_6, ...]
+#
+# For each q_i the server evaluates
+#   d_i = min_j f_cdf(p_j, q_i)
+# and returns grad_i = d d_i / d q_i.
+#
+# This is the exact information needed to linearize the scene-level CDF
+# constraint inside the receding-horizon QP.
+geometry_msgs/Point[] points
+float64[] q_flat
+int32 num_q
+---
+bool success
+string message
+float64[] min_distance
+float64[] min_gradient_flat
+int32[] argmin_point_index
+float64 inference_ms
