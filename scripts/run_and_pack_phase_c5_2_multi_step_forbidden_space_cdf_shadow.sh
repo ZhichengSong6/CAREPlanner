@@ -154,10 +154,11 @@ sleep 0.25
 cleanup_extra
 trap - EXIT INT TERM
 
-python3 - "${SHADOW_JSONL}" "${SUMMARY_JSON}" "${CONFIDENCE_THRESHOLD}" <<'PY'
+python3 - "${SHADOW_JSONL}" "${SUMMARY_JSON}" "${CONFIDENCE_THRESHOLD}" "${SIGNED_ZERO_BAND}" <<'PY'
 import json, math, os, statistics, sys
-src, dst, confidence_threshold = sys.argv[1:4]
+src, dst, confidence_threshold, signed_zero_band = sys.argv[1:5]
 confidence_threshold = float(confidence_threshold)
+signed_zero_band = float(signed_zero_band)
 records=[]
 if os.path.isfile(src):
     with open(src, errors="replace") as f:
@@ -257,7 +258,7 @@ summary={
     "service_roundtrip_ms":stats(rtt),
     "record_min_distance":stats(dmins),
     "record_p05_distance":stats(dp05),
-    "signed_zero_band":float("${SIGNED_ZERO_BAND}"),
+    "signed_zero_band":signed_zero_band,
     "record_negative_rate":stats(signed_negative_rates),
     "record_near_zero_rate":stats(signed_near_zero_rates),
     "record_positive_rate":stats(signed_positive_rates),
