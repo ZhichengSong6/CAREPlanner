@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_geometry_msgs
   arm_model
   arm_trajectory
+  care_collision_cdf
 )
 
 find_package(Eigen3 REQUIRED)
@@ -40,6 +41,7 @@ catkin_package(
     tf2_geometry_msgs
     arm_model
     arm_trajectory
+    care_collision_cdf
   DEPENDS EIGEN3
 )
 
