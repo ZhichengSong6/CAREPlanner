@@ -43,6 +43,11 @@ ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_3a_cdf_shadow_${CASE_ID}.zip}"
 
 cd "${REPO}"
 
+echo "[C5.3a] shell syntax preflight..."
+bash -n scripts/run_and_pack_phase_c5_3a_cdf_shadow_piqp.sh
+bash -n scripts/run_and_pack_phase_c4_9_blocker_aware_repair.sh
+bash -n scripts/run_phase_c4_4_verified_regime_smoke.sh
+
 echo "[C5.3a] branch: $(git branch --show-current)"
 echo "[C5.3a] head:   $(git rev-parse HEAD)"
 echo "[C5.3a] case:   ${CASE_ID}"
