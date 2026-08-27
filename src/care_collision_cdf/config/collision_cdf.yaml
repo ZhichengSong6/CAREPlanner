@@ -3,7 +3,8 @@ collision_cdf:
   # configuration-space distance units (radians / joint-space norm).
   input_dims: 10
   output_dims: 1
-  hidden_layers: [1024, 512, 256, 128, 128]
+  # Runtime reconstructs the exact no-skip Yiming MLP widths and NeRF flag
+  # directly from checkpoint tensor shapes. These fields document the raw I/O.
   nerf: true
 
   # "latest" selects the largest numeric iteration key for the original
@@ -11,7 +12,7 @@ collision_cdf:
   # state_dict/model_state_dict wrapped checkpoints.
   checkpoint_key: "latest"
 
-  device: "cuda"
+  device: "cpu"
   service_name: "/care_planner/collision_cdf/query"
 
   # Guard against accidentally sending the complete dense confidence grid.
