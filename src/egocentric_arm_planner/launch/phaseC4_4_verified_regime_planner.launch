@@ -46,6 +46,18 @@
        default="/care_planner/trajectory_risk/body_sweep_anchors" />
   <arg name="forbidden_space_confidence_threshold" default="0.50" />
 
+  <!-- C5.3a constrained-QP shadow. Defaults preserve all frozen C4.x runs. -->
+  <arg name="cdf_shadow_enabled" default="false" />
+  <arg name="cdf_shadow_safety_margin" default="0.0" />
+  <arg name="cdf_shadow_constraint_horizon_steps" default="20" />
+  <arg name="cdf_shadow_snapshot_timeout" default="0.75" />
+  <arg name="cdf_shadow_constraint_batch_topic"
+       default="/care_planner/collision_cdf/constraint_batch" />
+  <arg name="cdf_shadow_prediction_topic"
+       default="/care_planner/mpc/cdf_shadow_predicted_trajectory" />
+  <arg name="cdf_shadow_summary_topic"
+       default="/care_planner/mpc/cdf_shadow_summary" />
+
   <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
   <arg name="gated_command_topic" default="/care_planner/command_trajectory_vbc_gated" />
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
@@ -170,6 +182,20 @@
     <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
     <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
+
+    <!-- C5.3a is asynchronous shadow-only: it never replaces raw MPC output. -->
+    <param name="mpc/cdf_shadow/enabled" value="$(arg cdf_shadow_enabled)" />
+    <param name="mpc/cdf_shadow/safety_margin" value="$(arg cdf_shadow_safety_margin)" />
+    <param name="mpc/cdf_shadow/constraint_horizon_steps"
+           value="$(arg cdf_shadow_constraint_horizon_steps)" />
+    <param name="mpc/cdf_shadow/snapshot_timeout"
+           value="$(arg cdf_shadow_snapshot_timeout)" />
+    <param name="mpc/cdf_shadow/constraint_batch_topic"
+           value="$(arg cdf_shadow_constraint_batch_topic)" />
+    <param name="mpc/cdf_shadow/predicted_trajectory_topic"
+           value="$(arg cdf_shadow_prediction_topic)" />
+    <param name="mpc/cdf_shadow/summary_topic"
+           value="$(arg cdf_shadow_summary_topic)" />
   </node>
 
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
