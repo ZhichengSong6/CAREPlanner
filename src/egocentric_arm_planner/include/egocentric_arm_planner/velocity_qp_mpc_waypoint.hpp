@@ -398,6 +398,7 @@ private:
   std::unique_ptr<CDFShadowJob> cdf_shadow_pending_job_;
   std::thread cdf_shadow_worker_;
   bool cdf_shadow_worker_stop_ = false;
+  unsigned long long cdf_shadow_batch_callback_count_ = 0;
   unsigned long long cdf_shadow_job_received_ = 0;
   unsigned long long cdf_shadow_job_processed_ = 0;
   unsigned long long cdf_shadow_job_dropped_ = 0;
