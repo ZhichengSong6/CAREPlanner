@@ -762,7 +762,7 @@ class CppForbiddenVoxelGpuShadow {
     const PairMeta& min_pair = pairs[min_index];
 
     std::ofstream out(output_jsonl_, std::ios::out | std::ios::app);
-    out << std::setprecision(9);
+    out << std::setprecision(17);
     out << "{";
     out << "\"record_index\":" << record_index_ << ",";
     out << "\"wall_time\":" << ros::WallTime::now().toSec() << ",";
