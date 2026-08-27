@@ -8,6 +8,7 @@ so CAREPlanner does not need the original CDF repository at runtime.
 from __future__ import annotations
 
 from typing import Dict, Iterable, Tuple
+import re
 
 import torch
 from torch import nn
@@ -80,6 +81,75 @@ class MLPRegression(nn.Module):
         for layer in self.layers[1:]:
             y = layer(torch.cat((y, x_nerf), dim=1))
         return y
+
+
+def infer_mlp_architecture(
+    state: Dict[str, torch.Tensor],
+    raw_input_dims: int = 10,
+):
+    """Infer the no-skip Yiming MLP architecture from a state_dict.
+
+    Expected original-CDF key layout:
+      layers.0.0.0.weight
+      layers.0.1.0.weight
+      ...
+
+    Returns a dict with raw input dims, output dims, hidden layers and nerf flag.
+    """
+    pattern = re.compile(r"^layers\.0\.(\d+)\.0\.weight$")
+    weights = []
+    for key, value in state.items():
+        match = pattern.match(key)
+        if match and torch.is_tensor(value) and value.ndim == 2:
+            weights.append((int(match.group(1)), key, value))
+    weights.sort(key=lambda item: item[0])
+
+    if not weights:
+        raise ValueError(
+            "Could not infer Yiming MLP architecture: no "
+            "layers.0.<i>.0.weight tensors found"
+        )
+
+    expected = list(range(len(weights)))
+    actual = [item[0] for item in weights]
+    if actual != expected:
+        raise ValueError(
+            f"Unsupported/non-contiguous Yiming MLP layer indices: {actual}"
+        )
+
+    dims = []
+    previous_out = None
+    for idx, key, weight in weights:
+        out_features, in_features = map(int, weight.shape)
+        if previous_out is None:
+            dims.append(in_features)
+        elif in_features != previous_out:
+            raise ValueError(
+                f"Unsupported skip/branched architecture at {key}: "
+                f"in_features={in_features}, previous_out={previous_out}"
+            )
+        dims.append(out_features)
+        previous_out = out_features
+
+    encoded_input_dims = int(dims[0])
+    if encoded_input_dims == int(raw_input_dims) * 3:
+        nerf = True
+    elif encoded_input_dims == int(raw_input_dims):
+        nerf = False
+    else:
+        raise ValueError(
+            f"Checkpoint first layer expects {encoded_input_dims} features; "
+            f"expected {raw_input_dims} (plain) or {raw_input_dims*3} (NeRF encoding)"
+        )
+
+    return {
+        "input_dims": int(raw_input_dims),
+        "encoded_input_dims": encoded_input_dims,
+        "output_dims": int(dims[-1]),
+        "hidden_layers": [int(v) for v in dims[1:-1]],
+        "nerf": bool(nerf),
+        "linear_dims": [int(v) for v in dims],
+    }
 
 
 def _looks_like_state_dict(obj) -> bool:
@@ -155,18 +225,30 @@ class CollisionCDF:
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested for collision CDF but torch.cuda.is_available() is false")
         self.device = torch.device(device)
-        self.model = MLPRegression(
-            input_dims=input_dims,
-            output_dims=output_dims,
-            mlp_layers=hidden_layers,
-            nerf=nerf,
-        ).to(self.device)
 
+        # Load weights first, then recover the exact no-skip Yiming MLP widths
+        # from the checkpoint. This avoids coupling runtime to a hand-written
+        # hidden_layers list and supports larger retrained CDFs.
         payload = torch.load(checkpoint_path, map_location=self.device)
         state, selected = extract_state_dict(payload, checkpoint_key)
+        architecture = infer_mlp_architecture(state, raw_input_dims=input_dims)
+
+        if int(output_dims) != int(architecture["output_dims"]):
+            raise ValueError(
+                f"Configured output_dims={output_dims} but checkpoint has "
+                f"{architecture['output_dims']}"
+            )
+
+        self.model = MLPRegression(
+            input_dims=architecture["input_dims"],
+            output_dims=architecture["output_dims"],
+            mlp_layers=architecture["hidden_layers"],
+            nerf=architecture["nerf"],
+        ).to(self.device)
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
         self.selected_checkpoint = selected
+        self.architecture = architecture
 
     def scene_distance_and_gradient(
         self, points_xyz: torch.Tensor, q: torch.Tensor
