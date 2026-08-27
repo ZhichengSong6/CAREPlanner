@@ -11,7 +11,12 @@ import numpy as np
 import rospy
 import torch
 
-from care_collision_cdf.srv import QueryCollisionCDF, QueryCollisionCDFResponse
+from care_collision_cdf.srv import (
+    QueryCollisionCDF,
+    QueryCollisionCDFResponse,
+    QueryCollisionCDFPairs,
+    QueryCollisionCDFPairsResponse,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -38,8 +43,15 @@ class CollisionCDFServer:
         hidden = cfg.get("hidden_layers", [1024, 512, 256, 128, 128])
         self.max_points = int(cfg.get("max_points", 4096))
         self.max_q = int(cfg.get("max_q", 64))
+        self.max_pairs = int(cfg.get("max_pairs", 8000))
         self.service_name = str(
             cfg.get("service_name", "/care_planner/collision_cdf/query")
+        )
+        self.pair_service_name = str(
+            cfg.get(
+                "pair_service_name",
+                "/care_planner/collision_cdf/query_pairs",
+            )
         )
 
         self.cdf = CollisionCDF(
@@ -57,18 +69,30 @@ class CollisionCDFServer:
             p = torch.zeros((4, 3), device=self.cdf.device)
             q = torch.zeros((2, 7), device=self.cdf.device)
             self.cdf.scene_distance_and_gradient(p, q)
+            self.cdf.pair_distance_and_gradient(
+                torch.zeros((8, 3), device=self.cdf.device),
+                torch.zeros((8, 7), device=self.cdf.device),
+            )
         if self.cdf.device.type == "cuda":
             torch.cuda.synchronize(self.cdf.device)
 
         self.server = rospy.Service(
             self.service_name, QueryCollisionCDF, self._query_callback
         )
+        self.pair_server = rospy.Service(
+            self.pair_service_name,
+            QueryCollisionCDFPairs,
+            self._pair_query_callback,
+        )
         rospy.logwarn(
-            "[collision_cdf] READY checkpoint=%s selected=%s device=%s service=%s",
+            "[collision_cdf] READY checkpoint=%s selected=%s device=%s "
+            "scene_service=%s pair_service=%s max_pairs=%d",
             checkpoint,
             self.cdf.selected_checkpoint,
             str(self.cdf.device),
             self.service_name,
+            self.pair_service_name,
+            self.max_pairs,
         )
 
     def _query_callback(self, req):
@@ -124,6 +148,68 @@ class CollisionCDFServer:
             return res
         except Exception as exc:
             rospy.logerr_throttle(1.0, "[collision_cdf] query failed: %s", exc)
+            res.success = False
+            res.message = str(exc)
+            return res
+
+
+
+    def _pair_query_callback(self, req):
+        res = QueryCollisionCDFPairsResponse()
+        n_pairs = int(req.num_pairs)
+
+        if n_pairs <= 0 or n_pairs > self.max_pairs:
+            res.success = False
+            res.message = f"num_pairs must be in [1,{self.max_pairs}]"
+            return res
+        if len(req.points) != n_pairs:
+            res.success = False
+            res.message = (
+                f"points length {len(req.points)} != num_pairs={n_pairs}"
+            )
+            return res
+        if len(req.q_flat) != n_pairs * 7:
+            res.success = False
+            res.message = (
+                f"q_flat length {len(req.q_flat)} != "
+                f"num_pairs*7={n_pairs*7}"
+            )
+            return res
+
+        points = np.asarray(
+            [[p.x, p.y, p.z] for p in req.points], dtype=np.float32
+        )
+        q = np.asarray(req.q_flat, dtype=np.float32).reshape(n_pairs, 7)
+
+        if not np.all(np.isfinite(points)) or not np.all(np.isfinite(q)):
+            res.success = False
+            res.message = "non-finite point or q input"
+            return res
+
+        try:
+            if self.cdf.device.type == "cuda":
+                torch.cuda.synchronize(self.cdf.device)
+            t0 = time.perf_counter()
+            with torch.enable_grad():
+                d, grad = self.cdf.pair_distance_and_gradient(
+                    torch.from_numpy(points), torch.from_numpy(q)
+                )
+            if self.cdf.device.type == "cuda":
+                torch.cuda.synchronize(self.cdf.device)
+            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+            res.success = True
+            res.message = "ok"
+            res.distance = d.cpu().numpy().astype(np.float64).tolist()
+            res.gradient_flat = (
+                grad.cpu().numpy().astype(np.float64).reshape(-1).tolist()
+            )
+            res.inference_ms = float(elapsed_ms)
+            return res
+        except Exception as exc:
+            rospy.logerr_throttle(
+                1.0, "[collision_cdf] pair query failed: %s", exc
+            )
             res.success = False
             res.message = str(exc)
             return res
