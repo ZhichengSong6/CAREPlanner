@@ -13,6 +13,7 @@
   <depend>rospy</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
   <exec_depend>message_runtime</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
 </package>
