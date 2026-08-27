@@ -32,6 +32,7 @@ catkin_install_python(PROGRAMS
   scripts/evaluate_collision_cdf_gradient.py
   scripts/query_collision_cdf_smoke.py
   scripts/multi_step_forbidden_space_cdf_shadow_node.py
+  scripts/benchmark_collision_cdf_pairs_gpu.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
