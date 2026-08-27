@@ -1,7 +1,10 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(care_collision_cdf)
 
+add_compile_options(-std=c++14)
+
 find_package(catkin REQUIRED COMPONENTS
+  roscpp
   geometry_msgs
   message_generation
   rospy
@@ -22,7 +25,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs message_runtime rospy std_msgs sensor_msgs
+  CATKIN_DEPENDS geometry_msgs message_runtime roscpp rospy std_msgs sensor_msgs
 )
 
 catkin_install_python(PROGRAMS
@@ -40,4 +43,23 @@ catkin_install_python(PROGRAMS
 
 install(DIRECTORY config launch checkpoints
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
+
+
+add_executable(cpp_forbidden_voxel_gpu_shadow_node
+  src/cpp_forbidden_voxel_gpu_shadow_node.cpp
+)
+
+add_dependencies(cpp_forbidden_voxel_gpu_shadow_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(cpp_forbidden_voxel_gpu_shadow_node
+  ${catkin_LIBRARIES}
+)
+
+install(TARGETS
+  cpp_forbidden_voxel_gpu_shadow_node
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
