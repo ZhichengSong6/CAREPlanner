@@ -152,9 +152,10 @@ sleep 0.25
 cleanup_extra
 trap - EXIT INT TERM
 
-python3 - "${SHADOW_JSONL}" "${SUMMARY_JSON}" <<'PY'
+python3 - "${SHADOW_JSONL}" "${SUMMARY_JSON}" "${CONFIDENCE_THRESHOLD}" <<'PY'
 import json, math, os, statistics, sys
-src, dst = sys.argv[1:3]
+src, dst, confidence_threshold = sys.argv[1:4]
+confidence_threshold = float(confidence_threshold)
 records=[]
 if os.path.isfile(src):
     with open(src, errors="replace") as f:
@@ -225,7 +226,7 @@ summary={
     "shadow_only":True,
     "constraint_enforced":False,
     "source":"low-confidence predicted body-sweep samples from raw MPC trajectory",
-    "confidence_threshold":0.50,
+    "confidence_threshold":confidence_threshold,
     "records_total":len(records),
     "records_nonempty":len(nonempty),
     "pair_count":stats(pairs),
