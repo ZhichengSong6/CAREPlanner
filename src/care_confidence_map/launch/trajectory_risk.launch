@@ -60,7 +60,7 @@
   <arg name="evaluate_stale_trajectory" default="true" />
   <arg name="stale_trajectory_timeout" default="1.0" />
 
-  <!-- C5.2 shadow-only export of low-confidence swept body points paired with q. -->
+  <!-- C5.2 shadow-only export of predicted body-sweep spatial anchors. -->
   <arg name="forbidden_space_pair_publish_enabled" default="false" />
   <arg name="forbidden_space_pair_topic"
        default="/care_planner/trajectory_risk/body_sweep_anchors" />
