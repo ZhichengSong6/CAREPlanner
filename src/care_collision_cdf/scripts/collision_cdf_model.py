@@ -13,30 +13,72 @@ import torch
 from torch import nn
 
 
+def _mlp(channels, act_fn=nn.ReLU, islast=False):
+    # Preserve the nested Sequential structure used by idiap/cdf so original
+    # model_dict.pt state_dict key names match exactly.
+    if not islast:
+        layers = [
+            nn.Sequential(nn.Linear(channels[i - 1], channels[i]), act_fn())
+            for i in range(1, len(channels))
+        ]
+    else:
+        layers = [
+            nn.Sequential(nn.Linear(channels[i - 1], channels[i]), act_fn())
+            for i in range(1, len(channels) - 1)
+        ]
+        layers.append(nn.Sequential(nn.Linear(channels[-2], channels[-1])))
+    return nn.Sequential(*layers)
+
+
 class MLPRegression(nn.Module):
+    """Runtime-compatible copy of idiap/cdf frankaemika.mlp.MLPRegression."""
+
     def __init__(
         self,
         input_dims: int = 10,
         output_dims: int = 1,
         mlp_layers: Iterable[int] = (1024, 512, 256, 128, 128),
+        skips=(),
+        act_fn=nn.ReLU,
         nerf: bool = True,
     ):
         super().__init__()
+        input_dims = int(input_dims)
         self.nerf = bool(nerf)
-        encoded_dims = int(input_dims) * (3 if self.nerf else 1)
-        widths = [encoded_dims] + [int(v) for v in mlp_layers] + [int(output_dims)]
-        blocks = []
-        for i in range(len(widths) - 2):
-            blocks.append(nn.Sequential(nn.Linear(widths[i], widths[i + 1]), nn.ReLU()))
-        blocks.append(nn.Sequential(nn.Linear(widths[-2], widths[-1])))
-        self.layers = nn.ModuleList(blocks)
+        if self.nerf:
+            input_dims = 3 * input_dims
+
+        # The original implementation mutates mlp_layers in-place. Work on a
+        # fresh list but reproduce the same resulting module hierarchy.
+        widths = [int(v) for v in mlp_layers]
+        skips = [int(v) for v in skips]
+        mlp_arr = []
+        if skips:
+            mlp_arr.append(widths[0:skips[0]])
+            mlp_arr[0][-1] -= input_dims
+            for s in range(1, len(skips)):
+                mlp_arr.append(widths[skips[s - 1]:skips[s]])
+                mlp_arr[-1][-1] -= input_dims
+            mlp_arr.append(widths[skips[-1]:])
+        else:
+            mlp_arr.append(widths)
+
+        mlp_arr[-1].append(int(output_dims))
+        mlp_arr[0].insert(0, input_dims)
+
+        self.layers = nn.ModuleList()
+        for arr in mlp_arr[:-1]:
+            self.layers.append(_mlp(arr, act_fn=act_fn, islast=False))
+        self.layers.append(_mlp(mlp_arr[-1], act_fn=act_fn, islast=True))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.nerf:
-            x = torch.cat((x, torch.sin(x), torch.cos(x)), dim=-1)
-        y = x
-        for layer in self.layers:
-            y = layer(y)
+            x_nerf = torch.cat((x, torch.sin(x), torch.cos(x)), dim=-1)
+        else:
+            x_nerf = x
+        y = self.layers[0](x_nerf)
+        for layer in self.layers[1:]:
+            y = layer(torch.cat((y, x_nerf), dim=1))
         return y
 
 
