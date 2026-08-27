@@ -852,6 +852,67 @@ class CppForbiddenVoxelGpuShadow {
     out << "}\n";
   }
 
+  void publishConstraintBatch(
+      const std_msgs::Header& source_header,
+      const std::vector<PairMeta>& pairs,
+      const std::vector<float>& distance,
+      const std::vector<float>& gradient,
+      double selection_ms,
+      double buffer_build_ms,
+      double ipc_ms,
+      const ResponseHeader& gpu,
+      double pipeline_ms) {
+    if (pairs.empty() ||
+        distance.size() != pairs.size() ||
+        gradient.size() != pairs.size() * 7) {
+      ROS_ERROR_THROTTLE(
+          1.0, "[C5.3a C++] refusing malformed constraint batch");
+      return;
+    }
+
+    care_collision_cdf::CollisionCDFConstraintBatch msg;
+    msg.header = source_header;
+    msg.num_pairs = static_cast<int32_t>(pairs.size());
+    msg.dof = 7;
+    msg.original_timestep.resize(pairs.size());
+    msg.point_flat.resize(pairs.size() * 3);
+    msg.q_linearization_flat.resize(pairs.size() * 7);
+    msg.distance.resize(pairs.size());
+    msg.gradient_flat.resize(pairs.size() * 7);
+
+    for (std::size_t i = 0; i < pairs.size(); ++i) {
+      msg.original_timestep[i] =
+          static_cast<int32_t>(pairs[i].original_timestep);
+      for (int j = 0; j < 3; ++j) {
+        msg.point_flat[i * 3 + static_cast<std::size_t>(j)] =
+            static_cast<double>(
+                pairs[i].point[static_cast<std::size_t>(j)]);
+      }
+      for (int j = 0; j < 7; ++j) {
+        msg.q_linearization_flat[
+            i * 7 + static_cast<std::size_t>(j)] =
+            static_cast<double>(
+                pairs[i].q[static_cast<std::size_t>(j)]);
+        msg.gradient_flat[
+            i * 7 + static_cast<std::size_t>(j)] =
+            static_cast<double>(
+                gradient[i * 7 + static_cast<std::size_t>(j)]);
+      }
+      msg.distance[i] = static_cast<double>(distance[i]);
+    }
+
+    msg.pair_selection_ms = selection_ms;
+    msg.pair_buffer_build_ms = buffer_build_ms;
+    msg.ipc_roundtrip_ms = ipc_ms;
+    msg.gpu_h2d_ms = gpu.h2d_ms;
+    msg.gpu_inference_ms = gpu.inference_ms;
+    msg.gpu_d2h_ms = gpu.d2h_ms;
+    msg.gpu_worker_total_ms = gpu.worker_total_ms;
+    msg.online_pipeline_ms = pipeline_ms;
+
+    constraint_batch_pub_.publish(msg);
+  }
+
   void publishSummary(
       std::size_t pair_count,
       int active_step_count,
