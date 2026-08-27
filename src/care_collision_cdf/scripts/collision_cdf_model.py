@@ -250,6 +250,37 @@ class CollisionCDF:
         self.selected_checkpoint = selected
         self.architecture = architecture
 
+    def pair_distance_and_gradient(
+        self, points_xyz: torch.Tensor, q: torch.Tensor
+    ):
+        """Return one-to-one CDF distance [B] and dq gradient [B,7].
+
+        Row b evaluates f(points_xyz[b], q[b]).  Because each network row is
+        independent, autograd of the summed outputs w.r.t. the batched q tensor
+        returns the per-pair gradient without constructing a dense Jacobian.
+        """
+        points_xyz = points_xyz.to(self.device, dtype=torch.float32)
+        q = q.to(self.device, dtype=torch.float32).detach().clone()
+        q.requires_grad_(True)
+
+        if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
+            raise ValueError("points_xyz must have shape [B,3]")
+        if q.ndim != 2 or q.shape[1] != 7:
+            raise ValueError("q must have shape [B,7]")
+        if points_xyz.shape[0] == 0:
+            raise ValueError("pair batch must be non-empty")
+        if points_xyz.shape[0] != q.shape[0]:
+            raise ValueError(
+                f"pair batch mismatch: points={points_xyz.shape[0]} q={q.shape[0]}"
+            )
+
+        inputs = torch.cat((points_xyz, q), dim=-1)
+        pred = self.model(inputs).reshape(-1)
+        grad = torch.autograd.grad(
+            pred.sum(), q, retain_graph=False, create_graph=False
+        )[0]
+        return pred.detach(), grad.detach()
+
     def scene_distance_and_gradient(
         self, points_xyz: torch.Tensor, q: torch.Tensor
     ):
