@@ -6,11 +6,13 @@ find_package(catkin REQUIRED COMPONENTS
   message_generation
   rospy
   std_msgs
+  sensor_msgs
 )
 
 add_service_files(
   FILES
   QueryCollisionCDF.srv
+  QueryCollisionCDFPairs.srv
 )
 
 generate_messages(
@@ -20,7 +22,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs message_runtime rospy std_msgs
+  CATKIN_DEPENDS geometry_msgs message_runtime rospy std_msgs sensor_msgs
 )
 
 catkin_install_python(PROGRAMS
@@ -29,6 +31,7 @@ catkin_install_python(PROGRAMS
   scripts/inspect_collision_cdf_checkpoint.py
   scripts/evaluate_collision_cdf_gradient.py
   scripts/query_collision_cdf_smoke.py
+  scripts/multi_step_forbidden_space_cdf_shadow_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
