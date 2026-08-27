@@ -164,7 +164,7 @@ setsid bash -lc "
   cd '${REPO}'
   source devel/setup.bash
   while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
-  for i in $(seq 1 80); do
+  for i in \$(seq 1 80); do
     echo "===== sample=\$i ====="
     date '+wall=%s.%N'
     rostopic info '${CONSTRAINT_BATCH_TOPIC}' 2>&1
