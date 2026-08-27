@@ -246,7 +246,8 @@ class CppForbiddenVoxelGpuShadow {
         << " conf<" << confidence_threshold_
         << " proximity_margin=" << proximity_margin_
         << " max_pairs_per_step=" << max_pairs_per_step_
-        << " socket=" << gpu_socket_);
+        << " socket=" << gpu_socket_
+        << " constraint_batch_topic=" << constraint_batch_topic_);
   }
 
   ~CppForbiddenVoxelGpuShadow() {
@@ -911,6 +912,7 @@ class CppForbiddenVoxelGpuShadow {
     msg.online_pipeline_ms = pipeline_ms;
 
     constraint_batch_pub_.publish(msg);
+    ++constraint_batch_publish_count_;
   }
 
   void publishSummary(
@@ -940,7 +942,10 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_infer_ms=" << gpu.inference_ms
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
-        << " map_index_ms=" << map_index_ms;
+        << " map_index_ms=" << map_index_ms
+        << " batch_topic=" << constraint_batch_topic_
+        << " batch_subscribers=" << constraint_batch_pub_.getNumSubscribers()
+        << " batch_publish_count=" << constraint_batch_publish_count_;
 
     std_msgs::String msg;
     msg.data = oss.str();
@@ -1132,6 +1137,7 @@ class CppForbiddenVoxelGpuShadow {
 
   int gpu_fd_ = -1;
   std::size_t record_index_ = 0;
+  std::size_t constraint_batch_publish_count_ = 0;
 };
 
 }  // namespace care_collision_cdf
