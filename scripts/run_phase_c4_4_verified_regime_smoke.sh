@@ -178,7 +178,47 @@ for _ in $(seq 1 400); do
   BASE_READY=0
   CDF_READY=1
 
-  if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node
+  if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$' && \
+     echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
+     echo "${NODES}" | grep -q '^/joint_velocity_rate_limiter$' && \
+     echo "${NODES}" | grep -q '^/optimized_trajectory_continuity$' && \
+     echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$' && \
+     echo "${NODES}" | grep -q '^/execution_vbc_audit/trajectory_vbc_selector_node$' && \
+     echo "${NODES}" | grep -q '^/c4_4_verified_regime_manager$' && \
+     echo "${NODES}" | grep -q '^/phase_b2_controlled_trial$' && \
+     echo "${NODES}" | grep -q '^/vbc_execution_reference_gate$'; then
+    BASE_READY=1
+  fi
+
+  if [ "${CDF_SELECTOR_ENABLED}" = "true" ]; then
+    if ! echo "${NODES}" | grep -q '^/c5_3a_cpp_forbidden_voxel_gpu_shadow$'; then
+      CDF_READY=0
+    fi
+  fi
+
+  if [ "${CDF_SHADOW_VBC_AUDIT_ENABLED}" = "true" ]; then
+    if ! echo "${NODES}" | grep -q '^/cdf_shadow_vbc/trajectory_vbc_selector_node$'; then
+      CDF_READY=0
+    fi
+  fi
+
+  if [ "${BASE_READY}" = "1" ] && [ "${CDF_READY}" = "1" ]; then
+    READY=1
+    break
+  fi
+
+  sleep 0.1
+done
+
+if [ "${READY}" != "1" ]; then
+  echo "[ERROR] C4.4/C5.3a required nodes did not all start"
+  echo "[DEBUG] CDF_SELECTOR_ENABLED=${CDF_SELECTOR_ENABLED}"
+  echo "[DEBUG] CDF_SHADOW_VBC_AUDIT_ENABLED=${CDF_SHADOW_VBC_AUDIT_ENABLED}"
+  rosnode list 2>/dev/null || true
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
 if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
   echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
   exit 1
