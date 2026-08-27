@@ -144,6 +144,7 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
         << "batch=" << cdf_constraint_batch_topic_
         << ", output=" << cdf_shadow_prediction_topic_
         << ", d_safe=" << cdf_safety_margin_
+        << ", trust_q_inf=" << cdf_trust_region_q_inf_
         << ", horizon_steps=" << cdf_constraint_horizon_steps_
         << ". Raw MPC/commit/execution are unchanged.");
     startCDFShadowWorker();
@@ -312,6 +313,9 @@ bool VelocityQPMPCWaypoint::loadConfig() {
                    cdf_shadow_enabled_, cdf_shadow_enabled_);
   pnh_.param<double>("mpc/cdf_shadow/safety_margin",
                      cdf_safety_margin_, cdf_safety_margin_);
+  pnh_.param<double>("mpc/cdf_shadow/trust_region_q_inf",
+                     cdf_trust_region_q_inf_,
+                     cdf_trust_region_q_inf_);
   pnh_.param<int>("mpc/cdf_shadow/constraint_horizon_steps",
                   cdf_constraint_horizon_steps_,
                   cdf_constraint_horizon_steps_);
@@ -349,6 +353,8 @@ bool VelocityQPMPCWaypoint::loadConfig() {
     return false;
   }
   if (!std::isfinite(cdf_safety_margin_) || cdf_safety_margin_ < 0.0 ||
+      !std::isfinite(cdf_trust_region_q_inf_) ||
+      cdf_trust_region_q_inf_ <= 0.0 ||
       cdf_constraint_horizon_steps_ < 1 ||
       cdf_constraint_horizon_steps_ > num_intervals_ ||
       cdf_snapshot_timeout_s_ <= 0.0 ||
@@ -1056,6 +1062,7 @@ void VelocityQPMPCWaypoint::publishCDFShadowSummary(
       << " status=" << status
       << " control_mode=" << job.snapshot.control_mode
       << " d_safe=" << cdf_safety_margin_
+      << " trust_q_inf=" << cdf_trust_region_q_inf_
       << " horizon_steps=" << cdf_constraint_horizon_steps_
       << " batch_pairs=" << job.batch->num_pairs
       << " active_rows=" << active_constraint_rows
