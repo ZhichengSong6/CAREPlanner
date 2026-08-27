@@ -60,6 +60,12 @@
   <arg name="evaluate_stale_trajectory" default="true" />
   <arg name="stale_trajectory_timeout" default="1.0" />
 
+  <!-- C5.2 shadow-only export of low-confidence swept body points paired with q. -->
+  <arg name="forbidden_space_pair_publish_enabled" default="false" />
+  <arg name="forbidden_space_pair_topic"
+       default="/care_planner/trajectory_risk/low_confidence_sweep_pairs" />
+  <arg name="forbidden_space_confidence_threshold" default="0.50" />
+
   <!-- ========================= -->
   <!-- Trajectory risk node       -->
   <!-- ========================= -->
@@ -146,5 +152,14 @@
 
     <param name="trajectory_risk/stale_trajectory_timeout"
            value="$(arg stale_trajectory_timeout)" />
+
+    <param name="trajectory_risk/forbidden_space_pair_publish_enabled"
+           value="$(arg forbidden_space_pair_publish_enabled)" />
+
+    <param name="trajectory_risk/forbidden_space_pair_topic"
+           value="$(arg forbidden_space_pair_topic)" />
+
+    <param name="trajectory_risk/forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
   </node>
 </launch>
