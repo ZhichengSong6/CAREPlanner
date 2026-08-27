@@ -296,6 +296,11 @@ def stats(vals):
 shadow=rows(shadow_csv)
 vbc=rows(vbc_csv)
 
+if not shadow:
+    raise SystemExit("[ERROR] C5.3a produced no shadow-QP records")
+if not vbc:
+    raise SystemExit("[ERROR] C5.3a produced no shadow exact-VBC records")
+
 def col(name, source=shadow):
     return [fnum(r.get(name)) for r in source]
 
