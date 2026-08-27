@@ -883,17 +883,40 @@ bool VelocityQPMPCWaypoint::solveCDFShadowJob(
     return true;
   }
 
+  const int trust_region_rows =
+      cdf_constraint_horizon_steps_ * dof_;
+  const int cdf_row0 = n_constraints_ + trust_region_rows;
+  const int total_rows =
+      n_constraints_ + trust_region_rows + active_constraint_rows;
+
   Eigen::MatrixXd G_aug =
-      Eigen::MatrixXd::Zero(
-          n_constraints_ + active_constraint_rows, n_u_);
+      Eigen::MatrixXd::Zero(total_rows, n_u_);
   G_aug.topRows(n_constraints_) = G_;
 
-  Eigen::VectorXd lower_aug(
-      n_constraints_ + active_constraint_rows);
-  Eigen::VectorXd upper_aug(
-      n_constraints_ + active_constraint_rows);
+  Eigen::VectorXd lower_aug(total_rows);
+  Eigen::VectorXd upper_aug(total_rows);
   lower_aug.head(n_constraints_) = snapshot.lower;
   upper_aug.head(n_constraints_) = snapshot.upper;
+
+  // Local trust region around the raw MPC trajectory:
+  //   ||q_k - qbar_k||_inf <= cdf_trust_region_q_inf_
+  // Since q_k = q0 + S_k U and qbar_k = q0 + S_k U_raw,
+  // this becomes a two-sided linear bound on each row of S_k.
+  for (int k = 1; k <= cdf_constraint_horizon_steps_; ++k) {
+    for (int j = 0; j < dof_; ++j) {
+      const int row =
+          n_constraints_ + (k - 1) * dof_ + j;
+      const Eigen::RowVectorXd s_row =
+          S_.row((k - 1) * dof_ + j);
+      const double center =
+          s_row.dot(snapshot.raw_solution);
+      G_aug.row(row) = s_row;
+      lower_aug[row] =
+          center - cdf_trust_region_q_inf_;
+      upper_aug[row] =
+          center + cdf_trust_region_q_inf_;
+    }
+  }
 
   for (int row = 0; row < active_constraint_rows; ++row) {
     const int i = selected[static_cast<std::size_t>(row)];
@@ -920,13 +943,13 @@ bool VelocityQPMPCWaypoint::solveCDFShadowJob(
 
     const Eigen::MatrixXd S_k =
         S_.block((k - 1) * dof_, 0, dof_, n_u_);
-    G_aug.row(n_constraints_ + row) =
+    G_aug.row(cdf_row0 + row) =
         g.transpose() * S_k;
 
-    lower_aug[n_constraints_ + row] =
+    lower_aug[cdf_row0 + row] =
         cdf_safety_margin_ - d -
         g.dot(snapshot.q_current - q_bar);
-    upper_aug[n_constraints_ + row] = 1.0e20;
+    upper_aug[cdf_row0 + row] = 1.0e20;
   }
 
   if (!finiteMatrix(G_aug) ||
