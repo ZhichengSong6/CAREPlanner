@@ -22,6 +22,7 @@ FORBIDDEN_SPACE_PAIR_TOPIC="${FORBIDDEN_SPACE_PAIR_TOPIC:-/care_planner/trajecto
 FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD:-0.50}"
 CDF_SHADOW_ENABLED="${CDF_SHADOW_ENABLED:-false}"
 CDF_SHADOW_SAFETY_MARGIN="${CDF_SHADOW_SAFETY_MARGIN:-0.0}"
+CDF_SHADOW_TRUST_REGION_Q_INF="${CDF_SHADOW_TRUST_REGION_Q_INF:-0.20}"
 CDF_SHADOW_HORIZON_STEPS="${CDF_SHADOW_HORIZON_STEPS:-20}"
 CDF_SHADOW_SNAPSHOT_TIMEOUT="${CDF_SHADOW_SNAPSHOT_TIMEOUT:-0.75}"
 CDF_SHADOW_CONSTRAINT_BATCH_TOPIC="${CDF_SHADOW_CONSTRAINT_BATCH_TOPIC:-/care_planner/collision_cdf/constraint_batch}"
@@ -136,6 +137,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   forbidden_space_confidence_threshold:="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD}" \
   cdf_shadow_enabled:="${CDF_SHADOW_ENABLED}" \
   cdf_shadow_safety_margin:="${CDF_SHADOW_SAFETY_MARGIN}" \
+  cdf_shadow_trust_region_q_inf:="${CDF_SHADOW_TRUST_REGION_Q_INF}" \
   cdf_shadow_constraint_horizon_steps:="${CDF_SHADOW_HORIZON_STEPS}" \
   cdf_shadow_snapshot_timeout:="${CDF_SHADOW_SNAPSHOT_TIMEOUT}" \
   cdf_shadow_constraint_batch_topic:="${CDF_SHADOW_CONSTRAINT_BATCH_TOPIC}" \
