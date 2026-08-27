@@ -49,6 +49,7 @@
   <!-- C5.3a constrained-QP shadow. Defaults preserve all frozen C4.x runs. -->
   <arg name="cdf_shadow_enabled" default="false" />
   <arg name="cdf_shadow_safety_margin" default="0.0" />
+  <arg name="cdf_shadow_trust_region_q_inf" default="0.20" />
   <arg name="cdf_shadow_constraint_horizon_steps" default="20" />
   <arg name="cdf_shadow_snapshot_timeout" default="0.75" />
   <arg name="cdf_shadow_constraint_batch_topic"
@@ -186,6 +187,8 @@
     <!-- C5.3a is asynchronous shadow-only: it never replaces raw MPC output. -->
     <param name="mpc/cdf_shadow/enabled" value="$(arg cdf_shadow_enabled)" />
     <param name="mpc/cdf_shadow/safety_margin" value="$(arg cdf_shadow_safety_margin)" />
+    <param name="mpc/cdf_shadow/trust_region_q_inf"
+           value="$(arg cdf_shadow_trust_region_q_inf)" />
     <param name="mpc/cdf_shadow/constraint_horizon_steps"
            value="$(arg cdf_shadow_constraint_horizon_steps)" />
     <param name="mpc/cdf_shadow/snapshot_timeout"
