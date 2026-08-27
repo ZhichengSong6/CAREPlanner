@@ -508,7 +508,7 @@ private:
     pnh_.param<std::string>(
         "trajectory_risk/forbidden_space_pair_topic",
         forbidden_space_pair_topic_,
-        "/care_planner/trajectory_risk/low_confidence_sweep_pairs");
+        "/care_planner/trajectory_risk/body_sweep_anchors");
 
     pnh_.param(
         "trajectory_risk/forbidden_space_confidence_threshold",
@@ -2341,9 +2341,11 @@ private:
         const double confidence =
             static_cast<double>(srv.response.confidence[flat_index]);
 
-        if (!isIgnoredRiskLink(sample.link_name) &&
-            inside &&
-            confidence < forbidden_space_confidence_threshold_)
+        // C5.2: export every in-map risk-body sample as a spatial anchor.
+        // The anchor center itself is NOT a forbidden CDF point.  The shadow
+        // diagnostic uses it only to retrieve nearby low-confidence voxel
+        // centers from the confidence map.
+        if (!isIgnoredRiskLink(sample.link_name) && inside)
         {
           selected_count += 1;
         }
@@ -2417,16 +2419,13 @@ private:
         const float current_visibility =
             static_cast<float>(srv.response.current_visibility[flat_index]);
 
-        if (!isIgnoredRiskLink(sample.link_name) &&
-            inside &&
-            static_cast<double>(confidence) <
-                forbidden_space_confidence_threshold_)
+        if (!isIgnoredRiskLink(sample.link_name) && inside)
         {
           if (frame.q.size() != 7)
           {
             ROS_ERROR_THROTTLE(
                 1.0,
-                "[trajectory_risk_node] C5.2 forbidden-space export "
+                "[trajectory_risk_node] C5.2 body-sweep anchor export "
                 "requires 7-DoF q, got %ld",
                 static_cast<long>(frame.q.size()));
             return;
@@ -3271,7 +3270,7 @@ private:
   std::string refresh_body_prior_service_ =
       "/care_planner/confidence_map/refresh_body_prior";
   std::string forbidden_space_pair_topic_ =
-      "/care_planner/trajectory_risk/low_confidence_sweep_pairs";
+      "/care_planner/trajectory_risk/body_sweep_anchors";
 
   double eval_rate_ = 20.0;
   int max_eval_timesteps_ = 12;
