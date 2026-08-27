@@ -12,6 +12,11 @@ find_package(catkin REQUIRED COMPONENTS
   sensor_msgs
 )
 
+add_message_files(
+  FILES
+  CollisionCDFConstraintBatch.msg
+)
+
 add_service_files(
   FILES
   QueryCollisionCDF.srv
