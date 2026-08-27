@@ -1,0 +1,17 @@
+<launch>
+  <arg name="checkpoint"
+       default="$(find care_collision_cdf)/checkpoints/yiming_cdf/model_dict.pt"/>
+  <arg name="device" default="cuda"/>
+  <arg name="checkpoint_key" default="latest"/>
+
+  <node pkg="care_collision_cdf"
+        type="collision_cdf_server_node.py"
+        name="collision_cdf_server"
+        output="screen">
+    <rosparam command="load"
+              file="$(find care_collision_cdf)/config/collision_cdf.yaml"/>
+    <param name="checkpoint" value="$(arg checkpoint)"/>
+    <param name="device" value="$(arg device)"/>
+    <param name="checkpoint_key" value="$(arg checkpoint_key)"/>
+  </node>
+</launch>
