@@ -165,7 +165,7 @@ def time_path(cdf, points, q, warmup, repeats, force_host_input):
 
 def build_cdf(checkpoint, device, activation, checkpoint_key):
     return CollisionCDF(
-        checkpoint=checkpoint,
+        checkpoint_path=checkpoint,
         device=device,
         checkpoint_key=checkpoint_key,
         input_dims=10,
