@@ -10,6 +10,7 @@ CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/
 SHADOW_RATE="${SHADOW_RATE:-5.0}"
 CONFIDENCE_THRESHOLD="${CONFIDENCE_THRESHOLD:-0.50}"
 DEDUP_RESOLUTION="${DEDUP_RESOLUTION:-0.05}"
+SIGNED_ZERO_BAND="${SIGNED_ZERO_BAND:-0.05}"
 
 ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/phase_c5_2_multi_step_forbidden_space_cdf_shadow/${CASE_ID}}"
 ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_2_multi_step_forbidden_space_cdf_shadow/${CASE_ID}}"
@@ -115,6 +116,7 @@ setsid bash -lc "
     _output_jsonl:='${SHADOW_JSONL}' \
     _rate:='${SHADOW_RATE}' \
     _dedup_resolution:='${DEDUP_RESOLUTION}' \
+    _signed_zero_band:='${SIGNED_ZERO_BAND}' \
     _max_pairs:=8000
 " >"${ROOT_LOG}/multi_step_forbidden_space_shadow.log" 2>&1 &
 EXTRA_PIDS+=("$!")
@@ -210,6 +212,25 @@ dp05=[
     and isinstance(r["distance"].get("p05"),(int,float))
 ]
 
+signed_negative_rates=[
+    float(r["signed_counts"]["negative_rate"])
+    for r in nonempty
+    if isinstance(r.get("signed_counts"),dict)
+    and isinstance(r["signed_counts"].get("negative_rate"),(int,float))
+]
+signed_near_zero_rates=[
+    float(r["signed_counts"]["near_zero_rate"])
+    for r in nonempty
+    if isinstance(r.get("signed_counts"),dict)
+    and isinstance(r["signed_counts"].get("near_zero_rate"),(int,float))
+]
+signed_positive_rates=[
+    float(r["signed_counts"]["positive_rate"])
+    for r in nonempty
+    if isinstance(r.get("signed_counts"),dict)
+    and isinstance(r["signed_counts"].get("positive_rate"),(int,float))
+]
+
 global_min_record=None
 if nonempty:
     candidates=[
@@ -236,6 +257,10 @@ summary={
     "service_roundtrip_ms":stats(rtt),
     "record_min_distance":stats(dmins),
     "record_p05_distance":stats(dp05),
+    "signed_zero_band":float("${SIGNED_ZERO_BAND}"),
+    "record_negative_rate":stats(signed_negative_rates),
+    "record_near_zero_rate":stats(signed_near_zero_rates),
+    "record_positive_rate":stats(signed_positive_rates),
     "global_min_pair":(
         global_min_record.get("global_min_pair")
         if global_min_record else None
@@ -262,6 +287,7 @@ constraint_enforced=false
 trajectory_source=/care_planner/mpc/predicted_trajectory
 confidence_threshold=${CONFIDENCE_THRESHOLD}
 dedup_resolution=${DEDUP_RESOLUTION}
+signed_zero_band=${SIGNED_ZERO_BAND}
 cdf_env=${CDF_ENV}
 cdf_device=${CDF_DEVICE}
 checkpoint=${CHECKPOINT}
