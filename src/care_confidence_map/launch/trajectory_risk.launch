@@ -63,7 +63,7 @@
   <!-- C5.2 shadow-only export of low-confidence swept body points paired with q. -->
   <arg name="forbidden_space_pair_publish_enabled" default="false" />
   <arg name="forbidden_space_pair_topic"
-       default="/care_planner/trajectory_risk/low_confidence_sweep_pairs" />
+       default="/care_planner/trajectory_risk/body_sweep_anchors" />
   <arg name="forbidden_space_confidence_threshold" default="0.50" />
 
   <!-- ========================= -->
