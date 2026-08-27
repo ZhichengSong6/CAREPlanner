@@ -1,0 +1,36 @@
+<launch>
+  <!-- C5.3a exact VBC auditor for the constrained shadow trajectory only.
+       All steering outputs are isolated so this node cannot affect planner state. -->
+  <arg name="base_frame" default="base_link" />
+  <arg name="shadow_prediction_topic"
+       default="/care_planner/mpc/cdf_shadow_predicted_trajectory" />
+  <arg name="shadow_vbc_summary_topic"
+       default="/care_planner/cdf_shadow_vbc/summary" />
+  <arg name="confidence_query_service"
+       default="/care_planner/confidence_map/query" />
+  <arg name="predicted_trajectory_timeout" default="0.50" />
+  <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
+
+  <group ns="cdf_shadow_vbc">
+    <remap from="/care_planner/trajectory_risk/vbc_summary"
+           to="$(arg shadow_vbc_summary_topic)" />
+    <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic" value="$(arg shadow_prediction_topic)" />
+      <arg name="predicted_trajectory_topic" value="$(arg shadow_prediction_topic)" />
+      <arg name="prefer_predicted_trajectory" value="true" />
+      <arg name="predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+      <arg name="output_target_topic"
+           value="/care_planner/cdf_shadow_vbc/unused_target" />
+      <arg name="candidate_active_topic"
+           value="/care_planner/cdf_shadow_vbc/unused_active" />
+      <arg name="confidence_query_service" value="$(arg confidence_query_service)" />
+      <arg name="min_visibility_before_sweep_margin_s"
+           value="$(arg min_visibility_before_sweep_margin_s)" />
+      <arg name="temporal_layer_mpc_steps" value="2" />
+      <arg name="region_max_diameter_m" value="0.12" />
+      <arg name="active_set_points_topic"
+           value="/care_planner/cdf_shadow_vbc/unused_active_set_points" />
+    </include>
+  </group>
+</launch>
