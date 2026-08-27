@@ -176,6 +176,24 @@ setsid bash -lc "
 " >"${ROOT_LOG}/cpp_selector_gpu.log" 2>&1 &
 PIDS+=("$!")
 
+# Transport topology watchdog. This is diagnostic only and does not subscribe
+# to the large batch payload itself.
+setsid bash -lc "
+  set +e
+  cd '${REPO}'
+  source devel/setup.bash
+  while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
+  for i in $(seq 1 80); do
+    echo '===== sample='\"$i\"' ====='
+    date '+wall=%s.%N'
+    rostopic info '${CONSTRAINT_BATCH_TOPIC}' 2>&1
+    rosnode info /velocity_qp_mpc_waypoint_node 2>&1 | \
+      grep -A40 -B5 -E 'Subscriptions:|Publications:' || true
+    sleep 0.25
+  done
+" >"${ROOT_LOG}/constraint_batch_topology.log" 2>&1 &
+PIDS+=("$!")
+
 # Exact VBC audit of the shadow constrained trajectory. All steering-side
 # outputs are isolated inside the dedicated audit launch.
 setsid bash -lc "
