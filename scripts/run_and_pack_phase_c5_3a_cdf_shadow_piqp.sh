@@ -234,6 +234,16 @@ sleep 0.50
 cleanup
 trap - EXIT INT TERM
 
+pack_debug_bundle() {
+  cd "${REPO}"
+  rm -f "${ZIP_PATH}"
+  zip -r "${ZIP_PATH}" "${ROOT_OUT#${REPO}/}" "${ROOT_LOG#${REPO}/}" >/dev/null
+  echo "[C5.3a DEBUG ZIP] ${ZIP_PATH}"
+}
+
+# Preserve the complete outer bundle even if post-processing fails.
+trap 'rc=$?; if [[ -d "${ROOT_OUT}" || -d "${ROOT_LOG}" ]]; then pack_debug_bundle || true; fi; exit $rc' EXIT
+
 python3 -   "${CDF_SHADOW_SUMMARY_CSV}"   "${CDF_SHADOW_VBC_SUMMARY_CSV}"   "${C4_OUT}/c4_9_blocker_aware_summary.json"   "${SUMMARY_JSON}"   "${CDF_SAFETY_MARGIN}"   "${CDF_TRUST_REGION_Q_INF}"   "${CDF_HORIZON_STEPS}" <<'PY'
 import csv
 import json
@@ -391,8 +401,8 @@ shadow_prediction_topic=${CDF_SHADOW_PREDICTION_TOPIC}
 shadow_vbc_summary_topic=${CDF_SHADOW_VBC_SUMMARY_TOPIC}
 EOF
 
-cd "${REPO}"
-zip -r "${ZIP_PATH}" "${ROOT_OUT#${REPO}/}" "${ROOT_LOG#${REPO}/}"
+trap - EXIT
+pack_debug_bundle
 
 echo ""
 echo "[C5.3a COMPLETE]"
