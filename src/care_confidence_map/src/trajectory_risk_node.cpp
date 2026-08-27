@@ -2324,7 +2324,8 @@ private:
   void publishForbiddenSpaceSweepPairs(
       const care_confidence_map::TrajectorySampleResult& sample_result,
       const care_confidence_map::QueryConfidence& srv,
-      const RiskResult& risk_result)
+      const RiskResult& risk_result,
+      const ros::Time& source_trajectory_stamp)
   {
     if (!forbidden_space_pair_publish_enabled_)
     {
@@ -2355,7 +2356,9 @@ private:
 
     sensor_msgs::PointCloud2 cloud;
     cloud.header.frame_id = base_frame_;
-    cloud.header.stamp = ros::Time::now();
+    cloud.header.stamp = source_trajectory_stamp.isZero()
+        ? ros::Time::now()
+        : source_trajectory_stamp;
     cloud.height = 1;
     cloud.width = static_cast<uint32_t>(selected_count);
 
@@ -3089,7 +3092,8 @@ private:
     publishRiskStats(result);
     publishAttribution(attribution, result);
     publishActiveSensingTarget(attribution);
-    publishForbiddenSpaceSweepPairs(sample_result, srv, result);
+    publishForbiddenSpaceSweepPairs(
+        sample_result, srv, result, traj_msg.header.stamp);
 
     const ros::WallTime marker_start = ros::WallTime::now();
 
