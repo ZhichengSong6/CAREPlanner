@@ -16,6 +16,10 @@ EXECUTION_UNSAFE_REQUIRED="${EXECUTION_UNSAFE_REQUIRED:-2}"
 PROBE_SAFE_COMMITS="${PROBE_SAFE_COMMITS:-3}"
 # Preserve C4.4 behavior by default. C4.5/C4.6 wrappers override this explicitly.
 REGION_SCHEDULE_MODE="${REGION_SCHEDULE_MODE:-shared_persistent}"
+TRAJECTORY_RISK_INPUT_TOPIC="${TRAJECTORY_RISK_INPUT_TOPIC:-/care_planner/task_trajectory}"
+FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED:-false}"
+FORBIDDEN_SPACE_PAIR_TOPIC="${FORBIDDEN_SPACE_PAIR_TOPIC:-/care_planner/trajectory_risk/low_confidence_sweep_pairs}"
+FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD:-0.50}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
