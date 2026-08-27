@@ -49,15 +49,30 @@ fi
 echo "[C5] conda env: ${CONDA_DEFAULT_ENV:-none}"
 echo "[C5] conda prefix: ${CONDA_PREFIX:-none}"
 echo "[C5] python: ${PYTHON_BIN}"
-"${PYTHON_BIN}" -c 'import sys; print("[C5] python executable:", sys.executable)'
+
+# Bridge ROS Noetic / Ubuntu dist-packages into the conda interpreter.
+# Conda intentionally omits /usr/lib/python3/dist-packages, where rospkg and
+# several ROS Python dependencies live on Ubuntu 20.04.
+ROS_PY="/opt/ros/noetic/lib/python3/dist-packages"
+SYS_PY="/usr/lib/python3/dist-packages"
+export PYTHONPATH="${REPO}/devel/lib/python3/dist-packages:${ROS_PY}:${SYS_PY}:${PYTHONPATH:-}"
+
+"${PYTHON_BIN}" - <<'PY'
+import sys
+print("[C5] python executable:", sys.executable)
+print("[C5] sys.path contains ROS:", any("/opt/ros/noetic" in p for p in sys.path))
+print("[C5] sys.path contains system dist-packages:", "/usr/lib/python3/dist-packages" in sys.path)
+PY
 
 if ! "${PYTHON_BIN}" - <<'PY'
 import sys
 import torch
+import rospkg
 import rospy
 from care_collision_cdf.srv import QueryCollisionCDF
 print("[C5] torch:", torch.__version__)
 print("[C5] torch cuda available:", torch.cuda.is_available())
+print("[C5] rospkg:", rospkg.__file__)
 print("[C5] rospy:", rospy.__file__)
 print("[C5] generated ROS service import: OK")
 PY
