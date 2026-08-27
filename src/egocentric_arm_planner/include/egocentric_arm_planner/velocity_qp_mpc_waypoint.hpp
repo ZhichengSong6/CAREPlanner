@@ -366,6 +366,7 @@ private:
 
   bool cdf_shadow_enabled_ = false;
   double cdf_safety_margin_ = 0.0;
+  double cdf_trust_region_q_inf_ = 0.20;
   int cdf_constraint_horizon_steps_ = 20;
   double cdf_snapshot_timeout_s_ = 0.75;
   int cdf_snapshot_history_size_ = 12;
