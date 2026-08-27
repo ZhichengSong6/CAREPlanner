@@ -76,6 +76,17 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
         &VelocityQPMPCWaypoint::replanReadyCallback, this);
   }
 
+  if (cdf_shadow_enabled_) {
+    cdf_constraint_batch_sub_ = nh_.subscribe(
+        cdf_constraint_batch_topic_,
+        2,
+        &VelocityQPMPCWaypoint::cdfConstraintBatchCallback,
+        this);
+    ROS_WARN_STREAM(
+        "[VelocityQPMPCWaypoint] C5.3a constraint-batch subscriber registered: "
+        << cdf_constraint_batch_sub_.getTopic());
+  }
+
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       velocity_command_topic_, 1);
   prediction_pub_ = nh_.advertise<trajectory_msgs::JointTrajectory>(
