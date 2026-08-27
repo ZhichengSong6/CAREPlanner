@@ -630,6 +630,463 @@ void VelocityQPMPCWaypoint::replanReadyCallback(
   replan_ready_received_ = true;
 }
 
+
+void VelocityQPMPCWaypoint::cdfConstraintBatchCallback(
+    const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg) {
+  if (!cdf_shadow_enabled_ || !msg) return;
+
+  const int n = msg->num_pairs;
+  if (n <= 0 || msg->dof != dof_ ||
+      msg->original_timestep.size() != static_cast<std::size_t>(n) ||
+      msg->point_flat.size() != static_cast<std::size_t>(n * 3) ||
+      msg->q_linearization_flat.size() !=
+          static_cast<std::size_t>(n * dof_) ||
+      msg->distance.size() != static_cast<std::size_t>(n) ||
+      msg->gradient_flat.size() !=
+          static_cast<std::size_t>(n * dof_)) {
+    ROS_WARN_THROTTLE(
+        1.0, "[VelocityQPMPCWaypoint] C5.3a malformed CDF constraint batch");
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+  ++cdf_shadow_job_received_;
+
+  const ros::WallTime wall_now = ros::WallTime::now();
+  while (!cdf_shadow_snapshots_.empty() &&
+         (wall_now - cdf_shadow_snapshots_.front().created_wall).toSec() >
+             cdf_snapshot_timeout_s_) {
+    cdf_shadow_snapshots_.pop_front();
+  }
+
+  int best_index = -1;
+  double best_dt = std::numeric_limits<double>::infinity();
+  for (std::size_t i = 0; i < cdf_shadow_snapshots_.size(); ++i) {
+    const double dt = std::fabs(
+        (cdf_shadow_snapshots_[i].prediction_stamp -
+         msg->header.stamp).toSec());
+    if (dt < best_dt) {
+      best_dt = dt;
+      best_index = static_cast<int>(i);
+    }
+  }
+
+  if (best_index < 0 || best_dt > cdf_stamp_tolerance_s_) {
+    ++cdf_shadow_stamp_miss_;
+    ROS_WARN_STREAM_THROTTLE(
+        1.0,
+        "[VelocityQPMPCWaypoint] C5.3a constraint batch stamp miss: "
+        << "batch=" << msg->header.stamp.toSec()
+        << " best_dt=" << best_dt
+        << " history=" << cdf_shadow_snapshots_.size());
+    return;
+  }
+
+  if (cdf_shadow_pending_job_) {
+    ++cdf_shadow_job_dropped_;
+  }
+  cdf_shadow_pending_job_.reset(new CDFShadowJob());
+  cdf_shadow_pending_job_->snapshot =
+      cdf_shadow_snapshots_[static_cast<std::size_t>(best_index)];
+  cdf_shadow_pending_job_->batch = msg;
+  cdf_shadow_cv_.notify_one();
+}
+
+void VelocityQPMPCWaypoint::startCDFShadowWorker() {
+  std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+  if (cdf_shadow_worker_.joinable()) return;
+  cdf_shadow_worker_stop_ = false;
+  cdf_shadow_worker_ =
+      std::thread(&VelocityQPMPCWaypoint::cdfShadowWorkerLoop, this);
+}
+
+void VelocityQPMPCWaypoint::stopCDFShadowWorker() {
+  {
+    std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+    cdf_shadow_worker_stop_ = true;
+    cdf_shadow_pending_job_.reset();
+  }
+  cdf_shadow_cv_.notify_all();
+  if (cdf_shadow_worker_.joinable()) {
+    cdf_shadow_worker_.join();
+  }
+}
+
+void VelocityQPMPCWaypoint::cdfShadowWorkerLoop() {
+  while (true) {
+    std::unique_ptr<CDFShadowJob> job;
+    {
+      std::unique_lock<std::mutex> lock(cdf_shadow_mutex_);
+      cdf_shadow_cv_.wait(
+          lock,
+          [&]() {
+            return cdf_shadow_worker_stop_ ||
+                   static_cast<bool>(cdf_shadow_pending_job_);
+          });
+      if (cdf_shadow_worker_stop_) return;
+      job = std::move(cdf_shadow_pending_job_);
+    }
+    if (!job || !job->batch) continue;
+
+    Eigen::VectorXd solution;
+    int iterations = 0;
+    double primal = 0.0;
+    double dual = 0.0;
+    std::string status;
+    int active_rows = 0;
+    int skipped_step0 = 0;
+    int skipped_horizon = 0;
+    double qlin_error_inf = std::numeric_limits<double>::quiet_NaN();
+    double min_raw_distance = std::numeric_limits<double>::quiet_NaN();
+    double min_linearized_shadow =
+        std::numeric_limits<double>::quiet_NaN();
+    double solve_ms = 0.0;
+
+    const bool solved = solveCDFShadowJob(
+        *job,
+        solution,
+        iterations,
+        primal,
+        dual,
+        status,
+        active_rows,
+        skipped_step0,
+        skipped_horizon,
+        qlin_error_inf,
+        min_raw_distance,
+        min_linearized_shadow,
+        solve_ms);
+
+    if (solved) {
+      const Eigen::MatrixXd q_pred =
+          reconstructPredictedQ(job->snapshot.q_current, solution);
+      publishCDFShadowPrediction(
+          q_pred,
+          solution,
+          job->snapshot.frame_id,
+          job->snapshot.prediction_stamp);
+    }
+
+    const double age_ms =
+        (ros::WallTime::now() - job->snapshot.created_wall).toSec() * 1000.0;
+
+    {
+      std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+      ++cdf_shadow_job_processed_;
+    }
+
+    publishCDFShadowSummary(
+        *job,
+        solved,
+        status,
+        iterations,
+        primal,
+        dual,
+        active_rows,
+        skipped_step0,
+        skipped_horizon,
+        qlin_error_inf,
+        min_raw_distance,
+        min_linearized_shadow,
+        solve_ms,
+        age_ms);
+  }
+}
+
+bool VelocityQPMPCWaypoint::solveCDFShadowJob(
+    const CDFShadowJob& job,
+    Eigen::VectorXd& solution,
+    int& iterations,
+    double& primal_residual,
+    double& dual_residual,
+    std::string& status_string,
+    int& active_constraint_rows,
+    int& skipped_step0_rows,
+    int& skipped_horizon_rows,
+    double& max_linearization_q_error_inf,
+    double& min_raw_distance,
+    double& min_linearized_shadow_distance,
+    double& solve_ms) const {
+  const auto& snapshot = job.snapshot;
+  const auto& batch = *job.batch;
+  const int n = batch.num_pairs;
+
+  active_constraint_rows = 0;
+  skipped_step0_rows = 0;
+  skipped_horizon_rows = 0;
+  max_linearization_q_error_inf = 0.0;
+  min_raw_distance = std::numeric_limits<double>::infinity();
+  min_linearized_shadow_distance =
+      std::numeric_limits<double>::infinity();
+  solve_ms = 0.0;
+
+  if (snapshot.hessian.rows() != n_u_ ||
+      snapshot.hessian.cols() != n_u_ ||
+      snapshot.gradient.size() != n_u_ ||
+      snapshot.lower.size() != n_constraints_ ||
+      snapshot.upper.size() != n_constraints_ ||
+      snapshot.raw_solution.size() != n_u_ ||
+      snapshot.q_current.size() != dof_) {
+    status_string = "snapshot_dimension_error";
+    return false;
+  }
+
+  const Eigen::MatrixXd raw_q =
+      reconstructPredictedQ(snapshot.q_current, snapshot.raw_solution);
+
+  std::vector<int> selected;
+  selected.reserve(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) {
+    const int k =
+        batch.original_timestep[static_cast<std::size_t>(i)];
+    if (k == 0) {
+      ++skipped_step0_rows;
+      continue;
+    }
+    if (k < 0 || k > num_intervals_ ||
+        k > cdf_constraint_horizon_steps_) {
+      ++skipped_horizon_rows;
+      continue;
+    }
+
+    bool finite = std::isfinite(
+        batch.distance[static_cast<std::size_t>(i)]);
+    for (int j = 0; j < dof_; ++j) {
+      finite = finite &&
+          std::isfinite(
+              batch.q_linearization_flat[
+                  static_cast<std::size_t>(i * dof_ + j)]) &&
+          std::isfinite(
+              batch.gradient_flat[
+                  static_cast<std::size_t>(i * dof_ + j)]);
+    }
+    if (!finite) {
+      ++skipped_horizon_rows;
+      continue;
+    }
+    selected.push_back(i);
+  }
+
+  active_constraint_rows = static_cast<int>(selected.size());
+  if (selected.empty()) {
+    status_string = "no_active_cdf_rows";
+    solution = snapshot.raw_solution;
+    min_raw_distance = std::numeric_limits<double>::quiet_NaN();
+    min_linearized_shadow_distance =
+        std::numeric_limits<double>::quiet_NaN();
+    return true;
+  }
+
+  Eigen::MatrixXd G_aug =
+      Eigen::MatrixXd::Zero(
+          n_constraints_ + active_constraint_rows, n_u_);
+  G_aug.topRows(n_constraints_) = G_;
+
+  Eigen::VectorXd lower_aug(
+      n_constraints_ + active_constraint_rows);
+  Eigen::VectorXd upper_aug(
+      n_constraints_ + active_constraint_rows);
+  lower_aug.head(n_constraints_) = snapshot.lower;
+  upper_aug.head(n_constraints_) = snapshot.upper;
+
+  for (int row = 0; row < active_constraint_rows; ++row) {
+    const int i = selected[static_cast<std::size_t>(row)];
+    const int k =
+        batch.original_timestep[static_cast<std::size_t>(i)];
+
+    Eigen::VectorXd g(dof_);
+    Eigen::VectorXd q_bar(dof_);
+    for (int j = 0; j < dof_; ++j) {
+      g[j] = batch.gradient_flat[
+          static_cast<std::size_t>(i * dof_ + j)];
+      q_bar[j] = batch.q_linearization_flat[
+          static_cast<std::size_t>(i * dof_ + j)];
+    }
+
+    const double d =
+        batch.distance[static_cast<std::size_t>(i)];
+    min_raw_distance = std::min(min_raw_distance, d);
+
+    const double q_error =
+        (raw_q.col(k) - q_bar).lpNorm<Eigen::Infinity>();
+    max_linearization_q_error_inf =
+        std::max(max_linearization_q_error_inf, q_error);
+
+    const Eigen::MatrixXd S_k =
+        S_.block((k - 1) * dof_, 0, dof_, n_u_);
+    G_aug.row(n_constraints_ + row) =
+        g.transpose() * S_k;
+
+    lower_aug[n_constraints_ + row] =
+        cdf_safety_margin_ - d -
+        g.dot(snapshot.q_current - q_bar);
+    upper_aug[n_constraints_ + row] = 1.0e20;
+  }
+
+  if (!finiteMatrix(G_aug) ||
+      !finiteVector(lower_aug) ||
+      !finiteVector(upper_aug)) {
+    status_string = "cdf_matrix_finite_error";
+    return false;
+  }
+
+  piqp::DenseSolver<double> solver;
+  auto& settings = solver.settings();
+  settings.max_iter = piqp_max_iterations_;
+  settings.eps_abs = piqp_eps_abs_;
+  settings.eps_rel = piqp_eps_rel_;
+  settings.verbose = piqp_verbose_;
+  settings.compute_timings = piqp_compute_timings_;
+
+  const ros::WallTime tic = ros::WallTime::now();
+  solver.setup(
+      snapshot.hessian,
+      snapshot.gradient,
+      piqp::nullopt,
+      piqp::nullopt,
+      G_aug,
+      lower_aug,
+      upper_aug,
+      x_lower_,
+      x_upper_);
+  const piqp::Status status = solver.solve();
+  solve_ms = (ros::WallTime::now() - tic).toSec() * 1000.0;
+
+  const auto& result = solver.result();
+  iterations = static_cast<int>(result.info.iter);
+  primal_residual = result.info.primal_res;
+  dual_residual = result.info.dual_res;
+  status_string = piqp::status_to_string(status);
+
+  if (status != piqp::PIQP_SOLVED || !finiteVector(result.x)) {
+    return false;
+  }
+  solution = result.x;
+
+  for (int row = 0; row < active_constraint_rows; ++row) {
+    const int i = selected[static_cast<std::size_t>(row)];
+    const int k =
+        batch.original_timestep[static_cast<std::size_t>(i)];
+
+    Eigen::VectorXd g(dof_);
+    Eigen::VectorXd q_bar(dof_);
+    for (int j = 0; j < dof_; ++j) {
+      g[j] = batch.gradient_flat[
+          static_cast<std::size_t>(i * dof_ + j)];
+      q_bar[j] = batch.q_linearization_flat[
+          static_cast<std::size_t>(i * dof_ + j)];
+    }
+
+    const Eigen::MatrixXd S_k =
+        S_.block((k - 1) * dof_, 0, dof_, n_u_);
+    const Eigen::VectorXd q_new =
+        snapshot.q_current + S_k * solution;
+    const double d_linearized =
+        batch.distance[static_cast<std::size_t>(i)] +
+        g.dot(q_new - q_bar);
+    min_linearized_shadow_distance =
+        std::min(
+            min_linearized_shadow_distance, d_linearized);
+  }
+
+  return true;
+}
+
+void VelocityQPMPCWaypoint::publishCDFShadowPrediction(
+    const Eigen::MatrixXd& q_pred,
+    const Eigen::VectorXd& u_stack,
+    const std::string& frame_id,
+    const ros::Time& source_stamp) {
+  if (!cdf_shadow_enabled_) return;
+
+  trajectory_msgs::JointTrajectory msg;
+  msg.header.stamp =
+      source_stamp.isZero() ? ros::Time::now() : source_stamp;
+  msg.header.frame_id = frame_id;
+  msg.joint_names = joint_names_;
+  msg.points.resize(static_cast<std::size_t>(num_intervals_ + 1));
+
+  for (int k = 0; k <= num_intervals_; ++k) {
+    auto& point = msg.points[static_cast<std::size_t>(k)];
+    point.time_from_start = ros::Duration(k * dt_);
+    point.positions.resize(static_cast<std::size_t>(dof_));
+    point.velocities.resize(static_cast<std::size_t>(dof_));
+    for (int j = 0; j < dof_; ++j) {
+      point.positions[static_cast<std::size_t>(j)] = q_pred(j, k);
+      point.velocities[static_cast<std::size_t>(j)] =
+          k < num_intervals_
+              ? u_stack[k * dof_ + j]
+              : 0.0;
+    }
+  }
+  cdf_shadow_prediction_pub_.publish(msg);
+}
+
+void VelocityQPMPCWaypoint::publishCDFShadowSummary(
+    const CDFShadowJob& job,
+    bool solved,
+    const std::string& status,
+    int iterations,
+    double primal,
+    double dual,
+    int active_constraint_rows,
+    int skipped_step0_rows,
+    int skipped_horizon_rows,
+    double max_linearization_q_error_inf,
+    double min_raw_distance,
+    double min_linearized_shadow_distance,
+    double solve_ms,
+    double end_to_end_age_ms) {
+  unsigned long long received = 0;
+  unsigned long long processed = 0;
+  unsigned long long dropped = 0;
+  unsigned long long stamp_miss = 0;
+  {
+    std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+    received = cdf_shadow_job_received_;
+    processed = cdf_shadow_job_processed_;
+    dropped = cdf_shadow_job_dropped_;
+    stamp_miss = cdf_shadow_stamp_miss_;
+  }
+
+  std::ostringstream oss;
+  oss << "C5_3A_CDF_SHADOW"
+      << " stamp=" << job.snapshot.prediction_stamp.toSec()
+      << " solved=" << static_cast<int>(solved)
+      << " status=" << status
+      << " control_mode=" << job.snapshot.control_mode
+      << " d_safe=" << cdf_safety_margin_
+      << " horizon_steps=" << cdf_constraint_horizon_steps_
+      << " batch_pairs=" << job.batch->num_pairs
+      << " active_rows=" << active_constraint_rows
+      << " skipped_step0=" << skipped_step0_rows
+      << " skipped_horizon=" << skipped_horizon_rows
+      << " qlin_error_inf=" << max_linearization_q_error_inf
+      << " raw_min_d=" << min_raw_distance
+      << " shadow_linearized_min_d="
+      << min_linearized_shadow_distance
+      << " shadow_solve_ms=" << solve_ms
+      << " iter=" << iterations
+      << " primal=" << primal
+      << " dual=" << dual
+      << " upstream_pipeline_ms="
+      << job.batch->online_pipeline_ms
+      << " upstream_gpu_ms="
+      << job.batch->gpu_inference_ms
+      << " end_to_end_age_ms=" << end_to_end_age_ms
+      << " jobs_received=" << received
+      << " jobs_processed=" << processed
+      << " jobs_dropped=" << dropped
+      << " stamp_miss=" << stamp_miss;
+
+  std_msgs::String msg;
+  msg.data = oss.str();
+  cdf_shadow_summary_pub_.publish(msg);
+
+  ROS_INFO_STREAM_THROTTLE(
+      0.5, "[VelocityQPMPCWaypoint] " << msg.data);
+}
+
 bool VelocityQPMPCWaypoint::extractMeasuredQ(
     const sensor_msgs::JointState& msg,
     Eigen::VectorXd& q) const {
