@@ -26,6 +26,10 @@ bool finiteMatrix(const Eigen::MatrixXd& x) {
 
 }  // namespace
 
+VelocityQPMPCWaypoint::~VelocityQPMPCWaypoint() {
+  stopCDFShadowWorker();
+}
+
 bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
                                        const ros::NodeHandle& pnh) {
   nh_ = nh;
@@ -81,6 +85,14 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
       recovery_active_topic_, 1, true);
   recovery_complete_pub_ = nh_.advertise<std_msgs::Bool>(
       recovery_complete_topic_, 1, false);
+  if (cdf_shadow_enabled_) {
+    cdf_shadow_prediction_pub_ =
+        nh_.advertise<trajectory_msgs::JointTrajectory>(
+            cdf_shadow_prediction_topic_, 2);
+    cdf_shadow_summary_pub_ =
+        nh_.advertise<std_msgs::String>(
+            cdf_shadow_summary_topic_, 10);
+  }
 
   publishRecoveryActive(false);
 
@@ -125,6 +137,16 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
   }
   if (multi_deadline_enabled_) {
     ROS_WARN("[VelocityQPMPCWaypoint] C4.6 MULTI-DEADLINE REPAIR ENABLED: nominal task tracking is removed in REPAIR and every accumulated visibility obligation is applied at its own deadline index.");
+  }
+  if (cdf_shadow_enabled_) {
+    ROS_WARN_STREAM(
+        "[VelocityQPMPCWaypoint] C5.3a CDF SHADOW ENABLED: "
+        << "batch=" << cdf_constraint_batch_topic_
+        << ", output=" << cdf_shadow_prediction_topic_
+        << ", d_safe=" << cdf_safety_margin_
+        << ", horizon_steps=" << cdf_constraint_horizon_steps_
+        << ". Raw MPC/commit/execution are unchanged.");
+    startCDFShadowWorker();
   }
   return true;
 }
@@ -286,6 +308,30 @@ bool VelocityQPMPCWaypoint::loadConfig() {
   pnh_.param<std::string>("mpc/predicted_trajectory",
                           prediction_topic_, prediction_topic_);
 
+  pnh_.param<bool>("mpc/cdf_shadow/enabled",
+                   cdf_shadow_enabled_, cdf_shadow_enabled_);
+  pnh_.param<double>("mpc/cdf_shadow/safety_margin",
+                     cdf_safety_margin_, cdf_safety_margin_);
+  pnh_.param<int>("mpc/cdf_shadow/constraint_horizon_steps",
+                  cdf_constraint_horizon_steps_,
+                  cdf_constraint_horizon_steps_);
+  pnh_.param<double>("mpc/cdf_shadow/snapshot_timeout",
+                     cdf_snapshot_timeout_s_, cdf_snapshot_timeout_s_);
+  pnh_.param<int>("mpc/cdf_shadow/snapshot_history_size",
+                  cdf_snapshot_history_size_,
+                  cdf_snapshot_history_size_);
+  pnh_.param<double>("mpc/cdf_shadow/stamp_tolerance",
+                     cdf_stamp_tolerance_s_, cdf_stamp_tolerance_s_);
+  pnh_.param<std::string>("mpc/cdf_shadow/constraint_batch_topic",
+                          cdf_constraint_batch_topic_,
+                          cdf_constraint_batch_topic_);
+  pnh_.param<std::string>("mpc/cdf_shadow/predicted_trajectory_topic",
+                          cdf_shadow_prediction_topic_,
+                          cdf_shadow_prediction_topic_);
+  pnh_.param<std::string>("mpc/cdf_shadow/summary_topic",
+                          cdf_shadow_summary_topic_,
+                          cdf_shadow_summary_topic_);
+
   if (rate_ <= 0.0 || horizon_duration_ <= 0.0 || num_intervals_ < 2 ||
       piqp_max_iterations_ <= 0 || piqp_eps_abs_ <= 0.0 || piqp_eps_rel_ < 0.0) {
     ROS_ERROR("[VelocityQPMPCWaypoint] Invalid timing/PIQP parameters.");
@@ -300,6 +346,15 @@ bool VelocityQPMPCWaypoint::loadConfig() {
       waypoint_horizon_slack_ < 0.0 || recovery_weight_scale_ <= 0.0 ||
       recovery_signal_timeout_ <= 0.0 || max_repair_waypoints_ < 1) {
     ROS_ERROR("[VelocityQPMPCWaypoint] invalid visibility-waypoint/recovery parameters.");
+    return false;
+  }
+  if (!std::isfinite(cdf_safety_margin_) || cdf_safety_margin_ < 0.0 ||
+      cdf_constraint_horizon_steps_ < 1 ||
+      cdf_constraint_horizon_steps_ > num_intervals_ ||
+      cdf_snapshot_timeout_s_ <= 0.0 ||
+      cdf_snapshot_history_size_ < 2 ||
+      cdf_stamp_tolerance_s_ < 0.0) {
+    ROS_ERROR("[VelocityQPMPCWaypoint] invalid CDF shadow parameters.");
     return false;
   }
 
