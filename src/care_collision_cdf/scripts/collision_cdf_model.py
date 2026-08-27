@@ -14,6 +14,15 @@ import torch
 from torch import nn
 
 
+def resolve_activation(name: str):
+    key = str(name).strip().lower()
+    if key == "relu":
+        return nn.ReLU
+    if key == "gelu":
+        return nn.GELU
+    raise ValueError(f"Unsupported collision CDF activation: {name}")
+
+
 def _mlp(channels, act_fn=nn.ReLU, islast=False):
     # Preserve the nested Sequential structure used by idiap/cdf so original
     # model_dict.pt state_dict key names match exactly.
@@ -42,6 +51,7 @@ class MLPRegression(nn.Module):
         skips=(),
         act_fn=nn.ReLU,
         nerf: bool = True,
+        activation: str = "gelu",
     ):
         super().__init__()
         input_dims = int(input_dims)
@@ -232,6 +242,8 @@ class CollisionCDF:
         payload = torch.load(checkpoint_path, map_location=self.device)
         state, selected = extract_state_dict(payload, checkpoint_key)
         architecture = infer_mlp_architecture(state, raw_input_dims=input_dims)
+        activation_name = str(activation).strip().lower()
+        activation_cls = resolve_activation(activation_name)
 
         if int(output_dims) != int(architecture["output_dims"]):
             raise ValueError(
@@ -243,12 +255,15 @@ class CollisionCDF:
             input_dims=architecture["input_dims"],
             output_dims=architecture["output_dims"],
             mlp_layers=architecture["hidden_layers"],
+            act_fn=activation_cls,
             nerf=architecture["nerf"],
         ).to(self.device)
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
         self.selected_checkpoint = selected
-        self.architecture = architecture
+        self.architecture = dict(architecture)
+        self.architecture["activation"] = activation_name
+        self.signed = True
 
     def pair_distance_and_gradient(
         self, points_xyz: torch.Tensor, q: torch.Tensor
