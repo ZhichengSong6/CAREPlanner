@@ -1,0 +1,20 @@
+collision_cdf:
+  # Yiming CDF convention: input = [workspace xyz, q1..q7], output in
+  # configuration-space distance units (radians / joint-space norm).
+  input_dims: 10
+  output_dims: 1
+  hidden_layers: [1024, 512, 256, 128, 128]
+  nerf: true
+
+  # "latest" selects the largest numeric iteration key for the original
+  # Yiming model_dict.pt format. It also supports raw state_dict,
+  # state_dict/model_state_dict wrapped checkpoints.
+  checkpoint_key: "latest"
+
+  device: "cuda"
+  service_name: "/care_planner/collision_cdf/query"
+
+  # Guard against accidentally sending the complete dense confidence grid.
+  # C5 should query only occupied + relevant low-confidence frontier points.
+  max_points: 4096
+  max_q: 64
