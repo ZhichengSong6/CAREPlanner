@@ -21,9 +21,10 @@ trajectory_risk:
   frontier_gap_threshold: 0.50
   frontier_radius_margin: 0.05
 
-  # C5.2 shadow export: when enabled, trajectory_risk publishes every
-  # low-confidence body-sweep sample together with the exact q_k that produced
-  # it.  The collision CDF diagnostic consumes these as (p, q_k) pairs.
+  # C5.2 shadow export: when enabled, trajectory_risk publishes every in-map
+  # predicted risk-body sample together with the exact q_k and sphere radius.
+  # These centers are spatial query anchors only; actual forbidden CDF points
+  # come from nearby low-confidence confidence-map voxel centers.
   forbidden_space_pair_publish_enabled: false
   forbidden_space_pair_topic: /care_planner/trajectory_risk/body_sweep_anchors
   forbidden_space_confidence_threshold: 0.50
