@@ -1032,6 +1032,17 @@ class CppForbiddenVoxelGpuShadow {
         static_cast<double>(negative) /
         static_cast<double>(distance.size());
 
+    publishConstraintBatch(
+        anchor_cloud->header,
+        pairs,
+        distance,
+        gradient,
+        selection_ms,
+        buffer_ms,
+        ipc_ms,
+        gpu,
+        pipeline_ms);
+
     appendJsonRecord(
         anchor_cloud->header.stamp,
         *map,
