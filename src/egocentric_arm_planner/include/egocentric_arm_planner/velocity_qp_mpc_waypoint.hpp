@@ -2,6 +2,8 @@
 
 #include <ros/ros.h>
 
+#include <care_collision_cdf/CollisionCDFConstraintBatch.h>
+
 #include <sensor_msgs/JointState.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Float32.h>
@@ -14,6 +16,9 @@
 #include <piqp/piqp.hpp>
 
 #include <cmath>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -64,6 +69,7 @@ namespace egocentric_arm_planner {
 class VelocityQPMPCWaypoint {
 public:
   VelocityQPMPCWaypoint() = default;
+  ~VelocityQPMPCWaypoint();
 
   bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
 
@@ -91,6 +97,24 @@ private:
     Eigen::VectorXd q;
   };
 
+  struct CDFQPSnapshot {
+    ros::Time prediction_stamp;
+    ros::WallTime created_wall;
+    Eigen::VectorXd q_current;
+    Eigen::MatrixXd hessian;
+    Eigen::VectorXd gradient;
+    Eigen::VectorXd lower;
+    Eigen::VectorXd upper;
+    Eigen::VectorXd raw_solution;
+    std::string frame_id;
+    std::string control_mode;
+  };
+
+  struct CDFShadowJob {
+    CDFQPSnapshot snapshot;
+    care_collision_cdf::CollisionCDFConstraintBatchConstPtr batch;
+  };
+
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void referenceCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void waypointActiveCallback(const std_msgs::BoolConstPtr& msg);
@@ -101,6 +125,8 @@ private:
   void recoveryTriggerCallback(const std_msgs::BoolConstPtr& msg);
   void recoveryClearCallback(const std_msgs::BoolConstPtr& msg);
   void replanReadyCallback(const std_msgs::BoolConstPtr& msg);
+  void cdfConstraintBatchCallback(
+      const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg);
   void timerCallback(const ros::TimerEvent& event);
 
   bool loadConfig();
@@ -146,13 +172,52 @@ private:
                      double& dual_residual,
                      std::string& status_string) const;
 
+  void startCDFShadowWorker();
+  void stopCDFShadowWorker();
+  void cdfShadowWorkerLoop();
+  bool solveCDFShadowJob(
+      const CDFShadowJob& job,
+      Eigen::VectorXd& solution,
+      int& iterations,
+      double& primal_residual,
+      double& dual_residual,
+      std::string& status_string,
+      int& active_constraint_rows,
+      int& skipped_step0_rows,
+      int& skipped_horizon_rows,
+      double& max_linearization_q_error_inf,
+      double& min_raw_distance,
+      double& min_linearized_shadow_distance,
+      double& solve_ms) const;
+  void publishCDFShadowPrediction(
+      const Eigen::MatrixXd& q_pred,
+      const Eigen::VectorXd& u_stack,
+      const std::string& frame_id,
+      const ros::Time& source_stamp);
+  void publishCDFShadowSummary(
+      const CDFShadowJob& job,
+      bool solved,
+      const std::string& status,
+      int iterations,
+      double primal,
+      double dual,
+      int active_constraint_rows,
+      int skipped_step0_rows,
+      int skipped_horizon_rows,
+      double max_linearization_q_error_inf,
+      double min_raw_distance,
+      double min_linearized_shadow_distance,
+      double solve_ms,
+      double end_to_end_age_ms);
+
   Eigen::MatrixXd reconstructPredictedQ(const Eigen::VectorXd& q_current,
                                         const Eigen::VectorXd& u_stack) const;
   void publishVelocity(const Eigen::VectorXd& command);
   void publishSafeStop(const std::string& reason);
   void publishPrediction(const Eigen::MatrixXd& q_pred,
                          const Eigen::VectorXd& u_stack,
-                         const std::string& frame_id);
+                         const std::string& frame_id,
+                         const ros::Time& stamp);
   void publishRecoveryActive(bool active);
   void publishRecoveryComplete();
 
@@ -170,6 +235,7 @@ private:
   ros::Subscriber recovery_trigger_sub_;
   ros::Subscriber recovery_clear_sub_;
   ros::Subscriber replan_ready_sub_;
+  ros::Subscriber cdf_constraint_batch_sub_;
 
   ros::Publisher velocity_command_pub_;
   ros::Publisher prediction_pub_;
@@ -177,6 +243,8 @@ private:
   ros::Publisher summary_pub_;
   ros::Publisher recovery_active_pub_;
   ros::Publisher recovery_complete_pub_;
+  ros::Publisher cdf_shadow_prediction_pub_;
+  ros::Publisher cdf_shadow_summary_pub_;
   ros::Timer timer_;
 
   mutable std::mutex data_mutex_;
@@ -295,6 +363,19 @@ private:
   std::string replan_ready_topic_ =
       "/care_planner/execution/visibility_replan_ready";
 
+  bool cdf_shadow_enabled_ = false;
+  double cdf_safety_margin_ = 0.0;
+  int cdf_constraint_horizon_steps_ = 20;
+  double cdf_snapshot_timeout_s_ = 0.75;
+  int cdf_snapshot_history_size_ = 12;
+  double cdf_stamp_tolerance_s_ = 1e-6;
+  std::string cdf_constraint_batch_topic_ =
+      "/care_planner/collision_cdf/constraint_batch";
+  std::string cdf_shadow_prediction_topic_ =
+      "/care_planner/mpc/cdf_shadow_predicted_trajectory";
+  std::string cdf_shadow_summary_topic_ =
+      "/care_planner/mpc/cdf_shadow_summary";
+
   Eigen::MatrixXd S_;
   Eigen::MatrixXd S_terminal_;
   Eigen::MatrixXd D_;
@@ -308,6 +389,17 @@ private:
   int n_constraints_ = 0;
   int acceleration_row0_ = 0;
   int position_row0_ = 0;
+
+  mutable std::mutex cdf_shadow_mutex_;
+  std::condition_variable cdf_shadow_cv_;
+  std::deque<CDFQPSnapshot> cdf_shadow_snapshots_;
+  std::unique_ptr<CDFShadowJob> cdf_shadow_pending_job_;
+  std::thread cdf_shadow_worker_;
+  bool cdf_shadow_worker_stop_ = false;
+  unsigned long long cdf_shadow_job_received_ = 0;
+  unsigned long long cdf_shadow_job_processed_ = 0;
+  unsigned long long cdf_shadow_job_dropped_ = 0;
+  unsigned long long cdf_shadow_stamp_miss_ = 0;
 
   unsigned long long sequence_ = 0;
 };
