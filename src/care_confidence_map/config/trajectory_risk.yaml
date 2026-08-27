@@ -25,7 +25,7 @@ trajectory_risk:
   # low-confidence body-sweep sample together with the exact q_k that produced
   # it.  The collision CDF diagnostic consumes these as (p, q_k) pairs.
   forbidden_space_pair_publish_enabled: false
-  forbidden_space_pair_topic: /care_planner/trajectory_risk/low_confidence_sweep_pairs
+  forbidden_space_pair_topic: /care_planner/trajectory_risk/body_sweep_anchors
   forbidden_space_confidence_threshold: 0.50
 
   enable_secondary_frontier_group: true
