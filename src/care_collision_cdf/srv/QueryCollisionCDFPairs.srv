@@ -1,0 +1,17 @@
+# One-to-one batched forbidden-space CDF query.
+#
+# points[b] is evaluated only with q[b].
+# q_flat contains num_pairs consecutive 7-DoF configurations.
+#
+# Response:
+#   distance[b] = f_cdf(points[b], q[b])
+#   gradient_flat contains num_pairs consecutive dq gradients.
+geometry_msgs/Point[] points
+float64[] q_flat
+int32 num_pairs
+---
+bool success
+string message
+float64[] distance
+float64[] gradient_flat
+float64 inference_ms
