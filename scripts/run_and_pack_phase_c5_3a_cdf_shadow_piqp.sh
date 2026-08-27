@@ -152,30 +152,6 @@ if [[ "${READY}" != "1" ]]; then
   exit 4
 fi
 
-# C++ dense-grid selector. It waits for the C4.9 ROS master and publishes the
-# timestamped paired constraint batch consumed by the MPC shadow worker.
-setsid bash -lc "
-  set -e
-  cd '${REPO}'
-  source devel/setup.bash
-  while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
-  exec rosrun care_collision_cdf cpp_forbidden_voxel_gpu_shadow_node \
-    _anchor_topic:='${ANCHOR_TOPIC}' \
-    _map_topic:='${MAP_TOPIC}' \
-    _summary_topic:=/care_planner/collision_cdf/cpp_gpu_online_summary \
-    _constraint_batch_topic:='${CONSTRAINT_BATCH_TOPIC}' \
-    _output_jsonl:='${SELECTOR_JSONL}' \
-    _gpu_socket:='${GPU_SOCKET}' \
-    _rate:='${SHADOW_RATE}' \
-    _confidence_threshold:='${CONFIDENCE_THRESHOLD}' \
-    _map_resolution:='${MAP_RESOLUTION}' \
-    _proximity_margin:='${PROXIMITY_MARGIN}' \
-    _max_pairs_per_step:='${MAX_PAIRS_PER_STEP}' \
-    _signed_zero_band:='${SIGNED_ZERO_BAND}' \
-    _max_pairs:=8000
-" >"${ROOT_LOG}/cpp_selector_gpu.log" 2>&1 &
-PIDS+=("$!")
-
 # Transport topology watchdog. This is diagnostic only and does not subscribe
 # to the large batch payload itself.
 setsid bash -lc "
@@ -184,7 +160,7 @@ setsid bash -lc "
   source devel/setup.bash
   while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
   for i in $(seq 1 80); do
-    echo '===== sample='\"$i\"' ====='
+    echo "===== sample=\$i ====="
     date '+wall=%s.%N'
     rostopic info '${CONSTRAINT_BATCH_TOPIC}' 2>&1
     rosnode info /velocity_qp_mpc_waypoint_node 2>&1 | \
@@ -192,21 +168,6 @@ setsid bash -lc "
     sleep 0.25
   done
 " >"${ROOT_LOG}/constraint_batch_topology.log" 2>&1 &
-PIDS+=("$!")
-
-# Exact VBC audit of the shadow constrained trajectory. All steering-side
-# outputs are isolated inside the dedicated audit launch.
-setsid bash -lc "
-  set -e
-  cd '${REPO}'
-  source devel/setup.bash
-  while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
-  exec roslaunch egocentric_arm_planner c5_3a_cdf_shadow_vbc_audit.launch \
-    shadow_prediction_topic:='${CDF_SHADOW_PREDICTION_TOPIC}' \
-    shadow_vbc_summary_topic:='${CDF_SHADOW_VBC_SUMMARY_TOPIC}' \
-    predicted_trajectory_timeout:=0.50 \
-    min_visibility_before_sweep_margin_s:=0.30
-" >"${ROOT_LOG}/cdf_shadow_vbc_audit.log" 2>&1 &
 PIDS+=("$!")
 
 record_topic() {
@@ -241,6 +202,16 @@ CDF_SHADOW_SNAPSHOT_TIMEOUT="${CDF_SNAPSHOT_TIMEOUT}" \
 CDF_SHADOW_CONSTRAINT_BATCH_TOPIC="${CONSTRAINT_BATCH_TOPIC}" \
 CDF_SHADOW_PREDICTION_TOPIC="${CDF_SHADOW_PREDICTION_TOPIC}" \
 CDF_SHADOW_SUMMARY_TOPIC="${CDF_SHADOW_SUMMARY_TOPIC}" \
+CDF_SELECTOR_ENABLED="true" \
+CDF_SELECTOR_GPU_SOCKET="${GPU_SOCKET}" \
+CDF_SELECTOR_OUTPUT_JSONL="${SELECTOR_JSONL}" \
+CDF_SELECTOR_RATE="${SHADOW_RATE}" \
+CDF_SELECTOR_MAP_RESOLUTION="${MAP_RESOLUTION}" \
+CDF_SELECTOR_PROXIMITY_MARGIN="${PROXIMITY_MARGIN}" \
+CDF_SELECTOR_MAX_PAIRS_PER_STEP="${MAX_PAIRS_PER_STEP}" \
+CDF_SELECTOR_SIGNED_ZERO_BAND="${SIGNED_ZERO_BAND}" \
+CDF_SHADOW_VBC_AUDIT_ENABLED="true" \
+CDF_SHADOW_VBC_SUMMARY_TOPIC="${CDF_SHADOW_VBC_SUMMARY_TOPIC}" \
 CASE_ID="${CASE_ID}" \
 RUN_SECONDS="${RUN_SECONDS}" \
 OUT="${C4_OUT}" \
@@ -414,6 +385,8 @@ cdf_activation=gelu
 cdf_safety_margin=${CDF_SAFETY_MARGIN}
 cdf_trust_region_q_inf=${CDF_TRUST_REGION_Q_INF}
 cdf_constraint_horizon_steps=${CDF_HORIZON_STEPS}
+selector_launch_mode=integrated_same_roslaunch
+shadow_vbc_launch_mode=integrated_same_roslaunch
 constraint_batch_topic=${CONSTRAINT_BATCH_TOPIC}
 shadow_prediction_topic=${CDF_SHADOW_PREDICTION_TOPIC}
 shadow_vbc_summary_topic=${CDF_SHADOW_VBC_SUMMARY_TOPIC}
