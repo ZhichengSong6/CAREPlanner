@@ -59,6 +59,22 @@
   <arg name="cdf_shadow_summary_topic"
        default="/care_planner/mpc/cdf_shadow_summary" />
 
+  <!-- C5.3a runtime producer + exact shadow audit.  Both are disabled by
+       default so frozen C4.x launches remain bit-for-bit behaviorally unchanged. -->
+  <arg name="cdf_selector_enabled" default="false" />
+  <arg name="cdf_selector_gpu_socket"
+       default="/tmp/care_collision_cdf_gpu.sock" />
+  <arg name="cdf_selector_output_jsonl"
+       default="/tmp/c5_3a_cpp_selector_gpu.jsonl" />
+  <arg name="cdf_selector_rate" default="20.0" />
+  <arg name="cdf_selector_map_resolution" default="0.05" />
+  <arg name="cdf_selector_proximity_margin" default="0.075" />
+  <arg name="cdf_selector_max_pairs_per_step" default="250" />
+  <arg name="cdf_selector_signed_zero_band" default="0.05" />
+  <arg name="cdf_shadow_vbc_audit_enabled" default="false" />
+  <arg name="cdf_shadow_vbc_summary_topic"
+       default="/care_planner/cdf_shadow_vbc/summary" />
+
   <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
   <arg name="gated_command_topic" default="/care_planner/command_trajectory_vbc_gated" />
   <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
@@ -221,6 +237,49 @@
     <arg name="show_full_trajectory_markers" value="false" />
     <arg name="show_worst_timestep_markers" value="false" />
     <arg name="show_attribution_markers" value="false" />
+  </include>
+
+
+  <!-- C5.3a: run the paired forbidden-voxel selector inside the SAME
+       roslaunch/master as MPC and trajectory_risk.  This removes the external
+       master-registration race that produced cdf_batch_publishers=0. -->
+  <node if="$(arg cdf_selector_enabled)"
+        pkg="care_collision_cdf"
+        type="cpp_forbidden_voxel_gpu_shadow_node"
+        name="c5_3a_cpp_forbidden_voxel_gpu_shadow"
+        output="screen">
+    <param name="anchor_topic" value="$(arg forbidden_space_pair_topic)" />
+    <param name="map_topic" value="/care_planner/confidence_map/points" />
+    <param name="summary_topic"
+           value="/care_planner/collision_cdf/cpp_gpu_online_summary" />
+    <param name="constraint_batch_topic"
+           value="$(arg cdf_shadow_constraint_batch_topic)" />
+    <param name="output_jsonl" value="$(arg cdf_selector_output_jsonl)" />
+    <param name="gpu_socket" value="$(arg cdf_selector_gpu_socket)" />
+    <param name="rate" value="$(arg cdf_selector_rate)" />
+    <param name="confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+    <param name="map_resolution" value="$(arg cdf_selector_map_resolution)" />
+    <param name="proximity_margin" value="$(arg cdf_selector_proximity_margin)" />
+    <param name="max_pairs_per_step"
+           value="$(arg cdf_selector_max_pairs_per_step)" />
+    <param name="signed_zero_band"
+           value="$(arg cdf_selector_signed_zero_band)" />
+    <param name="max_pairs" value="8000" />
+  </node>
+
+  <!-- C5.3a: exact VBC audit of the constrained SHADOW trajectory.  The audit
+       is isolated and cannot feed steering/commit/execution. -->
+  <include if="$(arg cdf_shadow_vbc_audit_enabled)"
+           file="$(find egocentric_arm_planner)/launch/c5_3a_cdf_shadow_vbc_audit.launch">
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="shadow_prediction_topic"
+         value="$(arg cdf_shadow_prediction_topic)" />
+    <arg name="shadow_vbc_summary_topic"
+         value="$(arg cdf_shadow_vbc_summary_topic)" />
+    <arg name="predicted_trajectory_timeout" value="0.50" />
+    <arg name="min_visibility_before_sweep_margin_s"
+         value="$(arg vbc_min_margin_s)" />
   </include>
 
   <!-- Candidate verifier: this copy owns steering target + active set. Only its
