@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
 CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict.pt}"
 CDF_ENV="${CDF_ENV:-ncdf_l4c}"
-DEVICE="${DEVICE:-cuda}"
+DEVICE="${DEVICE:-cpu}"
 ROS_PORT="${ROS_PORT:-11319}"
 OUT="${OUT:-${REPO}/outputs/c5_collision_cdf_smoke}"
 
