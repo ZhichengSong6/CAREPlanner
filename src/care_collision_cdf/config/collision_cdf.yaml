@@ -1,11 +1,19 @@
 collision_cdf:
-  # Yiming CDF convention: input = [workspace xyz, q1..q7], output in
-  # configuration-space distance units (radians / joint-space norm).
+  # Signed configuration-space distance field adapted from Yiming CDF.
+  # Convention used by the GCDF-style signed training:
+  #   positive = point is outside robot / collision-free side
+  #   zero     = robot-point contact surface
+  #   negative = point is inside robot / collision side
+  # input = [workspace xyz, q1..q7].
   input_dims: 10
   output_dims: 1
   # Runtime reconstructs the exact no-skip Yiming MLP widths and NeRF flag
   # directly from checkpoint tensor shapes. These fields document the raw I/O.
   nerf: true
+  signed: true
+  # The signed checkpoint follows the GCDF training MLP, which uses GELU.
+  # Activation has no state_dict tensors, so it cannot be inferred from weights.
+  activation: "gelu"
 
   # "latest" selects the largest numeric iteration key for the original
   # Yiming model_dict.pt format. It also supports raw state_dict,
