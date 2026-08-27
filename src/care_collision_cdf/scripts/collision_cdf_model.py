@@ -51,7 +51,6 @@ class MLPRegression(nn.Module):
         skips=(),
         act_fn=nn.ReLU,
         nerf: bool = True,
-        activation: str = "gelu",
     ):
         super().__init__()
         input_dims = int(input_dims)
@@ -231,6 +230,7 @@ class CollisionCDF:
         output_dims: int = 1,
         hidden_layers=(1024, 512, 256, 128, 128),
         nerf: bool = True,
+        activation: str = "gelu",
     ):
         if str(device).startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError("CUDA requested for collision CDF but torch.cuda.is_available() is false")
