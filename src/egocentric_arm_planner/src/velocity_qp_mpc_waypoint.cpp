@@ -890,9 +890,10 @@ void VelocityQPMPCWaypoint::publishSafeStop(const std::string& reason) {
 void VelocityQPMPCWaypoint::publishPrediction(
     const Eigen::MatrixXd& q_pred,
     const Eigen::VectorXd& u_stack,
-    const std::string& frame_id) {
+    const std::string& frame_id,
+    const ros::Time& stamp) {
   trajectory_msgs::JointTrajectory msg;
-  msg.header.stamp = ros::Time::now();
+  msg.header.stamp = stamp.isZero() ? ros::Time::now() : stamp;
   msg.header.frame_id = frame_id;
   msg.joint_names = joint_names_;
   msg.points.resize(static_cast<std::size_t>(num_intervals_ + 1));
@@ -1343,8 +1344,33 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   previous_command_ = command;
 
   const Eigen::MatrixXd q_pred = reconstructPredictedQ(q_current, solution);
-  publishPrediction(q_pred, solution,
-                    reference_fresh ? reference.header.frame_id : std::string("base_link"));
+  const std::string prediction_frame =
+      reference_fresh ? reference.header.frame_id : std::string("base_link");
+  const ros::Time prediction_stamp = ros::Time::now();
+
+  if (cdf_shadow_enabled_) {
+    CDFQPSnapshot snapshot;
+    snapshot.prediction_stamp = prediction_stamp;
+    snapshot.created_wall = ros::WallTime::now();
+    snapshot.q_current = q_current;
+    snapshot.hessian = hessian;
+    snapshot.gradient = gradient;
+    snapshot.lower = lower;
+    snapshot.upper = upper;
+    snapshot.raw_solution = solution;
+    snapshot.frame_id = prediction_frame;
+    snapshot.control_mode = control_mode;
+
+    std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+    cdf_shadow_snapshots_.push_back(std::move(snapshot));
+    while (cdf_shadow_snapshots_.size() >
+           static_cast<std::size_t>(cdf_snapshot_history_size_)) {
+      cdf_shadow_snapshots_.pop_front();
+    }
+  }
+
+  publishPrediction(
+      q_pred, solution, prediction_frame, prediction_stamp);
 
   if (waypoint_status == "multi_deadline_repair") {
     double max_error = 0.0;
