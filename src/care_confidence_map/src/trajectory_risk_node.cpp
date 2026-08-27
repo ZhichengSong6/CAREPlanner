@@ -12,6 +12,8 @@
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PointStamped.h>
 #include <trajectory_msgs/JointTrajectory.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -169,6 +171,13 @@ public:
     risk_frontier_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
             "/care_planner/trajectory_risk/risk_frontier_attribution", 1, true);
+
+    if (forbidden_space_pair_publish_enabled_)
+    {
+      forbidden_space_pair_pub_ =
+          nh_.advertise<sensor_msgs::PointCloud2>(
+              forbidden_space_pair_topic_, 1, false);
+    }
 
     eval_timer_ =
         nh_.createTimer(
@@ -489,6 +498,21 @@ private:
         "trajectory_risk/stale_trajectory_timeout",
         stale_trajectory_timeout_,
         1.0);
+
+    pnh_.param(
+        "trajectory_risk/forbidden_space_pair_publish_enabled",
+        forbidden_space_pair_publish_enabled_,
+        false);
+
+    pnh_.param<std::string>(
+        "trajectory_risk/forbidden_space_pair_topic",
+        forbidden_space_pair_topic_,
+        "/care_planner/trajectory_risk/low_confidence_sweep_pairs");
+
+    pnh_.param(
+        "trajectory_risk/forbidden_space_confidence_threshold",
+        forbidden_space_confidence_threshold_,
+        0.50);
 
     ignored_risk_links_.clear();
     if (!pnh_.getParam("trajectory_risk/ignored_risk_links",
@@ -2296,6 +2320,147 @@ private:
     return msg;
   }
 
+  void publishForbiddenSpaceSweepPairs(
+      const care_confidence_map::TrajectorySampleResult& sample_result,
+      const care_confidence_map::QueryConfidence& srv,
+      const RiskResult& risk_result)
+  {
+    if (!forbidden_space_pair_publish_enabled_)
+    {
+      return;
+    }
+
+    std::size_t selected_count = 0;
+    std::size_t flat_index = 0;
+    for (const auto& frame : sample_result.frames)
+    {
+      for (const auto& sample : frame.samples)
+      {
+        const bool inside = (srv.response.inside_map[flat_index] != 0);
+        const double confidence =
+            static_cast<double>(srv.response.confidence[flat_index]);
+
+        if (!isIgnoredRiskLink(sample.link_name) &&
+            inside &&
+            confidence < forbidden_space_confidence_threshold_)
+        {
+          selected_count += 1;
+        }
+        flat_index += 1;
+      }
+    }
+
+    sensor_msgs::PointCloud2 cloud;
+    cloud.header.frame_id = base_frame_;
+    cloud.header.stamp = ros::Time::now();
+    cloud.height = 1;
+    cloud.width = static_cast<uint32_t>(selected_count);
+
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2Fields(
+        15,
+        "x", 1, sensor_msgs::PointField::FLOAT32,
+        "y", 1, sensor_msgs::PointField::FLOAT32,
+        "z", 1, sensor_msgs::PointField::FLOAT32,
+        "q0", 1, sensor_msgs::PointField::FLOAT32,
+        "q1", 1, sensor_msgs::PointField::FLOAT32,
+        "q2", 1, sensor_msgs::PointField::FLOAT32,
+        "q3", 1, sensor_msgs::PointField::FLOAT32,
+        "q4", 1, sensor_msgs::PointField::FLOAT32,
+        "q5", 1, sensor_msgs::PointField::FLOAT32,
+        "q6", 1, sensor_msgs::PointField::FLOAT32,
+        "confidence", 1, sensor_msgs::PointField::FLOAT32,
+        "current_visibility", 1, sensor_msgs::PointField::FLOAT32,
+        "radius", 1, sensor_msgs::PointField::FLOAT32,
+        "eval_timestep", 1, sensor_msgs::PointField::INT32,
+        "original_timestep", 1, sensor_msgs::PointField::INT32);
+    modifier.resize(selected_count);
+
+    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> iter_q0(cloud, "q0");
+    sensor_msgs::PointCloud2Iterator<float> iter_q1(cloud, "q1");
+    sensor_msgs::PointCloud2Iterator<float> iter_q2(cloud, "q2");
+    sensor_msgs::PointCloud2Iterator<float> iter_q3(cloud, "q3");
+    sensor_msgs::PointCloud2Iterator<float> iter_q4(cloud, "q4");
+    sensor_msgs::PointCloud2Iterator<float> iter_q5(cloud, "q5");
+    sensor_msgs::PointCloud2Iterator<float> iter_q6(cloud, "q6");
+    sensor_msgs::PointCloud2Iterator<float> iter_conf(cloud, "confidence");
+    sensor_msgs::PointCloud2Iterator<float> iter_vis(
+        cloud, "current_visibility");
+    sensor_msgs::PointCloud2Iterator<float> iter_radius(cloud, "radius");
+    sensor_msgs::PointCloud2Iterator<int32_t> iter_eval(
+        cloud, "eval_timestep");
+    sensor_msgs::PointCloud2Iterator<int32_t> iter_original(
+        cloud, "original_timestep");
+
+    flat_index = 0;
+    for (const auto& frame : sample_result.frames)
+    {
+      int original_timestep = -1;
+      if (frame.timestep_index >= 0 &&
+          frame.timestep_index <
+              static_cast<int>(risk_result.eval_to_original_index.size()))
+      {
+        original_timestep =
+            risk_result.eval_to_original_index[
+                static_cast<std::size_t>(frame.timestep_index)];
+      }
+
+      for (const auto& sample : frame.samples)
+      {
+        const bool inside = (srv.response.inside_map[flat_index] != 0);
+        const float confidence =
+            static_cast<float>(srv.response.confidence[flat_index]);
+        const float current_visibility =
+            static_cast<float>(srv.response.current_visibility[flat_index]);
+
+        if (!isIgnoredRiskLink(sample.link_name) &&
+            inside &&
+            static_cast<double>(confidence) <
+                forbidden_space_confidence_threshold_)
+        {
+          if (frame.q.size() != 7)
+          {
+            ROS_ERROR_THROTTLE(
+                1.0,
+                "[trajectory_risk_node] C5.2 forbidden-space export "
+                "requires 7-DoF q, got %ld",
+                static_cast<long>(frame.q.size()));
+            return;
+          }
+
+          *iter_x = static_cast<float>(sample.center_base.x());
+          *iter_y = static_cast<float>(sample.center_base.y());
+          *iter_z = static_cast<float>(sample.center_base.z());
+          *iter_q0 = static_cast<float>(frame.q(0));
+          *iter_q1 = static_cast<float>(frame.q(1));
+          *iter_q2 = static_cast<float>(frame.q(2));
+          *iter_q3 = static_cast<float>(frame.q(3));
+          *iter_q4 = static_cast<float>(frame.q(4));
+          *iter_q5 = static_cast<float>(frame.q(5));
+          *iter_q6 = static_cast<float>(frame.q(6));
+          *iter_conf = confidence;
+          *iter_vis = current_visibility;
+          *iter_radius = static_cast<float>(sample.radius);
+          *iter_eval = static_cast<int32_t>(frame.timestep_index);
+          *iter_original = static_cast<int32_t>(original_timestep);
+
+          ++iter_x; ++iter_y; ++iter_z;
+          ++iter_q0; ++iter_q1; ++iter_q2; ++iter_q3;
+          ++iter_q4; ++iter_q5; ++iter_q6;
+          ++iter_conf; ++iter_vis; ++iter_radius;
+          ++iter_eval; ++iter_original;
+        }
+
+        flat_index += 1;
+      }
+    }
+
+    forbidden_space_pair_pub_.publish(cloud);
+  }
+
   void publishRiskStats(const RiskResult& result)
   {
     score_pub_.publish(makeFloatMsg(result.score));
@@ -2924,6 +3089,7 @@ private:
     publishRiskStats(result);
     publishAttribution(attribution, result);
     publishActiveSensingTarget(attribution);
+    publishForbiddenSpaceSweepPairs(sample_result, srv, result);
 
     const ros::WallTime marker_start = ros::WallTime::now();
 
@@ -3014,6 +3180,12 @@ private:
                     << evaluate_stale_trajectory_);
     ROS_INFO_STREAM("stale_trajectory_timeout: "
                     << stale_trajectory_timeout_);
+    ROS_INFO_STREAM("forbidden_space_pair_publish_enabled: "
+                    << forbidden_space_pair_publish_enabled_);
+    ROS_INFO_STREAM("forbidden_space_pair_topic: "
+                    << forbidden_space_pair_topic_);
+    ROS_INFO_STREAM("forbidden_space_confidence_threshold: "
+                    << forbidden_space_confidence_threshold_);
     ROS_INFO_STREAM("Pinocchio nq: " << evaluator_.nq());
     ROS_INFO_STREAM("Pinocchio nv: " << evaluator_.nv());
     ROS_INFO_STREAM("active joints:");
@@ -3073,6 +3245,7 @@ private:
   ros::Publisher link_attribution_pub_;
   ros::Publisher topk_sample_attribution_pub_;
   ros::Publisher risk_frontier_attribution_pub_;
+  ros::Publisher forbidden_space_pair_pub_;
 
   ros::Timer eval_timer_;
 
@@ -3096,6 +3269,8 @@ private:
       "/care_planner/confidence_map/query";
   std::string refresh_body_prior_service_ =
       "/care_planner/confidence_map/refresh_body_prior";
+  std::string forbidden_space_pair_topic_ =
+      "/care_planner/trajectory_risk/low_confidence_sweep_pairs";
 
   double eval_rate_ = 20.0;
   int max_eval_timesteps_ = 12;
@@ -3115,9 +3290,11 @@ private:
   double frontier_confidence_threshold_ = 0.50;
   double frontier_gap_threshold_ = 0.50;
   double frontier_radius_margin_ = 0.05;
+  double forbidden_space_confidence_threshold_ = 0.50;
   std::vector<std::string> ignored_risk_links_;
 
   bool refresh_body_prior_before_query_ = true;
+  bool forbidden_space_pair_publish_enabled_ = false;
   bool show_full_trajectory_markers_ = false;
   bool show_worst_timestep_markers_ = true;
   bool show_attribution_markers_ = true;
