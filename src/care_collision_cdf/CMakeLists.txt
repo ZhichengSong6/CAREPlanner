@@ -28,6 +28,10 @@ catkin_package(
   CATKIN_DEPENDS geometry_msgs message_runtime roscpp rospy std_msgs sensor_msgs
 )
 
+include_directories(
+  ${catkin_INCLUDE_DIRS}
+)
+
 catkin_install_python(PROGRAMS
   scripts/collision_cdf_model.py
   scripts/collision_cdf_server_node.py
