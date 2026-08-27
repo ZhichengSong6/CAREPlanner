@@ -14,8 +14,10 @@ collision_cdf:
 
   device: "cpu"
   service_name: "/care_planner/collision_cdf/query"
+  pair_service_name: "/care_planner/collision_cdf/query_pairs"
 
   # Guard against accidentally sending the complete dense confidence grid.
   # C5 should query only occupied + relevant low-confidence frontier points.
   max_points: 4096
   max_q: 64
+  max_pairs: 8000
