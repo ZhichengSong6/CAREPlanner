@@ -62,6 +62,7 @@ class CollisionCDFServer:
             output_dims=int(cfg.get("output_dims", 1)),
             hidden_layers=hidden,
             nerf=bool(cfg.get("nerf", True)),
+            activation=str(cfg.get("activation", "gelu")),
         )
 
         # Warm up both forward and autograd before accepting MPC queries.
@@ -86,10 +87,11 @@ class CollisionCDFServer:
         )
         rospy.logwarn(
             "[collision_cdf] READY checkpoint=%s selected=%s device=%s "
-            "scene_service=%s pair_service=%s max_pairs=%d",
+            "activation=%s scene_service=%s pair_service=%s max_pairs=%d",
             checkpoint,
             self.cdf.selected_checkpoint,
             str(self.cdf.device),
+            self.cdf.architecture.get("activation", "unknown"),
             self.service_name,
             self.pair_service_name,
             self.max_pairs,
