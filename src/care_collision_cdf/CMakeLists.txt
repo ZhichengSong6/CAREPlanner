@@ -24,6 +24,7 @@ catkin_package(
 )
 
 catkin_install_python(PROGRAMS
+  scripts/collision_cdf_model.py
   scripts/collision_cdf_server_node.py
   scripts/inspect_collision_cdf_checkpoint.py
   scripts/query_collision_cdf_smoke.py
