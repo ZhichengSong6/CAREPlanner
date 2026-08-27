@@ -10,13 +10,14 @@ import torch
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
-from collision_cdf_model import MLPRegression, extract_state_dict, infer_mlp_architecture
+from collision_cdf_model import MLPRegression, extract_state_dict, infer_mlp_architecture, resolve_activation
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint")
     parser.add_argument("--checkpoint-key", default="latest")
+    parser.add_argument("--activation", choices=("gelu", "relu"), default="gelu")
     args = parser.parse_args()
 
     payload = torch.load(args.checkpoint, map_location="cpu")
@@ -50,11 +51,13 @@ def main():
     print("inferred output dims:", arch["output_dims"])
     print("inferred nerf:", arch["nerf"])
     print("linear dims:", arch["linear_dims"])
+    print("activation (must match training):", args.activation)
 
     model = MLPRegression(
         input_dims=arch["input_dims"],
         output_dims=arch["output_dims"],
         mlp_layers=arch["hidden_layers"],
+        act_fn=resolve_activation(args.activation),
         nerf=arch["nerf"],
     )
     model.load_state_dict(state, strict=True)
