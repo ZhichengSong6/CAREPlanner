@@ -123,6 +123,10 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   config_file:="${CONFIG_FILE}" waypoint_weight:="${CARE_WEIGHT}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
   selector_predicted_trajectory_timeout:="${PREDICTION_TIMEOUT}" \
+  trajectory_risk_input_topic:="${TRAJECTORY_RISK_INPUT_TOPIC}" \
+  forbidden_space_pair_publish_enabled:="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED}" \
+  forbidden_space_pair_topic:="${FORBIDDEN_SPACE_PAIR_TOPIC}" \
+  forbidden_space_confidence_threshold:="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD}" \
   candidate_unsafe_required:="${CANDIDATE_UNSAFE_REQUIRED}" \
   execution_unsafe_required:="${EXECUTION_UNSAFE_REQUIRED}" \
   probe_safe_commits_required:="${PROBE_SAFE_COMMITS}" \
