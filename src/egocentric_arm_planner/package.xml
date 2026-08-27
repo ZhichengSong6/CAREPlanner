@@ -21,6 +21,7 @@
 
   <depend>arm_model</depend>
   <depend>arm_trajectory</depend>
+  <depend>care_collision_cdf</depend>
 
   <depend>eigen</depend>
 
