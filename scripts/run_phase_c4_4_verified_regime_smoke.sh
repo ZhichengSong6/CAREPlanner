@@ -20,6 +20,13 @@ TRAJECTORY_RISK_INPUT_TOPIC="${TRAJECTORY_RISK_INPUT_TOPIC:-/care_planner/task_t
 FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED:-false}"
 FORBIDDEN_SPACE_PAIR_TOPIC="${FORBIDDEN_SPACE_PAIR_TOPIC:-/care_planner/trajectory_risk/body_sweep_anchors}"
 FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD:-0.50}"
+CDF_SHADOW_ENABLED="${CDF_SHADOW_ENABLED:-false}"
+CDF_SHADOW_SAFETY_MARGIN="${CDF_SHADOW_SAFETY_MARGIN:-0.0}"
+CDF_SHADOW_HORIZON_STEPS="${CDF_SHADOW_HORIZON_STEPS:-20}"
+CDF_SHADOW_SNAPSHOT_TIMEOUT="${CDF_SHADOW_SNAPSHOT_TIMEOUT:-0.75}"
+CDF_SHADOW_CONSTRAINT_BATCH_TOPIC="${CDF_SHADOW_CONSTRAINT_BATCH_TOPIC:-/care_planner/collision_cdf/constraint_batch}"
+CDF_SHADOW_PREDICTION_TOPIC="${CDF_SHADOW_PREDICTION_TOPIC:-/care_planner/mpc/cdf_shadow_predicted_trajectory}"
+CDF_SHADOW_SUMMARY_TOPIC="${CDF_SHADOW_SUMMARY_TOPIC:-/care_planner/mpc/cdf_shadow_summary}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
@@ -127,6 +134,13 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   forbidden_space_pair_publish_enabled:="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED}" \
   forbidden_space_pair_topic:="${FORBIDDEN_SPACE_PAIR_TOPIC}" \
   forbidden_space_confidence_threshold:="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD}" \
+  cdf_shadow_enabled:="${CDF_SHADOW_ENABLED}" \
+  cdf_shadow_safety_margin:="${CDF_SHADOW_SAFETY_MARGIN}" \
+  cdf_shadow_constraint_horizon_steps:="${CDF_SHADOW_HORIZON_STEPS}" \
+  cdf_shadow_snapshot_timeout:="${CDF_SHADOW_SNAPSHOT_TIMEOUT}" \
+  cdf_shadow_constraint_batch_topic:="${CDF_SHADOW_CONSTRAINT_BATCH_TOPIC}" \
+  cdf_shadow_prediction_topic:="${CDF_SHADOW_PREDICTION_TOPIC}" \
+  cdf_shadow_summary_topic:="${CDF_SHADOW_SUMMARY_TOPIC}" \
   candidate_unsafe_required:="${CANDIDATE_UNSAFE_REQUIRED}" \
   execution_unsafe_required:="${EXECUTION_UNSAFE_REQUIRED}" \
   probe_safe_commits_required:="${PROBE_SAFE_COMMITS}" \
