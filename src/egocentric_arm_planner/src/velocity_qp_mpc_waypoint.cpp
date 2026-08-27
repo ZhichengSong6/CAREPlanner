@@ -657,6 +657,7 @@ void VelocityQPMPCWaypoint::cdfConstraintBatchCallback(
   }
 
   std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+  ++cdf_shadow_batch_callback_count_;
   ++cdf_shadow_job_received_;
 
   const ros::WallTime wall_now = ros::WallTime::now();
@@ -1890,6 +1891,25 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       (q_current - q_ref.col(0)).lpNorm<Eigen::Infinity>();
   const double command_inf = command.lpNorm<Eigen::Infinity>();
 
+  unsigned long long cdf_batch_callbacks = 0;
+  unsigned long long cdf_jobs_received = 0;
+  unsigned long long cdf_jobs_processed = 0;
+  unsigned long long cdf_jobs_dropped = 0;
+  unsigned long long cdf_stamp_miss = 0;
+  std::size_t cdf_snapshot_count = 0;
+  unsigned int cdf_batch_publishers = 0;
+  if (cdf_shadow_enabled_) {
+    cdf_batch_publishers =
+        cdf_constraint_batch_sub_.getNumPublishers();
+    std::lock_guard<std::mutex> lock(cdf_shadow_mutex_);
+    cdf_batch_callbacks = cdf_shadow_batch_callback_count_;
+    cdf_jobs_received = cdf_shadow_job_received_;
+    cdf_jobs_processed = cdf_shadow_job_processed_;
+    cdf_jobs_dropped = cdf_shadow_job_dropped_;
+    cdf_stamp_miss = cdf_shadow_stamp_miss_;
+    cdf_snapshot_count = cdf_shadow_snapshots_.size();
+  }
+
   ++sequence_;
   std::ostringstream oss;
   oss << "seq=" << sequence_
@@ -1933,6 +1953,14 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       << repair_earliest_deadline_remaining
       << " repair_max_pred_error_inf=" << repair_max_pred_error_inf
       << " base_grad_inf=" << base_gradient_inf
+      << " cdf_shadow_enabled=" << static_cast<int>(cdf_shadow_enabled_)
+      << " cdf_batch_publishers=" << cdf_batch_publishers
+      << " cdf_batch_callbacks=" << cdf_batch_callbacks
+      << " cdf_snapshot_count=" << cdf_snapshot_count
+      << " cdf_jobs_received=" << cdf_jobs_received
+      << " cdf_jobs_processed=" << cdf_jobs_processed
+      << " cdf_jobs_dropped=" << cdf_jobs_dropped
+      << " cdf_stamp_miss=" << cdf_stamp_miss
       << " ref_horizon="
       << (reference_fresh && !reference.points.empty()
               ? reference.points.back().time_from_start.toSec()
