@@ -158,6 +158,10 @@ class CppForbiddenVoxelGpuShadow {
         summary_topic_,
         "/care_planner/collision_cdf/cpp_gpu_online_summary");
     pnh_.param<std::string>(
+        "constraint_batch_topic",
+        constraint_batch_topic_,
+        "/care_planner/collision_cdf/constraint_batch");
+    pnh_.param<std::string>(
         "output_jsonl",
         output_jsonl_,
         "/tmp/c5_2h_cpp_gpu_online.jsonl");
@@ -222,6 +226,9 @@ class CppForbiddenVoxelGpuShadow {
 
     summary_pub_ = nh_.advertise<std_msgs::String>(
         summary_topic_, 10);
+    constraint_batch_pub_ =
+        nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
+            constraint_batch_topic_, 2);
     anchor_sub_ = nh_.subscribe(
         anchor_topic_, 1,
         &CppForbiddenVoxelGpuShadow::anchorCallback, this);
@@ -1012,6 +1019,7 @@ class CppForbiddenVoxelGpuShadow {
   std::string anchor_topic_;
   std::string map_topic_;
   std::string summary_topic_;
+  std::string constraint_batch_topic_;
   std::string output_jsonl_;
   std::string gpu_socket_;
 
@@ -1039,6 +1047,7 @@ class CppForbiddenVoxelGpuShadow {
   ros::Subscriber anchor_sub_;
   ros::Subscriber map_sub_;
   ros::Publisher summary_pub_;
+  ros::Publisher constraint_batch_pub_;
   ros::Timer timer_;
 
   mutable std::mutex mutex_;
