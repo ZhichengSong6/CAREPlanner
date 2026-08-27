@@ -68,6 +68,7 @@ class MultiStepForbiddenSpaceCDFShadow:
             rospy.get_param("~dedup_resolution", 0.05)
         )
         self.max_pairs = int(rospy.get_param("~max_pairs", 8000))
+        self.zero_band = float(rospy.get_param("~signed_zero_band", 0.05))
 
         if self.rate_hz <= 0.0:
             raise ValueError("~rate must be positive")
@@ -75,6 +76,8 @@ class MultiStepForbiddenSpaceCDFShadow:
             raise ValueError("~dedup_resolution must be positive")
         if self.max_pairs <= 0:
             raise ValueError("~max_pairs must be positive")
+        if self.zero_band <= 0.0:
+            raise ValueError("~signed_zero_band must be positive")
 
         out_dir = os.path.dirname(self.output_jsonl)
         if out_dir:
@@ -104,11 +107,12 @@ class MultiStepForbiddenSpaceCDFShadow:
 
         rospy.logwarn(
             "[C5.2 shadow] READY input=%s service=%s rate=%.2fHz "
-            "dedup=%.3fm output=%s",
+            "dedup=%.3fm zero_band=%.3f output=%s",
             self.input_topic,
             self.service_name,
             self.rate_hz,
             self.dedup_resolution,
+            self.zero_band,
             self.output_jsonl,
         )
 
@@ -235,6 +239,7 @@ class MultiStepForbiddenSpaceCDFShadow:
                 float(np.linalg.norm(gradient[i])) for i in indices
             ]
             min_local = int(indices[int(np.argmin(np.asarray(d)))])
+            d_arr = np.asarray(d, dtype=np.float64)
             step_rows.append(
                 {
                     "original_timestep": int(original_timestep),
@@ -243,6 +248,11 @@ class MultiStepForbiddenSpaceCDFShadow:
                     "distance": self._quantiles(d),
                     "confidence": self._quantiles(conf),
                     "gradient_norm": self._quantiles(grad_norm),
+                    "signed_counts": {
+                        "negative": int(np.sum(d_arr < -self.zero_band)),
+                        "near_zero": int(np.sum(np.abs(d_arr) <= self.zero_band)),
+                        "positive": int(np.sum(d_arr > self.zero_band)),
+                    },
                     "min_pair_point": items[min_local]["point"],
                     "min_pair_radius": items[min_local]["radius"],
                     "min_pair_confidence": items[min_local]["confidence"],
@@ -256,8 +266,23 @@ class MultiStepForbiddenSpaceCDFShadow:
         all_grad_norm = [
             float(np.linalg.norm(gradient[i])) for i in range(len(items))
         ]
-        min_idx = int(np.argmin(np.asarray(all_distance))) if items else -1
+        d_all_arr = np.asarray(all_distance, dtype=np.float64)
+        min_idx = int(np.argmin(d_all_arr)) if items else -1
         counts = [row["pair_count"] for row in step_rows]
+        signed_counts = {
+            "negative": int(np.sum(d_all_arr < -self.zero_band)),
+            "near_zero": int(np.sum(np.abs(d_all_arr) <= self.zero_band)),
+            "positive": int(np.sum(d_all_arr > self.zero_band)),
+        }
+        signed_counts["negative_rate"] = (
+            float(signed_counts["negative"]) / len(items) if items else 0.0
+        )
+        signed_counts["near_zero_rate"] = (
+            float(signed_counts["near_zero"]) / len(items) if items else 0.0
+        )
+        signed_counts["positive_rate"] = (
+            float(signed_counts["positive"]) / len(items) if items else 0.0
+        )
 
         return {
             "record_index": self._record_index,
@@ -275,6 +300,8 @@ class MultiStepForbiddenSpaceCDFShadow:
                 "max": int(max(counts)) if counts else 0,
             },
             "distance": self._quantiles(all_distance),
+            "signed_zero_band": self.zero_band,
+            "signed_counts": signed_counts,
             "gradient_norm": self._quantiles(all_grad_norm),
             "inference_ms": float(inference_ms),
             "service_roundtrip_ms": float(rtt_ms),
@@ -308,6 +335,8 @@ class MultiStepForbiddenSpaceCDFShadow:
                 f"d_min={d['min']:.6f} "
                 f"d_p05={d['p05']:.6f} "
                 f"d_median={d['median']:.6f} "
+                f"neg_rate={record['signed_counts']['negative_rate']:.3f} "
+                f"zero_rate={record['signed_counts']['near_zero_rate']:.3f} "
                 f"min_step={pair['original_timestep']} "
                 f"min_conf={pair['confidence']:.3f} "
                 f"inference_ms={record['inference_ms']:.3f} "
