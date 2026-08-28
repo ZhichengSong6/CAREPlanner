@@ -1,0 +1,82 @@
+<launch>
+  <!--
+    C5.4 architecture:
+      one-shot nominal task plan
+        -> event-triggered sparse SCP local trajectory optimizer
+        -> exact candidate VBC
+        -> committed trajectory
+        -> full-trajectory tracking controller
+
+    The legacy 20 Hz planning MPC is intentionally absent.  Replanning is
+    triggered by new task references, visibility obligations, regime changes,
+    or tracking-error requests.
+  -->
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="waypoint_weight" default="3000.0" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+  <arg name="selector_predicted_trajectory_timeout" default="0.50" />
+  <arg name="candidate_unsafe_required" default="2" />
+  <arg name="execution_unsafe_required" default="2" />
+  <arg name="probe_safe_commits_required" default="3" />
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+  <arg name="trial_label" default="c5_4_local_sparse_scp" />
+  <arg name="log_output_root"
+       default="$(find egocentric_arm_planner)/../../outputs/phase_c5_4_local_sparse_scp" />
+
+  <arg name="gpu_socket"
+       default="/tmp/care_collision_cdf_gpu_c5_4.sock" />
+  <arg name="selector_jsonl"
+       default="/tmp/c5_4_local_scp_selector.jsonl" />
+
+  <include file="$(find egocentric_arm_planner)/launch/phaseC4_4_verified_regime_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="waypoint_weight" value="$(arg waypoint_weight)" />
+    <arg name="vbc_min_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="selector_predicted_trajectory_timeout"
+         value="$(arg selector_predicted_trajectory_timeout)" />
+    <arg name="candidate_unsafe_required"
+         value="$(arg candidate_unsafe_required)" />
+    <arg name="execution_unsafe_required"
+         value="$(arg execution_unsafe_required)" />
+    <arg name="probe_safe_commits_required"
+         value="$(arg probe_safe_commits_required)" />
+
+    <arg name="goal_x" value="$(arg goal_x)" />
+    <arg name="goal_y" value="$(arg goal_y)" />
+    <arg name="goal_z" value="$(arg goal_z)" />
+    <arg name="goal_qx" value="$(arg goal_qx)" />
+    <arg name="goal_qy" value="$(arg goal_qy)" />
+    <arg name="goal_qz" value="$(arg goal_qz)" />
+    <arg name="goal_qw" value="$(arg goal_qw)" />
+    <arg name="goal_delay" value="$(arg goal_delay)" />
+    <arg name="trial_label" value="$(arg trial_label)" />
+    <arg name="log_output_root" value="$(arg log_output_root)" />
+
+    <arg name="use_local_sparse_scp" value="true" />
+    <arg name="raw_mpc_trajectory_topic"
+         value="/care_planner/local_planner/candidate_trajectory" />
+    <arg name="trajectory_risk_input_topic"
+         value="/care_planner/local_planner/candidate_trajectory" />
+
+    <!-- C5.3 shadow path is disabled; CDF is now inside the local planner's
+         SCP inner loop instead of being a shadow after raw MPC. -->
+    <arg name="cdf_shadow_enabled" value="false" />
+    <arg name="cdf_selector_enabled" value="false" />
+    <arg name="cdf_shadow_vbc_audit_enabled" value="false" />
+
+    <arg name="local_scp_gpu_socket" value="$(arg gpu_socket)" />
+    <arg name="local_scp_selector_jsonl" value="$(arg selector_jsonl)" />
+  </include>
+</launch>
