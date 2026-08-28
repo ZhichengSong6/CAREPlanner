@@ -109,6 +109,9 @@ class C44VerifiedRegimeManager:
             "/care_planner/execution/predicted_vbc_verification_hold"))
         self.summary_topic = str(rospy.get_param(
             "~summary_topic", "/care_planner/c4_4/regime_summary"))
+        self.task_infeasible_topic = str(rospy.get_param(
+            "~task_infeasible_topic",
+            "/care_planner/local_planner/task_infeasible"))
 
         self.state = self.NORMAL
         self.execution_ready = False
@@ -143,6 +146,7 @@ class C44VerifiedRegimeManager:
         self.probe_failure_count = 0
         self.candidate_repair_entry_count = 0
         self.execution_repair_entry_count = 0
+        self.task_infeasible_repair_entry_count = 0
 
         # C4.7: a stale latched True from a previous acquisition episode must not
         # immediately clear a newly-entered REPAIR.  Each episode arms only after
@@ -183,6 +187,9 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.physical_deadline_topic, Float64, self._deadline_cb,
             queue_size=1)
+        rospy.Subscriber(
+            self.task_infeasible_topic, Bool, self._task_infeasible_cb,
+            queue_size=10)
         if self.repair_completion_gate_enabled:
             rospy.Subscriber(
                 self.repair_completion_topic, Bool,
@@ -253,6 +260,17 @@ class C44VerifiedRegimeManager:
                 self.clear_until = None
                 self.probe_ignore_until = None
                 self.last_transition_reason = "execution_not_ready"
+
+    def _task_infeasible_cb(self, msg):
+        if msg is None or not bool(msg.data):
+            return
+        now = rospy.Time.now()
+        with self._lock:
+            if not self.execution_ready or self.state != self.NORMAL:
+                return
+            self.task_infeasible_repair_entry_count += 1
+            self._transition_locked(
+                self.REPAIR, "task_planner_infeasible", now)
 
     def _deadline_cb(self, msg):
         if msg is None:
@@ -454,6 +472,8 @@ class C44VerifiedRegimeManager:
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
                 "execution_repair_entry_count={}".format(self.execution_repair_entry_count),
+                "task_infeasible_repair_entry_count={}".format(
+                    self.task_infeasible_repair_entry_count),
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
