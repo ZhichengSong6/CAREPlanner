@@ -147,6 +147,7 @@ class C44VerifiedRegimeManager:
         self.candidate_repair_entry_count = 0
         self.execution_repair_entry_count = 0
         self.task_infeasible_repair_entry_count = 0
+        self.task_infeasible_pending = False
 
         # C4.7: a stale latched True from a previous acquisition episode must not
         # immediately clear a newly-entered REPAIR.  Each episode arms only after
@@ -260,14 +261,25 @@ class C44VerifiedRegimeManager:
                 self.clear_until = None
                 self.probe_ignore_until = None
                 self.last_transition_reason = "execution_not_ready"
+            elif self.task_infeasible_pending and self.state == self.NORMAL:
+                self.task_infeasible_pending = False
+                self.task_infeasible_repair_entry_count += 1
+                self._transition_locked(
+                    self.REPAIR, "task_planner_infeasible_after_gate_release",
+                    self.execution_ready_time)
 
     def _task_infeasible_cb(self, msg):
         if msg is None or not bool(msg.data):
             return
         now = rospy.Time.now()
         with self._lock:
-            if not self.execution_ready or self.state != self.NORMAL:
+            if self.state != self.NORMAL:
                 return
+            if not self.execution_ready:
+                self.task_infeasible_pending = True
+                self.last_transition_reason = "task_planner_infeasible_pending"
+                return
+            self.task_infeasible_pending = False
             self.task_infeasible_repair_entry_count += 1
             self._transition_locked(
                 self.REPAIR, "task_planner_infeasible", now)
@@ -474,6 +486,8 @@ class C44VerifiedRegimeManager:
                 "execution_repair_entry_count={}".format(self.execution_repair_entry_count),
                 "task_infeasible_repair_entry_count={}".format(
                     self.task_infeasible_repair_entry_count),
+                "task_infeasible_pending={}".format(
+                    int(self.task_infeasible_pending)),
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
