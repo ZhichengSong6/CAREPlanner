@@ -357,21 +357,31 @@ void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
     const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg) {
   if (!msg) return;
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  ++cdf_batch_received_;
+  bool accepted = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++cdf_batch_received_;
 
-  if (!plan_running_ || !waiting_for_cdf_) return;
+    if (!plan_running_ || !waiting_for_cdf_) return;
 
-  const double dt =
-      std::fabs((msg->header.stamp - current_query_stamp_).toSec());
-  if (dt > cdf_stamp_tolerance_s_) {
-    ++cdf_stamp_miss_;
-    return;
+    const double dt =
+        std::fabs((msg->header.stamp - current_query_stamp_).toSec());
+    if (dt > cdf_stamp_tolerance_s_) {
+      ++cdf_stamp_miss_;
+      return;
+    }
+
+    pending_batch_ = msg;
+    waiting_for_cdf_ = false;
+    accepted = true;
   }
 
-  pending_batch_ = msg;
-  waiting_for_cdf_ = false;
-  worker_cv_.notify_one();
+  if (accepted) {
+    // Latched diagnostic: if PIQP later spends too long in setup/solve, the
+    // benchmark still tells us that timestamp matching and ROS transport worked.
+    publishSummary("cdf_batch_accepted");
+    worker_cv_.notify_one();
+  }
 }
 
 void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
@@ -731,6 +741,8 @@ void LocalSparseSCPPlanner::workerLoop() {
         cdf_stamp_tolerance_s_) {
       continue;
     }
+
+    publishSummary("sparse_qp_started");
 
     SparseSolveResult result =
         solveSparseSubproblem(
