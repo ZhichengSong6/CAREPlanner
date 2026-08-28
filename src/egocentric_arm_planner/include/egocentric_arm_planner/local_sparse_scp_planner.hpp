@@ -53,6 +53,7 @@ private:
     double min_distance = 0.0;
     double max_slack = 0.0;
     double mean_slack = 0.0;
+    double slack_linear_weight_used = 0.0;
     double step_inf = 0.0;
     Eigen::MatrixXd q;
     Eigen::MatrixXd u;
@@ -112,7 +113,8 @@ private:
       const Eigen::VectorXd& previous_command,
       const std::vector<DeadlineWaypoint>& schedule,
       bool repair_mode,
-      double trust_radius) const;
+      double trust_radius,
+      double slack_linear_weight) const;
 
   ros::Time publishQueryTrajectory(
       const Eigen::MatrixXd& q,
@@ -181,6 +183,7 @@ private:
   double trust_radius_ = 0.20;
   double previous_query_min_distance_ =
       std::numeric_limits<double>::quiet_NaN();
+  double plan_cdf_slack_linear_weight_ = 10.0;
   ros::Time current_query_stamp_;
   ros::WallTime current_query_wall_;
   ros::WallTime current_plan_start_wall_;
@@ -244,6 +247,10 @@ private:
   // GCDF slacks are nonnegative and not artificially capped. Keep the old
   // upper bound available for backwards compatibility.
   bool cdf_slack_use_upper_bound_ = true;
+  bool cdf_adaptive_slack_penalty_ = false;
+  double cdf_slack_penalty_multiplier_ = 10.0;
+  double cdf_slack_penalty_max_ = 1e8;
+  double cdf_slack_tolerance_ = 5e-3;
   bool cdf_safe_row_screening_ = true;
   double cdf_linearization_tolerance_inf_ = 1e-4;
 
