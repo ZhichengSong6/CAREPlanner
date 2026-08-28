@@ -227,6 +227,10 @@ class C44VerifiedRegimeManager:
             self.repair_completion_armed = False
             if reason.startswith("execution_"):
                 self.execution_repair_entry_count += 1
+            elif reason.startswith("task_"):
+                # Task-QP infeasibility has its own counter and is neither a
+                # candidate-VBC failure nor an execution-VBC failure.
+                pass
             else:
                 self.candidate_repair_entry_count += 1
         elif new_state == self.PROBE_NORMAL:
@@ -273,16 +277,29 @@ class C44VerifiedRegimeManager:
             return
         now = rospy.Time.now()
         with self._lock:
-            if self.state != self.NORMAL:
+            # NORMAL infeasibility starts the first sensing episode. A
+            # PROBE_NORMAL infeasibility means the just-expanded confidence map
+            # is still insufficient for the task, so it starts the next sensing
+            # episode instead of leaving the state machine stuck in PROBE_NORMAL.
+            if self.state not in (self.NORMAL, self.PROBE_NORMAL):
                 return
+
             if not self.execution_ready:
-                self.task_infeasible_pending = True
-                self.last_transition_reason = "task_planner_infeasible_pending"
+                if self.state == self.NORMAL:
+                    self.task_infeasible_pending = True
+                    self.last_transition_reason = "task_planner_infeasible_pending"
                 return
+
             self.task_infeasible_pending = False
             self.task_infeasible_repair_entry_count += 1
-            self._transition_locked(
-                self.REPAIR, "task_planner_infeasible", now)
+
+            if self.state == self.PROBE_NORMAL:
+                self.probe_failure_count += 1
+                self._transition_locked(
+                    self.REPAIR, "task_probe_infeasible", now)
+            else:
+                self._transition_locked(
+                    self.REPAIR, "task_planner_infeasible", now)
 
     def _deadline_cb(self, msg):
         if msg is None:
