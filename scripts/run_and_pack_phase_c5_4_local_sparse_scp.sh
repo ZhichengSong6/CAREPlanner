@@ -51,6 +51,15 @@ fi
 catkin build care_confidence_map care_collision_cdf egocentric_arm_planner
 source devel/setup.bash
 
+# Fail before launching the persistent GPU worker if a previous ROS/Gazebo
+# session is still alive. The common runner performs the same safety check,
+# but doing it here makes the failure immediate and preserves a clear reason.
+if timeout 2 rosnode list >/dev/null 2>&1; then
+  echo "[ERROR] ROS master already running before C5.x launch."
+  echo "[ERROR] Stop the previous ROS/Gazebo session before rerunning."
+  exit 5
+fi
+
 rm -rf "${ROOT_OUT}" "${ROOT_LOG}"
 rm -f "${ZIP_PATH}" "${GPU_SOCKET}"
 mkdir -p "${ROOT_OUT}" "${ROOT_LOG}"
@@ -139,7 +148,8 @@ fi
 
 # The new backend deliberately disables C4.8 safe-prefix commit semantics:
 # a complete local trajectory is optimized first and then exact VBC verifies it.
-USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY=0 TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" bash scripts/run_phase_c4_4_verified_regime_smoke.sh
+USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY=0 TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
+  bash scripts/run_phase_c4_4_verified_regime_smoke.sh 2>&1 | tee "${ROOT_LOG}/common_runner.log"
 
 cleanup
 
