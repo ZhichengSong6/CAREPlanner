@@ -256,7 +256,11 @@ summary = {
     'candidate_vbc_unsafe': sum(r.get('has_violation') == '1' for r in vbc_pred),
     'execution_vbc_records': len(exe_rows),
     'execution_vbc_unsafe': sum(r.get('has_violation') == '1' for r in exe_rows),
-    'commit_records': len(commit),
+    'commit_summary_records': len(commit),
+    'commit_count': (
+        int(float(commit[-1].get('commit_count', '0')))
+        if commit else 0
+    ),
     'tracker_records': len(tracker),
     'tracker_error_inf': stats(col(tracker, 'tracking_error_inf')),
     'cdf_selector_records': len(cdfsel),
@@ -275,6 +279,10 @@ summary['any_candidate_published'] = bool(candidates)
 summary['execution_safety_pass'] = (
     summary['execution_vbc_records'] > 0 and
     summary['execution_vbc_unsafe'] == 0
+)
+summary['execution_safety_status'] = (
+    'pass' if summary['execution_safety_pass']
+    else ('fail' if summary['execution_vbc_records'] > 0 else 'not_evaluated')
 )
 
 with open(dst, 'w') as f:
