@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+CASE_ID="${CASE_ID:-case_003}"
+RUN_SECONDS="${RUN_SECONDS:-20.0}"
+
+GPU_ENV="${GPU_ENV:-viscdf}"
+GPU_DEVICE="${GPU_DEVICE:-cuda}"
+CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt}"
+GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
+
+CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
+SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
+PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT:-0.50}"
+
+ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
+ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
+RUN_OUT="${ROOT_OUT}/run"
+RUN_LOG="${ROOT_LOG}/run"
+SELECTOR_JSONL="${ROOT_OUT}/local_scp_selector.jsonl"
+ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_4_local_sparse_scp_${CASE_ID}.zip}"
+SUMMARY_JSON="${ROOT_OUT}/c5_4_local_sparse_scp_summary.json"
+
+cd "${REPO}"
+
+echo "[C5.4] shell syntax preflight..."
+bash -n scripts/run_and_pack_phase_c5_4_local_sparse_scp.sh
+bash -n scripts/run_phase_c4_4_verified_regime_smoke.sh
+
+echo "[C5.4] branch: $(git branch --show-current)"
+echo "[C5.4] head:   $(git rev-parse HEAD)"
+echo "[C5.4] case:   ${CASE_ID}"
+echo "[C5.4] architecture: event-triggered Sparse SCP local planner -> exact VBC -> full-trajectory tracker"
+echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
+
+if [[ ! -f "${CHECKPOINT}" ]]; then
+  echo "[ERROR] signed CDF checkpoint not found: ${CHECKPOINT}"
+  exit 2
+fi
+
+if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
+  CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
+elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
+  CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
+else
+  echo "[ERROR] conda.sh not found"
+  exit 3
+fi
+
+catkin build care_confidence_map care_collision_cdf egocentric_arm_planner
+source devel/setup.bash
+
+rm -rf "${ROOT_OUT}" "${ROOT_LOG}"
+rm -f "${ZIP_PATH}" "${GPU_SOCKET}"
+mkdir -p "${ROOT_OUT}" "${ROOT_LOG}"
+
+PIDS=()
+kill_group() {
+  local pid="${1:-}"
+  [[ -z "${pid}" ]] && return 0
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -INT -- "-${pid}" 2>/dev/null || true
+    sleep 0.20
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    sleep 0.20
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL -- "-${pid}" 2>/dev/null || true
+  fi
+  wait "${pid}" 2>/dev/null || true
+}
+cleanup() {
+  local pid
+  for pid in "${PIDS[@]:-}"; do kill_group "${pid}"; done
+  PIDS=()
+  rm -f "${GPU_SOCKET}"
+}
+pack_debug_bundle() {
+  cd "${REPO}"
+  rm -f "${ZIP_PATH}"
+  zip -r "${ZIP_PATH}" "${ROOT_OUT#${REPO}/}" "${ROOT_LOG#${REPO}/}" >/dev/null
+  echo "[C5.4 ZIP] ${ZIP_PATH}"
+}
+trap 'rc=$?; cleanup || true; if [[ -d "${ROOT_OUT}" || -d "${ROOT_LOG}" ]]; then pack_debug_bundle || true; fi; exit $rc' EXIT
+
+echo "[C5.4] CUDA preflight..."
+bash -lc "
+  set -e
+  source '${CONDA_SH}'
+  conda activate '${GPU_ENV}'
+  cd '${REPO}'
+  python - <<'PY'
+import torch
+print('[preflight] torch:', torch.__version__)
+print('[preflight] cuda runtime:', torch.version.cuda)
+print('[preflight] cuda available:', torch.cuda.is_available())
+if not torch.cuda.is_available():
+    raise SystemExit('[ERROR] GPU_ENV has no usable CUDA PyTorch')
+print('[preflight] GPU:', torch.cuda.get_device_name(0))
+PY
+"
+
+# The neural signed-CDF oracle stays as a persistent GPU service.  The local
+# planner performs SCP synchronously at the algorithmic level, while transport
+# remains decoupled so GPU/C++ geometry code stays reusable.
+setsid bash -lc "
+  set -e
+  source '${CONDA_SH}'
+  conda activate '${GPU_ENV}'
+  cd '${REPO}'
+  exec python -u src/care_collision_cdf/scripts/collision_cdf_gpu_worker.py \
+    --checkpoint '${CHECKPOINT}' \
+    --activation gelu \
+    --device '${GPU_DEVICE}' \
+    --socket '${GPU_SOCKET}' \
+    --max-pairs 8000 \
+    --warmup-pairs 2048
+" >"${ROOT_LOG}/gpu_worker.log" 2>&1 &
+PIDS+=("$!")
+
+READY=0
+for _ in $(seq 1 200); do
+  if [[ -S "${GPU_SOCKET}" ]]; then READY=1; break; fi
+  if ! kill -0 "${PIDS[0]}" 2>/dev/null; then break; fi
+  sleep 0.05
+done
+if [[ "${READY}" != "1" ]]; then
+  echo "[ERROR] GPU worker socket did not become ready"
+  tail -n 160 "${ROOT_LOG}/gpu_worker.log" || true
+  exit 4
+fi
+
+# Extra C5.4 records. They wait for the ROS master started by the common runner.
+wait_record() {
+  local topic="$1"
+  local path="$2"
+  setsid bash -lc "
+    set +e
+    cd '${REPO}'
+    source devel/setup.bash
+    while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
+    mkdir -p '$(dirname "${path}")'
+    exec rostopic echo -p '${topic}'
+  " >"${path}" 2>"${path}.err" &
+  PIDS+=("$!")
+}
+
+wait_record "/care_planner/active_sensing/visibility_acquisition_summary"   "${RUN_OUT}/visibility_acquisition_summary.csv"
+wait_record "/care_planner/active_sensing/visibility_acquisition_complete"   "${RUN_OUT}/visibility_acquisition_complete.csv"
+wait_record "/care_planner/active_sensing/blocker_stack_summary"   "${RUN_OUT}/blocker_stack_summary.csv"
+wait_record "/care_planner/local_planner/cdf_selector_summary"   "${RUN_OUT}/local_cdf_selector_summary.csv"
+
+# The new backend deliberately disables C4.8 safe-prefix commit semantics:
+# a complete local trajectory is optimized first and then exact VBC verifies it.
+USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY=0 TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" bash scripts/run_phase_c4_4_verified_regime_smoke.sh
+
+cleanup
+
+python3 - "${RUN_OUT}" "${SUMMARY_JSON}" <<'PY'
+import csv
+import json
+import math
+import os
+import re
+import statistics
+import sys
+
+out, dst = sys.argv[1:3]
+TOK = re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+
+def rows(name):
+    path = os.path.join(out, name)
+    ans = []
+    if not os.path.isfile(path):
+        return ans
+    with open(path, newline='', errors='replace') as f:
+        rd = csv.reader(f)
+        h = next(rd, [])
+        if not h:
+            return ans
+        ti = h.index('%time') if '%time' in h else 0
+        di = h.index('field.data') if 'field.data' in h else 1
+        for row in rd:
+            if len(row) <= di:
+                continue
+            d = dict(TOK.findall(','.join(row[di:])))
+            try:
+                d['_t'] = float(row[ti]) / 1e9
+            except Exception:
+                d['_t'] = math.nan
+            if d:
+                ans.append(d)
+    return ans
+
+def fnum(v):
+    try:
+        return float(str(v).replace('ms',''))
+    except Exception:
+        return math.nan
+
+def stats(vals):
+    a = sorted(float(v) for v in vals if math.isfinite(float(v)))
+    if not a:
+        return None
+    def q(frac):
+        if len(a) == 1:
+            return a[0]
+        p = frac * (len(a)-1)
+        lo = int(p); hi = min(lo+1, len(a)-1); w = p-lo
+        return a[lo]*(1-w)+a[hi]*w
+    return {
+        'min': min(a),
+        'median': statistics.median(a),
+        'mean': statistics.fmean(a),
+        'p95': q(0.95),
+        'max': max(a),
+    }
+
+scp = rows('local_planner_summary.csv')
+tracker = rows('tracker_summary.csv')
+cand = rows('candidate_vbc_summary.csv')
+exe = rows('execution_vbc_summary.csv')
+commit = rows('commit_summary.csv')
+blocker = rows('blocker_stack_summary.csv')
+cdfsel = rows('local_cdf_selector_summary.csv')
+
+solved = [r for r in scp if r.get('event') == 'scp_solved' and r.get('solved') == '1']
+failed = [r for r in scp if r.get('event') == 'scp_failed']
+candidates = [r for r in scp if r.get('event') == 'candidate_published']
+
+def col(source, key):
+    return [fnum(r.get(key)) for r in source]
+
+vbc_pred = [r for r in cand if r.get('trajectory_source') == 'predicted']
+exe_rows = [r for r in exe if r.get('trajectory_source') in ('predicted','committed')]
+
+max_depth = 0
+targets = []
+for r in blocker:
+    s = r.get('stack','none')
+    depth = 0 if s == 'none' else len([x for x in s.split(':') if x])
+    max_depth = max(max_depth, depth)
+    try:
+        t = int(float(r.get('current_target_id','-1')))
+    except Exception:
+        t = -1
+    if t >= 0 and (not targets or targets[-1] != t):
+        targets.append(t)
+
+summary = {
+    'phase': 'C5.4',
+    'architecture': 'event-triggered local Sparse SCP -> exact VBC -> committed full-trajectory tracker',
+    'legacy_planning_mpc_present': False,
+    'planner_deadline_50ms_required': False,
+    'planner_initial_latency_goal_ms': 200.0,
+    'scp_summary_records': len(scp),
+    'scp_successful_subproblems': len(solved),
+    'scp_failed_subproblems': len(failed),
+    'candidate_trajectories_published': len(candidates),
+    'sparse_piqp_solve_ms': stats(col(solved, 'solve_ms')),
+    'cdf_rows': stats(col(solved, 'cdf_rows')),
+    'screened_safe_rows': stats(col(solved, 'screened_safe')),
+    'max_cdf_slack': stats(col(solved, 'max_slack')),
+    'mean_cdf_slack': stats(col(solved, 'mean_slack')),
+    'scp_step_inf': stats(col(solved, 'step_inf')),
+    'linearization_error_inf': stats(col(solved, 'qlin_error_inf')),
+    'candidate_vbc_records': len(vbc_pred),
+    'candidate_vbc_safe': sum(r.get('has_violation') == '0' for r in vbc_pred),
+    'candidate_vbc_unsafe': sum(r.get('has_violation') == '1' for r in vbc_pred),
+    'execution_vbc_records': len(exe_rows),
+    'execution_vbc_unsafe': sum(r.get('has_violation') == '1' for r in exe_rows),
+    'commit_records': len(commit),
+    'tracker_records': len(tracker),
+    'tracker_error_inf': stats(col(tracker, 'tracking_error_inf')),
+    'cdf_selector_records': len(cdfsel),
+    'blocker_max_stack_depth': max_depth,
+    'target_transition_sequence': targets,
+}
+
+plan_total = [
+    fnum(r.get('total_plan_ms'))
+    for r in candidates
+    if math.isfinite(fnum(r.get('total_plan_ms')))
+]
+summary['total_local_plan_ms'] = stats(plan_total)
+summary['any_sparse_scp_solution'] = bool(solved)
+summary['any_candidate_published'] = bool(candidates)
+summary['execution_safety_pass'] = (
+    summary['execution_vbc_records'] > 0 and
+    summary['execution_vbc_unsafe'] == 0
+)
+
+with open(dst, 'w') as f:
+    json.dump(summary, f, indent=2)
+
+print("")
+print("========== C5.4 LOCAL SPARSE SCP SUMMARY ==========")
+print(json.dumps(summary, indent=2))
+print("===================================================")
+
+if not scp:
+    raise SystemExit('[ERROR] no local planner summary records')
+if not cdfsel:
+    raise SystemExit('[ERROR] no local CDF selector records')
+PY
+
+cat > "${ROOT_OUT}/c5_4_run_metadata.txt" <<EOF
+branch=$(git branch --show-current)
+head=$(git rev-parse HEAD)
+case_id=${CASE_ID}
+run_seconds=${RUN_SECONDS}
+architecture=event_triggered_local_sparse_scp
+planning_mpc=false
+tracker=full_committed_trajectory
+exact_vbc_before_commit=true
+repair_prefix_verification=false
+cdf_variant=signed
+cdf_activation=gelu
+scp_max_iterations=3
+solver=piqp_sparse
+initial_planner_latency_goal_ms=200
+EOF
+
+trap - EXIT
+pack_debug_bundle
+
+echo ""
+echo "[C5.4 COMPLETE]"
+echo "[SUMMARY] ${SUMMARY_JSON}"
+echo "[ZIP] ${ZIP_PATH}"
+ls -lh "${ZIP_PATH}"
