@@ -6,6 +6,8 @@ CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_c2_vbc_c
 CONFIG_FILE="${CONFIG_FILE:-${REPO}/src/egocentric_arm_planner/config/planner_phase1_c4_3_planner.yaml}"
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-8.0}"
+INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
+INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
 NCDF_DEVICE="${NCDF_DEVICE:-cpu}"
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
@@ -306,9 +308,18 @@ record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
 record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 
 RELEASED=0
-for _ in $(seq 1 400); do
-  S="$(timeout 1 rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then RELEASED=1; break; fi
+echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, echo_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
+for i in $(seq 1 "${INITIAL_GATE_MAX_TRIES}"); do
+  S="$(timeout "${INITIAL_GATE_ECHO_TIMEOUT}" rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
+  if echo "${S}" | grep -q "released=1"; then
+    RELEASED=1
+    echo "[READY] initial execution gate released after ${i} checks"
+    break
+  fi
+  if (( i % 20 == 0 )); then
+    echo "[WAIT] gate still closed after ${i} checks"
+    echo "${S}" | grep -E "released=|decision=|waypoint_ready=|release_reason=" || true
+  fi
   sleep 0.05
 done
 if [ "${RELEASED}" != "1" ]; then
