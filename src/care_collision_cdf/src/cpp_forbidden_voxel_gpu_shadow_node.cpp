@@ -863,8 +863,7 @@ class CppForbiddenVoxelGpuShadow {
       double ipc_ms,
       const ResponseHeader& gpu,
       double pipeline_ms) {
-    if (pairs.empty() ||
-        distance.size() != pairs.size() ||
+    if (distance.size() != pairs.size() ||
         gradient.size() != pairs.size() * 7) {
       ROS_ERROR_THROTTLE(
           1.0, "[C5.3a C++] refusing malformed constraint batch");
@@ -993,7 +992,29 @@ class CppForbiddenVoxelGpuShadow {
     std::vector<PairMeta> pairs = buildPairs(
         anchors, *map, &raw_pair_count, &active_step_count);
     const auto selection_t1 = Clock::now();
+
+    // A safe query trajectory can legitimately have zero nearby forbidden
+    // voxels. That is not a transport failure: publish an explicit empty batch
+    // so the SCP may solve its objective-only local step and query again.
     if (pairs.empty()) {
+      ResponseHeader empty_gpu{};
+      const double pipeline_ms =
+          msBetween(pipeline_t0, Clock::now());
+      const double selection_ms =
+          msBetween(selection_t0, selection_t1);
+      publishConstraintBatch(
+          anchor_cloud->header,
+          pairs,
+          std::vector<float>{},
+          std::vector<float>{},
+          selection_ms,
+          0.0,
+          0.0,
+          empty_gpu,
+          pipeline_ms);
+      ROS_INFO_THROTTLE(
+          1.0,
+          "[C5.2h C++] zero nearby forbidden pairs -> published empty constraint batch");
       return;
     }
 
