@@ -114,9 +114,11 @@ local_planner:
   scp:
     max_iterations: 6
     step_tolerance_inf: 0.01
-    trust_region_initial: 0.20
-    trust_region_min: 0.05
-    trust_region_max: 0.50
+    # Small local steps are intentional in REPAIR: the current trusted-free
+    # envelope is tiny and should expand through repeated sense/replan cycles.
+    trust_region_initial: 0.05
+    trust_region_min: 0.02
+    trust_region_max: 0.10
     trust_region_grow: 1.50
     trust_region_shrink: 0.50
     improvement_tolerance: 0.002
@@ -153,6 +155,7 @@ local_planner:
   recovery_topic: /care_planner/execution/predicted_vbc_recovery_triggered
   replan_request_topic: /care_planner/local_planner/replan_request
   executed_command_topic: /care_arm/arm_group_velocity_controller/command
+  execution_summary_topic: /care_planner/execution/tracker_summary
   cdf_batch_topic: /care_planner/local_planner/cdf_constraint_batch
   query_trajectory_topic: /care_planner/local_planner/scp_query_trajectory
   candidate_trajectory_topic: /care_planner/local_planner/candidate_trajectory
