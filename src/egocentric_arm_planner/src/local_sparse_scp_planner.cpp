@@ -382,7 +382,7 @@ void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (plan_running_ && waiting_for_cdf_ &&
-        !current_query_wall_.isZero() &&
+        current_query_wall_.toSec() > 0.0 &&
         (ros::WallTime::now() - current_query_wall_).toSec() >
             cdf_wait_timeout_s_) {
       should_abort = true;
