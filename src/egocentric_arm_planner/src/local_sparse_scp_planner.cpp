@@ -1210,6 +1210,18 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   A.makeCompressed();
   G.makeCompressed();
 
+  ROS_WARN_STREAM(
+      "[LocalSparseSCPPlanner] sparse QP dimensions n=" << n
+      << " q_vars=" << n_q
+      << " u_vars=" << n_u
+      << " shared_cdf_slacks=" << n_s
+      << " eq=" << n_eq
+      << " ineq=" << n_ineq
+      << " selected_cdf_rows=" << selected.size()
+      << " nnz(P)=" << P.nonZeros()
+      << " nnz(A)=" << A.nonZeros()
+      << " nnz(G)=" << G.nonZeros());
+
   piqp::SparseSolver<double> solver;
   auto& settings = solver.settings();
   settings.max_iter = piqp_max_iterations_;
@@ -1220,14 +1232,24 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   settings.kkt_solver = piqp::KKTSolver::sparse_ldlt;
 
   const ros::WallTime tic = ros::WallTime::now();
+  ROS_WARN("[LocalSparseSCPPlanner] sparse PIQP setup begin");
   solver.setup(
       P, c,
       A, b,
       G, h_l, h_u,
       x_l, x_u);
+  const double setup_ms =
+      (ros::WallTime::now() - tic).toSec() * 1000.0;
+  ROS_WARN_STREAM(
+      "[LocalSparseSCPPlanner] sparse PIQP setup done in "
+      << setup_ms << " ms; solve begin");
   const piqp::Status status = solver.solve();
   out.setup_and_solve_ms =
       (ros::WallTime::now() - tic).toSec() * 1000.0;
+  ROS_WARN_STREAM(
+      "[LocalSparseSCPPlanner] sparse PIQP solve returned status="
+      << piqp::status_to_string(status)
+      << " total_ms=" << out.setup_and_solve_ms);
 
   const auto& result = solver.result();
   out.iterations = static_cast<int>(result.info.iter);
