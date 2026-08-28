@@ -63,6 +63,9 @@ private:
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void waypointScheduleCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
+  void singleWaypointActiveCallback(const std_msgs::BoolConstPtr& msg);
+  void singleWaypointQCallback(
+      const std_msgs::Float64MultiArrayConstPtr& msg);
   void recoveryCallback(const std_msgs::BoolConstPtr& msg);
   void replanRequestCallback(const std_msgs::BoolConstPtr& msg);
   void executedCommandCallback(
@@ -139,6 +142,8 @@ private:
   ros::Subscriber joint_state_sub_;
   ros::Subscriber reference_sub_;
   ros::Subscriber waypoint_schedule_sub_;
+  ros::Subscriber single_waypoint_active_sub_;
+  ros::Subscriber single_waypoint_q_sub_;
   ros::Subscriber recovery_sub_;
   ros::Subscriber replan_request_sub_;
   ros::Subscriber executed_command_sub_;
@@ -154,6 +159,9 @@ private:
   sensor_msgs::JointState latest_joint_state_;
   trajectory_msgs::JointTrajectory latest_reference_;
   std::vector<DeadlineWaypoint> latest_schedule_;
+  bool latest_single_waypoint_active_ = false;
+  bool has_single_waypoint_q_ = false;
+  Eigen::VectorXd latest_single_waypoint_q_;
   Eigen::VectorXd latest_executed_command_;
   ros::Time latest_joint_state_received_;
   ros::Time latest_reference_received_;
@@ -242,6 +250,10 @@ private:
   std::string reference_topic_ = "/care_planner/task_trajectory";
   std::string waypoint_schedule_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_schedule";
+  std::string single_waypoint_active_topic_ =
+      "/care_planner/active_sensing/visibility_waypoint_active";
+  std::string single_waypoint_q_topic_ =
+      "/care_planner/active_sensing/visibility_waypoint_q";
   std::string recovery_topic_ =
       "/care_planner/execution/predicted_vbc_recovery_triggered";
   std::string replan_request_topic_ =
