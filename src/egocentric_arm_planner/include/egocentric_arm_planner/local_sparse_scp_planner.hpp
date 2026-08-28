@@ -224,6 +224,9 @@ private:
   double q_tracking_weight_ = 50.0;
   double terminal_q_tracking_weight_ = 100.0;
   double u_tracking_weight_ = 2.0;
+  // Backward-compatible switch: true reproduces the existing CARE
+  // ||u-u_ref||^2 objective; false gives the GCDF-style ||u||^2 control cost.
+  bool u_reference_tracking_enabled_ = true;
   double u_smooth_weight_ = 1.0;
   double repair_task_tracking_scale_ = 0.0;
   double visibility_waypoint_weight_ = 3000.0;
@@ -232,6 +235,12 @@ private:
   double cdf_slack_linear_weight_ = 500.0;
   double cdf_slack_quadratic_weight_ = 1e-3;
   double cdf_slack_upper_bound_ = 2.0;
+  // Existing CARE runs share one user slack across all CDF rows at a
+  // timestep. G0 can switch to the GCDF convention: one slack per inequality.
+  bool cdf_per_constraint_slack_ = false;
+  // GCDF slacks are nonnegative and not artificially capped. Keep the old
+  // upper bound available for backwards compatibility.
+  bool cdf_slack_use_upper_bound_ = true;
   bool cdf_safe_row_screening_ = true;
   double cdf_linearization_tolerance_inf_ = 1e-4;
 
