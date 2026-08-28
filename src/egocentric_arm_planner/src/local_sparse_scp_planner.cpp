@@ -78,7 +78,7 @@ bool LocalSparseSCPPlanner::initialize(
       nh_.advertise<trajectory_msgs::JointTrajectory>(
           candidate_trajectory_topic_, 1);
   summary_pub_ =
-      nh_.advertise<std_msgs::String>(summary_topic_, 20);
+      nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
 
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / planner_poll_rate_),
@@ -945,9 +945,27 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     return out;
   }
 
+  // IMPORTANT: use ONE optimization slack per active horizon timestep, not one
+  // slack variable per CDF row.  PIQP already has an internal inequality slack
+  // for every row.  Adding another user variable for every one of ~1k CDF
+  // rows made the sparse KKT system unnecessarily large and caused the first
+  // C5.4 integration run to spend the entire trial inside the first solve.
+  //
+  // A shared s_k is also semantically cleaner:
+  //   d_i + g_i'(q_k-qbar_k) + s_k >= d_safe  for all i at timestep k.
+  // Hence s_k measures the worst unresolved forbidden-space violation at that
+  // future configuration.
+  std::vector<int> step_to_slack(
+      static_cast<std::size_t>(num_intervals_ + 1), -1);
+  int n_s = 0;
+  for (const auto& row : selected) {
+    if (step_to_slack[static_cast<std::size_t>(row.k)] < 0) {
+      step_to_slack[static_cast<std::size_t>(row.k)] = n_s++;
+    }
+  }
+
   const int n_q = num_intervals_ * dof_;
   const int n_u = num_intervals_ * dof_;
-  const int n_s = static_cast<int>(selected.size());
   const int n = n_q + n_u + n_s;
 
   const int n_eq = num_intervals_ * dof_;
@@ -1069,11 +1087,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  // CDF slacks guarantee every convex subproblem remains feasible even when
-  // the current iterate is deeply inside forbidden space.
+  // Per-timestep CDF slacks guarantee every convex subproblem remains
+  // feasible even when the current iterate is deeply inside forbidden space.
   const int slack0 = n_q + n_u;
-  for (int r = 0; r < n_s; ++r) {
-    const int si = slack0 + r;
+  for (int s = 0; s < n_s; ++s) {
+    const int si = slack0 + s;
     c[si] += cdf_slack_linear_weight_;
     p_triplets.emplace_back(
         si, si, 2.0 * cdf_slack_quadratic_weight_);
@@ -1153,8 +1171,14 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           qIndex(row_data.k, j),
           row_data.g[j]);
     }
+    const int slack_slot =
+        step_to_slack[static_cast<std::size_t>(row_data.k)];
+    if (slack_slot < 0 || slack_slot >= n_s) {
+      out.status = "cdf_slack_mapping_error";
+      return out;
+    }
     g_triplets.emplace_back(
-        row, slack0 + r, 1.0);
+        row, slack0 + slack_slot, 1.0);
     h_l[row] =
         cdf_safety_margin_ - row_data.d +
         row_data.g.dot(row_data.qlin);
@@ -1224,10 +1248,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
 
   double slack_sum = 0.0;
   out.max_slack = 0.0;
-  for (int r = 0; r < n_s; ++r) {
-    const double s = result.x[slack0 + r];
-    slack_sum += s;
-    out.max_slack = std::max(out.max_slack, s);
+  for (int s = 0; s < n_s; ++s) {
+    const double value = result.x[slack0 + s];
+    slack_sum += value;
+    out.max_slack = std::max(out.max_slack, value);
   }
   out.mean_slack =
       n_s > 0 ? slack_sum / static_cast<double>(n_s) : 0.0;
