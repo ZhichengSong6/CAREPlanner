@@ -193,6 +193,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<bool>("local_planner/cdf/slack_use_upper_bound",
                    cdf_slack_use_upper_bound_,
                    cdf_slack_use_upper_bound_);
+  pnh_.param<bool>("local_planner/cdf/slack_enabled",
+                   cdf_slack_enabled_,
+                   cdf_slack_enabled_);
   pnh_.param<bool>("local_planner/cdf/adaptive_slack_penalty",
                    cdf_adaptive_slack_penalty_,
                    cdf_adaptive_slack_penalty_);
@@ -1093,12 +1096,14 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   std::vector<int> step_to_slack(
       static_cast<std::size_t>(num_intervals_ + 1), -1);
   int n_s = 0;
-  if (cdf_per_constraint_slack_) {
-    n_s = static_cast<int>(selected.size());
-  } else {
-    for (const auto& row : selected) {
-      if (step_to_slack[static_cast<std::size_t>(row.k)] < 0) {
-        step_to_slack[static_cast<std::size_t>(row.k)] = n_s++;
+  if (cdf_slack_enabled_) {
+    if (cdf_per_constraint_slack_) {
+      n_s = static_cast<int>(selected.size());
+    } else {
+      for (const auto& row : selected) {
+        if (step_to_slack[static_cast<std::size_t>(row.k)] < 0) {
+          step_to_slack[static_cast<std::size_t>(row.k)] = n_s++;
+        }
       }
     }
   }
@@ -1319,16 +1324,18 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           qIndex(row_data.k, j),
           row_data.g[j]);
     }
-    const int slack_slot =
-        cdf_per_constraint_slack_
-            ? r
-            : step_to_slack[static_cast<std::size_t>(row_data.k)];
-    if (slack_slot < 0 || slack_slot >= n_s) {
-      out.status = "cdf_slack_mapping_error";
-      return out;
+    if (cdf_slack_enabled_) {
+      const int slack_slot =
+          cdf_per_constraint_slack_
+              ? r
+              : step_to_slack[static_cast<std::size_t>(row_data.k)];
+      if (slack_slot < 0 || slack_slot >= n_s) {
+        out.status = "cdf_slack_mapping_error";
+        return out;
+      }
+      g_triplets.emplace_back(
+          row, slack0 + slack_slot, 1.0);
     }
-    g_triplets.emplace_back(
-        row, slack0 + slack_slot, 1.0);
     h_l[row] =
         cdf_safety_margin_ - row_data.d +
         row_data.g.dot(row_data.qlin);
@@ -1353,6 +1360,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " q_vars=" << n_q
       << " u_vars=" << n_u
       << " cdf_slacks=" << n_s
+      << " slack_enabled=" << (cdf_slack_enabled_ ? 1 : 0)
       << " per_constraint_slack=" << (cdf_per_constraint_slack_ ? 1 : 0)
       << " accel_constraints="
       << (enforce_acceleration_constraints_ ? 1 : 0)
