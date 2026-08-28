@@ -295,6 +295,7 @@
       <arg name="show_worst_timestep_markers" value="false" />
       <arg name="show_attribution_markers" value="false" />
       <arg name="eval_rate" value="50.0" />
+      <arg name="refresh_body_prior_before_query" value="false" />
       <arg name="evaluate_stale_trajectory" value="false" />
     </include>
   </group>
