@@ -39,6 +39,28 @@
   <arg name="execution_vbc_summary_topic" default="/care_planner/execution_vbc/summary" />
   <arg name="regime_summary_topic" default="/care_planner/c4_4/regime_summary" />
 
+
+  <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
+  <arg name="use_local_sparse_scp" default="false" />
+  <arg name="local_scp_query_trajectory_topic"
+       default="/care_planner/local_planner/scp_query_trajectory" />
+  <arg name="local_scp_candidate_trajectory_topic"
+       default="/care_planner/local_planner/candidate_trajectory" />
+  <arg name="local_scp_summary_topic"
+       default="/care_planner/local_planner/summary" />
+  <arg name="local_scp_replan_request_topic"
+       default="/care_planner/local_planner/replan_request" />
+  <arg name="local_scp_body_anchor_topic"
+       default="/care_planner/local_planner/body_sweep_anchors" />
+  <arg name="local_scp_cdf_batch_topic"
+       default="/care_planner/local_planner/cdf_constraint_batch" />
+  <arg name="local_scp_risk_output_namespace"
+       default="/care_planner/local_scp_risk" />
+  <arg name="local_scp_gpu_socket"
+       default="/tmp/care_collision_cdf_gpu_c5_4.sock" />
+  <arg name="local_scp_selector_jsonl"
+       default="/tmp/c5_4_local_scp_selector.jsonl" />
+
   <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
   <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
   <arg name="forbidden_space_pair_publish_enabled" default="false" />
@@ -174,7 +196,8 @@
     <param name="summary_topic" value="$(arg regime_summary_topic)" />
   </node>
 
-  <node pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
+  <node unless="$(arg use_local_sparse_scp)"
+        pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
         name="velocity_qp_mpc_waypoint_node" output="screen">
     <rosparam command="load" file="$(arg config_file)" />
     <param name="mpc/reference_trajectory" value="$(arg gated_command_topic)" />
@@ -217,12 +240,87 @@
            value="$(arg cdf_shadow_summary_topic)" />
   </node>
 
+  <!-- C5.4 event-triggered local trajectory optimizer. It plans complete
+       local trajectories and never owns the actuator command. -->
+  <node if="$(arg use_local_sparse_scp)"
+        pkg="egocentric_arm_planner"
+        type="local_sparse_scp_planner_node"
+        name="local_sparse_scp_planner_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="local_planner/reference_trajectory"
+           value="/care_planner/task_trajectory" />
+    <param name="local_planner/visibility_waypoint_weight"
+           value="$(arg waypoint_weight)" />
+    <param name="local_planner/recovery_topic"
+           value="$(arg recovery_trigger_topic)" />
+    <param name="local_planner/replan_request_topic"
+           value="$(arg local_scp_replan_request_topic)" />
+    <param name="local_planner/cdf_batch_topic"
+           value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="local_planner/query_trajectory_topic"
+           value="$(arg local_scp_query_trajectory_topic)" />
+    <param name="local_planner/candidate_trajectory_topic"
+           value="$(arg local_scp_candidate_trajectory_topic)" />
+    <param name="local_planner/summary_topic"
+           value="$(arg local_scp_summary_topic)" />
+  </node>
+
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
        RECOVERY_HOLD in planner-mode semantics, so there is nothing to ack. -->
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
+
+
+  <!-- C5.4 inner-loop geometry query. This second risk instance is isolated
+       from the main risk diagnostics and only exports body-sweep anchors for
+       the current SCP iterate. -->
+  <group if="$(arg use_local_sparse_scp)" ns="local_scp_pair_export">
+    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/local_planner/unused_target" />
+      <arg name="output_namespace"
+           value="$(arg local_scp_risk_output_namespace)" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="$(arg local_scp_body_anchor_topic)" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="50.0" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+  </group>
+
+  <node if="$(arg use_local_sparse_scp)"
+        pkg="care_collision_cdf"
+        type="cpp_forbidden_voxel_gpu_shadow_node"
+        name="c5_4_local_scp_cdf_selector"
+        output="screen">
+    <param name="anchor_topic" value="$(arg local_scp_body_anchor_topic)" />
+    <param name="map_topic" value="/care_planner/confidence_map/points" />
+    <param name="summary_topic"
+           value="/care_planner/local_planner/cdf_selector_summary" />
+    <param name="constraint_batch_topic"
+           value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="output_jsonl" value="$(arg local_scp_selector_jsonl)" />
+    <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
+    <param name="rate" value="50.0" />
+    <param name="confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+    <param name="map_resolution" value="0.05" />
+    <param name="proximity_margin" value="0.075" />
+    <param name="max_pairs_per_step" value="250" />
+    <param name="signed_zero_band" value="0.05" />
+    <param name="max_pairs" value="8000" />
+  </node>
 
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
