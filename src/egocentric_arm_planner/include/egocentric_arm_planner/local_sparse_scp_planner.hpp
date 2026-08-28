@@ -228,6 +228,9 @@ private:
   // ||u-u_ref||^2 objective; false gives the GCDF-style ||u||^2 control cost.
   bool u_reference_tracking_enabled_ = true;
   double u_smooth_weight_ = 1.0;
+  // CARE execution normally enforces hard acceleration and terminal-braking
+  // rows. G0 disables them to match the GCDF formulation more closely.
+  bool enforce_acceleration_constraints_ = true;
   double repair_task_tracking_scale_ = 0.0;
   double visibility_waypoint_weight_ = 3000.0;
 
