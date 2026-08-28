@@ -285,8 +285,12 @@ record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/wa
 record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
 record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
 record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
+record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+  record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
   # Keep the historical filename for downstream summary scripts; fields that
   # are specific to legacy MPC will simply be absent.
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
