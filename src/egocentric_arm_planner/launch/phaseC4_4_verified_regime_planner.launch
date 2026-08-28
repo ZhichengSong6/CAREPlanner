@@ -38,6 +38,12 @@
   <arg name="candidate_outcome_topic" default="/care_planner/verification_outcome" />
   <arg name="execution_vbc_summary_topic" default="/care_planner/execution_vbc/summary" />
   <arg name="regime_summary_topic" default="/care_planner/c4_4/regime_summary" />
+  <!-- C4.8 legacy reactive-repair verification. C5.4 full-trajectory local
+       planning disables this and verifies the complete candidate trajectory. -->
+  <arg name="repair_prefix_verification_enabled" default="false" />
+  <arg name="repair_execution_prefix_s" default="0.15" />
+  <arg name="repair_brake_dt_s" default="0.05" />
+  <arg name="repair_hold_s" default="0.10" />
 
 
   <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
@@ -170,6 +176,14 @@
     <param name="rate" value="20.0" />
     <param name="continuation_start_delay_s" value="0.065" />
     <param name="continuation_timeout_s" value="0.50" />
+    <param name="repair_prefix_verification_enabled"
+           value="$(arg repair_prefix_verification_enabled)" />
+    <param name="repair_execution_prefix_s"
+           value="$(arg repair_execution_prefix_s)" />
+    <param name="repair_brake_dt_s"
+           value="$(arg repair_brake_dt_s)" />
+    <param name="repair_hold_s"
+           value="$(arg repair_hold_s)" />
   </node>
 
   <!-- C4.4 owns planner regime; candidate transitions consume only unique
