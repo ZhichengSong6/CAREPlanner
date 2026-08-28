@@ -1,0 +1,64 @@
+<launch>
+  <!--
+    G0: GCDF-aligned CAREPlanner baseline.
+    The obstacle/forbidden set is the existing low-confidence voxel set.
+    No CARE visibility waypoint objective is active in this baseline.
+  -->
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_g0_gcdf_aligned.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+  <arg name="selector_predicted_trajectory_timeout" default="0.50" />
+  <arg name="candidate_unsafe_required" default="2" />
+  <arg name="execution_unsafe_required" default="2" />
+  <arg name="probe_safe_commits_required" default="3" />
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+  <arg name="trial_label" default="g0_gcdf_aligned" />
+  <arg name="log_output_root"
+       default="$(find egocentric_arm_planner)/../../outputs/g0_gcdf_aligned" />
+  <arg name="gpu_socket"
+       default="/tmp/care_collision_cdf_gpu_g0.sock" />
+  <arg name="selector_jsonl"
+       default="/tmp/g0_gcdf_selector.jsonl" />
+
+  <include file="$(find egocentric_arm_planner)/launch/phaseC5_4_local_sparse_scp_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+
+    <!-- Critical G0 switch: completely disable CARE visibility waypoint cost. -->
+    <arg name="waypoint_weight" value="0.0" />
+
+    <arg name="vbc_min_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="selector_predicted_trajectory_timeout"
+         value="$(arg selector_predicted_trajectory_timeout)" />
+    <arg name="candidate_unsafe_required"
+         value="$(arg candidate_unsafe_required)" />
+    <arg name="execution_unsafe_required"
+         value="$(arg execution_unsafe_required)" />
+    <arg name="probe_safe_commits_required"
+         value="$(arg probe_safe_commits_required)" />
+
+    <arg name="goal_x" value="$(arg goal_x)" />
+    <arg name="goal_y" value="$(arg goal_y)" />
+    <arg name="goal_z" value="$(arg goal_z)" />
+    <arg name="goal_qx" value="$(arg goal_qx)" />
+    <arg name="goal_qy" value="$(arg goal_qy)" />
+    <arg name="goal_qz" value="$(arg goal_qz)" />
+    <arg name="goal_qw" value="$(arg goal_qw)" />
+    <arg name="goal_delay" value="$(arg goal_delay)" />
+    <arg name="trial_label" value="$(arg trial_label)" />
+    <arg name="log_output_root" value="$(arg log_output_root)" />
+
+    <arg name="gpu_socket" value="$(arg gpu_socket)" />
+    <arg name="selector_jsonl" value="$(arg selector_jsonl)" />
+  </include>
+</launch>
