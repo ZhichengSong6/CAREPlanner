@@ -1054,7 +1054,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   const int n_pairs = batch.num_pairs;
-  if (n_pairs <= 0 ||
+  if (n_pairs < 0 ||
       batch.dof != dof_ ||
       batch.original_timestep.size() !=
           static_cast<std::size_t>(n_pairs) ||
@@ -1136,6 +1136,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
 
   if (!std::isfinite(out.min_distance))
     out.min_distance = std::numeric_limits<double>::quiet_NaN();
+
+  if (n_pairs == 0) {
+    ROS_INFO(
+        "[LocalSparseSCPPlanner] received explicit empty CDF batch: no active forbidden pairs");
+  }
 
   if (out.qlin_error_inf > cdf_linearization_tolerance_inf_) {
     out.status = "cdf_linearization_mismatch";
