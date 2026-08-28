@@ -249,6 +249,19 @@ summary = {
     'screened_safe_rows': stats(col(solved, 'screened_safe')),
     'max_cdf_slack': stats(col(solved, 'max_slack')),
     'mean_cdf_slack': stats(col(solved, 'mean_slack')),
+    'slack_mu_used': stats(col(solved, 'slack_mu_used')),
+    'slack_mu_used_sequence': [
+        fnum(r.get('slack_mu_used')) for r in solved
+        if math.isfinite(fnum(r.get('slack_mu_used')))
+    ],
+    'max_cdf_slack_sequence': [
+        fnum(r.get('max_slack')) for r in solved
+        if math.isfinite(fnum(r.get('max_slack')))
+    ],
+    'min_cdf_distance_sequence': [
+        fnum(r.get('min_d')) for r in solved
+        if math.isfinite(fnum(r.get('min_d')))
+    ],
     'scp_step_inf': stats(col(solved, 'step_inf')),
     'linearization_error_inf': stats(col(solved, 'qlin_error_inf')),
     'candidate_vbc_records': len(vbc_pred),
@@ -311,7 +324,7 @@ exact_vbc_before_commit=true
 repair_prefix_verification=false
 cdf_variant=signed
 cdf_activation=gelu
-scp_max_iterations=3
+scp_max_iterations=from_config:${CONFIG_FILE}
 solver=piqp_sparse
 initial_planner_latency_goal_ms=200
 EOF
