@@ -133,25 +133,9 @@ if [[ "${READY}" != "1" ]]; then
   exit 4
 fi
 
-# Extra C5.4 records. They wait for the ROS master started by the common runner.
-wait_record() {
-  local topic="$1"
-  local path="$2"
-  setsid bash -lc "
-    set +e
-    cd '${REPO}'
-    source devel/setup.bash
-    while ! timeout 1 rostopic list >/dev/null 2>&1; do sleep 0.05; done
-    mkdir -p '$(dirname "${path}")'
-    exec rostopic echo -p '${topic}'
-  " >"${path}" 2>"${path}.err" &
-  PIDS+=("$!")
-}
-
-wait_record "/care_planner/active_sensing/visibility_acquisition_summary"   "${RUN_OUT}/visibility_acquisition_summary.csv"
-wait_record "/care_planner/active_sensing/visibility_acquisition_complete"   "${RUN_OUT}/visibility_acquisition_complete.csv"
-wait_record "/care_planner/active_sensing/blocker_stack_summary"   "${RUN_OUT}/blocker_stack_summary.csv"
-wait_record "/care_planner/local_planner/cdf_selector_summary"   "${RUN_OUT}/local_cdf_selector_summary.csv"
+# C5.4-specific ROS diagnostics are recorded by the common runner itself.
+# Do not start recorders here: that runner clears RUN_OUT at startup, which
+# unlinked the first C5.4 trial's early recorder files.
 
 # The new backend deliberately disables C4.8 safe-prefix commit semantics:
 # a complete local trajectory is optimized first and then exact VBC verifies it.
