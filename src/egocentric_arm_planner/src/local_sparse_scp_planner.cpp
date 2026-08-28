@@ -745,7 +745,9 @@ bool LocalSparseSCPPlanner::startPlan() {
 
   std::string initialization_mode = "task_reference";
   if (repair && repair_hold_initialization_enabled_) {
-    q_init.colwise() = q_current;
+    for (int k = 0; k <= num_intervals_; ++k) {
+      q_init.col(k) = q_current;
+    }
     u_init.setZero();
     initialization_mode = "repair_hold";
   }
