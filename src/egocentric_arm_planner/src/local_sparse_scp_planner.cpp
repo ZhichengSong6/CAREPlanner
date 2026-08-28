@@ -166,6 +166,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
                    u_reference_tracking_enabled_);
   pnh_.param<double>("local_planner/u_smooth_weight",
                      u_smooth_weight_, u_smooth_weight_);
+  pnh_.param<bool>("local_planner/enforce_acceleration_constraints",
+                   enforce_acceleration_constraints_,
+                   enforce_acceleration_constraints_);
   pnh_.param<double>("local_planner/repair_task_tracking_scale",
                      repair_task_tracking_scale_,
                      repair_task_tracking_scale_);
@@ -1068,7 +1071,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   const int n_eq = num_intervals_ * dof_;
   // Acceleration rows include the executed-command -> u0 boundary, all
   // inter-stage velocity changes, and u_{K-1} -> 0 terminal braking.
-  const int n_acc = (num_intervals_ + 1) * dof_;
+  const int n_acc =
+      enforce_acceleration_constraints_
+          ? (num_intervals_ + 1) * dof_
+          : 0;
   const int n_cdf_rows = static_cast<int>(selected.size());
   const int n_ineq = n_acc + n_cdf_rows;
 
@@ -1224,40 +1230,41 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  // Acceleration envelope.
-  for (int k = 0; k < num_intervals_; ++k) {
-    for (int j = 0; j < dof_; ++j) {
-      const int row = k * dof_ + j;
-      g_triplets.emplace_back(
-          row, uIndex(k, j), 1.0);
-
-      const double du =
-          acceleration_limits_[j] * dt_;
-      if (k == 0) {
-        const double prev =
-            previous_command.size() == dof_
-                ? previous_command[j]
-                : 0.0;
-        h_l[row] = prev - du;
-        h_u[row] = prev + du;
-      } else {
+  if (enforce_acceleration_constraints_) {
+    // CARE acceleration envelope.
+    for (int k = 0; k < num_intervals_; ++k) {
+      for (int j = 0; j < dof_; ++j) {
+        const int row = k * dof_ + j;
         g_triplets.emplace_back(
-            row, uIndex(k - 1, j), -1.0);
-        h_l[row] = -du;
-        h_u[row] = du;
+            row, uIndex(k, j), 1.0);
+
+        const double du =
+            acceleration_limits_[j] * dt_;
+        if (k == 0) {
+          const double prev =
+              previous_command.size() == dof_
+                  ? previous_command[j]
+                  : 0.0;
+          h_l[row] = prev - du;
+          h_u[row] = prev + du;
+        } else {
+          g_triplets.emplace_back(
+              row, uIndex(k - 1, j), -1.0);
+          h_l[row] = -du;
+          h_u[row] = du;
+        }
       }
     }
-  }
 
-  // Explicit terminal braking makes the published trajectory dynamically
-  // executable when its final JointTrajectory point carries zero velocity.
-  for (int j = 0; j < dof_; ++j) {
-    const int row = num_intervals_ * dof_ + j;
-    const double du = acceleration_limits_[j] * dt_;
-    g_triplets.emplace_back(
-        row, uIndex(num_intervals_ - 1, j), 1.0);
-    h_l[row] = -du;
-    h_u[row] = du;
+    // CARE terminal braking row.
+    for (int j = 0; j < dof_; ++j) {
+      const int row = num_intervals_ * dof_ + j;
+      const double du = acceleration_limits_[j] * dt_;
+      g_triplets.emplace_back(
+          row, uIndex(num_intervals_ - 1, j), 1.0);
+      h_l[row] = -du;
+      h_u[row] = du;
+    }
   }
 
   // Linearized CDF:
@@ -1308,6 +1315,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " u_vars=" << n_u
       << " cdf_slacks=" << n_s
       << " per_constraint_slack=" << (cdf_per_constraint_slack_ ? 1 : 0)
+      << " accel_constraints="
+      << (enforce_acceleration_constraints_ ? 1 : 0)
       << " eq=" << n_eq
       << " ineq=" << n_ineq
       << " selected_cdf_rows=" << n_cdf_rows
