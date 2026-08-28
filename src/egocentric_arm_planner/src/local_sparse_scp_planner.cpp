@@ -984,7 +984,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   // Acceleration rows include the executed-command -> u0 boundary, all
   // inter-stage velocity changes, and u_{K-1} -> 0 terminal braking.
   const int n_acc = (num_intervals_ + 1) * dof_;
-  const int n_ineq = n_acc + n_s;
+  const int n_cdf_rows = static_cast<int>(selected.size());
+  const int n_ineq = n_acc + n_cdf_rows;
 
   using Triplet = Eigen::Triplet<double>;
   std::vector<Triplet> p_triplets;
@@ -996,7 +997,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   a_triplets.reserve(
       static_cast<std::size_t>(n_eq * 3));
   g_triplets.reserve(
-      static_cast<std::size_t>(n_acc * 2 + n_s * (dof_ + 1)));
+      static_cast<std::size_t>(
+          n_acc * 2 + n_cdf_rows * (dof_ + 1)));
 
   Eigen::VectorXd c = Eigen::VectorXd::Zero(n);
   Eigen::VectorXd b = Eigen::VectorXd::Zero(n_eq);
@@ -1173,7 +1175,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   // Linearized CDF:
   // d + g'(q_k-qbar) + s >= d_safe
   // -> g' q_k + s >= d_safe - d + g' qbar.
-  for (int r = 0; r < n_s; ++r) {
+  for (int r = 0; r < n_cdf_rows; ++r) {
     const auto& row_data =
         selected[static_cast<std::size_t>(r)];
     const int row = n_acc + r;
@@ -1217,7 +1219,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " shared_cdf_slacks=" << n_s
       << " eq=" << n_eq
       << " ineq=" << n_ineq
-      << " selected_cdf_rows=" << selected.size()
+      << " selected_cdf_rows=" << n_cdf_rows
       << " nnz(P)=" << P.nonZeros()
       << " nnz(A)=" << A.nonZeros()
       << " nnz(G)=" << G.nonZeros());
