@@ -74,6 +74,9 @@ bool LocalSparseSCPPlanner::initialize(
   executed_command_sub_ = nh_.subscribe(
       executed_command_topic_, 2,
       &LocalSparseSCPPlanner::executedCommandCallback, this);
+  execution_summary_sub_ = nh_.subscribe(
+      execution_summary_topic_, 10,
+      &LocalSparseSCPPlanner::executionSummaryCallback, this);
   cdf_batch_sub_ = nh_.subscribe(
       cdf_batch_topic_, 2,
       &LocalSparseSCPPlanner::cdfConstraintBatchCallback, this);
@@ -169,6 +172,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<bool>("local_planner/enforce_acceleration_constraints",
                    enforce_acceleration_constraints_,
                    enforce_acceleration_constraints_);
+  pnh_.param<bool>("local_planner/repair_hold_initialization_enabled",
+                   repair_hold_initialization_enabled_,
+                   repair_hold_initialization_enabled_);
   pnh_.param<double>("local_planner/repair_task_tracking_scale",
                      repair_task_tracking_scale_,
                      repair_task_tracking_scale_);
@@ -248,6 +254,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/executed_command_topic",
                           executed_command_topic_,
                           executed_command_topic_);
+  pnh_.param<std::string>("local_planner/execution_summary_topic",
+                          execution_summary_topic_,
+                          execution_summary_topic_);
   pnh_.param<std::string>("local_planner/cdf_batch_topic",
                           cdf_batch_topic_, cdf_batch_topic_);
   pnh_.param<std::string>("local_planner/query_trajectory_topic",
@@ -439,6 +448,23 @@ void LocalSparseSCPPlanner::executedCommandCallback(
   std::lock_guard<std::mutex> lock(mutex_);
   latest_executed_command_ = u;
   latest_executed_command_received_ = ros::Time::now();
+}
+
+void LocalSparseSCPPlanner::executionSummaryCallback(
+    const std_msgs::StringConstPtr& msg) {
+  if (!msg) return;
+
+  const bool complete =
+      msg->data.find(" complete=1") != std::string::npos ||
+      msg->data.rfind("complete=1", 0) == 0;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool rising = complete && !latest_execution_complete_;
+  latest_execution_complete_ = complete;
+
+  if (rising && repair_mode_) {
+    requestPlanLocked("repair_trajectory_complete");
+  }
 }
 
 void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
@@ -717,6 +743,13 @@ bool LocalSparseSCPPlanner::startPlan() {
     return false;
   }
 
+  std::string initialization_mode = "task_reference";
+  if (repair && repair_hold_initialization_enabled_) {
+    q_init.colwise() = q_current;
+    u_init.setZero();
+    initialization_mode = "repair_hold";
+  }
+
   {
     std::lock_guard<std::mutex> lock(mutex_);
     plan_q_current_ = q_current;
@@ -727,6 +760,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
     plan_repair_mode_ = repair;
+    plan_initialization_mode_ = initialization_mode;
     scp_iteration_ = 0;
     trust_radius_ = trust_region_initial_;
     plan_cdf_slack_linear_weight_ = cdf_slack_linear_weight_;
@@ -752,7 +786,9 @@ bool LocalSparseSCPPlanner::startPlan() {
   ROS_INFO_STREAM(
       "[LocalSparseSCPPlanner] plan " << plan_sequence_
       << " started reason=" << reason
-      << " repair=" << static_cast<int>(repair));
+      << " repair=" << static_cast<int>(repair)
+      << " init=" << initialization_mode
+      << " vis_obligations=" << schedule.size());
   publishSummary("plan_started");
   return true;
 }
@@ -1515,6 +1551,7 @@ void LocalSparseSCPPlanner::publishSummary(
   bool running = false;
   bool repair = false;
   double active_slack_weight = 0.0;
+  std::string init_mode = "unknown";
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1528,6 +1565,7 @@ void LocalSparseSCPPlanner::publishSummary(
     running = plan_running_;
     repair = plan_repair_mode_;
     active_slack_weight = plan_cdf_slack_linear_weight_;
+    init_mode = plan_initialization_mode_;
   }
 
   std::ostringstream oss;
@@ -1536,6 +1574,7 @@ void LocalSparseSCPPlanner::publishSummary(
       << " plan_seq=" << plan_seq
       << " running=" << static_cast<int>(running)
       << " repair=" << static_cast<int>(repair)
+      << " init=" << init_mode
       << " scp_iter=" << scp_iter
       << " trust_q_inf=" << trust
       << " slack_mu=" << active_slack_weight
