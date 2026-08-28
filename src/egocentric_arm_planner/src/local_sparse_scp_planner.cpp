@@ -344,6 +344,48 @@ void LocalSparseSCPPlanner::waypointScheduleCallback(
   if (changed) requestPlanLocked("visibility_schedule_changed");
 }
 
+void LocalSparseSCPPlanner::singleWaypointActiveCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (latest_single_waypoint_active_ == msg->data) return;
+
+  latest_single_waypoint_active_ = msg->data;
+  requestPlanLocked(
+      msg->data
+          ? "single_visibility_waypoint_activated"
+          : "single_visibility_waypoint_deactivated");
+}
+
+void LocalSparseSCPPlanner::singleWaypointQCallback(
+    const std_msgs::Float64MultiArrayConstPtr& msg) {
+  if (!msg ||
+      msg->data.size() != static_cast<std::size_t>(dof_)) {
+    return;
+  }
+
+  Eigen::VectorXd q(dof_);
+  for (int j = 0; j < dof_; ++j) {
+    q[j] = msg->data[static_cast<std::size_t>(j)];
+  }
+  if (!finiteVector(q)) return;
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool changed =
+      !has_single_waypoint_q_ ||
+      latest_single_waypoint_q_.size() != dof_ ||
+      (q - latest_single_waypoint_q_)
+              .lpNorm<Eigen::Infinity>() > 1e-5;
+
+  latest_single_waypoint_q_ = q;
+  has_single_waypoint_q_ = true;
+
+  if (changed) {
+    requestPlanLocked("single_visibility_waypoint_q_changed");
+  }
+}
+
 void LocalSparseSCPPlanner::recoveryCallback(
     const std_msgs::BoolConstPtr& msg) {
   if (!msg) return;
