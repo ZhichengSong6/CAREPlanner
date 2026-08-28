@@ -193,6 +193,18 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<bool>("local_planner/cdf/slack_use_upper_bound",
                    cdf_slack_use_upper_bound_,
                    cdf_slack_use_upper_bound_);
+  pnh_.param<bool>("local_planner/cdf/adaptive_slack_penalty",
+                   cdf_adaptive_slack_penalty_,
+                   cdf_adaptive_slack_penalty_);
+  pnh_.param<double>("local_planner/cdf/slack_penalty_multiplier",
+                     cdf_slack_penalty_multiplier_,
+                     cdf_slack_penalty_multiplier_);
+  pnh_.param<double>("local_planner/cdf/slack_penalty_max",
+                     cdf_slack_penalty_max_,
+                     cdf_slack_penalty_max_);
+  pnh_.param<double>("local_planner/cdf/slack_tolerance",
+                     cdf_slack_tolerance_,
+                     cdf_slack_tolerance_);
   pnh_.param<bool>("local_planner/cdf/safe_row_screening",
                    cdf_safe_row_screening_,
                    cdf_safe_row_screening_);
@@ -251,7 +263,10 @@ bool LocalSparseSCPPlanner::loadConfig() {
       trust_region_max_ < trust_region_min_ ||
       cdf_slack_linear_weight_ < 0.0 ||
       cdf_slack_quadratic_weight_ < 0.0 ||
-      (cdf_slack_use_upper_bound_ && cdf_slack_upper_bound_ <= 0.0)) {
+      (cdf_slack_use_upper_bound_ && cdf_slack_upper_bound_ <= 0.0) ||
+      cdf_slack_penalty_multiplier_ < 1.0 ||
+      cdf_slack_penalty_max_ < cdf_slack_linear_weight_ ||
+      cdf_slack_tolerance_ < 0.0) {
     ROS_ERROR("[LocalSparseSCPPlanner] invalid local_planner parameters");
     return false;
   }
@@ -711,6 +726,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_repair_mode_ = repair;
     scp_iteration_ = 0;
     trust_radius_ = trust_region_initial_;
+    plan_cdf_slack_linear_weight_ = cdf_slack_linear_weight_;
     previous_query_min_distance_ =
         std::numeric_limits<double>::quiet_NaN();
     current_frame_id_ =
@@ -778,6 +794,7 @@ void LocalSparseSCPPlanner::workerLoop() {
     std::vector<DeadlineWaypoint> schedule;
     bool repair = false;
     double trust = 0.0;
+    double slack_linear_weight = 0.0;
     int iteration = 0;
     ros::Time expected_stamp;
 
@@ -827,6 +844,7 @@ void LocalSparseSCPPlanner::workerLoop() {
       schedule = plan_schedule_;
       repair = plan_repair_mode_;
       trust = trust_radius_;
+      slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
       expected_stamp = current_query_stamp_;
     }
@@ -849,7 +867,8 @@ void LocalSparseSCPPlanner::workerLoop() {
             previous_command,
             schedule,
             repair,
-            trust);
+            trust,
+            slack_linear_weight);
 
     bool publish_candidate = false;
     bool publish_next_query = false;
@@ -871,10 +890,25 @@ void LocalSparseSCPPlanner::workerLoop() {
         previous_query_min_distance_ = result.min_distance;
         ++scp_iteration_;
 
+        const bool slack_satisfied =
+            !cdf_adaptive_slack_penalty_ ||
+            result.max_slack <= cdf_slack_tolerance_;
         const bool converged =
-            result.step_inf <= scp_step_tolerance_inf_;
+            result.step_inf <= scp_step_tolerance_inf_ &&
+            slack_satisfied;
         const bool exhausted =
             scp_iteration_ >= max_scp_iterations_;
+
+        if (cdf_adaptive_slack_penalty_ &&
+            !slack_satisfied && !exhausted) {
+          plan_cdf_slack_linear_weight_ =
+              std::min(
+                  cdf_slack_penalty_max_,
+                  std::max(
+                      plan_cdf_slack_linear_weight_,
+                      cdf_slack_linear_weight_) *
+                      cdf_slack_penalty_multiplier_);
+        }
 
         if (converged || exhausted) {
           publish_candidate = true;
@@ -946,8 +980,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     const Eigen::VectorXd& previous_command,
     const std::vector<DeadlineWaypoint>& schedule,
     bool repair_mode,
-    double trust_radius) const {
+    double trust_radius,
+    double slack_linear_weight) const {
   SparseSolveResult out;
+  out.slack_linear_weight_used = slack_linear_weight;
   out.batch_pairs = batch.num_pairs;
   out.min_distance = std::numeric_limits<double>::infinity();
 
@@ -1202,7 +1238,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   const int slack0 = n_q + n_u;
   for (int s = 0; s < n_s; ++s) {
     const int si = slack0 + s;
-    c[si] += cdf_slack_linear_weight_;
+    c[si] += slack_linear_weight;
     p_triplets.emplace_back(
         si, si, 2.0 * cdf_slack_quadratic_weight_);
     x_l[si] = 0.0;
@@ -1470,6 +1506,7 @@ void LocalSparseSCPPlanner::publishSummary(
   double trust = 0.0;
   bool running = false;
   bool repair = false;
+  double active_slack_weight = 0.0;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1482,6 +1519,7 @@ void LocalSparseSCPPlanner::publishSummary(
     trust = trust_radius_;
     running = plan_running_;
     repair = plan_repair_mode_;
+    active_slack_weight = plan_cdf_slack_linear_weight_;
   }
 
   std::ostringstream oss;
@@ -1492,6 +1530,7 @@ void LocalSparseSCPPlanner::publishSummary(
       << " repair=" << static_cast<int>(repair)
       << " scp_iter=" << scp_iter
       << " trust_q_inf=" << trust
+      << " slack_mu=" << active_slack_weight
       << " batches=" << batches
       << " stamp_miss=" << misses
       << " solves=" << solves
@@ -1511,6 +1550,7 @@ void LocalSparseSCPPlanner::publishSummary(
         << " min_d=" << result->min_distance
         << " max_slack=" << result->max_slack
         << " mean_slack=" << result->mean_slack
+        << " slack_mu_used=" << result->slack_linear_weight_used
         << " step_inf=" << result->step_inf
         << " primal=" << result->primal_residual
         << " dual=" << result->dual_residual;
