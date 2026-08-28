@@ -89,6 +89,8 @@ bool LocalSparseSCPPlanner::initialize(
           candidate_trajectory_topic_, 1);
   summary_pub_ =
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
+  task_infeasible_pub_ =
+      nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
 
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / planner_poll_rate_),
@@ -267,6 +269,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
                           candidate_trajectory_topic_);
   pnh_.param<std::string>("local_planner/summary_topic",
                           summary_topic_, summary_topic_);
+  pnh_.param<std::string>("local_planner/task_infeasible_topic",
+                          task_infeasible_topic_,
+                          task_infeasible_topic_);
 
   if (planner_poll_rate_ <= 0.0 ||
       max_scp_iterations_ < 1 ||
@@ -977,6 +982,14 @@ void LocalSparseSCPPlanner::workerLoop() {
       ROS_WARN_STREAM(
           "[LocalSparseSCPPlanner] sparse PIQP failed: "
           << result.status);
+      if (!repair &&
+          result.status.find("primal infeasible") != std::string::npos) {
+        std_msgs::Bool infeasible_msg;
+        infeasible_msg.data = true;
+        task_infeasible_pub_.publish(infeasible_msg);
+        ROS_WARN(
+            "[LocalSparseSCPPlanner] NORMAL task QP infeasible -> request REPAIR regime");
+      }
       continue;
     }
 
