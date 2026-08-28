@@ -260,6 +260,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
   Eigen::VectorXd ddq_ref;
 
   bool has_joint_state = false;
+  bool has_received_trajectory = false;
   bool active = false;
   bool complete = false;
   bool have_reference = false;
@@ -271,6 +272,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
     std::lock_guard<std::mutex> lock(data_mutex_);
 
     has_joint_state = has_joint_state_;
+    has_received_trajectory = has_received_trajectory_;
     if (has_joint_state) q_measured = q_measured_;
 
     if (has_active_trajectory_) {
@@ -330,7 +332,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
     if (!hold_when_no_trajectory_) return;
 
     const Eigen::VectorXd dq_zero = makeZeroVelocityCommand();
-    if (hold_initial_zero_pose_ && !has_received_trajectory_) {
+    if (hold_initial_zero_pose_ && !has_received_trajectory) {
       q_ref = Eigen::VectorXd::Zero(
           static_cast<int>(joint_names_.size()));
       dq_ref = dq_zero;
