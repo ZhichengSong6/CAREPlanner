@@ -161,6 +161,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
                      terminal_q_tracking_weight_);
   pnh_.param<double>("local_planner/u_tracking_weight",
                      u_tracking_weight_, u_tracking_weight_);
+  pnh_.param<bool>("local_planner/u_reference_tracking_enabled",
+                   u_reference_tracking_enabled_,
+                   u_reference_tracking_enabled_);
   pnh_.param<double>("local_planner/u_smooth_weight",
                      u_smooth_weight_, u_smooth_weight_);
   pnh_.param<double>("local_planner/repair_task_tracking_scale",
@@ -181,6 +184,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<double>("local_planner/cdf/slack_upper_bound",
                      cdf_slack_upper_bound_,
                      cdf_slack_upper_bound_);
+  pnh_.param<bool>("local_planner/cdf/per_constraint_slack",
+                   cdf_per_constraint_slack_,
+                   cdf_per_constraint_slack_);
+  pnh_.param<bool>("local_planner/cdf/slack_use_upper_bound",
+                   cdf_slack_use_upper_bound_,
+                   cdf_slack_use_upper_bound_);
   pnh_.param<bool>("local_planner/cdf/safe_row_screening",
                    cdf_safe_row_screening_,
                    cdf_safe_row_screening_);
@@ -239,7 +248,7 @@ bool LocalSparseSCPPlanner::loadConfig() {
       trust_region_max_ < trust_region_min_ ||
       cdf_slack_linear_weight_ < 0.0 ||
       cdf_slack_quadratic_weight_ < 0.0 ||
-      cdf_slack_upper_bound_ <= 0.0) {
+      (cdf_slack_use_upper_bound_ && cdf_slack_upper_bound_ <= 0.0)) {
     ROS_ERROR("[LocalSparseSCPPlanner] invalid local_planner parameters");
     return false;
   }
@@ -995,22 +1004,18 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     return out;
   }
 
-  // IMPORTANT: use ONE optimization slack per active horizon timestep, not one
-  // slack variable per CDF row.  PIQP already has an internal inequality slack
-  // for every row.  Adding another user variable for every one of ~1k CDF
-  // rows made the sparse KKT system unnecessarily large and caused the first
-  // C5.4 integration run to spend the entire trial inside the first solve.
-  //
-  // A shared s_k is also semantically cleaner:
-  //   d_i + g_i'(q_k-qbar_k) + s_k >= d_safe  for all i at timestep k.
-  // Hence s_k measures the worst unresolved forbidden-space violation at that
-  // future configuration.
+  // CARE historically shared one user slack across all CDF rows at a
+  // timestep. G0 can switch to the GCDF convention: one slack per inequality.
   std::vector<int> step_to_slack(
       static_cast<std::size_t>(num_intervals_ + 1), -1);
   int n_s = 0;
-  for (const auto& row : selected) {
-    if (step_to_slack[static_cast<std::size_t>(row.k)] < 0) {
-      step_to_slack[static_cast<std::size_t>(row.k)] = n_s++;
+  if (cdf_per_constraint_slack_) {
+    n_s = static_cast<int>(selected.size());
+  } else {
+    for (const auto& row : selected) {
+      if (step_to_slack[static_cast<std::size_t>(row.k)] < 0) {
+        step_to_slack[static_cast<std::size_t>(row.k)] = n_s++;
+      }
     }
   }
 
@@ -1107,7 +1112,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     for (int j = 0; j < dof_; ++j) {
       const int ui = uIndex(k, j);
       addQuadraticTarget(
-          ui, u_tracking_weight_, u_ref(j, k));
+          ui, u_tracking_weight_,
+          u_reference_tracking_enabled_ ? u_ref(j, k) : 0.0);
       x_l[ui] = -velocity_limits_[j];
       x_u[ui] = velocity_limits_[j];
     }
@@ -1139,8 +1145,9 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  // Per-timestep CDF slacks guarantee every convex subproblem remains
-  // feasible even when the current iterate is deeply inside forbidden space.
+  // User CDF slacks guarantee every convex subproblem remains feasible even
+  // when the current iterate is deeply inside forbidden space. G0 uses one
+  // slack per CDF inequality, matching GCDF.
   const int slack0 = n_q + n_u;
   for (int s = 0; s < n_s; ++s) {
     const int si = slack0 + s;
@@ -1148,7 +1155,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     p_triplets.emplace_back(
         si, si, 2.0 * cdf_slack_quadratic_weight_);
     x_l[si] = 0.0;
-    x_u[si] = cdf_slack_upper_bound_;
+    if (cdf_slack_use_upper_bound_)
+      x_u[si] = cdf_slack_upper_bound_;
   }
 
   // Small diagonal regularization makes P strictly positive definite enough
@@ -1224,7 +1232,9 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           row_data.g[j]);
     }
     const int slack_slot =
-        step_to_slack[static_cast<std::size_t>(row_data.k)];
+        cdf_per_constraint_slack_
+            ? r
+            : step_to_slack[static_cast<std::size_t>(row_data.k)];
     if (slack_slot < 0 || slack_slot >= n_s) {
       out.status = "cdf_slack_mapping_error";
       return out;
@@ -1254,7 +1264,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       "[LocalSparseSCPPlanner] sparse QP dimensions n=" << n
       << " q_vars=" << n_q
       << " u_vars=" << n_u
-      << " shared_cdf_slacks=" << n_s
+      << " cdf_slacks=" << n_s
+      << " per_constraint_slack=" << (cdf_per_constraint_slack_ ? 1 : 0)
       << " eq=" << n_eq
       << " ineq=" << n_ineq
       << " selected_cdf_rows=" << n_cdf_rows
