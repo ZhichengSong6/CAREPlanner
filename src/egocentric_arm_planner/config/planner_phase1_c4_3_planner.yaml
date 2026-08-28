@@ -73,6 +73,63 @@ receding_horizon:
   mpc_command_topic: /care_arm/arm_group_velocity_controller/command
   mpc_command_timeout: 0.20
 
+
+# C5.4 event-triggered local trajectory optimizer.
+# This replaces 20 Hz planning-MPC in the new architecture while legacy C4.x
+# keeps using the mpc section below unchanged.
+local_planner:
+  num_intervals: 20
+  horizon_duration: 1.0
+  poll_rate: 50.0
+  min_replan_interval: 0.10
+  cdf_wait_timeout: 0.50
+  cdf_stamp_tolerance: 0.000001
+
+  q_tracking_weight: 50.0
+  terminal_q_tracking_weight: 100.0
+  u_tracking_weight: 2.0
+  u_smooth_weight: 1.0
+
+  # In REPAIR the local planner follows the active visibility obligations
+  # rather than fighting the original task reference.
+  repair_task_tracking_scale: 0.0
+  visibility_waypoint_weight: 3000.0
+
+  scp:
+    max_iterations: 3
+    step_tolerance_inf: 0.01
+    trust_region_initial: 0.20
+    trust_region_min: 0.05
+    trust_region_max: 0.50
+    trust_region_grow: 1.50
+    trust_region_shrink: 0.50
+    improvement_tolerance: 0.002
+
+  cdf:
+    safety_margin: 0.0
+    slack_linear_weight: 500.0
+    slack_quadratic_weight: 0.001
+    slack_upper_bound: 2.0
+    safe_row_screening: true
+    linearization_tolerance_inf: 0.0001
+
+  piqp:
+    max_iterations: 100
+    eps_abs: 0.00001
+    eps_rel: 0.00001
+    verbose: false
+
+  joint_states: /care_arm/joint_states
+  reference_trajectory: /care_planner/task_trajectory
+  waypoint_schedule_topic: /care_planner/active_sensing/visibility_waypoint_schedule
+  recovery_topic: /care_planner/execution/predicted_vbc_recovery_triggered
+  replan_request_topic: /care_planner/local_planner/replan_request
+  executed_command_topic: /care_arm/arm_group_velocity_controller/command
+  cdf_batch_topic: /care_planner/local_planner/cdf_constraint_batch
+  query_trajectory_topic: /care_planner/local_planner/scp_query_trajectory
+  candidate_trajectory_topic: /care_planner/local_planner/candidate_trajectory
+  summary_topic: /care_planner/local_planner/summary
+
 mpc:
   rate: 20.0
   horizon_duration: 1.0
@@ -200,5 +257,11 @@ execution:
   hold_initial_zero_pose: true
   hold_last_reference_when_no_trajectory: true
   reference_timeout: 0.15
+  # Full-trajectory tracker can ask the local planner for a new trajectory when
+  # measured tracking error becomes materially larger than nominal.
+  replan_tracking_error_inf: 0.25
+  replan_request_min_interval: 0.50
+  summary_topic: /care_planner/execution/tracker_summary
+  replan_request_topic: /care_planner/local_planner/replan_request
   position_feedback_gain: 2.5
   max_command_velocity: 2.0
