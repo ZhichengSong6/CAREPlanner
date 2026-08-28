@@ -41,6 +41,7 @@
   <arg name="eval_rate" default="20.0" />
   <arg name="max_eval_timesteps" default="50" />
   <arg name="query_timeout" default="0.10" />
+  <arg name="refresh_body_prior_before_query" default="true" />
 
   <!-- Marker publish rate is throttled separately from risk eval rate. -->
   <arg name="marker_publish_rate" default="2.0" />
@@ -112,6 +113,9 @@
 
     <param name="trajectory_risk/query_timeout"
            value="$(arg query_timeout)" />
+
+    <param name="trajectory_risk/refresh_body_prior_before_query"
+           value="$(arg refresh_body_prior_before_query)" />
 
     <param name="trajectory_risk/marker_publish_rate"
            value="$(arg marker_publish_rate)" />
