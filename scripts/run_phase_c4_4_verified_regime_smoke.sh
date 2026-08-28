@@ -38,10 +38,32 @@ CDF_SELECTOR_MAX_PAIRS_PER_STEP="${CDF_SELECTOR_MAX_PAIRS_PER_STEP:-250}"
 CDF_SELECTOR_SIGNED_ZERO_BAND="${CDF_SELECTOR_SIGNED_ZERO_BAND:-0.05}"
 CDF_SHADOW_VBC_AUDIT_ENABLED="${CDF_SHADOW_VBC_AUDIT_ENABLED:-false}"
 CDF_SHADOW_VBC_SUMMARY_TOPIC="${CDF_SHADOW_VBC_SUMMARY_TOPIC:-/care_planner/cdf_shadow_vbc/summary}"
+
+# C5.4 event-triggered local trajectory optimizer. Default false preserves
+# frozen C4.x behavior.
+USE_LOCAL_SPARSE_SCP="${USE_LOCAL_SPARSE_SCP:-false}"
+LOCAL_SCP_GPU_SOCKET="${LOCAL_SCP_GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
+LOCAL_SCP_SELECTOR_JSONL="${LOCAL_SCP_SELECTOR_JSONL:-/tmp/c5_4_local_scp_selector.jsonl}"
+LOCAL_SCP_CANDIDATE_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC:-/care_planner/local_planner/candidate_trajectory}"
+LOCAL_SCP_SUMMARY_TOPIC="${LOCAL_SCP_SUMMARY_TOPIC:-/care_planner/local_planner/summary}"
+LOCAL_SCP_REPLAN_TOPIC="${LOCAL_SCP_REPLAN_TOPIC:-/care_planner/local_planner/replan_request}"
+
+# C4.8 compatibility. C4.9 exports the historical C4_REPAIR_* variables;
+# C5.4 leaves this disabled and verifies the complete optimized trajectory.
+REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-${C4_REPAIR_PREFIX_VERIFY:-0}}"
+REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-${C4_REPAIR_PREFIX_S:-0.15}}"
+REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-${C4_REPAIR_BRAKE_DT_S:-0.05}}"
+REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
-RAW_MPC_TOPIC="/care_planner/mpc/predicted_trajectory"
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  RAW_PLANNER_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC}"
+  TRAJECTORY_RISK_INPUT_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC}"
+else
+  RAW_PLANNER_TOPIC="/care_planner/mpc/predicted_trajectory"
+fi
+RAW_MPC_TOPIC="${RAW_PLANNER_TOPIC}"
 VERIFY_TOPIC="/care_planner/optimized_trajectory"
 COMMITTED_TOPIC="/care_planner/committed_trajectory"
 CANDIDATE_VBC_TOPIC="/care_planner/candidate_vbc/summary"
@@ -163,6 +185,17 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   cdf_selector_signed_zero_band:="${CDF_SELECTOR_SIGNED_ZERO_BAND}" \
   cdf_shadow_vbc_audit_enabled:="${CDF_SHADOW_VBC_AUDIT_ENABLED}" \
   cdf_shadow_vbc_summary_topic:="${CDF_SHADOW_VBC_SUMMARY_TOPIC}" \
+  use_local_sparse_scp:="${USE_LOCAL_SPARSE_SCP}" \
+  raw_mpc_trajectory_topic:="${RAW_PLANNER_TOPIC}" \
+  local_scp_candidate_trajectory_topic:="${LOCAL_SCP_CANDIDATE_TOPIC}" \
+  local_scp_summary_topic:="${LOCAL_SCP_SUMMARY_TOPIC}" \
+  local_scp_replan_request_topic:="${LOCAL_SCP_REPLAN_TOPIC}" \
+  local_scp_gpu_socket:="${LOCAL_SCP_GPU_SOCKET}" \
+  local_scp_selector_jsonl:="${LOCAL_SCP_SELECTOR_JSONL}" \
+  repair_prefix_verification_enabled:="${REPAIR_PREFIX_VERIFY}" \
+  repair_execution_prefix_s:="${REPAIR_PREFIX_S}" \
+  repair_brake_dt_s:="${REPAIR_BRAKE_DT_S}" \
+  repair_hold_s:="${REPAIR_HOLD_S}" \
   candidate_unsafe_required:="${CANDIDATE_UNSAFE_REQUIRED}" \
   execution_unsafe_required:="${EXECUTION_UNSAFE_REQUIRED}" \
   probe_safe_commits_required:="${PROBE_SAFE_COMMITS}" \
@@ -175,11 +208,11 @@ CONTROL_PID=$!
 READY=0
 for _ in $(seq 1 400); do
   NODES="$(rosnode list 2>/dev/null || true)"
-  BASE_READY=0
+  COMMON_READY=0
+  BACKEND_READY=0
   CDF_READY=1
 
-  if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$' && \
-     echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
+  if echo "${NODES}" | grep -q '^/trajectory_execution_manager_node$' && \
      echo "${NODES}" | grep -q '^/joint_velocity_rate_limiter$' && \
      echo "${NODES}" | grep -q '^/optimized_trajectory_continuity$' && \
      echo "${NODES}" | grep -q '^/trajectory_vbc_selector_node$' && \
@@ -187,7 +220,19 @@ for _ in $(seq 1 400); do
      echo "${NODES}" | grep -q '^/c4_4_verified_regime_manager$' && \
      echo "${NODES}" | grep -q '^/phase_b2_controlled_trial$' && \
      echo "${NODES}" | grep -q '^/vbc_execution_reference_gate$'; then
-    BASE_READY=1
+    COMMON_READY=1
+  fi
+
+  if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+    if echo "${NODES}" | grep -q '^/local_sparse_scp_planner_node$' && \
+       echo "${NODES}" | grep -q '^/local_scp_pair_export/trajectory_risk_node$' && \
+       echo "${NODES}" | grep -q '^/c5_4_local_scp_cdf_selector$'; then
+      BACKEND_READY=1
+    fi
+  else
+    if echo "${NODES}" | grep -q '^/velocity_qp_mpc_waypoint_node$'; then
+      BACKEND_READY=1
+    fi
   fi
 
   if [ "${CDF_SELECTOR_ENABLED}" = "true" ]; then
@@ -202,20 +247,22 @@ for _ in $(seq 1 400); do
     fi
   fi
 
-  if [ "${BASE_READY}" = "1" ] && [ "${CDF_READY}" = "1" ]; then
+  if [ "${COMMON_READY}" = "1" ] &&
+     [ "${BACKEND_READY}" = "1" ] &&
+     [ "${CDF_READY}" = "1" ]; then
     READY=1
     break
   fi
-
   sleep 0.1
 done
 
 if [ "${READY}" != "1" ]; then
-  echo "[ERROR] C4.4/C5.3a required nodes did not all start"
+  echo "[ERROR] required planner/controller nodes did not all start"
+  echo "[DEBUG] USE_LOCAL_SPARSE_SCP=${USE_LOCAL_SPARSE_SCP}"
   echo "[DEBUG] CDF_SELECTOR_ENABLED=${CDF_SELECTOR_ENABLED}"
   echo "[DEBUG] CDF_SHADOW_VBC_AUDIT_ENABLED=${CDF_SHADOW_VBC_AUDIT_ENABLED}"
   rosnode list 2>/dev/null || true
-  tail -n 260 "${LOG}/controlled.log" || true
+  tail -n 320 "${LOG}/controlled.log" || true
   exit 1
 fi
 
@@ -238,7 +285,15 @@ record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/wa
 record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
 record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
 record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+  # Keep the historical filename for downstream summary scripts; fields that
+  # are specific to legacy MPC will simply be absent.
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
+else
+  record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+fi
+record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
 record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
 record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
 record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
@@ -258,7 +313,11 @@ if [ "${RELEASED}" != "1" ]; then
   exit 1
 fi
 
-echo "[ARCH] candidate verifier != committed execution auditor"
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
+else
+  echo "[ARCH] candidate verifier != committed execution auditor"
+fi
 echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
 echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
 sleep "${RUN_SECONDS}"
