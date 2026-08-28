@@ -147,6 +147,30 @@ target_link_libraries(velocity_qp_mpc_waypoint_node
   ${CMAKE_THREAD_LIBS_INIT}
 )
 
+# C5.4 event-triggered local trajectory optimizer. This is the new planning
+# backend: explicit q/u multiple shooting, sparse PIQP, slackened CDF constraints,
+# and a short sequential-convex inner loop. It never publishes actuator commands.
+add_executable(local_sparse_scp_planner_node
+  src/local_sparse_scp_planner_node.cpp
+  src/local_sparse_scp_planner.cpp
+)
+add_dependencies(local_sparse_scp_planner_node
+  ${catkin_EXPORTED_TARGETS}
+)
+target_include_directories(local_sparse_scp_planner_node PRIVATE
+  ${PIQP_INCLUDE_DIR}
+)
+target_compile_options(local_sparse_scp_planner_node PRIVATE
+  -O3
+)
+target_compile_definitions(local_sparse_scp_planner_node PRIVATE
+  NDEBUG
+)
+target_link_libraries(local_sparse_scp_planner_node
+  ${catkin_LIBRARIES}
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
 # One-shot C4.4 diagnostic: freeze the first actual REPAIR snapshot and solve
 # the exact repair-QP form at several horizons. The generated trajectories are
 # published only on a diagnostic topic and never enter the commit/execution path.
