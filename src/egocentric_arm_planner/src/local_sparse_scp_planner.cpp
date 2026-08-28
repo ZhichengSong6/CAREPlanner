@@ -344,7 +344,8 @@ void LocalSparseSCPPlanner::waypointScheduleCallback(
     }
   }
   latest_schedule_ = incoming;
-  if (changed) requestPlanLocked("visibility_schedule_changed");
+  if (changed && visibility_waypoint_weight_ > 0.0)
+    requestPlanLocked("visibility_schedule_changed");
 }
 
 void LocalSparseSCPPlanner::singleWaypointActiveCallback(
@@ -355,10 +356,12 @@ void LocalSparseSCPPlanner::singleWaypointActiveCallback(
   if (latest_single_waypoint_active_ == msg->data) return;
 
   latest_single_waypoint_active_ = msg->data;
-  requestPlanLocked(
-      msg->data
-          ? "single_visibility_waypoint_activated"
-          : "single_visibility_waypoint_deactivated");
+  if (visibility_waypoint_weight_ > 0.0) {
+    requestPlanLocked(
+        msg->data
+            ? "single_visibility_waypoint_activated"
+            : "single_visibility_waypoint_deactivated");
+  }
 }
 
 void LocalSparseSCPPlanner::singleWaypointQCallback(
@@ -384,7 +387,7 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
   latest_single_waypoint_q_ = q;
   has_single_waypoint_q_ = true;
 
-  if (changed) {
+  if (changed && visibility_waypoint_weight_ > 0.0) {
     requestPlanLocked("single_visibility_waypoint_q_changed");
   }
 }
