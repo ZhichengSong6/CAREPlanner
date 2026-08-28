@@ -951,7 +951,9 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   const int n = n_q + n_u + n_s;
 
   const int n_eq = num_intervals_ * dof_;
-  const int n_acc = num_intervals_ * dof_;
+  // Acceleration rows include the executed-command -> u0 boundary, all
+  // inter-stage velocity changes, and u_{K-1} -> 0 terminal braking.
+  const int n_acc = (num_intervals_ + 1) * dof_;
   const int n_ineq = n_acc + n_s;
 
   using Triplet = Eigen::Triplet<double>;
@@ -1125,6 +1127,17 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         h_u[row] = du;
       }
     }
+  }
+
+  // Explicit terminal braking makes the published trajectory dynamically
+  // executable when its final JointTrajectory point carries zero velocity.
+  for (int j = 0; j < dof_; ++j) {
+    const int row = num_intervals_ * dof_ + j;
+    const double du = acceleration_limits_[j] * dt_;
+    g_triplets.emplace_back(
+        row, uIndex(num_intervals_ - 1, j), 1.0);
+    h_l[row] = -du;
+    h_u[row] = du;
   }
 
   // Linearized CDF:
