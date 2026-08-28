@@ -71,55 +71,55 @@ public:
 
     score_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/score", 1, true);
+            outputTopic("score"), 1, true);
 
     mean_confidence_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/mean_confidence", 1, true);
+            outputTopic("mean_confidence"), 1, true);
 
     min_confidence_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/min_confidence", 1, true);
+            outputTopic("min_confidence"), 1, true);
 
     visible_ratio_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/visible_ratio", 1, true);
+            outputTopic("visible_ratio"), 1, true);
 
     worst_timestep_pub_ =
         nh_.advertise<std_msgs::Int32>(
-            "/care_planner/trajectory_risk/worst_timestep", 1, true);
+            outputTopic("worst_timestep"), 1, true);
 
     summary_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/summary", 1, true);
+            outputTopic("summary"), 1, true);
 
     timestep_summary_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/timestep_query_summary", 1, true);
+            outputTopic("timestep_query_summary"), 1, true);
 
     worst_timestep_summary_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/worst_timestep_summary", 1, true);
+            outputTopic("worst_timestep_summary"), 1, true);
 
     full_trajectory_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
-            "/care_planner/trajectory_risk/full_trajectory_markers", 1, true);
+            outputTopic("full_trajectory_markers"), 1, true);
 
     worst_timestep_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
-            "/care_planner/trajectory_risk/worst_timestep_markers", 1, true);
+            outputTopic("worst_timestep_markers"), 1, true);
 
     attribution_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
-            "/care_planner/trajectory_risk/attribution_markers", 1, true);
+            outputTopic("attribution_markers"), 1, true);
 
     primary_frontier_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
-            "/care_planner/trajectory_risk/primary_frontier_markers", 1, true);
+            outputTopic("primary_frontier_markers"), 1, true);
 
     secondary_frontier_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(
-            "/care_planner/trajectory_risk/secondary_frontier_markers", 1, true);
+            outputTopic("secondary_frontier_markers"), 1, true);
 
     active_sensing_target_pub_ =
         nh_.advertise<geometry_msgs::PointStamped>(
@@ -127,51 +127,51 @@ public:
 
     eval_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/eval_time_ms", 1, true);
+            outputTopic("eval_time_ms"), 1, true);
 
     fk_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/fk_time_ms", 1, true);
+            outputTopic("fk_time_ms"), 1, true);
 
     query_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/query_time_ms", 1, true);
+            outputTopic("query_time_ms"), 1, true);
 
     risk_compute_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/risk_compute_time_ms", 1, true);
+            outputTopic("risk_compute_time_ms"), 1, true);
 
     marker_time_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/marker_time_ms", 1, true);
+            outputTopic("marker_time_ms"), 1, true);
 
     input_age_pub_ =
         nh_.advertise<std_msgs::Float32>(
-            "/care_planner/trajectory_risk/input_age_ms", 1, true);
+            outputTopic("input_age_ms"), 1, true);
 
     timing_summary_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/timing_summary", 1, true);
+            outputTopic("timing_summary"), 1, true);
 
     attribution_summary_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/attribution_summary", 1, true);
+            outputTopic("attribution_summary"), 1, true);
 
     timestep_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/timestep_attribution", 1, true);
+            outputTopic("timestep_attribution"), 1, true);
 
     link_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/link_attribution", 1, true);
+            outputTopic("link_attribution"), 1, true);
 
     topk_sample_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/topk_sample_attribution", 1, true);
+            outputTopic("topk_sample_attribution"), 1, true);
 
     risk_frontier_attribution_pub_ =
         nh_.advertise<std_msgs::String>(
-            "/care_planner/trajectory_risk/risk_frontier_attribution", 1, true);
+            outputTopic("risk_frontier_attribution"), 1, true);
 
     if (forbidden_space_pair_publish_enabled_)
     {
@@ -386,6 +386,11 @@ private:
         "/care_planner/active_sensing/target_point");
 
     pnh_.param<std::string>(
+        "trajectory_risk/output_namespace",
+        output_namespace_,
+        "/care_planner/trajectory_risk");
+
+    pnh_.param<std::string>(
         "trajectory_risk/confidence_query_service",
         confidence_query_service_,
         "/care_planner/confidence_map/query");
@@ -526,6 +531,15 @@ private:
 
     ROS_INFO_STREAM("[trajectory_risk_node] ignored_risk_links: "
                     << ignoredRiskLinksToString());
+  }
+
+  std::string outputTopic(const std::string& leaf) const
+  {
+    std::string base = output_namespace_;
+    if (base.empty()) base = "/care_planner/trajectory_risk";
+    while (base.size() > 1 && base.back() == '/') base.pop_back();
+    if (leaf.empty()) return base;
+    return base + "/" + leaf;
   }
 
   double wallMs(const ros::WallTime& start, const ros::WallTime& end) const
@@ -3269,6 +3283,7 @@ private:
       "/care_planner/task_trajectory";
   std::string active_sensing_target_topic_ =
       "/care_planner/active_sensing/target_point";
+  std::string output_namespace_ = "/care_planner/trajectory_risk";
   std::string confidence_query_service_ =
       "/care_planner/confidence_map/query";
   std::string refresh_body_prior_service_ =
