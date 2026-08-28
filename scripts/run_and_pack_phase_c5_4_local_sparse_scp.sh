@@ -14,6 +14,13 @@ CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
 PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT:-0.50}"
 
+# Backward-compatible C4.8 repair-prefix verification controls.
+# C5.4/G0 defaults remain full-horizon; C5.5 explicitly opts in.
+REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-0}"
+REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.15}"
+REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
+REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
+
 ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
 ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
 RUN_OUT="${ROOT_OUT}/run"
@@ -146,9 +153,9 @@ fi
 # Do not start recorders here: that runner clears RUN_OUT at startup, which
 # unlinked the first C5.4 trial's early recorder files.
 
-# The new backend deliberately disables C4.8 safe-prefix commit semantics:
-# a complete local trajectory is optimized first and then exact VBC verifies it.
-USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY=0 TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
+# C5.4 defaults to full-horizon verification, while later integrations may
+# opt into the existing C4.8 safe-prefix verifier without changing the planner.
+USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY}" REPAIR_PREFIX_S="${REPAIR_PREFIX_S}" REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S}" REPAIR_HOLD_S="${REPAIR_HOLD_S}" TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
   bash scripts/run_phase_c4_4_verified_regime_smoke.sh 2>&1 | tee "${ROOT_LOG}/common_runner.log"
 
 cleanup
