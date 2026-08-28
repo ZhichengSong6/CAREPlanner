@@ -1207,7 +1207,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       out.u(j, k) = result.x[uIndex(k, j)];
 
   out.step_inf =
-      (out.q - q_bar).lpNorm<Eigen::Infinity>();
+      (out.q - q_bar).cwiseAbs().maxCoeff();
 
   double slack_sum = 0.0;
   out.max_slack = 0.0;
