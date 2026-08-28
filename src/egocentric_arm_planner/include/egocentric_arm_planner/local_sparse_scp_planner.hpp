@@ -156,6 +156,7 @@ private:
   ros::Publisher query_trajectory_pub_;
   ros::Publisher candidate_trajectory_pub_;
   ros::Publisher summary_pub_;
+  ros::Publisher task_infeasible_pub_;
 
   ros::Timer timer_;
 
@@ -300,6 +301,8 @@ private:
       "/care_planner/local_planner/candidate_trajectory";
   std::string summary_topic_ =
       "/care_planner/local_planner/summary";
+  std::string task_infeasible_topic_ =
+      "/care_planner/local_planner/task_infeasible";
 
   unsigned long long plan_sequence_ = 0;
   unsigned long long cdf_batch_received_ = 0;
