@@ -71,6 +71,7 @@ private:
   void replanRequestCallback(const std_msgs::BoolConstPtr& msg);
   void executedCommandCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
+  void executionSummaryCallback(const std_msgs::StringConstPtr& msg);
   void cdfConstraintBatchCallback(
       const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg);
   void timerCallback(const ros::TimerEvent&);
@@ -149,6 +150,7 @@ private:
   ros::Subscriber recovery_sub_;
   ros::Subscriber replan_request_sub_;
   ros::Subscriber executed_command_sub_;
+  ros::Subscriber execution_summary_sub_;
   ros::Subscriber cdf_batch_sub_;
 
   ros::Publisher query_trajectory_pub_;
@@ -168,6 +170,7 @@ private:
   ros::Time latest_joint_state_received_;
   ros::Time latest_reference_received_;
   ros::Time latest_executed_command_received_;
+  bool latest_execution_complete_ = false;
 
   bool has_joint_state_ = false;
   bool has_reference_ = false;
@@ -197,6 +200,7 @@ private:
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
   bool plan_repair_mode_ = false;
+  std::string plan_initialization_mode_ = "task_reference";
 
   // One CDF batch per SCP iterate. The callback only hands ownership to the
   // worker; PIQP never runs in a ROS callback.
@@ -234,6 +238,10 @@ private:
   // CARE execution normally enforces hard acceleration and terminal-braking
   // rows. G0 disables them to match the GCDF formulation more closely.
   bool enforce_acceleration_constraints_ = true;
+  // In REPAIR, initialize SCP from a measured hold trajectory instead of the
+  // known-infeasible task interpolation. The visibility objective then moves
+  // outward only as far as hard GCDF safety permits.
+  bool repair_hold_initialization_enabled_ = false;
   double repair_task_tracking_scale_ = 0.0;
   double visibility_waypoint_weight_ = 3000.0;
 
@@ -282,6 +290,8 @@ private:
       "/care_planner/local_planner/replan_request";
   std::string executed_command_topic_ =
       "/care_arm/arm_group_velocity_controller/command";
+  std::string execution_summary_topic_ =
+      "/care_planner/execution/tracker_summary";
   std::string cdf_batch_topic_ =
       "/care_planner/local_planner/cdf_constraint_batch";
   std::string query_trajectory_topic_ =
