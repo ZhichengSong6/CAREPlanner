@@ -48,6 +48,7 @@ bool LocalSparseSCPPlanner::initialize(
   if (!loadJointLimits()) return false;
 
   latest_executed_command_ = Eigen::VectorXd::Zero(dof_);
+  latest_single_waypoint_q_ = Eigen::VectorXd::Zero(dof_);
 
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1,
@@ -58,6 +59,12 @@ bool LocalSparseSCPPlanner::initialize(
   waypoint_schedule_sub_ = nh_.subscribe(
       waypoint_schedule_topic_, 1,
       &LocalSparseSCPPlanner::waypointScheduleCallback, this);
+  single_waypoint_active_sub_ = nh_.subscribe(
+      single_waypoint_active_topic_, 1,
+      &LocalSparseSCPPlanner::singleWaypointActiveCallback, this);
+  single_waypoint_q_sub_ = nh_.subscribe(
+      single_waypoint_q_topic_, 1,
+      &LocalSparseSCPPlanner::singleWaypointQCallback, this);
   recovery_sub_ = nh_.subscribe(
       recovery_topic_, 1,
       &LocalSparseSCPPlanner::recoveryCallback, this);
@@ -201,6 +208,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/waypoint_schedule_topic",
                           waypoint_schedule_topic_,
                           waypoint_schedule_topic_);
+  pnh_.param<std::string>("local_planner/single_waypoint_active_topic",
+                          single_waypoint_active_topic_,
+                          single_waypoint_active_topic_);
+  pnh_.param<std::string>("local_planner/single_waypoint_q_topic",
+                          single_waypoint_q_topic_,
+                          single_waypoint_q_topic_);
   pnh_.param<std::string>("local_planner/recovery_topic",
                           recovery_topic_, recovery_topic_);
   pnh_.param<std::string>("local_planner/replan_request_topic",
@@ -560,6 +573,9 @@ bool LocalSparseSCPPlanner::startPlan() {
   sensor_msgs::JointState joint_state;
   trajectory_msgs::JointTrajectory reference;
   std::vector<DeadlineWaypoint> schedule;
+  bool single_waypoint_active = false;
+  bool has_single_waypoint_q = false;
+  Eigen::VectorXd single_waypoint_q;
   Eigen::VectorXd previous_command;
   bool repair = false;
   std::string reason;
@@ -577,6 +593,9 @@ bool LocalSparseSCPPlanner::startPlan() {
     joint_state = latest_joint_state_;
     reference = latest_reference_;
     schedule = latest_schedule_;
+    single_waypoint_active = latest_single_waypoint_active_;
+    has_single_waypoint_q = has_single_waypoint_q_;
+    single_waypoint_q = latest_single_waypoint_q_;
     previous_command = latest_executed_command_;
     if (previous_command.size() != dof_)
       previous_command = Eigen::VectorXd::Zero(dof_);
@@ -588,6 +607,25 @@ bool LocalSparseSCPPlanner::startPlan() {
     waiting_for_cdf_ = false;
     pending_batch_.reset();
     ++plan_sequence_;
+  }
+
+  // C4.7/C4.9 blocker-aware acquisition intentionally publishes only the
+  // currently selected persistent q_vis through the legacy single-waypoint
+  // topics; its multi-deadline schedule topic stays empty.  The C5.4 local
+  // planner accepts both interfaces. In REPAIR, fall back to a synthetic
+  // terminal-horizon obligation for that active q_vis.
+  if (!repair) {
+    schedule.clear();
+  } else if (schedule.empty() &&
+             single_waypoint_active &&
+             has_single_waypoint_q &&
+             single_waypoint_q.size() == dof_) {
+    DeadlineWaypoint wp;
+    wp.id = -1;
+    wp.deadline_abs_s =
+        ros::Time::now().toSec() + horizon_duration_;
+    wp.q = single_waypoint_q;
+    schedule.push_back(std::move(wp));
   }
 
   Eigen::VectorXd q_current;
