@@ -247,6 +247,9 @@ private:
   // GCDF slacks are nonnegative and not artificially capped. Keep the old
   // upper bound available for backwards compatibility.
   bool cdf_slack_use_upper_bound_ = true;
+  // G0.2 diagnostic can remove user slacks entirely and test whether the
+  // linearized CDF-constrained subproblem is genuinely feasible.
+  bool cdf_slack_enabled_ = true;
   bool cdf_adaptive_slack_penalty_ = false;
   double cdf_slack_penalty_multiplier_ = 10.0;
   double cdf_slack_penalty_max_ = 1e8;
