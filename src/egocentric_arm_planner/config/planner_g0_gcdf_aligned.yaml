@@ -97,6 +97,10 @@ local_planner:
   # Disabled in G0 because GCDF does not include an explicit Delta-u cost.
   u_smooth_weight: 0.0
 
+  # GCDF-aligned G0 does not add CARE's hard acceleration envelope or
+  # terminal-braking row. Legacy CARE configurations keep these enabled.
+  enforce_acceleration_constraints: false
+
   # Keep task tracking active in G0; there is no CARE-specific REPAIR objective.
   repair_task_tracking_scale: 1.0
   visibility_waypoint_weight: 0.0
