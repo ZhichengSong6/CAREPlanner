@@ -89,6 +89,10 @@ class C44VerifiedRegimeManager:
             "~candidate_outcome_topic", "/care_planner/verification_outcome"))
         self.execution_summary_topic = str(rospy.get_param(
             "~execution_summary_topic", "/care_planner/execution_vbc/summary"))
+        self.tracker_summary_topic = str(rospy.get_param(
+            "~tracker_summary_topic", "/care_planner/execution/tracker_summary"))
+        self.replan_request_topic = str(rospy.get_param(
+            "~replan_request_topic", "/care_planner/local_planner/replan_request"))
         self.committed_trajectory_topic = str(rospy.get_param(
             "~committed_trajectory_topic", "/care_planner/committed_trajectory"))
         self.execution_ready_topic = str(rospy.get_param(
@@ -144,6 +148,9 @@ class C44VerifiedRegimeManager:
         self.last_commit_count = 0
         self.last_commit_event_time = None
         self.probe_safe_commit_streak = 0
+        self.probe_completed_execution_count = 0
+        self.pending_probe_execution_seq = 0
+        self.last_tracker_complete_seq = 0
         self.repair_safe_commit_count = 0
 
         self.repair_entry_count = 0
@@ -182,6 +189,8 @@ class C44VerifiedRegimeManager:
             self.effective_deadline_topic, Float64, queue_size=1)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
+        self.replan_request_pub = rospy.Publisher(
+            self.replan_request_topic, Bool, queue_size=10, latch=False)
 
         rospy.Subscriber(
             self.candidate_outcome_topic, String, self._candidate_outcome_cb,
@@ -189,6 +198,9 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.execution_summary_topic, String, self._execution_summary_cb,
             queue_size=1)
+        rospy.Subscriber(
+            self.tracker_summary_topic, String, self._tracker_summary_cb,
+            queue_size=20)
         rospy.Subscriber(
             self.committed_trajectory_topic, rospy.AnyMsg,
             self._committed_trajectory_cb, queue_size=1)
@@ -244,6 +256,7 @@ class C44VerifiedRegimeManager:
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
             self.probe_safe_commit_streak = 0
+            self.pending_probe_execution_seq = 0
             self.clear_until = None
             self.probe_ignore_until = None
             self.repair_completion = False
@@ -259,11 +272,13 @@ class C44VerifiedRegimeManager:
         elif new_state == self.PROBE_NORMAL:
             self.probe_entry_count += 1
             self.probe_safe_commit_streak = 0
+            self.pending_probe_execution_seq = 0
             self.clear_until = now + rospy.Duration(self.clear_pulse_s)
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
             self.normal_entry_count += 1
             self.probe_safe_commit_streak = 0
+            self.pending_probe_execution_seq = 0
             self.clear_until = None
             self.probe_ignore_until = None
 
@@ -283,6 +298,7 @@ class C44VerifiedRegimeManager:
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
                 self.probe_safe_commit_streak = 0
+                self.pending_probe_execution_seq = 0
                 self.repair_completion = False
                 self.repair_completion_armed = False
                 self.clear_until = None
