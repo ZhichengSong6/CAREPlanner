@@ -24,6 +24,9 @@ export REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.15}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 
+python3 -m py_compile \
+  "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
+
 echo "[C5.5] Existing VBC/regime architecture + hard GCDF safety"
 echo "[C5.5] REPAIR: q_vis objective + 5-step executable-horizon hard GCDF + hold initialization"
 echo "[C5.5] PROBE_NORMAL: task objective + 5-step executable-horizon hard GCDF + safe-prefix commit"
