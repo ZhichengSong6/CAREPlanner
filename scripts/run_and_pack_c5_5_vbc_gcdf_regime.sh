@@ -2,15 +2,25 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-CASE_ID="${CASE_ID:-case_003}"
+CASE_LABEL="${CASE_LABEL:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-30.0}"
+
+# Every invocation gets a unique, upload-safe ASCII run identity.  Reusing the
+# literal filename CAREPlanner_C5_analysis_case_003.zip caused chat uploads to
+# be renamed as "(1)", "(2)", etc. and made attachment mounting ambiguous.
+# Millisecond timestamp + git short SHA keeps scenario identity while ensuring
+# that output directories and the single ZIP never collide with an earlier run.
+RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d-%H%M%S-%3N)}"
+GIT_SHORT="$(git -C "${REPO}" rev-parse --short=8 HEAD)"
+RUN_ID="${RUN_ID:-${CASE_LABEL}_${RUN_STAMP}_${GIT_SHORT}}"
+CASE_ID="${RUN_ID}"
 
 export CONFIG_FILE="${REPO}/src/egocentric_arm_planner/config/planner_c5_5_vbc_gcdf_regime.yaml"
 export CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 export GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_5.sock}"
 export ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/c5_5_vbc_gcdf_regime/${CASE_ID}}"
 export ROOT_LOG="${ROOT_LOG:-${REPO}/logs/c5_5_vbc_gcdf_regime/${CASE_ID}}"
-export ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_5_vbc_gcdf_regime_${CASE_ID}.zip}"
+export ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${CASE_ID}.zip}"
 export INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-100}"
 export INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-0.20}"
 
@@ -27,6 +37,9 @@ export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 python3 -m py_compile \
   "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
 
+echo "[RUN ID] ${CASE_ID}"
+echo "[OUTPUT] ${ROOT_OUT}"
+echo "[UPLOAD ZIP] ${ZIP_PATH}"
 echo "[C5.5] Existing VBC/regime architecture + hard GCDF safety"
 echo "[C5.5] REPAIR: q_vis objective + 5-step executable-horizon hard GCDF + hold initialization"
 echo "[C5.5] PROBE_NORMAL: task objective + 5-step executable-horizon hard GCDF + safe-prefix commit"
