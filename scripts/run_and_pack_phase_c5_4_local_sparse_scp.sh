@@ -441,6 +441,18 @@ PY
 
   echo "[C5.x SINGLE UPLOAD ZIP] ${ZIP_PATH}"
   ls -lh "${ZIP_PATH}"
+
+  # Chat attachment mounting is outside the runner's control.  Always mirror
+  # the machine-readable digest to stdout so a run remains analyzable from the
+  # terminal transcript even if the ZIP is not mounted by the chat platform.
+  if [[ -f "${stage}/c5_analysis_digest.json" ]]; then
+    echo ""
+    echo "========== C5 ANALYSIS DIGEST BEGIN =========="
+    cat "${stage}/c5_analysis_digest.json"
+    echo ""
+    echo "========== C5 ANALYSIS DIGEST END =========="
+  fi
+
   rm -rf "${stage}"
 }
 trap 'rc=$?; cleanup || true; if [[ -d "${ROOT_OUT}" || -d "${ROOT_LOG}" ]]; then pack_debug_bundle || true; fi; exit $rc' EXIT
