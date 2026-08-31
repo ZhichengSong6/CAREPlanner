@@ -63,6 +63,9 @@ class OptimizedTrajectoryContinuityNode:
             "~output_topic", "/care_planner/optimized_trajectory"))
         self.committed_topic = str(rospy.get_param(
             "~committed_output_topic", "/care_planner/committed_trajectory"))
+        self.execution_audit_topic = str(rospy.get_param(
+            "~execution_audit_output_topic",
+            "/care_planner/execution/audit_trajectory"))
         self.global_summary_topic = str(rospy.get_param(
             "~global_summary_topic", "/care_planner/trajectory_risk/vbc_summary"))
         self.summary_topic = str(rospy.get_param(
@@ -85,6 +88,8 @@ class OptimizedTrajectoryContinuityNode:
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_enabled = bool(rospy.get_param(
             "~continuation_enabled", False))
+        self.execution_audit_enabled = bool(rospy.get_param(
+            "~execution_audit_enabled", False))
         self.continuation_start_delay_s = float(rospy.get_param(
             "~continuation_start_delay_s", 0.065))
         self.continuation_timeout_s = float(rospy.get_param(
@@ -182,6 +187,7 @@ class OptimizedTrajectoryContinuityNode:
         self._commit_count = 0
         self._committed_publish_count = 0
         self._continuation_count = 0
+        self._execution_audit_publish_count = 0
         self._pending_replace_count = 0
         self._repair_prefix_build_count = 0
         self._repair_prefix_safe_count = 0
@@ -205,6 +211,8 @@ class OptimizedTrajectoryContinuityNode:
             self.verification_topic, JointTrajectory, queue_size=1)
         self.committed_pub = rospy.Publisher(
             self.committed_topic, JointTrajectory, queue_size=1)
+        self.execution_audit_pub = rospy.Publisher(
+            self.execution_audit_topic, JointTrajectory, queue_size=1)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
         self.verification_event_pub = rospy.Publisher(
@@ -227,11 +235,14 @@ class OptimizedTrajectoryContinuityNode:
         self._publish_summary()
         rospy.logwarn(
             "[optimized_trajectory_continuity] SELECTOR-CYCLE VERIFY raw=%s "
-            "final_gcdf=%s verify=%s committed=%s continuation=%d repair_prefix=%d "
-            "prefix=%.3fs brake_dt=%.3fs hold=%.3fs timeout=%.3fs",
+            "final_gcdf=%s verify=%s committed=%s audit=%s continuation=%d "
+            "audit_enabled=%d repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
+            "hold=%.3fs timeout=%.3fs",
             self.input_topic, self.final_gcdf_query_topic,
             self.verification_topic, self.committed_topic,
+            self.execution_audit_topic,
             int(self.continuation_enabled),
+            int(self.execution_audit_enabled),
             int(self.repair_prefix_verification_enabled),
             self.repair_execution_prefix_s, self.repair_brake_dt_s,
             self.repair_hold_s, self.verification_timeout_s)
@@ -530,10 +541,14 @@ class OptimizedTrajectoryContinuityNode:
         if msg is None or not msg.points:
             return
         self.committed_pub.publish(msg)
+        if self.execution_audit_enabled:
+            self.execution_audit_pub.publish(copy.deepcopy(msg))
         with self._lock:
             self._committed_publish_count += 1
             if source == "committed_continuation":
                 self._continuation_count += 1
+            if self.execution_audit_enabled and source != "committed_continuation":
+                self._execution_audit_publish_count += 1
             self._last_source = source
             self._last_committed_age_s = float(age_s)
             self._publish_summary_locked()
@@ -894,6 +909,9 @@ class OptimizedTrajectoryContinuityNode:
                 else "{:.6f}".format(self._last_repair_brake_duration_s)),
             "commit_count={}".format(self._commit_count),
             "continuation_enabled={}".format(int(self.continuation_enabled)),
+            "execution_audit_enabled={}".format(int(self.execution_audit_enabled)),
+            "execution_audit_publish_count={}".format(
+                self._execution_audit_publish_count),
             "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
             "continuation_count={}".format(self._continuation_count),
