@@ -936,9 +936,19 @@ void LocalSparseSCPPlanner::workerLoop() {
       pending_batch_.reset();
       if (!batch || !plan_running_) continue;
 
+      repair = plan_repair_mode_;
+      probe = plan_probe_mode_;
+      const bool executable_prefix_mode = repair || probe;
+
       double current_min_d =
           std::numeric_limits<double>::infinity();
-      for (double d : batch->distance) {
+      for (std::size_t i = 0; i < batch->distance.size(); ++i) {
+        if (i >= batch->original_timestep.size()) break;
+        const int k = batch->original_timestep[i];
+        if (k < 1 || k > num_intervals_) continue;
+        if (executable_prefix_mode && k > cdf_constraint_horizon_steps_)
+          continue;
+        const double d = batch->distance[i];
         if (std::isfinite(d))
           current_min_d = std::min(current_min_d, d);
       }
@@ -966,8 +976,6 @@ void LocalSparseSCPPlanner::workerLoop() {
       u_ref = plan_u_ref_;
       previous_command = plan_previous_command_;
       schedule = plan_schedule_;
-      repair = plan_repair_mode_;
-      probe = plan_probe_mode_;
       trust = trust_radius_;
       slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
@@ -1067,8 +1075,10 @@ void LocalSparseSCPPlanner::workerLoop() {
         std_msgs::Bool infeasible_msg;
         infeasible_msg.data = true;
         task_infeasible_pub_.publish(infeasible_msg);
-        ROS_WARN(
-            "[LocalSparseSCPPlanner] NORMAL task QP infeasible -> request REPAIR regime");
+        ROS_WARN_STREAM(
+            "[LocalSparseSCPPlanner] task QP infeasible in "
+            << (probe ? "PROBE_NORMAL" : "NORMAL")
+            << " -> request REPAIR regime");
       }
       continue;
     }
