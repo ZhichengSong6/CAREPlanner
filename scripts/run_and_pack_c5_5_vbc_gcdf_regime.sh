@@ -14,16 +14,16 @@ export ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_5_vbc_gcdf_regime_${CASE_ID}
 export INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-100}"
 export INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-0.20}"
 
-# Reuse the validated C4.8/C4.9 execution semantics: REPAIR plans a 1 s local
-# horizon, but exact VBC verifies and commits only a short executable prefix
-# with braking and hold. NORMAL remains full-horizon verification.
+# C5.8 execution semantics: REPAIR/PROBE optimize over a 1 s local horizon but
+# build a short executable prefix with the actual braking/hold tail. That exact
+# executable view must pass final GCDF and exact VBC before a single commit.
+# NORMAL remains full-horizon GCDF/VBC verification.
 export REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-1}"
 export REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.15}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 
 echo "[C5.5] Existing VBC/regime architecture + hard GCDF safety"
-echo "[C5.5] NORMAL: task objective + hard GCDF"
 echo "[C5.5] REPAIR: q_vis objective + 5-step executable-horizon hard GCDF + hold initialization"
 echo "[C5.5] PROBE_NORMAL: task objective + 5-step executable-horizon hard GCDF + safe-prefix commit"
 echo "[C5.5] NORMAL: task objective + full-horizon hard GCDF"
