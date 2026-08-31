@@ -184,6 +184,10 @@
            value="$(arg repair_brake_dt_s)" />
     <param name="repair_hold_s"
            value="$(arg repair_hold_s)" />
+    <param name="repair_active_topic"
+           value="$(arg recovery_trigger_topic)" />
+    <param name="probe_active_topic"
+           value="/care_planner/c4_4/probe_active" />
   </node>
 
   <!-- C4.4 owns planner regime; candidate transitions consume only unique
@@ -207,6 +211,7 @@
     <param name="trigger_topic" value="$(arg recovery_trigger_topic)" />
     <param name="clear_topic" value="$(arg recovery_clear_topic)" />
     <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
     <param name="summary_topic" value="$(arg regime_summary_topic)" />
   </node>
 
@@ -268,6 +273,8 @@
            value="$(arg waypoint_weight)" />
     <param name="local_planner/recovery_topic"
            value="$(arg recovery_trigger_topic)" />
+    <param name="local_planner/probe_active_topic"
+           value="/care_planner/c4_4/probe_active" />
     <param name="local_planner/replan_request_topic"
            value="$(arg local_scp_replan_request_topic)" />
     <param name="local_planner/cdf_batch_topic"
