@@ -40,6 +40,7 @@ import json
 import math
 import re
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -275,11 +276,14 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             raise RuntimeError("measured_joint_state_not_ready")
 
         self._seed_override = measured
+        t_generate_start = time.perf_counter()
         try:
             result = RollingVbcDeadlineWaypointNode._generate_active_set_waypoint(
                 self, region["points"], trajectory, sweep_time_s,
                 trajectory_received)
         finally:
+            q_vis_generation_ms = 1000.0 * (
+                time.perf_counter() - t_generate_start)
             self._seed_override = None
 
         q_vis = np.asarray(result["q_vis"], dtype=np.float64)
@@ -305,6 +309,7 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                 min_hit <= max(0.0, deadline_remaining) + 1e-9),
             "final_f_min": float(result["final_f_min"]),
             "shared_solution_mode": str(result["shared_solution_mode"]),
+            "q_vis_generation_ms": float(q_vis_generation_ms),
         }
         self._next_obligation_id += 1
 
@@ -318,6 +323,7 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_deadline_remaining_at_discovery_s": deadline_remaining,
             "c4_6_reachable_before_discovered_deadline_lower_bound": ob[
                 "reachable_before_discovered_deadline_lower_bound"],
+            "c4_6_q_vis_generation_ms": float(q_vis_generation_ms),
         })
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = Path(self.output_root) / (
@@ -326,10 +332,10 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
 
         rospy.logwarn(
             "[vbc_multi_deadline] ADD obligation=%d points=%d deadline_rem=%.3fs "
-            "Tmin_rest=%.3fs reachable_lb=%d min_f=%+.4f q_vis=%s",
+            "Tmin_rest=%.3fs reachable_lb=%d min_f=%+.4f qvis_ms=%.3f q_vis=%s",
             ob["id"], len(ob["points"]), deadline_remaining, min_hit,
             int(ob["reachable_before_discovered_deadline_lower_bound"]),
-            ob["final_f_min"], _fmt(q_vis, 4))
+            ob["final_f_min"], q_vis_generation_ms, _fmt(q_vis, 4))
         return ob
 
     # ------------------------------------------------------------------
@@ -458,6 +464,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         unreachable = sum(
             not bool(ob["reachable_before_discovered_deadline_lower_bound"])
             for ob in obligations)
+        qvis_times = [
+            float(ob.get("q_vis_generation_ms", math.nan))
+            for ob in obligations
+            if math.isfinite(float(ob.get("q_vis_generation_ms", math.nan)))
+        ]
         s = String()
         s.data = (
             "steering_policy=accumulated_multi_deadline"
@@ -470,6 +481,10 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             f" matched_obligation_count={self._schedule_matched_obligations}"
             f" clear_count={self._schedule_clear_count}"
             f" generation_failure_count={self._schedule_generation_failures}"
+            f" q_vis_generation_last_ms="
+            f"{(qvis_times[-1] if qvis_times else math.nan):.3f}"
+            f" q_vis_generation_max_ms="
+            f"{(max(qvis_times) if qvis_times else math.nan):.3f}"
         )
         self.schedule_summary_pub.publish(s)
 
