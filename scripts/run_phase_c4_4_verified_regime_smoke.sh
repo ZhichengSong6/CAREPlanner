@@ -294,6 +294,7 @@ record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT
 record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
+record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -305,6 +306,7 @@ else
 fi
 record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
 record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
 record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
 record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
 record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
