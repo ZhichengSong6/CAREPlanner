@@ -157,6 +157,7 @@ private:
   ros::Publisher candidate_trajectory_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher task_infeasible_pub_;
+  ros::Publisher force_vbc_bootstrap_pub_;
 
   ros::Timer timer_;
 
@@ -303,6 +304,8 @@ private:
       "/care_planner/local_planner/summary";
   std::string task_infeasible_topic_ =
       "/care_planner/local_planner/task_infeasible";
+  std::string force_vbc_bootstrap_topic_ =
+      "/care_planner/trajectory_risk/force_bootstrap";
 
   unsigned long long plan_sequence_ = 0;
   unsigned long long cdf_batch_received_ = 0;
