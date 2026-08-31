@@ -92,6 +92,8 @@ class OptimizedTrajectoryContinuityNode:
             "~continuation_timeout_s", 0.50))
         self.verification_timeout_s = float(rospy.get_param(
             "~verification_timeout_s", 0.25))
+        self.final_gcdf_enabled = bool(rospy.get_param(
+            "~final_gcdf_enabled", False))
         self.final_gcdf_timeout_s = float(rospy.get_param(
             "~final_gcdf_timeout_s", 0.50))
         self.final_gcdf_safety_margin = float(rospy.get_param(
@@ -121,7 +123,7 @@ class OptimizedTrajectoryContinuityNode:
                 raise ValueError("~continuation_timeout_s must exceed start delay")
         if self.verification_timeout_s <= 0.0:
             raise ValueError("~verification_timeout_s must be positive")
-        if self.final_gcdf_timeout_s <= 0.0:
+        if self.final_gcdf_enabled and self.final_gcdf_timeout_s <= 0.0:
             raise ValueError("~final_gcdf_timeout_s must be positive")
         if self.final_gcdf_stamp_tolerance_s <= 0.0:
             raise ValueError("~final_gcdf_stamp_tolerance_s must be positive")
@@ -459,7 +461,7 @@ class OptimizedTrajectoryContinuityNode:
         if (self._gcdf_outstanding is not None or
                 self._outstanding is not None or
                 self._pending_raw is None):
-            return None
+            return None, "none"
 
         raw = self._pending_raw
         raw_received = self._pending_raw_received
@@ -474,7 +476,7 @@ class OptimizedTrajectoryContinuityNode:
         candidate = self._suffix_from_phase(raw, age)
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
-            return None
+            return None, "none"
 
         view = "full_horizon"
         prefix_mode = bool(pending_repair or pending_probe)
@@ -482,7 +484,7 @@ class OptimizedTrajectoryContinuityNode:
             candidate = self._repair_prefix_with_braking_tail(candidate)
             if candidate is None or not candidate.points:
                 self._last_source = "prefix_build_failed"
-                return None
+                return None, "none"
             if pending_repair:
                 view = "repair_prefix_brake_hold"
                 self._repair_prefix_build_count += 1
@@ -495,19 +497,35 @@ class OptimizedTrajectoryContinuityNode:
         candidate.header.seq = seq
         candidate.header.stamp = now
 
-        # C5.7: audit the exact executable view against learned GCDF first.
-        # Only this same stamped trajectory may proceed to exact VBC and commit.
-        self._gcdf_outstanding = copy.deepcopy(candidate)
-        self._gcdf_outstanding_sent = now
-        self._gcdf_outstanding_seq = seq
-        self._gcdf_outstanding_repair = bool(pending_repair)
-        self._gcdf_outstanding_probe = bool(pending_probe)
-        self._gcdf_outstanding_view = view
-        self._final_gcdf_query_count += 1
-        self._last_source = "candidate_sent_to_final_gcdf"
+        if self.final_gcdf_enabled:
+            # C5.7/C5.8: audit the exact executable view against learned GCDF
+            # first. Only this same q-trajectory may proceed to exact VBC.
+            self._gcdf_outstanding = copy.deepcopy(candidate)
+            self._gcdf_outstanding_sent = now
+            self._gcdf_outstanding_seq = seq
+            self._gcdf_outstanding_repair = bool(pending_repair)
+            self._gcdf_outstanding_probe = bool(pending_probe)
+            self._gcdf_outstanding_view = view
+            self._final_gcdf_query_count += 1
+            self._last_source = "candidate_sent_to_final_gcdf"
+            self._last_verification_view = view
+            self._publish_summary_locked()
+            return candidate, "gcdf"
+
+        # Legacy/non-local path: preserve the original exact-VBC-only commit
+        # protocol when no final learned-GCDF transport is configured.
+        self._outstanding = copy.deepcopy(candidate)
+        self._outstanding_sent = now
+        self._outstanding_seq = seq
+        self._outstanding_dispatch_cycle = self._selector_cycle_count
+        self._outstanding_repair = bool(pending_repair)
+        self._outstanding_probe = bool(pending_probe)
+        self._outstanding_view = view
+        self._verification_publish_count += 1
+        self._last_source = "candidate_sent_directly_to_exact_vbc"
         self._last_verification_view = view
         self._publish_summary_locked()
-        return candidate
+        return candidate, "vbc"
 
     def _publish_committed(self, msg, source, age_s):
         if msg is None or not msg.points:
@@ -820,6 +838,7 @@ class OptimizedTrajectoryContinuityNode:
             "repair_active={}".format(int(self._repair_active)),
             "probe_active={}".format(int(self._probe_active)),
             "repair_prefix_enabled={}".format(int(self.repair_prefix_verification_enabled)),
+            "final_gcdf_enabled={}".format(int(self.final_gcdf_enabled)),
             "final_gcdf_outstanding={}".format(int(self._gcdf_outstanding is not None)),
             "final_gcdf_outstanding_seq={}".format(int(self._gcdf_outstanding_seq)),
             "final_gcdf_query_count={}".format(self._final_gcdf_query_count),
