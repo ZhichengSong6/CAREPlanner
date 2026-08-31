@@ -363,6 +363,17 @@ digest["task_failure_slack_diagnostics"] = [
 commit_rows = R["commit_summary.csv"]
 candidate_plans = [r for r in local if r.get("event") == "candidate_published"]
 
+# commit_summary is a high-rate state stream; the timing fields persist after a
+# verdict. Collapse it to one record per completed verification seq before
+# computing statistics, otherwise one candidate appears hundreds of times.
+timing_commit_by_seq = {}
+for r in commit_rows:
+    seq = as_int(r.get("last_verification_seq"), 0)
+    if seq <= 0:
+        continue
+    timing_commit_by_seq.setdefault(seq, r)
+timing_commit_rows = list(timing_commit_by_seq.values())
+
 digest["timing"] = {
     "local_plan_total_ms": timing_stats([
         as_float(r.get("total_plan_ms")) for r in candidate_plans
@@ -371,17 +382,17 @@ digest["timing"] = {
         as_float(r.get("solve_ms")) for r in candidate_plans
     ]),
     "raw_to_safety_dispatch_ms": timing_stats([
-        as_float(r.get("raw_to_safety_dispatch_ms")) for r in commit_rows
+        as_float(r.get("raw_to_safety_dispatch_ms")) for r in timing_commit_rows
     ]),
     "final_gcdf_roundtrip_ms": timing_stats([
-        as_float(r.get("final_gcdf_roundtrip_ms")) for r in commit_rows
+        as_float(r.get("final_gcdf_roundtrip_ms")) for r in timing_commit_rows
     ]),
     "exact_vbc_roundtrip_ms": timing_stats([
-        as_float(r.get("exact_vbc_roundtrip_ms")) for r in commit_rows
+        as_float(r.get("exact_vbc_roundtrip_ms")) for r in timing_commit_rows
     ]),
     "candidate_total_safety_pipeline_ms": timing_stats([
         as_float(r.get("candidate_total_safety_pipeline_ms"))
-        for r in commit_rows
+        for r in timing_commit_rows
     ]),
 }
 
