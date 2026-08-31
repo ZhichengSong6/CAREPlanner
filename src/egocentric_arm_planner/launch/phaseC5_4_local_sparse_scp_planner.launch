@@ -65,6 +65,8 @@
     <arg name="log_output_root" value="$(arg log_output_root)" />
 
     <arg name="use_local_sparse_scp" value="true" />
+    <arg name="final_executable_gcdf_enabled" value="true" />
+    <arg name="committed_continuation_enabled" value="false" />
     <arg name="raw_mpc_trajectory_topic"
          value="/care_planner/local_planner/candidate_trajectory" />
     <arg name="trajectory_risk_input_topic"
