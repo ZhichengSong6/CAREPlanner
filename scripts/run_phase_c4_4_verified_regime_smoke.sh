@@ -50,6 +50,15 @@ LOCAL_SCP_CANDIDATE_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC:-/care_planner/local_plan
 LOCAL_SCP_SUMMARY_TOPIC="${LOCAL_SCP_SUMMARY_TOPIC:-/care_planner/local_planner/summary}"
 LOCAL_SCP_REPLAN_TOPIC="${LOCAL_SCP_REPLAN_TOPIC:-/care_planner/local_planner/replan_request}"
 
+# C5.8/C5.9 commit-pipeline capabilities. Defaults preserve legacy C4.x.
+FINAL_EXECUTABLE_GCDF_ENABLED="${FINAL_EXECUTABLE_GCDF_ENABLED:-false}"
+COMMITTED_CONTINUATION_ENABLED="${COMMITTED_CONTINUATION_ENABLED:-true}"
+EXECUTION_AUDIT_STREAM_ENABLED="${EXECUTION_AUDIT_STREAM_ENABLED:-false}"
+EXECUTION_VBC_TRAJECTORY_TOPIC="${EXECUTION_VBC_TRAJECTORY_TOPIC:-/care_planner/committed_trajectory}"
+PROBE_SINGLE_FLIGHT_ENABLED="${PROBE_SINGLE_FLIGHT_ENABLED:-false}"
+PROBE_SINGLE_FLIGHT_TOPIC="${PROBE_SINGLE_FLIGHT_TOPIC:-/care_planner/local_planner/candidate_trajectory_single_flight}"
+PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC:-/care_planner/execution/probe_single_flight_summary}"
+
 # C4.8 compatibility. C4.9 exports the historical C4_REPAIR_* variables;
 # C5.4 leaves this disabled and verifies the complete optimized trajectory.
 REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-${C4_REPAIR_PREFIX_VERIFY:-0}}"
@@ -66,6 +75,11 @@ else
   RAW_PLANNER_TOPIC="/care_planner/mpc/predicted_trajectory"
 fi
 RAW_MPC_TOPIC="${RAW_PLANNER_TOPIC}"
+if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  COMMIT_PIPELINE_CANDIDATE_TOPIC="${PROBE_SINGLE_FLIGHT_TOPIC}"
+else
+  COMMIT_PIPELINE_CANDIDATE_TOPIC="${RAW_PLANNER_TOPIC}"
+fi
 VERIFY_TOPIC="/care_planner/optimized_trajectory"
 COMMITTED_TOPIC="/care_planner/committed_trajectory"
 CANDIDATE_VBC_TOPIC="/care_planner/candidate_vbc/summary"
@@ -189,6 +203,13 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   cdf_shadow_vbc_summary_topic:="${CDF_SHADOW_VBC_SUMMARY_TOPIC}" \
   use_local_sparse_scp:="${USE_LOCAL_SPARSE_SCP}" \
   raw_mpc_trajectory_topic:="${RAW_PLANNER_TOPIC}" \
+  final_executable_gcdf_enabled:="${FINAL_EXECUTABLE_GCDF_ENABLED}" \
+  committed_continuation_enabled:="${COMMITTED_CONTINUATION_ENABLED}" \
+  execution_audit_stream_enabled:="${EXECUTION_AUDIT_STREAM_ENABLED}" \
+  execution_vbc_trajectory_topic:="${EXECUTION_VBC_TRAJECTORY_TOPIC}" \
+  probe_single_flight_enabled:="${PROBE_SINGLE_FLIGHT_ENABLED}" \
+  commit_pipeline_candidate_topic:="${COMMIT_PIPELINE_CANDIDATE_TOPIC}" \
+  probe_single_flight_summary_topic:="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" \
   local_scp_candidate_trajectory_topic:="${LOCAL_SCP_CANDIDATE_TOPIC}" \
   local_scp_summary_topic:="${LOCAL_SCP_SUMMARY_TOPIC}" \
   local_scp_replan_request_topic:="${LOCAL_SCP_REPLAN_TOPIC}" \
@@ -295,6 +316,7 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
+record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -335,7 +357,8 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
+  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
+  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
