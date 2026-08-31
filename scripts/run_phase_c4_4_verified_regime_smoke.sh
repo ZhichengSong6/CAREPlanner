@@ -387,23 +387,59 @@ record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
 record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
 record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 
-RELEASED=0
-echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, echo_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
-for i in $(seq 1 "${INITIAL_GATE_MAX_TRIES}"); do
-  S="$(timeout "${INITIAL_GATE_ECHO_TIMEOUT}" rostopic echo -n 1 /care_planner/execution/gate_summary 2>/dev/null || true)"
-  if echo "${S}" | grep -q "released=1"; then
-    RELEASED=1
-    echo "[READY] initial execution gate released after ${i} checks"
-    break
-  fi
-  if (( i % 20 == 0 )); then
-    echo "[WAIT] gate still closed after ${i} checks"
-    echo "${S}" | grep -E "released=|decision=|waypoint_ready=|release_reason=" || true
-  fi
-  sleep 0.05
-done
-if [ "${RELEASED}" != "1" ]; then
-  echo "[ERROR] initial gate release timeout"
+echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, msg_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
+if ! python3 - "${INITIAL_GATE_MAX_TRIES}" "${INITIAL_GATE_ECHO_TIMEOUT}" <<'PY'
+import sys
+import time
+
+import rospy
+from std_msgs.msg import String
+
+tries = int(sys.argv[1])
+msg_timeout = float(sys.argv[2])
+topic = "/care_planner/execution/gate_summary"
+
+# Keep one ROS subscriber alive for the whole wait. Repeated shell-level
+# 'timeout rostopic echo' calls can expire during process startup / subscriber
+# handshake even when the gate has already published released=1.
+rospy.init_node(
+    "careplanner_initial_gate_wait",
+    anonymous=True,
+    disable_signals=True,
+)
+
+last = ""
+for i in range(1, tries + 1):
+    try:
+        msg = rospy.wait_for_message(topic, String, timeout=msg_timeout)
+        last = str(msg.data)
+    except rospy.ROSException:
+        pass
+
+    if "released=1" in last:
+        print(f"[READY] initial execution gate released after {i} checks")
+        raise SystemExit(0)
+
+    if i % 20 == 0:
+        print(f"[WAIT] gate still closed after {i} checks")
+        if last:
+            interesting = []
+            for token in last.split():
+                if token.startswith((
+                    "released=", "decision=", "waypoint_ready=",
+                    "release_reason="
+                )):
+                    interesting.append(token)
+            if interesting:
+                print(" ".join(interesting))
+    time.sleep(0.05)
+
+print("[ERROR] initial gate release timeout")
+if last:
+    print("[LAST GATE SUMMARY] " + last)
+raise SystemExit(1)
+PY
+then
   tail -n 260 "${LOG}/controlled.log" || true
   exit 1
 fi
