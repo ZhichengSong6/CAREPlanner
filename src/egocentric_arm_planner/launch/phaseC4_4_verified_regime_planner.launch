@@ -176,7 +176,8 @@
     <param name="final_gcdf_query_topic"
            value="/care_planner/final_gcdf/query_trajectory" />
     <param name="final_gcdf_batch_topic"
-           value="$(arg local_scp_cdf_batch_topic)" />
+           value="/care_planner/final_gcdf/constraint_batch" />
+    <param name="continuation_enabled" value="false" />
     <param name="final_gcdf_timeout_s" value="0.50" />
     <param name="final_gcdf_safety_margin" value="0.0" />
     <param name="final_gcdf_stamp_tolerance_s" value="0.000001" />
@@ -325,7 +326,7 @@
            value="/care_planner/final_gcdf/risk" />
       <arg name="forbidden_space_pair_publish_enabled" value="true" />
       <arg name="forbidden_space_pair_topic"
-           value="$(arg local_scp_body_anchor_topic)" />
+           value="/care_planner/final_gcdf/body_sweep_anchors" />
       <arg name="forbidden_space_confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
       <arg name="show_full_trajectory_markers" value="false" />
@@ -378,11 +379,17 @@
         name="c5_4_local_scp_cdf_selector"
         output="screen">
     <param name="anchor_topic" value="$(arg local_scp_body_anchor_topic)" />
+    <param name="final_anchor_topic"
+           value="/care_planner/final_gcdf/body_sweep_anchors" />
     <param name="map_topic" value="/care_planner/confidence_map/points" />
     <param name="summary_topic"
            value="/care_planner/local_planner/cdf_selector_summary" />
     <param name="constraint_batch_topic"
            value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="final_summary_topic"
+           value="/care_planner/final_gcdf/selector_summary" />
+    <param name="final_constraint_batch_topic"
+           value="/care_planner/final_gcdf/constraint_batch" />
     <param name="output_jsonl" value="$(arg local_scp_selector_jsonl)" />
     <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
     <param name="rate" value="50.0" />
