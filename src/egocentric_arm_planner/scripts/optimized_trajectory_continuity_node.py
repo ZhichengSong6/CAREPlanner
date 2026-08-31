@@ -629,13 +629,15 @@ class OptimizedTrajectoryContinuityNode:
         committed_to_publish = None
         event_to_publish = None
         verification_to_publish = None
+        gcdf_to_publish = None
         with self._lock:
             self._selector_cycle_count += 1
             self._last_selector_cycle_time = now
 
             if self._outstanding is None or self._outstanding_sent is None:
-                verification_to_publish = self._dispatch_pending_locked(now)
-                if verification_to_publish is None:
+                gcdf_to_publish = self._dispatch_pending_locked(now)
+                if (gcdf_to_publish is None and
+                        self._gcdf_outstanding is None):
                     self._last_source = "selector_cycle_complete_no_pending_candidate"
                 self._publish_summary_locked()
             else:
@@ -699,7 +701,7 @@ class OptimizedTrajectoryContinuityNode:
                             event_to_publish = self._make_verification_event(
                                 seq, "timeout", False, verification_age, view)
 
-                    verification_to_publish = self._dispatch_pending_locked(now)
+                    gcdf_to_publish = self._dispatch_pending_locked(now)
                     self._publish_summary_locked()
 
         if committed_to_publish is not None:
@@ -709,6 +711,8 @@ class OptimizedTrajectoryContinuityNode:
             self.verification_event_pub.publish(event_to_publish)
         if verification_to_publish is not None:
             self.verification_pub.publish(verification_to_publish)
+        if gcdf_to_publish is not None:
+            self.final_gcdf_query_pub.publish(gcdf_to_publish)
 
     def _timer_cb(self, _event):
         now = rospy.Time.now()
