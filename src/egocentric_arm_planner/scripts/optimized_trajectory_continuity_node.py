@@ -634,7 +634,11 @@ class OptimizedTrajectoryContinuityNode:
                 self._last_source = "candidate_rejected_final_gcdf_unsafe"
                 event_to_publish = self._make_verification_event(
                     seq, "unsafe", False, age, view, safety_gate="gcdf")
-                next_gcdf_to_publish = self._dispatch_pending_locked(now)
+                dispatched, route = self._dispatch_pending_locked(now)
+                if route == "gcdf":
+                    next_gcdf_to_publish = dispatched
+                elif route == "vbc":
+                    verification_to_publish = dispatched
 
             self._publish_summary_locked()
 
@@ -666,9 +670,14 @@ class OptimizedTrajectoryContinuityNode:
             self._last_selector_cycle_time = now
 
             if self._outstanding is None or self._outstanding_sent is None:
-                gcdf_to_publish = self._dispatch_pending_locked(now)
-                if (gcdf_to_publish is None and
-                        self._gcdf_outstanding is None):
+                dispatched, route = self._dispatch_pending_locked(now)
+                if route == "gcdf":
+                    gcdf_to_publish = dispatched
+                elif route == "vbc":
+                    verification_to_publish = dispatched
+                if (dispatched is None and
+                        self._gcdf_outstanding is None and
+                        self._outstanding is None):
                     self._last_source = "selector_cycle_complete_no_pending_candidate"
                 self._publish_summary_locked()
             else:
@@ -735,7 +744,11 @@ class OptimizedTrajectoryContinuityNode:
                             event_to_publish = self._make_verification_event(
                                 seq, "timeout", False, verification_age, view)
 
-                    gcdf_to_publish = self._dispatch_pending_locked(now)
+                    dispatched, route = self._dispatch_pending_locked(now)
+                    if route == "gcdf":
+                        gcdf_to_publish = dispatched
+                    elif route == "vbc":
+                        verification_to_publish = dispatched
                     self._publish_summary_locked()
 
         if committed_to_publish is not None:
@@ -754,6 +767,7 @@ class OptimizedTrajectoryContinuityNode:
         timeout_event = None
         gcdf_timeout_event = None
         next_gcdf_to_publish = None
+        next_verification_to_publish = None
         continuation_age = math.nan
 
         with self._lock:
@@ -780,7 +794,11 @@ class OptimizedTrajectoryContinuityNode:
                     gcdf_timeout_event = self._make_verification_event(
                         seq, "timeout", False, gcdf_age, view,
                         safety_gate="gcdf")
-                    next_gcdf_to_publish = self._dispatch_pending_locked(now)
+                    dispatched, route = self._dispatch_pending_locked(now)
+                    if route == "gcdf":
+                        next_gcdf_to_publish = dispatched
+                    elif route == "vbc":
+                        next_verification_to_publish = dispatched
 
             if self._outstanding is not None and self._outstanding_sent is not None:
                 age = (now - self._outstanding_sent).to_sec()
@@ -826,6 +844,8 @@ class OptimizedTrajectoryContinuityNode:
             self.verification_event_pub.publish(gcdf_timeout_event)
         if next_gcdf_to_publish is not None:
             self.final_gcdf_query_pub.publish(next_gcdf_to_publish)
+        if next_verification_to_publish is not None:
+            self.verification_pub.publish(next_verification_to_publish)
 
     def _publish_summary_locked(self):
         msg = String()
