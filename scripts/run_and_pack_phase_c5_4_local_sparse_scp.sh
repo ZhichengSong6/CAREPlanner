@@ -498,6 +498,21 @@ digest["c5_12_recovery"] = {
     "gcdf_recovery_reason": (
         blocker_rows[-1].get("gcdf_recovery_reason")
         if blocker_rows else None),
+    "gcdf_recovery_event_stamp": (
+        blocker_rows[-1].get("gcdf_recovery_event_stamp")
+        if blocker_rows else None),
+    "gcdf_recovery_trajectory_stamp": (
+        blocker_rows[-1].get("gcdf_recovery_trajectory_stamp")
+        if blocker_rows else None),
+    "gcdf_recovery_cache_size": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_cache_size"))
+        if blocker_rows else 0),
+    "gcdf_recovery_cache_hit_count": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_cache_hit_count"))
+        if blocker_rows else 0),
+    "gcdf_recovery_cache_miss_count": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_cache_miss_count"))
+        if blocker_rows else 0),
 }
 
 # The key C5.12 invariant is checked on observed regime records rather than
