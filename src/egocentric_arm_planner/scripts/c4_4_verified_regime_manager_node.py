@@ -511,7 +511,9 @@ class C44VerifiedRegimeManager:
         f = _tokens(msg.data)
         complete = _as_bool(f.get("complete"))
         seq = _as_int(f.get("seq"), 0)
-        if complete is not True or seq <= 0:
+        source = f.get("source", "")
+        if (complete is not True or seq <= 0 or
+                source != "trajectory_complete_hold"):
             return
 
         now = rospy.Time.now()
