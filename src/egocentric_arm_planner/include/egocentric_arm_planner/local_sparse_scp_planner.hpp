@@ -118,7 +118,8 @@ private:
       bool repair_mode,
       bool probe_mode,
       double trust_radius,
-      double slack_linear_weight) const;
+      double slack_linear_weight,
+      bool force_diagnostic_slack = false) const;
 
   ros::Time publishQueryTrajectory(
       const Eigen::MatrixXd& q,
@@ -267,6 +268,12 @@ private:
   // G0.2 diagnostic can remove user slacks entirely and test whether the
   // linearized CDF-constrained subproblem is genuinely feasible.
   bool cdf_slack_enabled_ = true;
+  // Diagnostic-only fallback: after a hard task QP failure, solve the same
+  // convex subproblem with per-constraint nonnegative CDF slacks. The result is
+  // never executable; max_slack only diagnoses numerical failure vs. genuine
+  // local hard-GCDF infeasibility.
+  bool task_failure_slack_diagnostic_enabled_ = true;
+  double task_failure_slack_diagnostic_weight_ = 1.0;
   bool cdf_adaptive_slack_penalty_ = false;
   double cdf_slack_penalty_multiplier_ = 10.0;
   double cdf_slack_penalty_max_ = 1e8;
