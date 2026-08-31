@@ -278,6 +278,8 @@
            value="$(arg local_scp_candidate_trajectory_topic)" />
     <param name="local_planner/summary_topic"
            value="$(arg local_scp_summary_topic)" />
+    <param name="local_planner/force_vbc_bootstrap_topic"
+           value="/care_planner/trajectory_risk/force_bootstrap" />
   </node>
 
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
@@ -413,6 +415,7 @@
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/trajectory_risk/vbc_active_set_points" />
+      <arg name="force_bootstrap_topic" value="/care_planner/trajectory_risk/force_bootstrap" />
     </include>
   </group>
 
@@ -440,6 +443,7 @@
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/execution_vbc/audit_active_set_unused" />
+      <arg name="force_bootstrap_topic" value="/care_planner/execution_vbc/audit_force_bootstrap_unused" />
     </include>
   </group>
 
