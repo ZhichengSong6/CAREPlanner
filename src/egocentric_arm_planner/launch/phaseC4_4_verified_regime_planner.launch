@@ -211,6 +211,10 @@
     <param name="probe_ignore_s" value="0.16" />
     <param name="candidate_outcome_topic" value="$(arg candidate_outcome_topic)" />
     <param name="execution_summary_topic" value="$(arg execution_vbc_summary_topic)" />
+    <param name="tracker_summary_topic"
+           value="/care_planner/execution/tracker_summary" />
+    <param name="replan_request_topic"
+           value="$(arg local_scp_replan_request_topic)" />
     <param name="committed_trajectory_topic" value="$(arg committed_trajectory_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
     <param name="physical_deadline_topic" value="$(arg rolling_deadline_topic)" />
