@@ -141,6 +141,10 @@ class C44VerifiedRegimeManager:
         self.candidate_outcome_time = None
         self.last_candidate_seq = 0
         self.last_candidate_result = "none"
+        self.last_candidate_safety_gate = "none"
+        self.last_candidate_verification_view = "none"
+        self.candidate_outcome_pending_gate_replay = False
+        self.candidate_gate_replay_count = 0
         self.candidate_last_unsafe = False
         self.candidate_unsafe_streak = 0
         self.candidate_unsafe_count = 0
@@ -352,6 +356,7 @@ class C44VerifiedRegimeManager:
             if not self.execution_ready:
                 self.state = self.NORMAL
                 self.candidate_unsafe_streak = 0
+                self.candidate_outcome_pending_gate_replay = False
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
                 self.probe_completed_prefix_streak = 0
@@ -380,6 +385,15 @@ class C44VerifiedRegimeManager:
                 self._transition_locked(
                     self.REPAIR, "task_planner_uncertified_after_gate_release",
                     self.execution_ready_time)
+            elif (self.candidate_outcome_pending_gate_replay and
+                  self.state == self.NORMAL):
+                self.candidate_outcome_pending_gate_replay = False
+                self.candidate_gate_replay_count += 1
+                self._handle_normal_candidate_result_locked(
+                    self.last_candidate_result,
+                    self.last_candidate_safety_gate,
+                    self.execution_ready_time,
+                    replay=True)
 
     def _begin_blocker_rediscovery_locked(
             self, origin, force_bootstrap=True):
@@ -577,6 +591,29 @@ class C44VerifiedRegimeManager:
                 self._transition_locked(
                     self.PROBE_NORMAL, "actual_visibility_acquisition_complete", now)
 
+    def _handle_normal_candidate_result_locked(
+            self, result, safety_gate, now, replay=False):
+        """Apply NORMAL candidate safety semantics from live or replayed input."""
+        source = "after_gate_release" if replay else "live"
+        if result == "unsafe" and safety_gate == "gcdf":
+            self._transition_locked(
+                self.REPAIR,
+                "final_gcdf_normal_unsafe_{}".format(source),
+                now)
+        elif (result == "unsafe" and
+              self.candidate_unsafe_streak >= self.candidate_unsafe_required):
+            self._transition_locked(
+                self.REPAIR,
+                "candidate_unique_unsafe_confirmed_{}".format(source),
+                now)
+        elif result == "timeout":
+            # No candidate was certified or committed. Stay in NORMAL and
+            # explicitly request a fresh plan; never reuse stale execution.
+            self.last_transition_reason = (
+                "{}_normal_timeout_replan_{}".format(
+                    safety_gate, source))
+            self.replan_request_pub.publish(Bool(data=True))
+
     def _candidate_outcome_cb(self, msg):
         if msg is None:
             return
@@ -596,6 +633,8 @@ class C44VerifiedRegimeManager:
                 return
             self.last_candidate_seq = seq
             self.last_candidate_result = result
+            self.last_candidate_safety_gate = safety_gate
+            self.last_candidate_verification_view = verification_view
             self.candidate_outcome_time = now
             self.candidate_event_count += 1
 
@@ -612,23 +651,19 @@ class C44VerifiedRegimeManager:
                 self.candidate_unsafe_streak = 0
 
             if not self.execution_ready:
+                # Startup race protection: preserve the safety fact and replay
+                # it when execution_ready rises.  The old code recorded the
+                # unsafe result then returned forever if no later candidate
+                # event arrived.
+                self.candidate_outcome_pending_gate_replay = True
+                self.last_transition_reason = (
+                    "candidate_outcome_pending_gate_replay")
                 return
 
+            self.candidate_outcome_pending_gate_replay = False
             if self.state == self.NORMAL:
-                if result == "unsafe" and safety_gate == "gcdf":
-                    self._transition_locked(
-                        self.REPAIR, "final_gcdf_normal_unsafe", now)
-                elif (result == "unsafe" and
-                      self.candidate_unsafe_streak >= self.candidate_unsafe_required):
-                    self._transition_locked(
-                        self.REPAIR, "candidate_unique_unsafe_confirmed", now)
-                elif result == "timeout":
-                    # No candidate was certified or committed. Stay in NORMAL
-                    # and explicitly request a fresh plan; never reuse stale
-                    # execution merely because a safety transport timed out.
-                    self.last_transition_reason = (
-                        "{}_normal_timeout_replan".format(safety_gate))
-                    self.replan_request_pub.publish(Bool(data=True))
+                self._handle_normal_candidate_result_locked(
+                    result, safety_gate, now, replay=False)
                 return
 
             if self.state == self.REPAIR:
@@ -864,6 +899,14 @@ class C44VerifiedRegimeManager:
                 "execution_ready={}".format(int(self.execution_ready)),
                 "last_candidate_seq={}".format(self.last_candidate_seq),
                 "last_candidate_result={}".format(self.last_candidate_result),
+                "last_candidate_safety_gate={}".format(
+                    self.last_candidate_safety_gate),
+                "last_candidate_verification_view={}".format(
+                    self.last_candidate_verification_view),
+                "candidate_outcome_pending_gate_replay={}".format(
+                    int(self.candidate_outcome_pending_gate_replay)),
+                "candidate_gate_replay_count={}".format(
+                    self.candidate_gate_replay_count),
                 "candidate_event_count={}".format(self.candidate_event_count),
                 "candidate_last_unsafe={}".format(int(self.candidate_last_unsafe)),
                 "candidate_unsafe_streak={}".format(self.candidate_unsafe_streak),
