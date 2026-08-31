@@ -135,7 +135,7 @@ local_planner:
     # result is never executable; required_max_slack distinguishes numerical
     # non-convergence (~0 slack) from genuine local hard-GCDF infeasibility.
     task_failure_slack_diagnostic_enabled: true
-    task_failure_slack_diagnostic_weight: 1.0
+    task_failure_slack_diagnostic_weight: 10000.0
 
     slack_linear_weight: 10.0
     slack_quadratic_weight: 0.0
