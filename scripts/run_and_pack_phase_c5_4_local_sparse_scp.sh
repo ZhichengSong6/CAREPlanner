@@ -59,7 +59,8 @@ catkin build care_confidence_map care_collision_cdf egocentric_arm_planner
 source devel/setup.bash
 python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
-  src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py
+  src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py \
+  src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py
 python3 - <<'PY'
 import xml.etree.ElementTree as ET
 for path in (
@@ -167,7 +168,27 @@ fi
 
 # C5.4 defaults to full-horizon verification, while later integrations may
 # opt into the existing C4.8 safe-prefix verifier without changing the planner.
-USE_LOCAL_SPARSE_SCP=true LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY}" REPAIR_PREFIX_S="${REPAIR_PREFIX_S}" REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S}" REPAIR_HOLD_S="${REPAIR_HOLD_S}" TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" REGION_SCHEDULE_MODE="blocker_aware_acquisition" CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
+USE_LOCAL_SPARSE_SCP=true \
+FINAL_EXECUTABLE_GCDF_ENABLED=true \
+COMMITTED_CONTINUATION_ENABLED=false \
+EXECUTION_AUDIT_STREAM_ENABLED=true \
+EXECUTION_VBC_TRAJECTORY_TOPIC="/care_planner/execution/audit_trajectory" \
+PROBE_SINGLE_FLIGHT_ENABLED=true \
+PROBE_SINGLE_FLIGHT_TOPIC="/care_planner/local_planner/candidate_trajectory_single_flight" \
+LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" \
+LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" \
+LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" \
+LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" \
+LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" \
+REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY}" \
+REPAIR_PREFIX_S="${REPAIR_PREFIX_S}" \
+REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S}" \
+REPAIR_HOLD_S="${REPAIR_HOLD_S}" \
+TRAJECTORY_RISK_INPUT_TOPIC="/care_planner/local_planner/candidate_trajectory" \
+REGION_SCHEDULE_MODE="blocker_aware_acquisition" \
+CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" CARE_WEIGHT="${CARE_WEIGHT}" \
+SAFETY_MARGIN="${SAFETY_MARGIN}" PREDICTION_TIMEOUT="${PREDICTION_TIMEOUT}" \
+OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
   bash scripts/run_phase_c4_4_verified_regime_smoke.sh 2>&1 | tee "${ROOT_LOG}/common_runner.log"
 
 cleanup
