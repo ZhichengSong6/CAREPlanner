@@ -210,6 +210,7 @@ catkin_install_python(PROGRAMS
   scripts/c4_3_planner_regime_handoff_node.py
   scripts/c4_4_verified_regime_manager_node.py
   scripts/optimized_trajectory_continuity_node.py
+  scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
