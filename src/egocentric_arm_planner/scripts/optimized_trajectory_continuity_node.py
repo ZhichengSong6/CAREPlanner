@@ -72,6 +72,9 @@ class OptimizedTrajectoryContinuityNode:
         self.repair_active_topic = str(rospy.get_param(
             "~repair_active_topic",
             "/care_planner/execution/predicted_vbc_recovery_triggered"))
+        self.probe_active_topic = str(rospy.get_param(
+            "~probe_active_topic",
+            "/care_planner/c4_4/probe_active"))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_start_delay_s = float(rospy.get_param(
@@ -112,9 +115,11 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~repair_acceleration_limits must be positive")
 
         self._repair_active = False
+        self._probe_active = False
         self._pending_raw = None
         self._pending_raw_received = None
         self._pending_repair = False
+        self._pending_probe = False
         self._last_raw_received = None
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
@@ -127,6 +132,7 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_seq = 0
         self._outstanding_dispatch_cycle = -1
         self._outstanding_repair = False
+        self._outstanding_probe = False
         self._outstanding_view = "none"
         self._next_verification_seq = 1
 
@@ -146,6 +152,9 @@ class OptimizedTrajectoryContinuityNode:
         self._repair_prefix_build_count = 0
         self._repair_prefix_safe_count = 0
         self._repair_prefix_unsafe_count = 0
+        self._probe_prefix_build_count = 0
+        self._probe_prefix_safe_count = 0
+        self._probe_prefix_unsafe_count = 0
         self._last_repair_prefix_duration_s = math.nan
         self._last_repair_brake_duration_s = math.nan
         self._last_source = "waiting_selector_cycle"
@@ -170,6 +179,8 @@ class OptimizedTrajectoryContinuityNode:
             self.global_summary_topic, String, self._global_summary_cb, queue_size=1)
         self.repair_sub = rospy.Subscriber(
             self.repair_active_topic, Bool, self._repair_active_cb, queue_size=1)
+        self.probe_sub = rospy.Subscriber(
+            self.probe_active_topic, Bool, self._probe_active_cb, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
 
@@ -188,6 +199,12 @@ class OptimizedTrajectoryContinuityNode:
             return
         with self._lock:
             self._repair_active = bool(msg.data)
+
+    def _probe_active_cb(self, msg):
+        if msg is None:
+            return
+        with self._lock:
+            self._probe_active = bool(msg.data)
 
     @staticmethod
     def _duration(msg: JointTrajectory) -> float:
@@ -392,6 +409,7 @@ class OptimizedTrajectoryContinuityNode:
             self._pending_raw = copy.deepcopy(msg)
             self._pending_raw_received = now
             self._pending_repair = bool(self._repair_active)
+            self._pending_probe = bool(self._probe_active)
             self._last_raw_received = now
             self._raw_input_count += 1
             self._last_source = "raw_candidate_buffered_waiting_selector_cycle"
@@ -404,9 +422,11 @@ class OptimizedTrajectoryContinuityNode:
         raw = self._pending_raw
         raw_received = self._pending_raw_received
         pending_repair = bool(self._pending_repair or self._repair_active)
+        pending_probe = bool(self._pending_probe or self._probe_active)
         self._pending_raw = None
         self._pending_raw_received = None
         self._pending_repair = False
+        self._pending_probe = False
 
         age = max(0.0, (now - raw_received).to_sec())
         candidate = self._suffix_from_phase(raw, age)
@@ -415,12 +435,17 @@ class OptimizedTrajectoryContinuityNode:
             return None
 
         view = "full_horizon"
-        if self.repair_prefix_verification_enabled and pending_repair:
+        prefix_mode = bool(pending_repair or pending_probe)
+        if self.repair_prefix_verification_enabled and prefix_mode:
             candidate = self._repair_prefix_with_braking_tail(candidate)
             if candidate is None or not candidate.points:
-                self._last_source = "repair_prefix_build_failed"
+                self._last_source = "prefix_build_failed"
                 return None
-            view = "repair_prefix_brake_hold"
+            if pending_repair:
+                view = "repair_prefix_brake_hold"
+            else:
+                view = "probe_prefix_brake_hold"
+                self._probe_prefix_build_count += 1
 
         seq = self._next_verification_seq
         self._next_verification_seq += 1
@@ -431,6 +456,7 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_seq = seq
         self._outstanding_dispatch_cycle = self._selector_cycle_count
         self._outstanding_repair = bool(pending_repair)
+        self._outstanding_probe = bool(pending_probe)
         self._outstanding_view = view
         self._verification_publish_count += 1
         self._last_source = "candidate_sent_on_selector_cycle_boundary"
@@ -498,12 +524,14 @@ class OptimizedTrajectoryContinuityNode:
                     candidate = copy.deepcopy(self._outstanding)
                     seq = int(self._outstanding_seq)
                     was_repair = bool(self._outstanding_repair)
+                    was_probe = bool(self._outstanding_probe)
                     view = str(self._outstanding_view)
                     self._outstanding = None
                     self._outstanding_sent = None
                     self._outstanding_seq = 0
                     self._outstanding_dispatch_cycle = -1
                     self._outstanding_repair = False
+                    self._outstanding_probe = False
                     self._outstanding_view = "none"
                     self._last_verification_age_s = verification_age
                     self._last_verification_seq = seq
@@ -514,6 +542,8 @@ class OptimizedTrajectoryContinuityNode:
                         self._verification_unsafe_count += 1
                         if was_repair and view == "repair_prefix_brake_hold":
                             self._repair_prefix_unsafe_count += 1
+                        if was_probe and view == "probe_prefix_brake_hold":
+                            self._probe_prefix_unsafe_count += 1
                         self._last_verification_result = "unsafe"
                         self._last_source = "candidate_rejected_vbc_unsafe"
                         event_to_publish = self._make_verification_event(
@@ -524,6 +554,8 @@ class OptimizedTrajectoryContinuityNode:
                             self._verification_safe_count += 1
                             if was_repair and view == "repair_prefix_brake_hold":
                                 self._repair_prefix_safe_count += 1
+                            if was_probe and view == "probe_prefix_brake_hold":
+                                self._probe_prefix_safe_count += 1
                             self._last_verification_result = "safe"
                             committed.header.seq = seq
                             committed.header.stamp = now
@@ -607,6 +639,7 @@ class OptimizedTrajectoryContinuityNode:
             "pending_replace_count={}".format(self._pending_replace_count),
             "selector_cycle_count={}".format(self._selector_cycle_count),
             "repair_active={}".format(int(self._repair_active)),
+            "probe_active={}".format(int(self._probe_active)),
             "repair_prefix_enabled={}".format(int(self.repair_prefix_verification_enabled)),
             "verification_outstanding={}".format(int(self._outstanding is not None)),
             "outstanding_seq={}".format(int(self._outstanding_seq)),
@@ -622,6 +655,9 @@ class OptimizedTrajectoryContinuityNode:
             "repair_prefix_build_count={}".format(self._repair_prefix_build_count),
             "repair_prefix_safe_count={}".format(self._repair_prefix_safe_count),
             "repair_prefix_unsafe_count={}".format(self._repair_prefix_unsafe_count),
+            "probe_prefix_build_count={}".format(self._probe_prefix_build_count),
+            "probe_prefix_safe_count={}".format(self._probe_prefix_safe_count),
+            "probe_prefix_unsafe_count={}".format(self._probe_prefix_unsafe_count),
             "repair_prefix_duration_s={}".format(
                 "nan" if not math.isfinite(self._last_repair_prefix_duration_s)
                 else "{:.6f}".format(self._last_repair_prefix_duration_s)),
