@@ -196,6 +196,7 @@ class OptimizedTrajectoryContinuityNode:
         self._last_verification_seq = 0
         self._last_verification_result = "none"
         self._last_verification_view = "none"
+        self._last_execution_stamp_ns = 0
 
         self.final_gcdf_query_pub = rospy.Publisher(
             self.final_gcdf_query_topic, JointTrajectory, queue_size=1)
@@ -521,15 +522,18 @@ class OptimizedTrajectoryContinuityNode:
             self._publish_summary_locked()
 
     def _make_verification_event(
-            self, seq, result, committed, age_s, view, safety_gate="vbc"):
+            self, seq, result, committed, age_s, view, safety_gate="vbc",
+            execution_stamp_ns=0):
         msg = String()
         msg.data = (
             "seq={} result={} committed={} verification_age_s={:.6f} "
-            "verification_view={} safety_gate={} outcome_count={} safe_count={} "
-            "unsafe_count={} timeout_count={} commit_count={}"
+            "verification_view={} safety_gate={} execution_stamp_ns={} "
+            "outcome_count={} safe_count={} unsafe_count={} timeout_count={} "
+            "commit_count={}"
         ).format(
             int(seq), result, int(bool(committed)), float(age_s), view,
-            safety_gate, self._verification_outcome_count,
+            safety_gate, int(execution_stamp_ns),
+            self._verification_outcome_count,
             self._verification_safe_count, self._verification_unsafe_count,
             self._verification_timeout_count, self._commit_count)
         return msg
@@ -695,6 +699,8 @@ class OptimizedTrajectoryContinuityNode:
                             self._last_verification_result = "safe"
                             committed.header.seq = seq
                             committed.header.stamp = now
+                            execution_stamp_ns = int(committed.header.stamp.to_nsec())
+                            self._last_execution_stamp_ns = execution_stamp_ns
                             self._committed_master = copy.deepcopy(committed)
                             self._committed_received = now
                             self._commit_count += 1
@@ -702,7 +708,8 @@ class OptimizedTrajectoryContinuityNode:
                             self._last_source = "candidate_verified_safe_committed"
                             committed_to_publish = copy.deepcopy(committed)
                             event_to_publish = self._make_verification_event(
-                                seq, "safe", True, verification_age, view)
+                                seq, "safe", True, verification_age, view,
+                                execution_stamp_ns=execution_stamp_ns)
                         else:
                             self._verification_timeout_count += 1
                             self._last_verification_result = "expired_safe"
@@ -834,6 +841,7 @@ class OptimizedTrajectoryContinuityNode:
             "last_verification_seq={}".format(self._last_verification_seq),
             "last_verification_result={}".format(self._last_verification_result),
             "last_verification_view={}".format(self._last_verification_view),
+            "last_execution_stamp_ns={}".format(self._last_execution_stamp_ns),
             "repair_prefix_build_count={}".format(self._repair_prefix_build_count),
             "repair_prefix_safe_count={}".format(self._repair_prefix_safe_count),
             "repair_prefix_unsafe_count={}".format(self._repair_prefix_unsafe_count),
