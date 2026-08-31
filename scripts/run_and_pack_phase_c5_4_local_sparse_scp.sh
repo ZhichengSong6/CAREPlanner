@@ -60,7 +60,9 @@ source devel/setup.bash
 python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
   src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py \
-  src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py
+  src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py \
+  src/care_visibility_cdf/scripts/vbc_visibility_acquisition_impl.py \
+  src/care_visibility_cdf/scripts/vbc_blocker_aware_acquisition_impl.py
 python3 - <<'PY'
 import xml.etree.ElementTree as ET
 for path in (
