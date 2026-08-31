@@ -718,9 +718,36 @@ class OptimizedTrajectoryContinuityNode:
         now = rospy.Time.now()
         continuation_to_publish = None
         timeout_event = None
+        gcdf_timeout_event = None
+        next_gcdf_to_publish = None
         continuation_age = math.nan
 
         with self._lock:
+            if (self._gcdf_outstanding is not None and
+                    self._gcdf_outstanding_sent is not None):
+                gcdf_age = (now - self._gcdf_outstanding_sent).to_sec()
+                if gcdf_age > self.final_gcdf_timeout_s:
+                    seq = int(self._gcdf_outstanding_seq)
+                    view = str(self._gcdf_outstanding_view)
+                    self._gcdf_outstanding = None
+                    self._gcdf_outstanding_sent = None
+                    self._gcdf_outstanding_seq = 0
+                    self._gcdf_outstanding_repair = False
+                    self._gcdf_outstanding_probe = False
+                    self._gcdf_outstanding_view = "none"
+                    self._final_gcdf_timeout_count += 1
+                    self._verification_timeout_count += 1
+                    self._verification_outcome_count += 1
+                    self._last_verification_seq = seq
+                    self._last_verification_result = "timeout"
+                    self._last_source = "final_gcdf_timeout_candidate_rejected"
+                    self._last_verification_age_s = gcdf_age
+                    self._last_verification_view = view
+                    gcdf_timeout_event = self._make_verification_event(
+                        seq, "timeout", False, gcdf_age, view,
+                        safety_gate="gcdf")
+                    next_gcdf_to_publish = self._dispatch_pending_locked(now)
+
             if self._outstanding is not None and self._outstanding_sent is not None:
                 age = (now - self._outstanding_sent).to_sec()
                 if age > self.verification_timeout_s:
@@ -759,6 +786,10 @@ class OptimizedTrajectoryContinuityNode:
                 continuation_to_publish, "committed_continuation", continuation_age)
         if timeout_event is not None:
             self.verification_event_pub.publish(timeout_event)
+        if gcdf_timeout_event is not None:
+            self.verification_event_pub.publish(gcdf_timeout_event)
+        if next_gcdf_to_publish is not None:
+            self.final_gcdf_query_pub.publish(next_gcdf_to_publish)
 
     def _publish_summary_locked(self):
         msg = String()
@@ -771,6 +802,16 @@ class OptimizedTrajectoryContinuityNode:
             "repair_active={}".format(int(self._repair_active)),
             "probe_active={}".format(int(self._probe_active)),
             "repair_prefix_enabled={}".format(int(self.repair_prefix_verification_enabled)),
+            "final_gcdf_outstanding={}".format(int(self._gcdf_outstanding is not None)),
+            "final_gcdf_outstanding_seq={}".format(int(self._gcdf_outstanding_seq)),
+            "final_gcdf_query_count={}".format(self._final_gcdf_query_count),
+            "final_gcdf_safe_count={}".format(self._final_gcdf_safe_count),
+            "final_gcdf_unsafe_count={}".format(self._final_gcdf_unsafe_count),
+            "final_gcdf_timeout_count={}".format(self._final_gcdf_timeout_count),
+            "final_gcdf_stamp_miss_count={}".format(self._final_gcdf_stamp_miss_count),
+            "final_gcdf_min_d={}".format(
+                "nan" if not math.isfinite(self._last_final_gcdf_min_d)
+                else "{:.6f}".format(self._last_final_gcdf_min_d)),
             "verification_outstanding={}".format(int(self._outstanding is not None)),
             "outstanding_seq={}".format(int(self._outstanding_seq)),
             "outstanding_view={}".format(self._outstanding_view),
