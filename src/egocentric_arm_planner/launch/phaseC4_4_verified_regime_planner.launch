@@ -54,6 +54,15 @@
   <arg name="committed_continuation_enabled" default="true" />
   <arg name="execution_audit_stream_enabled" default="false" />
 
+  <!-- C5.9 commit-pipeline serialization. Legacy C4.x remains transparent.
+       When enabled, raw planner candidates first pass a PROBE-only single-flight
+       gate before entering the final GCDF -> exact VBC -> commit pipeline. -->
+  <arg name="probe_single_flight_enabled" default="false" />
+  <arg name="commit_pipeline_candidate_topic"
+       default="$(arg raw_mpc_trajectory_topic)" />
+  <arg name="probe_single_flight_summary_topic"
+       default="/care_planner/execution/probe_single_flight_summary" />
+
   <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
   <arg name="use_local_sparse_scp" default="false" />
   <arg name="local_scp_query_trajectory_topic"
@@ -172,7 +181,20 @@
     <param name="progress/summary_topic" value="/care_planner/execution/nominal_progress_summary" />
   </node>
 
-  <!-- Serial candidate verifier and safe-plan commit memory. -->
+  <!-- C5.9 PROBE single-flight gate. Outside PROBE_NORMAL this node is a
+       transparent pass-through, so REPAIR can preempt task probing immediately. -->
+  <node if="$(arg probe_single_flight_enabled)"
+        pkg="egocentric_arm_planner" type="probe_single_flight_gate_node.py"
+        name="probe_single_flight_gate" output="screen">
+    <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
+    <param name="output_topic" value="$(arg commit_pipeline_candidate_topic)" />
+    <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
+    <param name="verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="tracker_summary_topic" value="/care_planner/execution/tracker_summary" />
+    <param name="summary_topic" value="$(arg probe_single_flight_summary_topic)" />
+  </node>
+
+  <!-- Serial executable safety gate and safe-plan commit memory. -->
   <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
         name="optimized_trajectory_continuity" output="screen">
     <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
