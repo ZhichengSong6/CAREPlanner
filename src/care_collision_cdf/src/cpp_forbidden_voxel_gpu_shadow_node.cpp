@@ -1000,36 +1000,58 @@ class CppForbiddenVoxelGpuShadow {
 
   void timerCallback(const ros::TimerEvent&) {
     const auto pipeline_t0 = Clock::now();
+    const ros::Time now = ros::Time::now();
 
     sensor_msgs::PointCloud2ConstPtr anchor_cloud;
     ros::Time anchor_received;
     std::shared_ptr<MapIndex> map;
+    bool final_channel = false;
+
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      anchor_cloud = latest_anchor_cloud_;
-      anchor_received = latest_anchor_received_;
       map = latest_map_;
+      if (!map || (now - map->received).toSec() > map_stale_s_) {
+        return;
+      }
+
+      // Final executable audits are safety-critical and therefore have
+      // priority over local-SCP geometry queries. The two channels keep
+      // independent latest/processed slots, so neither can overwrite the
+      // other's request while still sharing the same GPU connection.
+      if (latest_final_anchor_cloud_ &&
+          latest_final_anchor_cloud_->header.stamp !=
+              last_processed_final_anchor_stamp_ &&
+          (now - latest_final_anchor_received_).toSec() <= anchor_stale_s_) {
+        final_channel = true;
+        anchor_cloud = latest_final_anchor_cloud_;
+        anchor_received = latest_final_anchor_received_;
+        last_processed_final_anchor_stamp_ = anchor_cloud->header.stamp;
+      } else if (
+          latest_anchor_cloud_ &&
+          latest_anchor_cloud_->header.stamp != last_processed_anchor_stamp_ &&
+          (now - latest_anchor_received_).toSec() <= anchor_stale_s_) {
+        final_channel = false;
+        anchor_cloud = latest_anchor_cloud_;
+        anchor_received = latest_anchor_received_;
+        last_processed_anchor_stamp_ = anchor_cloud->header.stamp;
+      }
     }
 
     if (!anchor_cloud || !map) {
       return;
     }
-
-    const ros::Time now = ros::Time::now();
-    if ((now - anchor_received).toSec() > anchor_stale_s_ ||
-        (now - map->received).toSec() > map_stale_s_) {
+    if ((now - anchor_received).toSec() > anchor_stale_s_) {
       return;
     }
-
-    if (anchor_cloud->header.stamp == last_processed_anchor_stamp_) {
-      return;
-    }
-    last_processed_anchor_stamp_ = anchor_cloud->header.stamp;
 
     const auto decode_t0 = Clock::now();
     std::vector<Anchor> anchors = decodeAnchors(*anchor_cloud);
     const auto decode_t1 = Clock::now();
     if (anchors.empty()) {
+      ROS_WARN_STREAM_THROTTLE(
+          1.0,
+          "[C5.8 C++] empty anchor decode channel="
+              << (final_channel ? "final" : "local"));
       return;
     }
 
@@ -1040,9 +1062,8 @@ class CppForbiddenVoxelGpuShadow {
         anchors, *map, &raw_pair_count, &active_step_count);
     const auto selection_t1 = Clock::now();
 
-    // A safe query trajectory can legitimately have zero nearby forbidden
-    // voxels. That is not a transport failure: publish an explicit empty batch
-    // so the SCP may solve its objective-only local step and query again.
+    // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
+    // miss. This is especially important for the final executable gate.
     if (pairs.empty()) {
       ResponseHeader empty_gpu{};
       const double pipeline_ms =
@@ -1050,6 +1071,7 @@ class CppForbiddenVoxelGpuShadow {
       const double selection_ms =
           msBetween(selection_t0, selection_t1);
       publishConstraintBatch(
+          final_channel,
           anchor_cloud->header,
           pairs,
           std::vector<float>{},
@@ -1059,9 +1081,24 @@ class CppForbiddenVoxelGpuShadow {
           0.0,
           empty_gpu,
           pipeline_ms);
-      ROS_INFO_THROTTLE(
+      publishSummary(
+          final_channel,
+          0,
+          0,
+          std::numeric_limits<double>::quiet_NaN(),
+          0.0,
+          msBetween(decode_t0, decode_t1),
+          selection_ms,
+          0.0,
+          0.0,
+          empty_gpu,
+          pipeline_ms,
+          map->build_ms);
+      ROS_INFO_STREAM_THROTTLE(
           1.0,
-          "[C5.2h C++] zero nearby forbidden pairs -> published empty constraint batch");
+          "[C5.8 C++] zero nearby forbidden pairs channel="
+              << (final_channel ? "final" : "local")
+              << " -> explicit empty batch");
       return;
     }
 
@@ -1080,8 +1117,10 @@ class CppForbiddenVoxelGpuShadow {
             &gradient,
             &ipc_ms,
             &gpu)) {
-      ROS_WARN_THROTTLE(
-          1.0, "[C5.2h C++] GPU query failed");
+      ROS_WARN_STREAM_THROTTLE(
+          1.0,
+          "[C5.8 C++] GPU query failed channel="
+              << (final_channel ? "final" : "local"));
       return;
     }
 
@@ -1106,6 +1145,7 @@ class CppForbiddenVoxelGpuShadow {
         static_cast<double>(distance.size());
 
     publishConstraintBatch(
+        final_channel,
         anchor_cloud->header,
         pairs,
         distance,
@@ -1133,6 +1173,7 @@ class CppForbiddenVoxelGpuShadow {
         pipeline_ms);
 
     publishSummary(
+        final_channel,
         pairs.size(),
         active_step_count,
         d_stats.min,
@@ -1147,7 +1188,8 @@ class CppForbiddenVoxelGpuShadow {
 
     ROS_INFO_STREAM_THROTTLE(
         1.0,
-        "[C5.2h C++] pairs=" << pairs.size()
+        "[C5.8 C++] channel=" << (final_channel ? "final" : "local")
+        << " pairs=" << pairs.size()
         << " pipeline=" << pipeline_ms << " ms"
         << " selection=" << selection_ms << " ms"
         << " ipc=" << ipc_ms << " ms"
@@ -1162,9 +1204,12 @@ class CppForbiddenVoxelGpuShadow {
   ros::NodeHandle pnh_;
 
   std::string anchor_topic_;
+  std::string final_anchor_topic_;
   std::string map_topic_;
   std::string summary_topic_;
+  std::string final_summary_topic_;
   std::string constraint_batch_topic_;
+  std::string final_constraint_batch_topic_;
   std::string output_jsonl_;
   std::string gpu_socket_;
 
@@ -1190,22 +1235,29 @@ class CppForbiddenVoxelGpuShadow {
   std::size_t grid_size_ = 0;
 
   ros::Subscriber anchor_sub_;
+  ros::Subscriber final_anchor_sub_;
   ros::Subscriber map_sub_;
   ros::Publisher summary_pub_;
+  ros::Publisher final_summary_pub_;
   ros::Publisher constraint_batch_pub_;
+  ros::Publisher final_constraint_batch_pub_;
   ros::Timer timer_;
 
   mutable std::mutex mutex_;
   sensor_msgs::PointCloud2ConstPtr latest_anchor_cloud_;
   ros::Time latest_anchor_received_;
+  sensor_msgs::PointCloud2ConstPtr latest_final_anchor_cloud_;
+  ros::Time latest_final_anchor_received_;
   std::shared_ptr<MapIndex> latest_map_;
   ros::Time last_processed_anchor_stamp_;
+  ros::Time last_processed_final_anchor_stamp_;
 
   std::vector<float> best_clearance_;
 
   int gpu_fd_ = -1;
   std::size_t record_index_ = 0;
   std::size_t constraint_batch_publish_count_ = 0;
+  std::size_t final_constraint_batch_publish_count_ = 0;
 };
 
 }  // namespace care_collision_cdf
