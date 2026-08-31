@@ -115,6 +115,9 @@ class C44VerifiedRegimeManager:
         self.task_infeasible_topic = str(rospy.get_param(
             "~task_infeasible_topic",
             "/care_planner/local_planner/task_infeasible"))
+        self.task_uncertified_topic = str(rospy.get_param(
+            "~task_uncertified_topic",
+            "/care_planner/local_planner/task_uncertified"))
 
         self.state = self.NORMAL
         self.execution_ready = False
@@ -151,6 +154,8 @@ class C44VerifiedRegimeManager:
         self.execution_repair_entry_count = 0
         self.task_infeasible_repair_entry_count = 0
         self.task_infeasible_pending = False
+        self.task_uncertified_repair_entry_count = 0
+        self.task_uncertified_pending = False
 
         # C4.7: a stale latched True from a previous acquisition episode must not
         # immediately clear a newly-entered REPAIR.  Each episode arms only after
@@ -195,6 +200,9 @@ class C44VerifiedRegimeManager:
             queue_size=1)
         rospy.Subscriber(
             self.task_infeasible_topic, Bool, self._task_infeasible_cb,
+            queue_size=10)
+        rospy.Subscriber(
+            self.task_uncertified_topic, Bool, self._task_uncertified_cb,
             queue_size=10)
         if self.repair_completion_gate_enabled:
             rospy.Subscriber(
@@ -286,6 +294,12 @@ class C44VerifiedRegimeManager:
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible_after_gate_release",
                     self.execution_ready_time)
+            elif self.task_uncertified_pending and self.state == self.NORMAL:
+                self.task_uncertified_pending = False
+                self.task_uncertified_repair_entry_count += 1
+                self._transition_locked(
+                    self.REPAIR, "task_planner_uncertified_after_gate_release",
+                    self.execution_ready_time)
 
     def _task_infeasible_cb(self, msg):
         if msg is None or not bool(msg.data):
@@ -315,6 +329,36 @@ class C44VerifiedRegimeManager:
             else:
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible", now)
+
+    def _task_uncertified_cb(self, msg):
+        if msg is None or not bool(msg.data):
+            return
+        now = rospy.Time.now()
+        with self._lock:
+            # "Uncertified" is deliberately distinct from mathematical
+            # infeasibility. It means PIQP exhausted its iteration budget and
+            # therefore did not provide a hard-GCDF-certified task candidate.
+            # Safety takes priority over task progress, so NORMAL/PROBE both
+            # fall back to REPAIR while preserving the numerical diagnosis.
+            if self.state not in (self.NORMAL, self.PROBE_NORMAL):
+                return
+
+            if not self.execution_ready:
+                if self.state == self.NORMAL:
+                    self.task_uncertified_pending = True
+                    self.last_transition_reason = "task_planner_uncertified_pending"
+                return
+
+            self.task_uncertified_pending = False
+            self.task_uncertified_repair_entry_count += 1
+
+            if self.state == self.PROBE_NORMAL:
+                self.probe_failure_count += 1
+                self._transition_locked(
+                    self.REPAIR, "task_probe_uncertified", now)
+            else:
+                self._transition_locked(
+                    self.REPAIR, "task_planner_uncertified", now)
 
     def _deadline_cb(self, msg):
         if msg is None:
@@ -522,6 +566,10 @@ class C44VerifiedRegimeManager:
                     self.task_infeasible_repair_entry_count),
                 "task_infeasible_pending={}".format(
                     int(self.task_infeasible_pending)),
+                "task_uncertified_repair_entry_count={}".format(
+                    self.task_uncertified_repair_entry_count),
+                "task_uncertified_pending={}".format(
+                    int(self.task_uncertified_pending)),
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
