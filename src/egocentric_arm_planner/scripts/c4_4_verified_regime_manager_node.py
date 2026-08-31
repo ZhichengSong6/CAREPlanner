@@ -595,7 +595,8 @@ class C44VerifiedRegimeManager:
                     self.NORMAL, "probe_normal_completed_prefixes", now)
             else:
                 self.last_transition_reason = (
-                    "probe_prefix_execution_complete_seq_{}".format(seq))
+                    "probe_prefix_execution_complete_stamp_{}".format(
+                        execution_stamp_ns))
                 request_next_probe = True
 
         if request_next_probe:
