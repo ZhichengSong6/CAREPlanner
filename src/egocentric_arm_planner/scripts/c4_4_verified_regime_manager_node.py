@@ -321,6 +321,11 @@ class C44VerifiedRegimeManager:
                 self.candidate_repair_entry_count += 1
         elif new_state == self.PROBE_NORMAL:
             self.probe_entry_count += 1
+            # The REPAIR episode is complete only after its obligations are
+            # gone. Locally clear the waypoint-active latch so a stale final
+            # q_vis publication from that episode cannot authorize a future
+            # PROBE->REPAIR transition.
+            self.visibility_waypoint_active = False
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
