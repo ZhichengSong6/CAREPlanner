@@ -282,6 +282,10 @@ class C44VerifiedRegimeManager:
         old = self.state
         self.state = new_state
         self.last_transition_reason = reason
+        # Blocker rediscovery is a PROBE-only fail-closed substate. Any real
+        # regime transition terminates that substate.
+        self.blocker_rediscovery_pending = False
+        self.blocker_rediscovery_origin = "none"
 
         # Publish planner modes immediately on transition so subscribers cannot
         # race against stale REPAIR/PROBE state before the next 20 Hz timer tick.
@@ -346,6 +350,9 @@ class C44VerifiedRegimeManager:
                 self.pending_probe_execution_stamp_ns = 0
                 self.repair_completion = False
                 self.repair_completion_armed = False
+                self.blocker_rediscovery_pending = False
+                self.blocker_rediscovery_origin = "none"
+                self.force_vbc_bootstrap_pub.publish(Bool(data=False))
                 self.clear_until = None
                 self.probe_ignore_until = None
                 self.last_transition_reason = "execution_not_ready"
