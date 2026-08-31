@@ -267,6 +267,12 @@
            value="/care_planner/local_planner/task_infeasible" />
     <param name="task_uncertified_topic"
            value="/care_planner/local_planner/task_uncertified" />
+    <param name="visibility_waypoint_active_topic"
+           value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="candidate_vbc_summary_topic"
+           value="$(arg candidate_vbc_summary_topic)" />
+    <param name="force_vbc_bootstrap_topic"
+           value="/care_planner/trajectory_risk/force_bootstrap" />
     <param name="summary_topic" value="$(arg regime_summary_topic)" />
   </node>
 
