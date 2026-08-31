@@ -451,7 +451,9 @@ class OptimizedTrajectoryContinuityNode:
             self._publish_summary_locked()
 
     def _dispatch_pending_locked(self, now):
-        if self._outstanding is not None or self._pending_raw is None:
+        if (self._gcdf_outstanding is not None or
+                self._outstanding is not None or
+                self._pending_raw is None):
             return None
 
         raw = self._pending_raw
@@ -487,15 +489,17 @@ class OptimizedTrajectoryContinuityNode:
         self._next_verification_seq += 1
         candidate.header.seq = seq
         candidate.header.stamp = now
-        self._outstanding = copy.deepcopy(candidate)
-        self._outstanding_sent = now
-        self._outstanding_seq = seq
-        self._outstanding_dispatch_cycle = self._selector_cycle_count
-        self._outstanding_repair = bool(pending_repair)
-        self._outstanding_probe = bool(pending_probe)
-        self._outstanding_view = view
-        self._verification_publish_count += 1
-        self._last_source = "candidate_sent_on_selector_cycle_boundary"
+
+        # C5.7: audit the exact executable view against learned GCDF first.
+        # Only this same stamped trajectory may proceed to exact VBC and commit.
+        self._gcdf_outstanding = copy.deepcopy(candidate)
+        self._gcdf_outstanding_sent = now
+        self._gcdf_outstanding_seq = seq
+        self._gcdf_outstanding_repair = bool(pending_repair)
+        self._gcdf_outstanding_probe = bool(pending_probe)
+        self._gcdf_outstanding_view = view
+        self._final_gcdf_query_count += 1
+        self._last_source = "candidate_sent_to_final_gcdf"
         self._last_verification_view = view
         self._publish_summary_locked()
         return candidate
