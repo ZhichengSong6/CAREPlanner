@@ -212,6 +212,10 @@
     <param name="clear_topic" value="$(arg recovery_clear_topic)" />
     <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
     <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
+    <param name="task_infeasible_topic"
+           value="/care_planner/local_planner/task_infeasible" />
+    <param name="task_uncertified_topic"
+           value="/care_planner/local_planner/task_uncertified" />
     <param name="summary_topic" value="$(arg regime_summary_topic)" />
   </node>
 
@@ -285,6 +289,10 @@
            value="$(arg local_scp_candidate_trajectory_topic)" />
     <param name="local_planner/summary_topic"
            value="$(arg local_scp_summary_topic)" />
+    <param name="local_planner/task_infeasible_topic"
+           value="/care_planner/local_planner/task_infeasible" />
+    <param name="local_planner/task_uncertified_topic"
+           value="/care_planner/local_planner/task_uncertified" />
     <param name="local_planner/force_vbc_bootstrap_topic"
            value="/care_planner/trajectory_risk/force_bootstrap" />
   </node>
