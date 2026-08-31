@@ -327,6 +327,25 @@ digest["execution_vbc"] = {
     "last": exe[-1] if exe else None,
 }
 
+local = R["local_planner_summary.csv"]
+digest["task_failure_slack_diagnostics"] = [
+    {
+        "t": r.get("_t"),
+        "plan_seq": r.get("plan_seq"),
+        "probe": r.get("probe"),
+        "solved": r.get("solved"),
+        "status": r.get("status"),
+        "cdf_rows": r.get("cdf_rows"),
+        "min_d": r.get("min_d"),
+        "max_slack": r.get("max_slack"),
+        "mean_slack": r.get("mean_slack"),
+        "primal": r.get("primal"),
+        "dual": r.get("dual"),
+    }
+    for r in local
+    if r.get("event") == "task_failure_slack_diagnostic"
+]
+
 # Collect exception/error evidence from the compact log tails.
 err_pat = re.compile(r"(Traceback|Exception|ERROR|FATAL|timer callback exception|stamp_miss|timeout)", re.I)
 errors = {}
