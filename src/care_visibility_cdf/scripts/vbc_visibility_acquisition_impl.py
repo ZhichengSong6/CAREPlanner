@@ -314,15 +314,25 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
     def _publish_state(self) -> None:
         if not self._c47_ready:
             return
-        obligations = self._ordered_obligations()
-        active = len(obligations) > 0
-        a = Bool(); a.data = active; self.active_pub.publish(a)
-        if obligations:
-            q = np.asarray(obligations[0]["q_vis"], dtype=np.float64)
-            self.waypoint_pub.publish(_vector_msg(q))
-            # Plumbing timestamp only; not a REPAIR deadline.
-            d = Float64(); d.data = rospy.Time.now().to_sec() + 1.0
-            self.deadline_pub.publish(d)
+
+        # Use the same publication lock as _publish_schedule so the periodic
+        # state publisher cannot interleave its waypoint/deadline pair with a
+        # callback-driven schedule snapshot.
+        with self._schedule_publish_lock:
+            obligations = self._ordered_obligations()
+            active = len(obligations) > 0
+            a = Bool()
+            a.data = active
+            self.active_pub.publish(a)
+            if obligations:
+                q_snapshot = np.asarray(
+                    obligations[0]["q_vis"], dtype=np.float64).reshape(7).copy()
+                deadline_snapshot = float(rospy.Time.now().to_sec() + 1.0)
+                self.waypoint_pub.publish(_vector_msg(q_snapshot))
+                # Plumbing timestamp only; not a REPAIR deadline.
+                d = Float64()
+                d.data = deadline_snapshot
+                self.deadline_pub.publish(d)
 
         msg = String()
         msg.data = (
