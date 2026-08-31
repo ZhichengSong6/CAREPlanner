@@ -198,6 +198,7 @@ class C44VerifiedRegimeManager:
         self.visibility_waypoint_active = False
         self.blocker_rediscovery_pending = False
         self.blocker_rediscovery_origin = "none"
+        self.blocker_rediscovery_force_bootstrap = False
         self.blocker_rediscovery_count = 0
         self.blocker_rediscovery_vbc_unsafe_count = 0
         self.blocker_rediscovery_vbc_safe_count = 0
@@ -286,6 +287,9 @@ class C44VerifiedRegimeManager:
         # regime transition terminates that substate.
         self.blocker_rediscovery_pending = False
         self.blocker_rediscovery_origin = "none"
+        if self.blocker_rediscovery_force_bootstrap:
+            self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+        self.blocker_rediscovery_force_bootstrap = False
 
         # Publish planner modes immediately on transition so subscribers cannot
         # race against stale REPAIR/PROBE state before the next 20 Hz timer tick.
@@ -352,6 +356,7 @@ class C44VerifiedRegimeManager:
                 self.repair_completion_armed = False
                 self.blocker_rediscovery_pending = False
                 self.blocker_rediscovery_origin = "none"
+                self.blocker_rediscovery_force_bootstrap = False
                 self.force_vbc_bootstrap_pub.publish(Bool(data=False))
                 self.clear_until = None
                 self.probe_ignore_until = None
@@ -371,18 +376,26 @@ class C44VerifiedRegimeManager:
                     self.REPAIR, "task_planner_uncertified_after_gate_release",
                     self.execution_ready_time)
 
-    def _begin_blocker_rediscovery_locked(self, origin):
-        """Fail closed in PROBE while VBC discovers a real sensing obligation."""
+    def _begin_blocker_rediscovery_locked(
+            self, origin, force_bootstrap=True):
+        """Fail closed in PROBE until a real visibility obligation exists.
+
+        Numerical task-QP failures need task-bootstrap VBC rediscovery.
+        Exact-VBC rejection already carries a VBC active set, while final-GCDF
+        rejection now exports the exact low-confidence voxels from the rejected
+        executable trajectory.  Those latter two paths must not replace their
+        stronger evidence with a guessed task-bootstrap blocker.
+        """
         self.blocker_rediscovery_pending = True
         self.blocker_rediscovery_origin = str(origin)
+        self.blocker_rediscovery_force_bootstrap = bool(force_bootstrap)
         self.blocker_rediscovery_count += 1
         self.pending_probe_candidate_seq = 0
         self.pending_probe_execution_stamp_ns = 0
         self.last_transition_reason = (
             "{}_wait_visibility_obligation".format(origin))
-        # Force the candidate VBC selector to audit the task/bootstrap
-        # trajectory rather than any stale failed PROBE prediction.
-        self.force_vbc_bootstrap_pub.publish(Bool(data=True))
+        self.force_vbc_bootstrap_pub.publish(
+            Bool(data=bool(force_bootstrap)))
 
     def _visibility_waypoint_active_cb(self, msg):
         if msg is None:
@@ -397,8 +410,12 @@ class C44VerifiedRegimeManager:
                 return
 
             origin = self.blocker_rediscovery_origin
+            force_bootstrap = self.blocker_rediscovery_force_bootstrap
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
+            self.blocker_rediscovery_force_bootstrap = False
+            if force_bootstrap:
+                self.force_vbc_bootstrap_pub.publish(Bool(data=False))
             if "uncertified" in origin:
                 self.task_uncertified_repair_entry_count += 1
             elif "infeasible" in origin:
@@ -422,6 +439,7 @@ class C44VerifiedRegimeManager:
         clear_bootstrap = False
         with self._lock:
             if (not self.blocker_rediscovery_pending or
+                    not self.blocker_rediscovery_force_bootstrap or
                     self.state != self.PROBE_NORMAL):
                 return
 
@@ -437,6 +455,7 @@ class C44VerifiedRegimeManager:
             self.blocker_rediscovery_vbc_safe_count += 1
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
+            self.blocker_rediscovery_force_bootstrap = False
             self.last_transition_reason = (
                 "probe_no_visibility_blocker_after_solver_failure_replan")
             request_replan = True
@@ -667,12 +686,23 @@ class C44VerifiedRegimeManager:
                     self.probe_failure_count += 1
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
-                    self._transition_locked(
-                        self.REPAIR,
+
+                    origin = (
                         "final_gcdf_probe_unsafe"
                         if safety_gate == "gcdf"
-                        else "candidate_probe_unique_unsafe",
-                        now)
+                        else "candidate_probe_unique_unsafe")
+
+                    # C5.12 invariant:
+                    #   PROBE -> REPAIR only after q_vis/obligation is active.
+                    # Exact VBC already emitted an active set. Final GCDF now
+                    # emits its own earliest rejected low-confidence voxels.
+                    if (self.repair_completion_gate_enabled and
+                            not self.visibility_waypoint_active):
+                        self._begin_blocker_rediscovery_locked(
+                            origin, force_bootstrap=False)
+                    else:
+                        self._transition_locked(
+                            self.REPAIR, origin, now)
                     return
 
                 if (result == "timeout" and
@@ -891,6 +921,8 @@ class C44VerifiedRegimeManager:
                     int(self.blocker_rediscovery_pending)),
                 "blocker_rediscovery_origin={}".format(
                     self.blocker_rediscovery_origin),
+                "blocker_rediscovery_force_bootstrap={}".format(
+                    int(self.blocker_rediscovery_force_bootstrap)),
                 "blocker_rediscovery_count={}".format(
                     self.blocker_rediscovery_count),
                 "blocker_rediscovery_vbc_unsafe_count={}".format(
