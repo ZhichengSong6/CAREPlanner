@@ -388,7 +388,6 @@ class OptimizedTrajectoryContinuityNode:
             hold.time_from_start = rospy.Duration(t)
             out.points.append(hold)
 
-        self._repair_prefix_build_count += 1
         self._last_repair_prefix_duration_s = prefix_t
         self._last_repair_brake_duration_s = max(
             0.0, t - self.repair_hold_s - brake_start)
@@ -443,6 +442,7 @@ class OptimizedTrajectoryContinuityNode:
                 return None
             if pending_repair:
                 view = "repair_prefix_brake_hold"
+                self._repair_prefix_build_count += 1
             else:
                 view = "probe_prefix_brake_hold"
                 self._probe_prefix_build_count += 1
