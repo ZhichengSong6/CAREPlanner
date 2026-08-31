@@ -49,6 +49,7 @@ private:
     int screened_safe_rows = 0;
     int skipped_step0_rows = 0;
     int skipped_horizon_rows = 0;
+    int skipped_safety_horizon_rows = 0;
     double qlin_error_inf = 0.0;
     double min_distance = 0.0;
     double max_slack = 0.0;
@@ -68,6 +69,7 @@ private:
   void singleWaypointQCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void recoveryCallback(const std_msgs::BoolConstPtr& msg);
+  void probeActiveCallback(const std_msgs::BoolConstPtr& msg);
   void replanRequestCallback(const std_msgs::BoolConstPtr& msg);
   void executedCommandCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
@@ -114,6 +116,7 @@ private:
       const Eigen::VectorXd& previous_command,
       const std::vector<DeadlineWaypoint>& schedule,
       bool repair_mode,
+      bool probe_mode,
       double trust_radius,
       double slack_linear_weight) const;
 
@@ -148,6 +151,7 @@ private:
   ros::Subscriber single_waypoint_active_sub_;
   ros::Subscriber single_waypoint_q_sub_;
   ros::Subscriber recovery_sub_;
+  ros::Subscriber probe_active_sub_;
   ros::Subscriber replan_request_sub_;
   ros::Subscriber executed_command_sub_;
   ros::Subscriber execution_summary_sub_;
@@ -177,6 +181,7 @@ private:
   bool has_joint_state_ = false;
   bool has_reference_ = false;
   bool repair_mode_ = false;
+  bool probe_mode_ = false;
   bool plan_requested_ = false;
   std::string plan_request_reason_ = "none";
   ros::Time last_plan_finish_time_;
@@ -202,6 +207,7 @@ private:
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
   bool plan_repair_mode_ = false;
+  bool plan_probe_mode_ = false;
   std::string plan_initialization_mode_ = "task_reference";
 
   // One CDF batch per SCP iterate. The callback only hands ownership to the
@@ -266,6 +272,9 @@ private:
   double cdf_slack_tolerance_ = 5e-3;
   bool cdf_safe_row_screening_ = true;
   double cdf_linearization_tolerance_inf_ = 1e-4;
+  // Unknown/low-confidence CDF is enforced over the actually executable
+  // prefix in REPAIR/PROBE. NORMAL keeps the full planning horizon.
+  int cdf_constraint_horizon_steps_ = 20;
 
   int piqp_max_iterations_ = 100;
   double piqp_eps_abs_ = 1e-5;
@@ -288,6 +297,8 @@ private:
       "/care_planner/active_sensing/visibility_waypoint_q";
   std::string recovery_topic_ =
       "/care_planner/execution/predicted_vbc_recovery_triggered";
+  std::string probe_active_topic_ =
+      "/care_planner/c4_4/probe_active";
   std::string replan_request_topic_ =
       "/care_planner/local_planner/replan_request";
   std::string executed_command_topic_ =
