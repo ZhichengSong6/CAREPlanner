@@ -17,11 +17,13 @@ resumed.  Spatial proximity alone never causes preemption.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Dict, List
 
 import numpy as np
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import Float64MultiArray, String
+from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
 
@@ -41,6 +43,22 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._process_attempt_count = 0
         self._process_success_count = 0
         self._last_process_reason = "startup"
+
+        # C5.12 direct final-GCDF recovery evidence.  A rejected executable
+        # trajectory can expose low-confidence voxels that the task-bootstrap
+        # VBC does not report (notably braking-tail sweep).  Keep this evidence
+        # on a separate persistent channel and convert it into ordinary
+        # visibility obligations using the same VisCDF projector.
+        self._gcdf_recovery_lock = threading.Lock()
+        self._gcdf_recovery_trajectory = None
+        self._gcdf_recovery_trajectory_received = None
+        self._pending_gcdf_recovery_event = None
+        self._processed_gcdf_recovery_seq = 0
+        self._gcdf_recovery_event_count = 0
+        self._gcdf_recovery_generated_count = 0
+        self._gcdf_recovery_match_count = 0
+        self._gcdf_recovery_drop_count = 0
+        self._last_gcdf_recovery_reason = "startup"
         super().__init__()
 
         self.blocker_push_max_sweep_s = float(rospy.get_param(
@@ -50,6 +68,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
             "/care_planner/active_sensing/blocker_stack_summary"))
+        self.gcdf_recovery_trajectory_topic = str(rospy.get_param(
+            "~gcdf_recovery_trajectory_topic",
+            "/care_planner/final_gcdf/recovery_trajectory"))
+        self.gcdf_recovery_event_topic = str(rospy.get_param(
+            "~gcdf_recovery_event_topic",
+            "/care_planner/final_gcdf/recovery_visibility_event"))
         if self.blocker_push_max_sweep_s <= 0.0:
             raise ValueError("~blocker_push_max_sweep_s must be positive")
         if self.blocker_confirmations < 1:
@@ -57,6 +81,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
+        self.gcdf_recovery_trajectory_sub = rospy.Subscriber(
+            self.gcdf_recovery_trajectory_topic, JointTrajectory,
+            self._gcdf_recovery_trajectory_cb, queue_size=1)
+        self.gcdf_recovery_event_sub = rospy.Subscriber(
+            self.gcdf_recovery_event_topic, Float64MultiArray,
+            self._gcdf_recovery_event_cb, queue_size=1)
         self._c49_ready = True
         self._prune_or_initialize_stack()
         self._publish_schedule()
@@ -64,6 +94,174 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         rospy.logwarn(
             "[vbc_blocker_stack] C4.9 ENABLED max_blocker_sweep=%.3fs confirmations=%d",
             self.blocker_push_max_sweep_s, self.blocker_confirmations)
+
+    def _gcdf_recovery_trajectory_cb(self, msg) -> None:
+        if msg is None or not msg.points:
+            return
+        with self._gcdf_recovery_lock:
+            self._gcdf_recovery_trajectory = msg
+            self._gcdf_recovery_trajectory_received = rospy.Time.now()
+
+    def _gcdf_recovery_event_cb(self, msg) -> None:
+        if msg is None:
+            return
+        values = list(msg.data)
+        if len(values) < 4:
+            self._gcdf_recovery_drop_count += 1
+            self._last_gcdf_recovery_reason = "malformed_short_event"
+            return
+
+        try:
+            seq = int(round(float(values[0])))
+            sweep_s = float(values[1])
+            timestep = int(round(float(values[2])))
+            count = int(round(float(values[3])))
+        except Exception:
+            self._gcdf_recovery_drop_count += 1
+            self._last_gcdf_recovery_reason = "malformed_header"
+            return
+
+        if (seq <= 0 or not math.isfinite(sweep_s) or sweep_s < 0.0 or
+                timestep < 0 or count <= 0 or len(values) != 4 + 3 * count):
+            self._gcdf_recovery_drop_count += 1
+            self._last_gcdf_recovery_reason = "malformed_shape"
+            return
+
+        points = np.asarray(values[4:], dtype=np.float64).reshape(count, 3)
+        if not np.all(np.isfinite(points)):
+            self._gcdf_recovery_drop_count += 1
+            self._last_gcdf_recovery_reason = "nonfinite_points"
+            return
+
+        with self._gcdf_recovery_lock:
+            if seq <= self._processed_gcdf_recovery_seq:
+                self._last_gcdf_recovery_reason = "stale_processed_event"
+                return
+            self._pending_gcdf_recovery_event = {
+                "seq": seq,
+                "sweep_s": sweep_s,
+                "timestep": timestep,
+                "points": points.copy(),
+            }
+            self._gcdf_recovery_event_count += 1
+            self._last_gcdf_recovery_reason = "event_pending"
+
+        # A fresh hard-GCDF blocker defines a new acquisition episode even
+        # before q_vis generation finishes.  This makes the current latched
+        # completion state truthful while the regime manager remains fail-closed.
+        with self._obligation_lock:
+            no_obligations = len(self._obligations) == 0
+        if self._acquisition_complete and no_obligations:
+            self._acquisition_started = True
+            self._acquisition_complete = False
+            self._visibility_episode_reopen_count += 1
+            self.acquisition_complete_pub.publish(
+                __import__("std_msgs.msg", fromlist=["Bool"]).Bool(data=False))
+            rospy.logwarn(
+                "[vbc_blocker_stack] FINAL-GCDF blocker reopens acquisition "
+                "episode seq=%d count=%d sweep=%.3fs",
+                seq, count, sweep_s)
+
+    def _process_gcdf_recovery_event(self) -> None:
+        with self._gcdf_recovery_lock:
+            event = (
+                None if self._pending_gcdf_recovery_event is None
+                else dict(self._pending_gcdf_recovery_event))
+            trajectory = self._gcdf_recovery_trajectory
+            trajectory_received = self._gcdf_recovery_trajectory_received
+
+        if event is None:
+            return
+        seq = int(event["seq"])
+        if seq <= self._processed_gcdf_recovery_seq:
+            with self._gcdf_recovery_lock:
+                self._pending_gcdf_recovery_event = None
+            self._last_gcdf_recovery_reason = "already_processed"
+            return
+        if trajectory is None or not trajectory.points:
+            self._last_gcdf_recovery_reason = "waiting_recovery_trajectory"
+            return
+        if int(getattr(trajectory.header, "seq", 0)) != seq:
+            self._last_gcdf_recovery_reason = "waiting_matching_recovery_trajectory"
+            return
+        if self._latest_measured_q is None:
+            self._last_gcdf_recovery_reason = "waiting_measured_q"
+            return
+
+        points = np.asarray(event["points"], dtype=np.float64).reshape(-1, 3)
+        sweep_s = float(event["sweep_s"])
+        regions = self._cluster_regions(points)
+        active_ids: List[int] = []
+        new_ids: List[int] = []
+        all_regions_handled = True
+
+        for region in regions:
+            with self._obligation_lock:
+                matched = self._match_existing(region)
+                if matched is not None:
+                    matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
+                    matched["points"] = np.asarray(
+                        region["points"], dtype=np.float64).copy()
+                    matched["keys"] = tuple(region["keys"])
+                    matched["centroid"] = np.asarray(
+                        region["centroid"], dtype=np.float64).copy()
+                    active_ids.append(int(matched["id"]))
+                    self._schedule_matched_obligations += 1
+                    self._gcdf_recovery_match_count += 1
+                    continue
+                if len(self._obligations) >= self.max_obligations:
+                    all_regions_handled = False
+                    self._last_gcdf_recovery_reason = "max_obligations"
+                    continue
+
+            try:
+                new_ob = self._generate_new_obligation(
+                    region,
+                    trajectory,
+                    sweep_s,
+                    trajectory_received,
+                    "final_gcdf_rejected")
+            except Exception as exc:
+                self._schedule_generation_failures += 1
+                all_regions_handled = False
+                self._last_gcdf_recovery_reason = "generation_failed"
+                rospy.logerr(
+                    "[vbc_blocker_stack] final-GCDF obligation generation "
+                    "failed seq=%d: %s", seq, exc)
+                continue
+
+            with self._obligation_lock:
+                matched = self._match_existing(region)
+                if matched is None and len(self._obligations) < self.max_obligations:
+                    self._obligations.append(new_ob)
+                    self._schedule_new_obligations += 1
+                    oid = int(new_ob["id"])
+                    active_ids.append(oid)
+                    new_ids.append(oid)
+                    self._gcdf_recovery_generated_count += 1
+                    rospy.logwarn(
+                        "[vbc_blocker_stack] FINAL-GCDF ADD obligation=%d "
+                        "seq=%d points=%d sweep=%.3fs",
+                        oid, seq, len(region["points"]), sweep_s)
+                elif matched is not None:
+                    active_ids.append(int(matched["id"]))
+                    self._gcdf_recovery_match_count += 1
+
+        if not all_regions_handled:
+            return
+
+        with self._gcdf_recovery_lock:
+            self._processed_gcdf_recovery_seq = max(
+                self._processed_gcdf_recovery_seq, seq)
+            if (self._pending_gcdf_recovery_event is not None and
+                    int(self._pending_gcdf_recovery_event["seq"]) == seq):
+                self._pending_gcdf_recovery_event = None
+        self._last_gcdf_recovery_reason = "handled"
+
+        self._prune_or_initialize_stack()
+        self._consider_active_layer(active_ids, new_ids, sweep_s)
+        self._publish_schedule()
+        self._publish_blocker_stack_summary()
 
     def _prune_or_initialize_stack(self) -> None:
         with self._obligation_lock:
@@ -165,6 +363,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._pending_blocker_count = 0
 
     def _process_new_active_set(self) -> None:
+        if self._c49_ready:
+            self._process_gcdf_recovery_event()
         if not self._c49_ready:
             self._last_process_reason = "not_ready"
             return
@@ -289,6 +489,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" raw_active_set_serial={self._raw_active_set_serial}"
             f" processed_active_set_serial={self._processed_active_set_serial}"
             f" process_reason={self._last_process_reason}"
+            f" gcdf_recovery_event_count={self._gcdf_recovery_event_count}"
+            f" gcdf_recovery_generated_count={self._gcdf_recovery_generated_count}"
+            f" gcdf_recovery_match_count={self._gcdf_recovery_match_count}"
+            f" gcdf_recovery_drop_count={self._gcdf_recovery_drop_count}"
+            f" gcdf_recovery_processed_seq={self._processed_gcdf_recovery_seq}"
+            f" gcdf_recovery_reason={self._last_gcdf_recovery_reason}"
             f" switch_reason={self._last_switch_reason}"
         )
         self.blocker_stack_summary_pub.publish(msg)
