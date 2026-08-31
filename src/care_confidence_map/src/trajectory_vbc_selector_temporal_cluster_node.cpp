@@ -749,6 +749,18 @@ private:
     target_msg.point.z = representative.point_base.z();
     target_pub_.publish(target_msg);
 
+    // Publish the active-set identity before its sweep timestamp.  The online
+    // waypoint node intentionally clears its cached sweep whenever the active
+    // set changes.  Publishing sweep first therefore creates a transport race:
+    // the following active-set callback can erase the fresh sweep and delay or
+    // suppress obligation generation.  active_set -> sweep makes one coherent
+    // rediscovery transaction even on the first observation of a new blocker.
+    std::vector<const Candidate*> active_points;
+    active_points.reserve(active_layer.member_indices.size());
+    for (const int idx : active_layer.member_indices)
+      active_points.push_back(&candidates[static_cast<std::size_t>(idx)]);
+    publishActiveSet(active_points);
+
     // The steering deadline is tied to the earliest point in the active layer.
     std_msgs::Float32 sweep_msg;
     sweep_msg.data = static_cast<float>(active_layer.min_sweep_time_s);
@@ -766,11 +778,6 @@ private:
         : -std::numeric_limits<float>::infinity();
     selected_margin_pub_.publish(margin_msg);
 
-    std::vector<const Candidate*> active_points;
-    active_points.reserve(active_layer.member_indices.size());
-    for (const int idx : active_layer.member_indices)
-      active_points.push_back(&candidates[static_cast<std::size_t>(idx)]);
-    publishActiveSet(active_points);
     publishCandidateActive(true);
 
     int violation_count = 0;
