@@ -169,6 +169,7 @@ class OptimizedTrajectoryContinuityNode:
         self._gcdf_outstanding_repair = False
         self._gcdf_outstanding_probe = False
         self._gcdf_outstanding_view = "none"
+        self._gcdf_outstanding_raw_received = None
 
         self._outstanding = None
         self._outstanding_sent = None
@@ -177,6 +178,7 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_repair = False
         self._outstanding_probe = False
         self._outstanding_view = "none"
+        self._outstanding_raw_received = None
         self._next_verification_seq = 1
 
         self._committed_master = None
@@ -220,6 +222,13 @@ class OptimizedTrajectoryContinuityNode:
         self._last_verification_result = "none"
         self._last_verification_view = "none"
         self._last_execution_stamp_ns = 0
+
+        # C5.13 stage timing (wall-clock durations measured by ROS time in the
+        # same process, reported in milliseconds).
+        self._last_raw_to_safety_dispatch_ms = math.nan
+        self._last_final_gcdf_roundtrip_ms = math.nan
+        self._last_exact_vbc_roundtrip_ms = math.nan
+        self._last_candidate_total_safety_pipeline_ms = math.nan
 
         self.final_gcdf_query_pub = rospy.Publisher(
             self.final_gcdf_query_topic, JointTrajectory, queue_size=1)
@@ -505,6 +514,7 @@ class OptimizedTrajectoryContinuityNode:
         self._pending_probe = False
 
         age = max(0.0, (now - raw_received).to_sec())
+        self._last_raw_to_safety_dispatch_ms = 1000.0 * age
         candidate = self._suffix_from_phase(raw, age)
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
@@ -538,6 +548,7 @@ class OptimizedTrajectoryContinuityNode:
             self._gcdf_outstanding_repair = bool(pending_repair)
             self._gcdf_outstanding_probe = bool(pending_probe)
             self._gcdf_outstanding_view = view
+            self._gcdf_outstanding_raw_received = raw_received
             self._final_gcdf_query_count += 1
             self._last_source = "candidate_sent_to_final_gcdf"
             self._last_verification_view = view
@@ -553,6 +564,7 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_repair = bool(pending_repair)
         self._outstanding_probe = bool(pending_probe)
         self._outstanding_view = view
+        self._outstanding_raw_received = raw_received
         self._verification_publish_count += 1
         self._last_source = "candidate_sent_directly_to_exact_vbc"
         self._last_verification_view = view
@@ -688,7 +700,9 @@ class OptimizedTrajectoryContinuityNode:
             was_repair = bool(self._gcdf_outstanding_repair)
             was_probe = bool(self._gcdf_outstanding_probe)
             view = str(self._gcdf_outstanding_view)
+            raw_received = self._gcdf_outstanding_raw_received
             age = max(0.0, (now - self._gcdf_outstanding_sent).to_sec())
+            self._last_final_gcdf_roundtrip_ms = 1000.0 * age
 
             self._gcdf_outstanding = None
             self._gcdf_outstanding_sent = None
@@ -696,6 +710,7 @@ class OptimizedTrajectoryContinuityNode:
             self._gcdf_outstanding_repair = False
             self._gcdf_outstanding_probe = False
             self._gcdf_outstanding_view = "none"
+            self._gcdf_outstanding_raw_received = None
 
             distances = [float(d) for d in msg.distance]
             finite_distances = [d for d in distances if math.isfinite(d)]
@@ -722,6 +737,7 @@ class OptimizedTrajectoryContinuityNode:
                 self._outstanding_repair = was_repair
                 self._outstanding_probe = was_probe
                 self._outstanding_view = view
+                self._outstanding_raw_received = raw_received
                 self._verification_publish_count += 1
                 self._last_source = "final_gcdf_safe_sent_to_exact_vbc"
                 verification_to_publish = copy.deepcopy(candidate)
@@ -737,6 +753,9 @@ class OptimizedTrajectoryContinuityNode:
                 self._last_verification_result = "unsafe"
                 self._last_verification_age_s = age
                 self._last_verification_view = view
+                if raw_received is not None:
+                    self._last_candidate_total_safety_pipeline_ms = (
+                        1000.0 * max(0.0, (now - raw_received).to_sec()))
                 self._last_source = "candidate_rejected_final_gcdf_unsafe"
 
                 (
@@ -816,6 +835,11 @@ class OptimizedTrajectoryContinuityNode:
                 else:
                     verification_age = max(
                         0.0, (now - self._outstanding_sent).to_sec())
+                    self._last_exact_vbc_roundtrip_ms = 1000.0 * verification_age
+                    raw_received = self._outstanding_raw_received
+                    if raw_received is not None:
+                        self._last_candidate_total_safety_pipeline_ms = (
+                            1000.0 * max(0.0, (now - raw_received).to_sec()))
                     candidate = copy.deepcopy(self._outstanding)
                     seq = int(self._outstanding_seq)
                     was_repair = bool(self._outstanding_repair)
@@ -828,6 +852,7 @@ class OptimizedTrajectoryContinuityNode:
                     self._outstanding_repair = False
                     self._outstanding_probe = False
                     self._outstanding_view = "none"
+                    self._outstanding_raw_received = None
                     self._last_verification_age_s = verification_age
                     self._last_verification_seq = seq
                     self._last_verification_view = view
@@ -907,12 +932,18 @@ class OptimizedTrajectoryContinuityNode:
                 if gcdf_age > self.final_gcdf_timeout_s:
                     seq = int(self._gcdf_outstanding_seq)
                     view = str(self._gcdf_outstanding_view)
+                    raw_received = self._gcdf_outstanding_raw_received
+                    if raw_received is not None:
+                        self._last_candidate_total_safety_pipeline_ms = (
+                            1000.0 * max(0.0, (now - raw_received).to_sec()))
+                    self._last_final_gcdf_roundtrip_ms = 1000.0 * gcdf_age
                     self._gcdf_outstanding = None
                     self._gcdf_outstanding_sent = None
                     self._gcdf_outstanding_seq = 0
                     self._gcdf_outstanding_repair = False
                     self._gcdf_outstanding_probe = False
                     self._gcdf_outstanding_view = "none"
+                    self._gcdf_outstanding_raw_received = None
                     self._final_gcdf_timeout_count += 1
                     self._verification_timeout_count += 1
                     self._verification_outcome_count += 1
@@ -935,6 +966,11 @@ class OptimizedTrajectoryContinuityNode:
                 if age > self.verification_timeout_s:
                     seq = int(self._outstanding_seq)
                     view = str(self._outstanding_view)
+                    raw_received = self._outstanding_raw_received
+                    self._last_exact_vbc_roundtrip_ms = 1000.0 * age
+                    if raw_received is not None:
+                        self._last_candidate_total_safety_pipeline_ms = (
+                            1000.0 * max(0.0, (now - raw_received).to_sec()))
                     self._outstanding = None
                     self._outstanding_sent = None
                     self._outstanding_seq = 0
@@ -942,6 +978,7 @@ class OptimizedTrajectoryContinuityNode:
                     self._outstanding_repair = False
                     self._outstanding_probe = False
                     self._outstanding_view = "none"
+                    self._outstanding_raw_received = None
                     self._verification_timeout_count += 1
                     self._verification_outcome_count += 1
                     self._last_verification_seq = seq
@@ -1061,6 +1098,20 @@ class OptimizedTrajectoryContinuityNode:
             "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
             "continuation_count={}".format(self._continuation_count),
+            "raw_to_safety_dispatch_ms={}".format(
+                "nan" if not math.isfinite(self._last_raw_to_safety_dispatch_ms)
+                else "{:.3f}".format(self._last_raw_to_safety_dispatch_ms)),
+            "final_gcdf_roundtrip_ms={}".format(
+                "nan" if not math.isfinite(self._last_final_gcdf_roundtrip_ms)
+                else "{:.3f}".format(self._last_final_gcdf_roundtrip_ms)),
+            "exact_vbc_roundtrip_ms={}".format(
+                "nan" if not math.isfinite(self._last_exact_vbc_roundtrip_ms)
+                else "{:.3f}".format(self._last_exact_vbc_roundtrip_ms)),
+            "candidate_total_safety_pipeline_ms={}".format(
+                "nan" if not math.isfinite(
+                    self._last_candidate_total_safety_pipeline_ms)
+                else "{:.3f}".format(
+                    self._last_candidate_total_safety_pipeline_ms)),
             "verification_age_s={}".format(
                 "nan" if not math.isfinite(self._last_verification_age_s)
                 else "{:.6f}".format(self._last_verification_age_s)),
