@@ -149,8 +149,10 @@ class C44VerifiedRegimeManager:
         self.last_commit_event_time = None
         self.probe_safe_commit_streak = 0
         self.probe_completed_execution_count = 0
-        self.pending_probe_execution_seq = 0
+        self.pending_probe_candidate_seq = 0
+        self.pending_probe_execution_stamp_ns = 0
         self.last_tracker_complete_seq = 0
+        self.last_tracker_complete_stamp_ns = 0
         self.repair_safe_commit_count = 0
 
         self.repair_entry_count = 0
@@ -256,7 +258,7 @@ class C44VerifiedRegimeManager:
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
             self.probe_safe_commit_streak = 0
-            self.pending_probe_execution_seq = 0
+            self.pending_probe_candidate_seq = 0
             self.clear_until = None
             self.probe_ignore_until = None
             self.repair_completion = False
@@ -272,13 +274,13 @@ class C44VerifiedRegimeManager:
         elif new_state == self.PROBE_NORMAL:
             self.probe_entry_count += 1
             self.probe_safe_commit_streak = 0
-            self.pending_probe_execution_seq = 0
+            self.pending_probe_candidate_seq = 0
             self.clear_until = now + rospy.Duration(self.clear_pulse_s)
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
             self.normal_entry_count += 1
             self.probe_safe_commit_streak = 0
-            self.pending_probe_execution_seq = 0
+            self.pending_probe_candidate_seq = 0
             self.clear_until = None
             self.probe_ignore_until = None
 
@@ -298,7 +300,7 @@ class C44VerifiedRegimeManager:
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
                 self.probe_safe_commit_streak = 0
-                self.pending_probe_execution_seq = 0
+                self.pending_probe_candidate_seq = 0
                 self.repair_completion = False
                 self.repair_completion_armed = False
                 self.clear_until = None
@@ -489,7 +491,7 @@ class C44VerifiedRegimeManager:
                         verification_view == "probe_prefix_brake_hold"):
                     self.last_commit_count += 1
                     self.last_commit_event_time = now
-                    self.pending_probe_execution_seq = seq
+                    self.pending_probe_candidate_seq = seq
                     self.last_transition_reason = (
                         "safe_probe_commit_wait_execution_seq_{}".format(seq))
                     return
@@ -503,7 +505,7 @@ class C44VerifiedRegimeManager:
                             now < self.probe_ignore_until):
                         return
                     self.probe_failure_count += 1
-                    self.pending_probe_execution_seq = 0
+                    self.pending_probe_candidate_seq = 0
                     self._transition_locked(
                         self.REPAIR, "candidate_probe_unique_unsafe", now)
                     return
@@ -512,7 +514,7 @@ class C44VerifiedRegimeManager:
                         verification_view == "probe_prefix_brake_hold"):
                     # Timeout is not evidence that active sensing is required;
                     # stay in PROBE, fail closed, and request a fresh candidate.
-                    self.pending_probe_execution_seq = 0
+                    self.pending_probe_candidate_seq = 0
                     self.last_transition_reason = "probe_candidate_timeout_replan"
                     self.replan_request_pub.publish(Bool(data=True))
                     return
@@ -537,14 +539,14 @@ class C44VerifiedRegimeManager:
 
             if self.state != self.PROBE_NORMAL:
                 return
-            if self.pending_probe_execution_seq <= 0:
+            if self.pending_probe_candidate_seq <= 0:
                 return
-            if seq != self.pending_probe_execution_seq:
+            if seq != self.pending_probe_candidate_seq:
                 # Exact sequence matching rejects stale completion edges from
                 # the previous REPAIR episode or an older replaced trajectory.
                 return
 
-            self.pending_probe_execution_seq = 0
+            self.pending_probe_candidate_seq = 0
             self.probe_safe_commit_streak += 1
             self.probe_completed_execution_count += 1
 
@@ -671,7 +673,7 @@ class C44VerifiedRegimeManager:
                 "probe_completed_execution_count={}".format(
                     self.probe_completed_execution_count),
                 "pending_probe_execution_seq={}".format(
-                    self.pending_probe_execution_seq),
+                    self.pending_probe_candidate_seq),
                 "last_tracker_complete_seq={}".format(
                     self.last_tracker_complete_seq),
                 "normal_entry_count={}".format(self.normal_entry_count),
