@@ -90,6 +90,8 @@ class OptimizedTrajectoryContinuityNode:
             "~continuation_enabled", False))
         self.execution_audit_enabled = bool(rospy.get_param(
             "~execution_audit_enabled", False))
+        self.execution_audit_post_hold_s = float(rospy.get_param(
+            "~execution_audit_post_hold_s", 0.15))
         self.continuation_start_delay_s = float(rospy.get_param(
             "~continuation_start_delay_s", 0.065))
         self.continuation_timeout_s = float(rospy.get_param(
@@ -129,6 +131,8 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~verification_timeout_s must be positive")
         if self.final_gcdf_enabled and self.final_gcdf_timeout_s <= 0.0:
             raise ValueError("~final_gcdf_timeout_s must be positive")
+        if self.execution_audit_post_hold_s < 0.0:
+            raise ValueError("~execution_audit_post_hold_s must be non-negative")
         if self.final_gcdf_stamp_tolerance_s <= 0.0:
             raise ValueError("~final_gcdf_stamp_tolerance_s must be positive")
         if self.repair_execution_prefix_s <= 0.0:
@@ -778,6 +782,8 @@ class OptimizedTrajectoryContinuityNode:
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         continuation_to_publish = None
+        execution_audit_to_publish = None
+        execution_audit_age = math.nan
         timeout_event = None
         gcdf_timeout_event = None
         next_gcdf_to_publish = None
@@ -836,6 +842,18 @@ class OptimizedTrajectoryContinuityNode:
                     timeout_event = self._make_verification_event(
                         seq, "timeout", False, age, view)
 
+            if (self.execution_audit_enabled and
+                    self._committed_master is not None and
+                    self._committed_received is not None):
+                execution_audit_age = (
+                    now - self._committed_received).to_sec()
+                master_duration = self._duration(self._committed_master)
+                if (0.0 <= execution_audit_age <=
+                        master_duration + self.execution_audit_post_hold_s):
+                    execution_audit_to_publish = self._suffix_from_phase(
+                        self._committed_master,
+                        min(execution_audit_age, master_duration))
+
             if (self.continuation_enabled and
                     self._committed_master is not None and
                     self._committed_received is not None):
@@ -849,6 +867,11 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_committed_age_s = continuation_age
             self._publish_summary_locked()
 
+        if execution_audit_to_publish is not None:
+            self.execution_audit_pub.publish(execution_audit_to_publish)
+            with self._lock:
+                self._execution_audit_publish_count += 1
+                self._publish_summary_locked()
         if continuation_to_publish is not None:
             self._publish_committed(
                 continuation_to_publish, "committed_continuation", continuation_age)
