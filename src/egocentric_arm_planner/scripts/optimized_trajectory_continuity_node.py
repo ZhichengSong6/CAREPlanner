@@ -34,7 +34,7 @@ import threading
 
 import rospy
 from care_collision_cdf.msg import CollisionCDFConstraintBatch
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 
@@ -78,6 +78,12 @@ class OptimizedTrajectoryContinuityNode:
         self.final_gcdf_batch_topic = str(rospy.get_param(
             "~final_gcdf_batch_topic",
             "/care_planner/final_gcdf/constraint_batch"))
+        self.final_gcdf_recovery_trajectory_topic = str(rospy.get_param(
+            "~final_gcdf_recovery_trajectory_topic",
+            "/care_planner/final_gcdf/recovery_trajectory"))
+        self.final_gcdf_recovery_event_topic = str(rospy.get_param(
+            "~final_gcdf_recovery_event_topic",
+            "/care_planner/final_gcdf/recovery_visibility_event"))
         self.repair_active_topic = str(rospy.get_param(
             "~repair_active_topic",
             "/care_planner/execution/predicted_vbc_recovery_triggered"))
@@ -183,6 +189,12 @@ class OptimizedTrajectoryContinuityNode:
         self._final_gcdf_timeout_count = 0
         self._final_gcdf_stamp_miss_count = 0
         self._last_final_gcdf_min_d = math.nan
+        self._final_gcdf_recovery_event_count = 0
+        self._final_gcdf_recovery_event_drop_count = 0
+        self._last_final_gcdf_recovery_seq = 0
+        self._last_final_gcdf_recovery_timestep = -1
+        self._last_final_gcdf_recovery_sweep_s = math.nan
+        self._last_final_gcdf_recovery_point_count = 0
         self._verification_publish_count = 0
         self._verification_safe_count = 0
         self._verification_unsafe_count = 0
@@ -211,6 +223,12 @@ class OptimizedTrajectoryContinuityNode:
 
         self.final_gcdf_query_pub = rospy.Publisher(
             self.final_gcdf_query_topic, JointTrajectory, queue_size=1)
+        self.final_gcdf_recovery_trajectory_pub = rospy.Publisher(
+            self.final_gcdf_recovery_trajectory_topic,
+            JointTrajectory, queue_size=1, latch=True)
+        self.final_gcdf_recovery_event_pub = rospy.Publisher(
+            self.final_gcdf_recovery_event_topic,
+            Float64MultiArray, queue_size=1, latch=True)
         self.verification_pub = rospy.Publisher(
             self.verification_topic, JointTrajectory, queue_size=1)
         self.committed_pub = rospy.Publisher(
@@ -574,6 +592,74 @@ class OptimizedTrajectoryContinuityNode:
             self._verification_timeout_count, self._commit_count)
         return msg
 
+    def _build_final_gcdf_recovery_evidence(
+            self, candidate, seq, batch, distances):
+        """Extract the earliest real low-confidence blocker from final GCDF.
+
+        The final-GCDF batch already contains the low-confidence voxel point
+        paired with each executable body anchor.  When the exact executable
+        prefix+brake+hold is rejected, use the earliest violated timestep as
+        active-sensing evidence instead of guessing from the nominal task VBC.
+        """
+        unsafe = []
+        for i, d in enumerate(distances):
+            if (not math.isfinite(d) or
+                    d >= self.final_gcdf_safety_margin or
+                    i >= len(batch.original_timestep)):
+                continue
+            k = int(batch.original_timestep[i])
+            unsafe.append((k, i))
+        if not unsafe:
+            return None, None
+
+        earliest = min(k for k, _ in unsafe)
+        if earliest < 0 or earliest >= len(candidate.points):
+            return None, None
+
+        sweep_s = float(
+            candidate.points[earliest].time_from_start.to_sec())
+        if not math.isfinite(sweep_s) or sweep_s < 0.0:
+            return None, None
+
+        points = []
+        seen = set()
+        for k, i in unsafe:
+            if k != earliest:
+                continue
+            j = 3 * i
+            if j + 2 >= len(batch.point_flat):
+                continue
+            p = (
+                float(batch.point_flat[j]),
+                float(batch.point_flat[j + 1]),
+                float(batch.point_flat[j + 2]),
+            )
+            if not all(math.isfinite(v) for v in p):
+                continue
+            # Exact float identity is enough here because all points originate
+            # from the same confidence-map voxel centers.
+            if p in seen:
+                continue
+            seen.add(p)
+            points.append(p)
+
+        if not points:
+            return None, None
+
+        traj = copy.deepcopy(candidate)
+        traj.header.seq = int(seq)
+
+        event = Float64MultiArray()
+        event.data = [
+            float(seq),
+            float(sweep_s),
+            float(earliest),
+            float(len(points)),
+        ]
+        for p in points:
+            event.data.extend([float(p[0]), float(p[1]), float(p[2])])
+        return traj, event
+
     def _final_gcdf_batch_cb(self, msg):
         if msg is None:
             return
@@ -582,6 +668,8 @@ class OptimizedTrajectoryContinuityNode:
         verification_to_publish = None
         next_gcdf_to_publish = None
         event_to_publish = None
+        gcdf_recovery_trajectory_to_publish = None
+        gcdf_recovery_event_to_publish = None
 
         with self._lock:
             if (self._gcdf_outstanding is None or
@@ -650,6 +738,22 @@ class OptimizedTrajectoryContinuityNode:
                 self._last_verification_age_s = age
                 self._last_verification_view = view
                 self._last_source = "candidate_rejected_final_gcdf_unsafe"
+
+                (
+                    gcdf_recovery_trajectory_to_publish,
+                    gcdf_recovery_event_to_publish,
+                ) = self._build_final_gcdf_recovery_evidence(
+                    candidate, seq, msg, distances)
+                if gcdf_recovery_event_to_publish is not None:
+                    self._final_gcdf_recovery_event_count += 1
+                    self._last_final_gcdf_recovery_seq = seq
+                    data = list(gcdf_recovery_event_to_publish.data)
+                    self._last_final_gcdf_recovery_sweep_s = float(data[1])
+                    self._last_final_gcdf_recovery_timestep = int(round(data[2]))
+                    self._last_final_gcdf_recovery_point_count = int(round(data[3]))
+                else:
+                    self._final_gcdf_recovery_event_drop_count += 1
+
                 event_to_publish = self._make_verification_event(
                     seq, "unsafe", False, age, view, safety_gate="gcdf")
                 dispatched, route = self._dispatch_pending_locked(now)
@@ -660,6 +764,12 @@ class OptimizedTrajectoryContinuityNode:
 
             self._publish_summary_locked()
 
+        if gcdf_recovery_trajectory_to_publish is not None:
+            self.final_gcdf_recovery_trajectory_pub.publish(
+                gcdf_recovery_trajectory_to_publish)
+        if gcdf_recovery_event_to_publish is not None:
+            self.final_gcdf_recovery_event_pub.publish(
+                gcdf_recovery_event_to_publish)
         if verification_to_publish is not None:
             self.verification_pub.publish(verification_to_publish)
         if event_to_publish is not None:
@@ -903,6 +1013,19 @@ class OptimizedTrajectoryContinuityNode:
             "final_gcdf_unsafe_count={}".format(self._final_gcdf_unsafe_count),
             "final_gcdf_timeout_count={}".format(self._final_gcdf_timeout_count),
             "final_gcdf_stamp_miss_count={}".format(self._final_gcdf_stamp_miss_count),
+            "final_gcdf_recovery_event_count={}".format(
+                self._final_gcdf_recovery_event_count),
+            "final_gcdf_recovery_event_drop_count={}".format(
+                self._final_gcdf_recovery_event_drop_count),
+            "last_final_gcdf_recovery_seq={}".format(
+                self._last_final_gcdf_recovery_seq),
+            "last_final_gcdf_recovery_timestep={}".format(
+                self._last_final_gcdf_recovery_timestep),
+            "last_final_gcdf_recovery_sweep_s={}".format(
+                "nan" if not math.isfinite(self._last_final_gcdf_recovery_sweep_s)
+                else "{:.6f}".format(self._last_final_gcdf_recovery_sweep_s)),
+            "last_final_gcdf_recovery_point_count={}".format(
+                self._last_final_gcdf_recovery_point_count),
             "final_gcdf_min_d={}".format(
                 "nan" if not math.isfinite(self._last_final_gcdf_min_d)
                 else "{:.6f}".format(self._last_final_gcdf_min_d)),
