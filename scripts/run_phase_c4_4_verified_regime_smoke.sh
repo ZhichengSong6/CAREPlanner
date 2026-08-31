@@ -80,6 +80,13 @@ if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
 else
   COMMIT_PIPELINE_CANDIDATE_TOPIC="${RAW_PLANNER_TOPIC}"
 fi
+
+if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ] && \
+   [ "${COMMIT_PIPELINE_CANDIDATE_TOPIC}" = "${RAW_PLANNER_TOPIC}" ]; then
+  echo "[ERROR] PROBE single-flight enabled but commit pipeline still bypasses gate" >&2
+  exit 2
+fi
+
 VERIFY_TOPIC="/care_planner/optimized_trajectory"
 COMMITTED_TOPIC="/care_planner/committed_trajectory"
 CANDIDATE_VBC_TOPIC="/care_planner/candidate_vbc/summary"
@@ -362,6 +369,10 @@ execution_audit_enabled=${RUNTIME_EXEC_AUDIT}
 execution_vbc_trajectory_topic=${EXECUTION_VBC_TRAJECTORY_TOPIC}
 probe_single_flight_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
 probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
+probe_single_flight_input_topic=${RAW_PLANNER_TOPIC}
+probe_single_flight_output_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+continuity_input_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPELINE_CANDIDATE_TOPIC}" ] && echo 1 || echo 0)
 probe_repair_requires_visibility_obligation=true
 probe_solver_failure_uses_blocker_rediscovery=true
 probe_vbc_unsafe_uses_blocker_rediscovery=true
