@@ -185,7 +185,7 @@ import sys
 stage, repo, case_id = sys.argv[1:4]
 run = os.path.join(stage, "run")
 logs = os.path.join(stage, "logs")
-TOK = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+TOK = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 def records(name):
     path = os.path.join(run, name)
