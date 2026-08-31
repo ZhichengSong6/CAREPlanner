@@ -47,25 +47,6 @@
   <arg name="gated_local_candidate_topic"
        default="/care_planner/local_planner/candidate_trajectory_execution_gated" />
 
-  <!-- C5.9: PROBE is strictly single-flight. A second task candidate cannot
-       replace a PROBE prefix while that prefix is still being safety-verified
-       or executed. Leaving PROBE immediately clears the gate so REPAIR can
-       preempt for safety. NORMAL/REPAIR remain transparent passthrough. -->
-  <node pkg="egocentric_arm_planner"
-        type="probe_single_flight_gate_node.py"
-        name="probe_single_flight_gate"
-        output="screen">
-    <param name="input_topic" value="$(arg raw_local_candidate_topic)" />
-    <param name="output_topic" value="$(arg gated_local_candidate_topic)" />
-    <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
-    <param name="verification_outcome_topic"
-           value="/care_planner/verification_outcome" />
-    <param name="tracker_summary_topic"
-           value="/care_planner/execution/tracker_summary" />
-    <param name="summary_topic"
-           value="/care_planner/execution/probe_single_flight_summary" />
-  </node>
-
   <include file="$(find egocentric_arm_planner)/launch/phaseC4_4_verified_regime_planner.launch">
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
@@ -99,9 +80,12 @@
     <arg name="execution_vbc_trajectory_topic"
          value="/care_planner/execution/audit_trajectory" />
     <arg name="raw_mpc_trajectory_topic"
+         value="$(arg raw_local_candidate_topic)" />
+    <arg name="probe_single_flight_enabled" value="true" />
+    <arg name="commit_pipeline_candidate_topic"
          value="$(arg gated_local_candidate_topic)" />
     <arg name="trajectory_risk_input_topic"
-         value="$(arg gated_local_candidate_topic)" />
+         value="$(arg raw_local_candidate_topic)" />
     <arg name="local_scp_candidate_trajectory_topic"
          value="$(arg raw_local_candidate_topic)" />
 
