@@ -722,6 +722,7 @@ class CppForbiddenVoxelGpuShadow {
   }
 
   void appendJsonRecord(
+      bool final_channel,
       const ros::Time& anchor_stamp,
       const MapIndex& map,
       std::size_t anchor_count,
@@ -794,6 +795,8 @@ class CppForbiddenVoxelGpuShadow {
     out << std::setprecision(17);
     out << "{";
     out << "\"record_index\":" << record_index_ << ",";
+    out << "\"channel\":\""
+        << (final_channel ? "final" : "local") << "\",";
     out << "\"wall_time\":" << ros::WallTime::now().toSec() << ",";
     out << "\"anchor_cloud_stamp\":" << anchor_stamp.toSec() << ",";
     out << "\"map_cloud_stamp\":" << map.stamp.toSec() << ",";
@@ -1157,6 +1160,7 @@ class CppForbiddenVoxelGpuShadow {
         pipeline_ms);
 
     appendJsonRecord(
+        final_channel,
         anchor_cloud->header.stamp,
         *map,
         anchors.size(),
