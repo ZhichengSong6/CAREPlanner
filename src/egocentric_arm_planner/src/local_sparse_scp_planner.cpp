@@ -1587,7 +1587,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
 
   piqp::SparseSolver<double> solver;
   auto& settings = solver.settings();
-  settings.max_iter = piqp_max_iterations_;
+  settings.max_iter =
+      force_diagnostic_slack
+          ? std::max(piqp_max_iterations_, 1000)
+          : piqp_max_iterations_;
   settings.eps_abs = piqp_eps_abs_;
   settings.eps_rel = piqp_eps_rel_;
   settings.verbose = piqp_verbose_;
