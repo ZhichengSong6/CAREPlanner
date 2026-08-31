@@ -512,9 +512,10 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
 
   if (rising && repair_mode_) {
     requestPlanLocked("repair_trajectory_complete");
-  } else if (rising && probe_mode_) {
-    requestPlanLocked("probe_trajectory_complete");
   }
+  // PROBE_NORMAL replanning is owned by the regime manager and is released
+  // only after tracker complete=1 for the exact committed trajectory seq.
+  // Do not use a bare complete edge here: it can belong to the previous mode.
 }
 
 void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
