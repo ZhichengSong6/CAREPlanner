@@ -150,6 +150,10 @@ class CppForbiddenVoxelGpuShadow {
         anchor_topic_,
         "/care_planner/trajectory_risk/body_sweep_anchors");
     pnh_.param<std::string>(
+        "final_anchor_topic",
+        final_anchor_topic_,
+        "/care_planner/final_gcdf/body_sweep_anchors");
+    pnh_.param<std::string>(
         "map_topic",
         map_topic_,
         "/care_planner/confidence_map/points");
@@ -161,6 +165,14 @@ class CppForbiddenVoxelGpuShadow {
         "constraint_batch_topic",
         constraint_batch_topic_,
         "/care_planner/collision_cdf/constraint_batch");
+    pnh_.param<std::string>(
+        "final_summary_topic",
+        final_summary_topic_,
+        "/care_planner/final_gcdf/selector_summary");
+    pnh_.param<std::string>(
+        "final_constraint_batch_topic",
+        final_constraint_batch_topic_,
+        "/care_planner/final_gcdf/constraint_batch");
     pnh_.param<std::string>(
         "output_jsonl",
         output_jsonl_,
@@ -226,12 +238,20 @@ class CppForbiddenVoxelGpuShadow {
 
     summary_pub_ = nh_.advertise<std_msgs::String>(
         summary_topic_, 10);
+    final_summary_pub_ = nh_.advertise<std_msgs::String>(
+        final_summary_topic_, 10);
     constraint_batch_pub_ =
         nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
             constraint_batch_topic_, 2);
+    final_constraint_batch_pub_ =
+        nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
+            final_constraint_batch_topic_, 2);
     anchor_sub_ = nh_.subscribe(
         anchor_topic_, 1,
         &CppForbiddenVoxelGpuShadow::anchorCallback, this);
+    final_anchor_sub_ = nh_.subscribe(
+        final_anchor_topic_, 1,
+        &CppForbiddenVoxelGpuShadow::finalAnchorCallback, this);
     map_sub_ = nh_.subscribe(
         map_topic_, 1,
         &CppForbiddenVoxelGpuShadow::mapCallback, this);
@@ -247,7 +267,9 @@ class CppForbiddenVoxelGpuShadow {
         << " proximity_margin=" << proximity_margin_
         << " max_pairs_per_step=" << max_pairs_per_step_
         << " socket=" << gpu_socket_
-        << " constraint_batch_topic=" << constraint_batch_topic_);
+        << " local_batch_topic=" << constraint_batch_topic_
+        << " final_anchor_topic=" << final_anchor_topic_
+        << " final_batch_topic=" << final_constraint_batch_topic_);
   }
 
   ~CppForbiddenVoxelGpuShadow() {
@@ -289,6 +311,12 @@ class CppForbiddenVoxelGpuShadow {
     std::lock_guard<std::mutex> lock(mutex_);
     latest_anchor_cloud_ = msg;
     latest_anchor_received_ = ros::Time::now();
+  }
+
+  void finalAnchorCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_final_anchor_cloud_ = msg;
+    latest_final_anchor_received_ = ros::Time::now();
   }
 
   void mapCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
