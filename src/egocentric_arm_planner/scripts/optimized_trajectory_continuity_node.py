@@ -658,12 +658,19 @@ class OptimizedTrajectoryContinuityNode:
         if not points:
             return None, None
 
+        # Correlate the rejected executable and its blocker event by the
+        # exact executable header.stamp.  Header.seq is retained only as a
+        # human-readable diagnostic; ROS topic ordering / stale seq values must
+        # not be the transaction identity.
         traj = copy.deepcopy(candidate)
         traj.header.seq = int(seq)
+        stamp = traj.header.stamp
 
         event = Float64MultiArray()
         event.data = [
             float(seq),
+            float(stamp.secs),
+            float(stamp.nsecs),
             float(sweep_s),
             float(earliest),
             float(len(points)),
@@ -767,9 +774,9 @@ class OptimizedTrajectoryContinuityNode:
                     self._final_gcdf_recovery_event_count += 1
                     self._last_final_gcdf_recovery_seq = seq
                     data = list(gcdf_recovery_event_to_publish.data)
-                    self._last_final_gcdf_recovery_sweep_s = float(data[1])
-                    self._last_final_gcdf_recovery_timestep = int(round(data[2]))
-                    self._last_final_gcdf_recovery_point_count = int(round(data[3]))
+                    self._last_final_gcdf_recovery_sweep_s = float(data[3])
+                    self._last_final_gcdf_recovery_timestep = int(round(data[4]))
+                    self._last_final_gcdf_recovery_point_count = int(round(data[5]))
                 else:
                     self._final_gcdf_recovery_event_drop_count += 1
 
