@@ -399,9 +399,13 @@ class C44VerifiedRegimeManager:
             origin = self.blocker_rediscovery_origin
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
+            if "uncertified" in origin:
+                self.task_uncertified_repair_entry_count += 1
+            elif "infeasible" in origin:
+                self.task_infeasible_repair_entry_count += 1
             self._transition_locked(
                 self.REPAIR,
-                "visibility_obligation_ready_after_{}".format(origin),
+                "{}_visibility_obligation_ready".format(origin),
                 now)
 
     def _candidate_vbc_summary_cb(self, msg):
@@ -463,7 +467,6 @@ class C44VerifiedRegimeManager:
 
             self.task_infeasible_pending = False
             self.task_uncertified_pending = False
-            self.task_infeasible_repair_entry_count += 1
 
             if self.state == self.PROBE_NORMAL:
                 self.probe_failure_count += 1
@@ -472,9 +475,11 @@ class C44VerifiedRegimeManager:
                     self._begin_blocker_rediscovery_locked(
                         "task_probe_infeasible")
                 else:
+                    self.task_infeasible_repair_entry_count += 1
                     self._transition_locked(
                         self.REPAIR, "task_probe_infeasible", now)
             else:
+                self.task_infeasible_repair_entry_count += 1
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible", now)
 
@@ -500,7 +505,6 @@ class C44VerifiedRegimeManager:
 
             self.task_uncertified_pending = False
             self.task_infeasible_pending = False
-            self.task_uncertified_repair_entry_count += 1
 
             if self.state == self.PROBE_NORMAL:
                 self.probe_failure_count += 1
@@ -509,9 +513,11 @@ class C44VerifiedRegimeManager:
                     self._begin_blocker_rediscovery_locked(
                         "task_probe_uncertified")
                 else:
+                    self.task_uncertified_repair_entry_count += 1
                     self._transition_locked(
                         self.REPAIR, "task_probe_uncertified", now)
             else:
+                self.task_uncertified_repair_entry_count += 1
                 self._transition_locked(
                     self.REPAIR, "task_planner_uncertified", now)
 
