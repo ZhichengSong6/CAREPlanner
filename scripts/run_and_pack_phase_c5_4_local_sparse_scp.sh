@@ -38,7 +38,7 @@ bash -n scripts/run_phase_c4_4_verified_regime_smoke.sh
 echo "[C5.4] branch: $(git branch --show-current)"
 echo "[C5.4] head:   $(git rev-parse HEAD)"
 echo "[C5.4] case:   ${CASE_ID}"
-echo "[C5.4] architecture: event-triggered Sparse SCP local planner -> exact VBC -> full-trajectory tracker"
+echo "[C5.8] architecture: Sparse SCP -> executable GCDF -> exact VBC -> single commit -> tracker"
 echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
@@ -60,6 +60,15 @@ source devel/setup.bash
 python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
   src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py
+python3 - <<'PY'
+import xml.etree.ElementTree as ET
+for path in (
+    "src/egocentric_arm_planner/launch/phaseC4_4_verified_regime_planner.launch",
+    "src/egocentric_arm_planner/launch/phaseC5_4_local_sparse_scp_planner.launch",
+):
+    ET.parse(path)
+print("[C5.8] Python + launch XML preflight passed")
+PY
 
 # Fail before launching the persistent GPU worker if a previous ROS/Gazebo
 # session is still alive. The common runner performs the same safety check,
