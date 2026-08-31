@@ -22,7 +22,7 @@ from typing import Dict, List
 
 import numpy as np
 import rospy
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
@@ -155,8 +155,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._acquisition_started = True
             self._acquisition_complete = False
             self._visibility_episode_reopen_count += 1
-            self.acquisition_complete_pub.publish(
-                __import__("std_msgs.msg", fromlist=["Bool"]).Bool(data=False))
+            self.acquisition_complete_pub.publish(Bool(data=False))
             rospy.logwarn(
                 "[vbc_blocker_stack] FINAL-GCDF blocker reopens acquisition "
                 "episode seq=%d count=%d sweep=%.3fs",
