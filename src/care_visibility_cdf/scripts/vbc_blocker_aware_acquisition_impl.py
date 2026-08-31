@@ -38,6 +38,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._last_active_layer_ids: List[int] = []
         self._last_active_layer_sweep_s = math.nan
         self._last_switch_reason = "startup"
+        self._process_attempt_count = 0
+        self._process_success_count = 0
+        self._last_process_reason = "startup"
         super().__init__()
 
         self.blocker_push_max_sweep_s = float(rospy.get_param(
@@ -163,23 +166,36 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
     def _process_new_active_set(self) -> None:
         if not self._c49_ready:
+            self._last_process_reason = "not_ready"
             return
         with self._obligation_lock:
             serial = self._raw_active_set_serial
-            if serial == self._processed_active_set_serial:
+            processed = self._processed_active_set_serial
+            if serial == processed:
+                self._last_process_reason = "duplicate_serial"
                 return
             raw = self._raw_active_set.copy()
+
+        self._process_attempt_count += 1
         if raw.shape[0] == 0:
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
+            self._last_process_reason = "empty_active_set"
             return
 
         with self._lock:
             sweep = self._sweep_time_s
             trajectory, trajectory_received, trajectory_source = (
                 self._preferred_trajectory_locked())
-        if sweep is None or trajectory is None or self._latest_measured_q is None:
+        if sweep is None:
+            self._last_process_reason = "waiting_sweep"
+            return
+        if trajectory is None:
+            self._last_process_reason = "waiting_trajectory"
+            return
+        if self._latest_measured_q is None:
+            self._last_process_reason = "waiting_measured_q"
             return
 
         regions = self._cluster_regions(raw)
@@ -228,6 +244,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
+            self._process_success_count += 1
+            self._last_process_reason = "handled"
+        else:
+            self._last_process_reason = "generation_failed"
         self._prune_or_initialize_stack()
         self._consider_active_layer(active_ids, new_ids, float(sweep))
         self._publish_schedule()
@@ -264,6 +284,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" push_count={self._stack_push_count}"
             f" pop_count={self._stack_pop_count}"
             f" cycle_block_count={self._stack_cycle_block_count}"
+            f" process_attempt_count={self._process_attempt_count}"
+            f" process_success_count={self._process_success_count}"
+            f" raw_active_set_serial={self._raw_active_set_serial}"
+            f" processed_active_set_serial={self._processed_active_set_serial}"
+            f" process_reason={self._last_process_reason}"
             f" switch_reason={self._last_switch_reason}"
         )
         self.blocker_stack_summary_pub.publish(msg)
