@@ -411,12 +411,27 @@ digest["timing"]["tracker_execution_ms"] = timing_stats(
     list(tracker_exec_by_stamp.values()))
 
 schedule_rows = R["waypoint_schedule_summary.csv"]
-digest["timing"]["q_vis_generation_last_ms"] = timing_stats([
+blocker_rows_for_timing = R["blocker_stack_summary.csv"]
+qvis_last_values = [
     as_float(r.get("q_vis_generation_last_ms")) for r in schedule_rows
-])
-digest["timing"]["q_vis_generation_max_ms_observed"] = timing_stats([
+]
+qvis_max_values = [
     as_float(r.get("q_vis_generation_max_ms")) for r in schedule_rows
-])
+]
+if not any(v is not None for v in qvis_last_values):
+    qvis_last_values = [
+        as_float(r.get("q_vis_generation_last_ms"))
+        for r in blocker_rows_for_timing
+    ]
+if not any(v is not None for v in qvis_max_values):
+    qvis_max_values = [
+        as_float(r.get("q_vis_generation_max_ms"))
+        for r in blocker_rows_for_timing
+    ]
+digest["timing"]["q_vis_generation_last_ms"] = timing_stats(
+    qvis_last_values)
+digest["timing"]["q_vis_generation_max_ms_observed"] = timing_stats(
+    qvis_max_values)
 
 # Acquisition elapsed is physical sensing/execution latency, not pure compute.
 # Record episode durations separately so they are never confused with planner
