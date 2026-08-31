@@ -68,8 +68,6 @@ class C44VerifiedRegimeManager:
         self.probe_completed_prefixes_required = int(rospy.get_param(
             "~probe_completed_prefixes_required", legacy_probe_required))
         self.input_timeout = float(rospy.get_param("~input_timeout", 0.25))
-        self.committed_trajectory_timeout = float(rospy.get_param(
-            "~committed_trajectory_timeout", 0.30))
         self.clear_pulse_s = float(rospy.get_param("~clear_pulse_s", 0.12))
         self.probe_ignore_s = float(rospy.get_param("~probe_ignore_s", 0.16))
 
@@ -85,7 +83,7 @@ class C44VerifiedRegimeManager:
             raise ValueError("unsafe streak requirements must be >= 1")
         if self.probe_completed_prefixes_required < 1:
             raise ValueError("probe_completed_prefixes_required must be >= 1")
-        if min(self.input_timeout, self.committed_trajectory_timeout,
+        if min(self.input_timeout,
                self.clear_pulse_s, self.probe_ignore_s) <= 0.0:
             raise ValueError("timeouts/pulses must be positive")
 
