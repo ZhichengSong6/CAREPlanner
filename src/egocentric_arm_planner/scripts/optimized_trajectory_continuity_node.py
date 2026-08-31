@@ -567,7 +567,9 @@ class OptimizedTrajectoryContinuityNode:
 
             distances = [float(d) for d in msg.distance]
             finite_distances = [d for d in distances if math.isfinite(d)]
-            malformed = len(finite_distances) != len(distances)
+            malformed = (
+                len(finite_distances) != len(distances) or
+                len(distances) != int(msg.num_pairs))
             min_d = min(finite_distances) if finite_distances else math.inf
             self._last_final_gcdf_min_d = min_d
 
@@ -578,6 +580,9 @@ class OptimizedTrajectoryContinuityNode:
 
             if gcdf_safe:
                 self._final_gcdf_safe_count += 1
+                # GCDF certifies the q-trajectory geometry; refresh only the
+                # epoch before exact VBC so its temporal audit starts now.
+                candidate.header.stamp = now
                 self._outstanding = candidate
                 self._outstanding_sent = now
                 self._outstanding_seq = seq
