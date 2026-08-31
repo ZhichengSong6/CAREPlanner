@@ -45,6 +45,11 @@
   <arg name="repair_brake_dt_s" default="0.05" />
   <arg name="repair_hold_s" default="0.10" />
 
+  <!-- Commit-pipeline capabilities. Legacy C4.x preserves its old behavior;
+       C5.4+ enables final executable GCDF and lets the full-trajectory tracker
+       own execution after a single commit publication. -->
+  <arg name="final_executable_gcdf_enabled" default="false" />
+  <arg name="committed_continuation_enabled" default="true" />
 
   <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
   <arg name="use_local_sparse_scp" default="false" />
@@ -173,11 +178,14 @@
     <param name="global_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
     <param name="summary_topic" value="/care_planner/optimized_trajectory_summary" />
     <param name="verification_event_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="final_gcdf_enabled"
+           value="$(arg final_executable_gcdf_enabled)" />
     <param name="final_gcdf_query_topic"
            value="/care_planner/final_gcdf/query_trajectory" />
     <param name="final_gcdf_batch_topic"
            value="/care_planner/final_gcdf/constraint_batch" />
-    <param name="continuation_enabled" value="false" />
+    <param name="continuation_enabled"
+           value="$(arg committed_continuation_enabled)" />
     <param name="final_gcdf_timeout_s" value="0.50" />
     <param name="final_gcdf_safety_margin" value="0.0" />
     <param name="final_gcdf_stamp_tolerance_s" value="0.000001" />
@@ -315,7 +323,8 @@
        exact view. The anchors intentionally reuse the existing local-SCP CDF
        selector/GPU client; by this stage the inner SCP plan has finished, and
        stamp matching keeps the final-audit batch separate from planner batches. -->
-  <group if="$(arg use_local_sparse_scp)" ns="final_executable_gcdf_pair_export">
+  <group if="$(arg final_executable_gcdf_enabled)"
+         ns="final_executable_gcdf_pair_export">
     <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic"
