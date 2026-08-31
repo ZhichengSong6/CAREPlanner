@@ -129,6 +129,14 @@ local_planner:
     # Hard GCDF safety in both NORMAL and REPAIR.
     # No user slack variables: low-confidence space is a true forbidden set.
     slack_enabled: false
+
+    # Diagnostic only: if a hard NORMAL/PROBE task QP fails, solve the same
+    # convex subproblem once with uncapped per-constraint slacks. This shadow
+    # result is never executable; required_max_slack distinguishes numerical
+    # non-convergence (~0 slack) from genuine local hard-GCDF infeasibility.
+    task_failure_slack_diagnostic_enabled: true
+    task_failure_slack_diagnostic_weight: 1.0
+
     slack_linear_weight: 10.0
     slack_quadratic_weight: 0.0
     per_constraint_slack: true
