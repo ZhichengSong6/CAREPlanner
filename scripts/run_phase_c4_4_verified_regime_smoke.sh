@@ -109,14 +109,23 @@ else
   exit 1
 fi
 
-read -r GX GY GZ GQX GQY GQZ GQW <<< "$(python3 - "${CASE_FILE}" "${CASE_ID}" <<'PY'
+if ! GOAL_LINE="$(python3 - "${CASE_FILE}" "${CASE_ID}" <<'PY'
 import json,sys
 p,cid=sys.argv[1:]
 d=json.load(open(p)); c=next((x for x in d['cases'] if x['case_id']==cid),None)
-if c is None: raise SystemExit('unknown case_id: '+cid)
+if c is None:
+    raise SystemExit('unknown case_id: '+cid)
 print(*c['goal_position'],*c['goal_orientation'])
 PY
-)"
+)"; then
+  echo "[ERROR] failed to resolve controlled-trial CASE_ID=${CASE_ID}" >&2
+  exit 2
+fi
+read -r GX GY GZ GQX GQY GQZ GQW <<< "${GOAL_LINE}"
+if [[ -z "${GX:-}" || -z "${GY:-}" || -z "${GZ:-}" || -z "${GQW:-}" ]]; then
+  echo "[ERROR] incomplete goal resolved for CASE_ID=${CASE_ID}: ${GOAL_LINE}" >&2
+  exit 2
+fi
 
 GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
 REC_PIDS=()
@@ -343,6 +352,7 @@ cat > "${OUT}/runtime_semantics.txt" <<EOF
 branch=${RUNTIME_BRANCH}
 head=${RUNTIME_HEAD}
 case_id=${CASE_ID}
+run_id=${RUN_ID:-${CASE_ID}}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
 commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
