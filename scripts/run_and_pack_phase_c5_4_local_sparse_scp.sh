@@ -2,11 +2,13 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-if [[ -z "${CASE_ID:-}" ]]; then
+CASE_ID="${CASE_ID:-case_003}"
+if [[ -z "${RUN_ID:-}" ]]; then
   _RUN_STAMP="$(date +%Y%m%d-%H%M%S-%3N)"
   _GIT_SHORT="$(git -C "${REPO}" rev-parse --short=8 HEAD)"
-  CASE_ID="case_003_${_RUN_STAMP}_${_GIT_SHORT}"
+  RUN_ID="${CASE_ID}_${_RUN_STAMP}_${_GIT_SHORT}"
 fi
+export CASE_ID RUN_ID
 RUN_SECONDS="${RUN_SECONDS:-20.0}"
 
 GPU_ENV="${GPU_ENV:-viscdf}"
@@ -25,12 +27,12 @@ REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.15}"
 REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 
-ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
-ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
+ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/phase_c5_4_local_sparse_scp/${RUN_ID}}"
+ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_4_local_sparse_scp/${RUN_ID}}"
 RUN_OUT="${ROOT_OUT}/run"
 RUN_LOG="${ROOT_LOG}/run"
 SELECTOR_JSONL="${ROOT_OUT}/local_scp_selector.jsonl"
-ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${CASE_ID}.zip}"
+ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${RUN_ID}.zip}"
 SUMMARY_JSON="${ROOT_OUT}/c5_4_local_sparse_scp_summary.json"
 
 cd "${REPO}"
@@ -42,6 +44,7 @@ bash -n scripts/run_phase_c4_4_verified_regime_smoke.sh
 echo "[C5.4] branch: $(git branch --show-current)"
 echo "[C5.4] head:   $(git rev-parse HEAD)"
 echo "[C5.4] case:   ${CASE_ID}"
+echo "[C5.4] run:    ${RUN_ID}"
 echo "[C5.8] architecture: Sparse SCP -> executable GCDF -> exact VBC -> single commit -> tracker"
 echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
 
@@ -148,7 +151,7 @@ pack_debug_bundle() {
     fi
   done
 
-  python3 - "${stage}" "${REPO}" "${CASE_ID}" <<'PY'
+  python3 - "${stage}" "${REPO}" "${RUN_ID}" "${CASE_ID}" <<'PY'
 import csv
 import hashlib
 import json
@@ -158,7 +161,8 @@ import re
 import subprocess
 import sys
 
-stage, repo, case_id = sys.argv[1:4]
+stage, repo, run_id, scenario_case_id = sys.argv[1:5]
+case_id = run_id
 run = os.path.join(stage, "run")
 logs = os.path.join(stage, "logs")
 TOK = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -227,6 +231,8 @@ R = {n: records(n) for n in names}
 
 digest = {
     "case_id": case_id,
+    "run_id": run_id,
+    "scenario_case_id": scenario_case_id,
     "branch": subprocess.check_output(["git", "-C", repo, "branch", "--show-current"], text=True).strip(),
     "head": subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip(),
     "files": {},
