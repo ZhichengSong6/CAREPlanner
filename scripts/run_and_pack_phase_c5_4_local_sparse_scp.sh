@@ -346,6 +346,63 @@ digest["task_failure_slack_diagnostics"] = [
     if r.get("event") == "task_failure_slack_diagnostic"
 ]
 
+commit_rows = R["commit_summary.csv"]
+blocker_rows = R["blocker_stack_summary.csv"]
+digest["c5_12_recovery"] = {
+    "final_gcdf_recovery_event_count": (
+        as_int(commit_rows[-1].get("final_gcdf_recovery_event_count"))
+        if commit_rows else 0),
+    "final_gcdf_recovery_event_drop_count": (
+        as_int(commit_rows[-1].get("final_gcdf_recovery_event_drop_count"))
+        if commit_rows else 0),
+    "last_final_gcdf_recovery_seq": (
+        as_int(commit_rows[-1].get("last_final_gcdf_recovery_seq"))
+        if commit_rows else 0),
+    "last_final_gcdf_recovery_timestep": (
+        as_int(commit_rows[-1].get("last_final_gcdf_recovery_timestep"), -1)
+        if commit_rows else -1),
+    "last_final_gcdf_recovery_point_count": (
+        as_int(commit_rows[-1].get("last_final_gcdf_recovery_point_count"))
+        if commit_rows else 0),
+    "gcdf_recovery_generated_count": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_generated_count"))
+        if blocker_rows else 0),
+    "gcdf_recovery_drop_count": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_drop_count"))
+        if blocker_rows else 0),
+    "gcdf_recovery_processed_seq": (
+        as_int(blocker_rows[-1].get("gcdf_recovery_processed_seq"))
+        if blocker_rows else 0),
+    "gcdf_recovery_reason": (
+        blocker_rows[-1].get("gcdf_recovery_reason")
+        if blocker_rows else None),
+}
+
+# The key C5.12 invariant is checked on observed regime records rather than
+# inferred from final state: a transition into REPAIR from PROBE must name a
+# visibility-obligation-ready reason (direct transition is only allowed when
+# waypoint_active was already true).
+reg_rows = R["regime_summary.csv"]
+probe_repair_entries = []
+prev_state = None
+for r in reg_rows:
+    state = r.get("state")
+    if state == "REPAIR" and prev_state == "PROBE_NORMAL":
+        probe_repair_entries.append({
+            "t": r.get("_t"),
+            "reason": r.get("reason"),
+            "visibility_waypoint_active": r.get("visibility_waypoint_active"),
+            "blocker_rediscovery_pending": r.get("blocker_rediscovery_pending"),
+        })
+    if state is not None:
+        prev_state = state
+digest["c5_12_recovery"]["probe_to_repair_entries"] = probe_repair_entries
+digest["c5_12_recovery"]["probe_to_repair_invariant_pass"] = all(
+    (e.get("visibility_waypoint_active") == "1" or
+     "visibility_obligation_ready" in str(e.get("reason")))
+    for e in probe_repair_entries
+)
+
 # Collect exception/error evidence from the compact log tails.
 err_pat = re.compile(r"(Traceback|Exception|ERROR|FATAL|timer callback exception|stamp_miss|timeout)", re.I)
 errors = {}
