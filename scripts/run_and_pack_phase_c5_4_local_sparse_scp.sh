@@ -303,6 +303,36 @@ digest["execution_vbc"] = {
     "last": exe[-1] if exe else None,
 }
 
+def as_float(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except Exception:
+        return None
+
+def timing_stats(values):
+    xs = sorted(x for x in values if x is not None and math.isfinite(x))
+    if not xs:
+        return None
+    n = len(xs)
+    def pct(p):
+        if n == 1:
+            return xs[0]
+        k = (n - 1) * p
+        lo = int(math.floor(k))
+        hi = int(math.ceil(k))
+        if lo == hi:
+            return xs[lo]
+        return xs[lo] * (hi - k) + xs[hi] * (k - lo)
+    return {
+        "count": n,
+        "min": xs[0],
+        "median": pct(0.5),
+        "mean": sum(xs) / n,
+        "p95": pct(0.95),
+        "max": xs[-1],
+    }
+
 local = R["local_planner_summary.csv"]
 digest["task_failure_slack_diagnostics"] = [
     {
@@ -323,6 +353,59 @@ digest["task_failure_slack_diagnostics"] = [
 ]
 
 commit_rows = R["commit_summary.csv"]
+candidate_plans = [r for r in local if r.get("event") == "candidate_published"]
+
+digest["timing"] = {
+    "local_plan_total_ms": timing_stats([
+        as_float(r.get("total_plan_ms")) for r in candidate_plans
+    ]),
+    "piqp_final_solve_ms": timing_stats([
+        as_float(r.get("solve_ms")) for r in candidate_plans
+    ]),
+    "raw_to_safety_dispatch_ms": timing_stats([
+        as_float(r.get("raw_to_safety_dispatch_ms")) for r in commit_rows
+    ]),
+    "final_gcdf_roundtrip_ms": timing_stats([
+        as_float(r.get("final_gcdf_roundtrip_ms")) for r in commit_rows
+    ]),
+    "exact_vbc_roundtrip_ms": timing_stats([
+        as_float(r.get("exact_vbc_roundtrip_ms")) for r in commit_rows
+    ]),
+    "candidate_total_safety_pipeline_ms": timing_stats([
+        as_float(r.get("candidate_total_safety_pipeline_ms"))
+        for r in commit_rows
+    ]),
+}
+
+# Keep only unique tracker completions when estimating physical execution time.
+tracker_exec_by_stamp = {}
+for r in R["tracker_summary.csv"]:
+    if r.get("complete") != "1" or r.get("source") != "trajectory_complete_hold":
+        continue
+    stamp = r.get("execution_stamp_ns")
+    if stamp in (None, "0"):
+        continue
+    phase = as_float(r.get("phase_s"))
+    if phase is not None:
+        tracker_exec_by_stamp[stamp] = phase * 1000.0
+digest["timing"]["tracker_execution_ms"] = timing_stats(
+    list(tracker_exec_by_stamp.values()))
+
+# Per-latest-candidate end-to-end compute estimate excludes physical tracker
+# execution and uses only instrumented online compute/transport stages.
+latest_plan_ms = None
+if candidate_plans:
+    latest_plan_ms = as_float(candidate_plans[-1].get("total_plan_ms"))
+latest_safety_ms = None
+if commit_rows:
+    latest_safety_ms = as_float(
+        commit_rows[-1].get("candidate_total_safety_pipeline_ms"))
+digest["timing"]["latest_online_compute_end_to_end_ms"] = (
+    latest_plan_ms + latest_safety_ms
+    if latest_plan_ms is not None and latest_safety_ms is not None
+    else None)
+
+
 blocker_rows = R["blocker_stack_summary.csv"]
 digest["c5_12_recovery"] = {
     "final_gcdf_recovery_event_count": (
