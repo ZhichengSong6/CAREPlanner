@@ -455,6 +455,18 @@ class C44VerifiedRegimeManager:
                 return
 
             if self.state == self.REPAIR:
+                if result == "unsafe":
+                    # Final executable GCDF/VBC rejection means no trajectory
+                    # was committed, so there will be no tracker-complete event
+                    # to drive another REPAIR plan. Stay in REPAIR and explicitly
+                    # request a fresh local plan.
+                    self.last_transition_reason = "repair_candidate_unsafe_replan"
+                    self.replan_request_pub.publish(Bool(data=True))
+                    return
+                if result == "timeout":
+                    self.last_transition_reason = "repair_candidate_timeout_replan"
+                    self.replan_request_pub.publish(Bool(data=True))
+                    return
                 if result == "safe" and committed is True:
                     self.last_commit_count += 1
                     self.repair_safe_commit_count += 1
