@@ -482,13 +482,27 @@ class C44VerifiedRegimeManager:
                         "safe_probe_commit_wait_execution_seq_{}".format(seq))
                     return
 
-                if self.probe_ignore_until is not None and now < self.probe_ignore_until:
-                    return
                 if result == "unsafe":
+                    # A current PROBE prefix has an unambiguous view tag and
+                    # must never be hidden by the short post-transition ignore
+                    # window. The window only suppresses stale non-PROBE events.
+                    if (verification_view != "probe_prefix_brake_hold" and
+                            self.probe_ignore_until is not None and
+                            now < self.probe_ignore_until):
+                        return
                     self.probe_failure_count += 1
                     self.pending_probe_execution_seq = 0
                     self._transition_locked(
                         self.REPAIR, "candidate_probe_unique_unsafe", now)
+                    return
+
+                if (result == "timeout" and
+                        verification_view == "probe_prefix_brake_hold"):
+                    # Timeout is not evidence that active sensing is required;
+                    # stay in PROBE, fail closed, and request a fresh candidate.
+                    self.pending_probe_execution_seq = 0
+                    self.last_transition_reason = "probe_candidate_timeout_replan"
+                    self.replan_request_pub.publish(Bool(data=True))
                     return
 
     def _tracker_summary_cb(self, msg):
