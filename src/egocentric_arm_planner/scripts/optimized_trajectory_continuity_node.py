@@ -34,6 +34,7 @@ import re
 import threading
 
 import rospy
+from care_collision_cdf.msg import CollisionCDFConstraintBatch
 from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -69,6 +70,12 @@ class OptimizedTrajectoryContinuityNode:
             "~summary_topic", "/care_planner/optimized_trajectory_summary"))
         self.verification_event_topic = str(rospy.get_param(
             "~verification_event_topic", "/care_planner/verification_outcome"))
+        self.final_gcdf_query_topic = str(rospy.get_param(
+            "~final_gcdf_query_topic",
+            "/care_planner/final_gcdf/query_trajectory"))
+        self.final_gcdf_batch_topic = str(rospy.get_param(
+            "~final_gcdf_batch_topic",
+            "/care_planner/final_gcdf/constraint_batch"))
         self.repair_active_topic = str(rospy.get_param(
             "~repair_active_topic",
             "/care_planner/execution/predicted_vbc_recovery_triggered"))
@@ -83,6 +90,12 @@ class OptimizedTrajectoryContinuityNode:
             "~continuation_timeout_s", 0.50))
         self.verification_timeout_s = float(rospy.get_param(
             "~verification_timeout_s", 0.25))
+        self.final_gcdf_timeout_s = float(rospy.get_param(
+            "~final_gcdf_timeout_s", 0.50))
+        self.final_gcdf_safety_margin = float(rospy.get_param(
+            "~final_gcdf_safety_margin", 0.0))
+        self.final_gcdf_stamp_tolerance_s = float(rospy.get_param(
+            "~final_gcdf_stamp_tolerance_s", 1e-6))
 
         self.repair_prefix_verification_enabled = bool(rospy.get_param(
             "~repair_prefix_verification_enabled", False))
@@ -105,6 +118,10 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~continuation_timeout_s must exceed start delay")
         if self.verification_timeout_s <= 0.0:
             raise ValueError("~verification_timeout_s must be positive")
+        if self.final_gcdf_timeout_s <= 0.0:
+            raise ValueError("~final_gcdf_timeout_s must be positive")
+        if self.final_gcdf_stamp_tolerance_s <= 0.0:
+            raise ValueError("~final_gcdf_stamp_tolerance_s must be positive")
         if self.repair_execution_prefix_s <= 0.0:
             raise ValueError("~repair_execution_prefix_s must be positive")
         if self.repair_brake_dt_s <= 0.0 or self.repair_hold_s < 0.0:
@@ -127,6 +144,13 @@ class OptimizedTrajectoryContinuityNode:
         self._selector_cycle_count = 0
         self._last_selector_cycle_time = None
 
+        self._gcdf_outstanding = None
+        self._gcdf_outstanding_sent = None
+        self._gcdf_outstanding_seq = 0
+        self._gcdf_outstanding_repair = False
+        self._gcdf_outstanding_probe = False
+        self._gcdf_outstanding_view = "none"
+
         self._outstanding = None
         self._outstanding_sent = None
         self._outstanding_seq = 0
@@ -140,6 +164,12 @@ class OptimizedTrajectoryContinuityNode:
         self._committed_received = None
 
         self._raw_input_count = 0
+        self._final_gcdf_query_count = 0
+        self._final_gcdf_safe_count = 0
+        self._final_gcdf_unsafe_count = 0
+        self._final_gcdf_timeout_count = 0
+        self._final_gcdf_stamp_miss_count = 0
+        self._last_final_gcdf_min_d = math.nan
         self._verification_publish_count = 0
         self._verification_safe_count = 0
         self._verification_unsafe_count = 0
@@ -164,6 +194,8 @@ class OptimizedTrajectoryContinuityNode:
         self._last_verification_result = "none"
         self._last_verification_view = "none"
 
+        self.final_gcdf_query_pub = rospy.Publisher(
+            self.final_gcdf_query_topic, JointTrajectory, queue_size=1)
         self.verification_pub = rospy.Publisher(
             self.verification_topic, JointTrajectory, queue_size=1)
         self.committed_pub = rospy.Publisher(
@@ -177,6 +209,9 @@ class OptimizedTrajectoryContinuityNode:
             self.input_topic, JointTrajectory, self._raw_cb, queue_size=1)
         self.summary_sub = rospy.Subscriber(
             self.global_summary_topic, String, self._global_summary_cb, queue_size=1)
+        self.final_gcdf_batch_sub = rospy.Subscriber(
+            self.final_gcdf_batch_topic, CollisionCDFConstraintBatch,
+            self._final_gcdf_batch_cb, queue_size=2)
         self.repair_sub = rospy.Subscriber(
             self.repair_active_topic, Bool, self._repair_active_cb, queue_size=1)
         self.probe_sub = rospy.Subscriber(
@@ -187,9 +222,10 @@ class OptimizedTrajectoryContinuityNode:
         self._publish_summary()
         rospy.logwarn(
             "[optimized_trajectory_continuity] SELECTOR-CYCLE VERIFY raw=%s "
-            "verify=%s committed=%s repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
+            "final_gcdf=%s verify=%s committed=%s repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
             "hold=%.3fs timeout=%.3fs",
-            self.input_topic, self.verification_topic, self.committed_topic,
+            self.input_topic, self.final_gcdf_query_topic,
+            self.verification_topic, self.committed_topic,
             int(self.repair_prefix_verification_enabled),
             self.repair_execution_prefix_s, self.repair_brake_dt_s,
             self.repair_hold_s, self.verification_timeout_s)
