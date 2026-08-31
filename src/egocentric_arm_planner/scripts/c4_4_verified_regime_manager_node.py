@@ -290,12 +290,14 @@ class C44VerifiedRegimeManager:
                 self.last_transition_reason = "execution_not_ready"
             elif self.task_infeasible_pending and self.state == self.NORMAL:
                 self.task_infeasible_pending = False
+                self.task_uncertified_pending = False
                 self.task_infeasible_repair_entry_count += 1
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible_after_gate_release",
                     self.execution_ready_time)
             elif self.task_uncertified_pending and self.state == self.NORMAL:
                 self.task_uncertified_pending = False
+                self.task_infeasible_pending = False
                 self.task_uncertified_repair_entry_count += 1
                 self._transition_locked(
                     self.REPAIR, "task_planner_uncertified_after_gate_release",
@@ -320,6 +322,7 @@ class C44VerifiedRegimeManager:
                 return
 
             self.task_infeasible_pending = False
+            self.task_uncertified_pending = False
             self.task_infeasible_repair_entry_count += 1
 
             if self.state == self.PROBE_NORMAL:
@@ -350,6 +353,7 @@ class C44VerifiedRegimeManager:
                 return
 
             self.task_uncertified_pending = False
+            self.task_infeasible_pending = False
             self.task_uncertified_repair_entry_count += 1
 
             if self.state == self.PROBE_NORMAL:
