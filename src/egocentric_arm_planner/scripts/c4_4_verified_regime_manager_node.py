@@ -422,6 +422,8 @@ class C44VerifiedRegimeManager:
         result = f.get("result", "")
         committed = _as_bool(f.get("committed"))
         verification_view = f.get("verification_view", "none")
+        safety_gate = f.get("safety_gate", "vbc")
+        execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         if seq <= 0 or result not in ("safe", "unsafe", "timeout"):
             return
 
@@ -450,8 +452,11 @@ class C44VerifiedRegimeManager:
                 return
 
             if self.state == self.NORMAL:
-                if (result == "unsafe" and
-                        self.candidate_unsafe_streak >= self.candidate_unsafe_required):
+                if result == "unsafe" and safety_gate == "gcdf":
+                    self._transition_locked(
+                        self.REPAIR, "final_gcdf_normal_unsafe", now)
+                elif (result == "unsafe" and
+                      self.candidate_unsafe_streak >= self.candidate_unsafe_required):
                     self._transition_locked(
                         self.REPAIR, "candidate_unique_unsafe_confirmed", now)
                 return
@@ -489,11 +494,20 @@ class C44VerifiedRegimeManager:
                 # executable prefix may arm the PROBE execution handshake.
                 if (result == "safe" and committed is True and
                         verification_view == "probe_prefix_brake_hold"):
+                    if execution_stamp_ns <= 0:
+                        self.pending_probe_candidate_seq = 0
+                        self.pending_probe_execution_stamp_ns = 0
+                        self.last_transition_reason = (
+                            "probe_commit_missing_execution_token_replan")
+                        self.replan_request_pub.publish(Bool(data=True))
+                        return
                     self.last_commit_count += 1
                     self.last_commit_event_time = now
                     self.pending_probe_candidate_seq = seq
+                    self.pending_probe_execution_stamp_ns = execution_stamp_ns
                     self.last_transition_reason = (
-                        "safe_probe_commit_wait_execution_seq_{}".format(seq))
+                        "safe_probe_commit_wait_execution_stamp_{}".format(
+                            execution_stamp_ns))
                     return
 
                 if result == "unsafe":
@@ -506,8 +520,13 @@ class C44VerifiedRegimeManager:
                         return
                     self.probe_failure_count += 1
                     self.pending_probe_candidate_seq = 0
+                    self.pending_probe_execution_stamp_ns = 0
                     self._transition_locked(
-                        self.REPAIR, "candidate_probe_unique_unsafe", now)
+                        self.REPAIR,
+                        "final_gcdf_probe_unsafe"
+                        if safety_gate == "gcdf"
+                        else "candidate_probe_unique_unsafe",
+                        now)
                     return
 
                 if (result == "timeout" and
@@ -515,6 +534,7 @@ class C44VerifiedRegimeManager:
                     # Timeout is not evidence that active sensing is required;
                     # stay in PROBE, fail closed, and request a fresh candidate.
                     self.pending_probe_candidate_seq = 0
+                    self.pending_probe_execution_stamp_ns = 0
                     self.last_transition_reason = "probe_candidate_timeout_replan"
                     self.replan_request_pub.publish(Bool(data=True))
                     return
