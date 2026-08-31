@@ -68,6 +68,9 @@ bool LocalSparseSCPPlanner::initialize(
   recovery_sub_ = nh_.subscribe(
       recovery_topic_, 1,
       &LocalSparseSCPPlanner::recoveryCallback, this);
+  probe_active_sub_ = nh_.subscribe(
+      probe_active_topic_, 1,
+      &LocalSparseSCPPlanner::probeActiveCallback, this);
   replan_request_sub_ = nh_.subscribe(
       replan_request_topic_, 10,
       &LocalSparseSCPPlanner::replanRequestCallback, this);
@@ -228,6 +231,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<double>("local_planner/cdf/linearization_tolerance_inf",
                      cdf_linearization_tolerance_inf_,
                      cdf_linearization_tolerance_inf_);
+  pnh_.param<int>("local_planner/cdf/constraint_horizon_steps",
+                  cdf_constraint_horizon_steps_,
+                  cdf_constraint_horizon_steps_);
 
   pnh_.param<int>("local_planner/piqp/max_iterations",
                   piqp_max_iterations_, piqp_max_iterations_);
@@ -257,6 +263,8 @@ bool LocalSparseSCPPlanner::loadConfig() {
                           single_waypoint_q_topic_);
   pnh_.param<std::string>("local_planner/recovery_topic",
                           recovery_topic_, recovery_topic_);
+  pnh_.param<std::string>("local_planner/probe_active_topic",
+                          probe_active_topic_, probe_active_topic_);
   pnh_.param<std::string>("local_planner/replan_request_topic",
                           replan_request_topic_, replan_request_topic_);
   pnh_.param<std::string>("local_planner/executed_command_topic",
@@ -292,7 +300,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
       (cdf_slack_use_upper_bound_ && cdf_slack_upper_bound_ <= 0.0) ||
       cdf_slack_penalty_multiplier_ < 1.0 ||
       cdf_slack_penalty_max_ < cdf_slack_linear_weight_ ||
-      cdf_slack_tolerance_ < 0.0) {
+      cdf_slack_tolerance_ < 0.0 ||
+      cdf_constraint_horizon_steps_ < 1 ||
+      cdf_constraint_horizon_steps_ > num_intervals_) {
     ROS_ERROR("[LocalSparseSCPPlanner] invalid local_planner parameters");
     return false;
   }
@@ -453,6 +463,16 @@ void LocalSparseSCPPlanner::recoveryCallback(
   }
 }
 
+void LocalSparseSCPPlanner::probeActiveCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (probe_mode_ == msg->data) return;
+  probe_mode_ = msg->data;
+  requestPlanLocked(
+      probe_mode_ ? "enter_probe_normal" : "leave_probe_normal");
+}
+
 void LocalSparseSCPPlanner::replanRequestCallback(
     const std_msgs::BoolConstPtr& msg) {
   if (!msg || !msg->data) return;
@@ -487,6 +507,8 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
 
   if (rising && repair_mode_) {
     requestPlanLocked("repair_trajectory_complete");
+  } else if (rising && probe_mode_) {
+    requestPlanLocked("probe_trajectory_complete");
   }
 }
 
@@ -702,6 +724,7 @@ bool LocalSparseSCPPlanner::startPlan() {
   Eigen::VectorXd single_waypoint_q;
   Eigen::VectorXd previous_command;
   bool repair = false;
+  bool probe = false;
   std::string reason;
 
   {
@@ -724,6 +747,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     if (previous_command.size() != dof_)
       previous_command = Eigen::VectorXd::Zero(dof_);
     repair = repair_mode_;
+    probe = probe_mode_;
     reason = plan_request_reason_;
 
     plan_requested_ = false;
@@ -818,6 +842,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
     plan_repair_mode_ = repair;
+    plan_probe_mode_ = probe;
     plan_initialization_mode_ = initialization_mode;
     scp_iteration_ = 0;
     trust_radius_ = trust_region_initial_;
@@ -845,6 +870,7 @@ bool LocalSparseSCPPlanner::startPlan() {
       "[LocalSparseSCPPlanner] plan " << plan_sequence_
       << " started reason=" << reason
       << " repair=" << static_cast<int>(repair)
+      << " probe=" << static_cast<int>(probe)
       << " init=" << initialization_mode
       << " vis_obligations=" << schedule.size());
   publishSummary("plan_started");
@@ -890,6 +916,7 @@ void LocalSparseSCPPlanner::workerLoop() {
     Eigen::VectorXd previous_command;
     std::vector<DeadlineWaypoint> schedule;
     bool repair = false;
+    bool probe = false;
     double trust = 0.0;
     double slack_linear_weight = 0.0;
     int iteration = 0;
@@ -940,6 +967,7 @@ void LocalSparseSCPPlanner::workerLoop() {
       previous_command = plan_previous_command_;
       schedule = plan_schedule_;
       repair = plan_repair_mode_;
+      probe = plan_probe_mode_;
       trust = trust_radius_;
       slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
@@ -964,6 +992,7 @@ void LocalSparseSCPPlanner::workerLoop() {
             previous_command,
             schedule,
             repair,
+            probe,
             trust,
             slack_linear_weight);
 
@@ -1085,6 +1114,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     const Eigen::VectorXd& previous_command,
     const std::vector<DeadlineWaypoint>& schedule,
     bool repair_mode,
+    bool probe_mode,
     double trust_radius,
     double slack_linear_weight) const {
   SparseSolveResult out;
@@ -1138,6 +1168,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
     if (k < 1 || k > num_intervals_) {
       ++out.skipped_horizon_rows;
+      continue;
+    }
+    const bool executable_prefix_mode = repair_mode || probe_mode;
+    if (executable_prefix_mode && k > cdf_constraint_horizon_steps_) {
+      ++out.skipped_safety_horizon_rows;
       continue;
     }
 
@@ -1621,6 +1656,7 @@ void LocalSparseSCPPlanner::publishSummary(
   double trust = 0.0;
   bool running = false;
   bool repair = false;
+  bool probe = false;
   double active_slack_weight = 0.0;
   std::string init_mode = "unknown";
 
@@ -1635,6 +1671,7 @@ void LocalSparseSCPPlanner::publishSummary(
     trust = trust_radius_;
     running = plan_running_;
     repair = plan_repair_mode_;
+    probe = plan_probe_mode_;
     active_slack_weight = plan_cdf_slack_linear_weight_;
     init_mode = plan_initialization_mode_;
   }
@@ -1645,6 +1682,9 @@ void LocalSparseSCPPlanner::publishSummary(
       << " plan_seq=" << plan_seq
       << " running=" << static_cast<int>(running)
       << " repair=" << static_cast<int>(repair)
+      << " probe=" << static_cast<int>(probe)
+      << " cdf_horizon_steps="
+      << ((repair || probe) ? cdf_constraint_horizon_steps_ : num_intervals_)
       << " init=" << init_mode
       << " scp_iter=" << scp_iter
       << " trust_q_inf=" << trust
@@ -1664,6 +1704,8 @@ void LocalSparseSCPPlanner::publishSummary(
         << " screened_safe=" << result->screened_safe_rows
         << " skipped_step0=" << result->skipped_step0_rows
         << " skipped_horizon=" << result->skipped_horizon_rows
+        << " skipped_safety_horizon="
+        << result->skipped_safety_horizon_rows
         << " qlin_error_inf=" << result->qlin_error_inf
         << " min_d=" << result->min_distance
         << " max_slack=" << result->max_slack
