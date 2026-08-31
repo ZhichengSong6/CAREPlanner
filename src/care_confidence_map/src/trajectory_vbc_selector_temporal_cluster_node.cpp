@@ -98,6 +98,9 @@ public:
     predicted_trajectory_sub_ = nh_.subscribe(
         predicted_trajectory_topic_, 1,
         &TrajectoryVbcTemporalClusterNode::predictedTrajectoryCallback, this);
+    force_bootstrap_sub_ = nh_.subscribe(
+        force_bootstrap_topic_, 1,
+        &TrajectoryVbcTemporalClusterNode::forceBootstrapCallback, this);
 
     target_pub_ = nh_.advertise<geometry_msgs::PointStamped>(
         output_target_topic_, 1, false);
@@ -193,6 +196,10 @@ private:
         "trajectory_vbc/active_set_points_topic",
         active_set_points_topic_,
         "/care_planner/trajectory_risk/vbc_active_set_points");
+    pnh_.param<std::string>(
+        "trajectory_vbc/force_bootstrap_topic",
+        force_bootstrap_topic_,
+        "/care_planner/trajectory_risk/force_bootstrap");
 
     pnh_.param("trajectory_vbc/enabled", enabled_, true);
     pnh_.param("trajectory_vbc/eval_rate", eval_rate_, 20.0);
@@ -1050,6 +1057,20 @@ private:
     has_predicted_traj_ = true;
   }
 
+  void forceBootstrapCallback(const std_msgs::BoolConstPtr& msg)
+  {
+    if (!msg) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool changed = force_bootstrap_ != msg->data;
+    force_bootstrap_ = msg->data;
+    if (changed)
+    {
+      ROS_INFO_STREAM(
+          "[trajectory_vbc_temporal] force_bootstrap="
+          << static_cast<int>(force_bootstrap_));
+    }
+  }
+
   void timerCallback(const ros::TimerEvent&)
   {
     trajectory_msgs::JointTrajectory traj;
@@ -1058,6 +1079,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       const bool predicted_fresh =
+          !force_bootstrap_ &&
           prefer_predicted_trajectory_ && has_predicted_traj_ &&
           (now - predicted_traj_received_).toSec() >= 0.0 &&
           (now - predicted_traj_received_).toSec() <=
@@ -1100,6 +1122,7 @@ private:
     ROS_INFO_STREAM("spatial region maximum diameter: "
                     << region_max_diameter_m_ << " m");
     ROS_INFO_STREAM("active set topic: " << active_set_points_topic_);
+    ROS_INFO_STREAM("force bootstrap topic: " << force_bootstrap_topic_);
     ROS_INFO_STREAM("required VBC margin: " << min_margin_s_ << " s");
     ROS_INFO_STREAM(
         "Rule: audit every candidate; sort violations by t_sweep; greedily form "
@@ -1115,6 +1138,7 @@ private:
   ros::NodeHandle pnh_;
   ros::Subscriber trajectory_sub_;
   ros::Subscriber predicted_trajectory_sub_;
+  ros::Subscriber force_bootstrap_sub_;
   ros::ServiceClient confidence_query_client_;
   ros::Publisher target_pub_;
   ros::Publisher candidate_active_pub_;
@@ -1132,6 +1156,7 @@ private:
   ros::Time predicted_traj_received_;
   bool has_traj_ = false;
   bool has_predicted_traj_ = false;
+  bool force_bootstrap_ = false;
 
   bool has_selected_key_ = false;
   CandidateKey selected_key_;
@@ -1163,6 +1188,8 @@ private:
       "/care_planner/confidence_map/query";
   std::string active_set_points_topic_ =
       "/care_planner/trajectory_risk/vbc_active_set_points";
+  std::string force_bootstrap_topic_ =
+      "/care_planner/trajectory_risk/force_bootstrap";
 
   std::vector<std::string> ignored_risk_links_;
   std::vector<std::string> sensor_frames_;
