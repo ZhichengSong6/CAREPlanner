@@ -70,6 +70,9 @@
     <arg name="use_local_sparse_scp" value="true" />
     <arg name="final_executable_gcdf_enabled" value="true" />
     <arg name="committed_continuation_enabled" value="false" />
+    <arg name="execution_audit_stream_enabled" value="true" />
+    <arg name="execution_vbc_trajectory_topic"
+         value="/care_planner/execution/audit_trajectory" />
     <arg name="raw_mpc_trajectory_topic"
          value="/care_planner/local_planner/candidate_trajectory" />
     <arg name="trajectory_risk_input_topic"
