@@ -477,7 +477,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -518,8 +517,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -650,7 +648,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -691,8 +688,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -823,7 +819,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -864,8 +859,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -963,12 +957,10 @@ expect_rosparam_bool() {
   fi
 }
 
-# C5.9 fail-fast assertions. These catch exactly the class of launch/wrapper
-# mismatch where the source code is correct but the old runtime semantics were
-# silently selected.
 expect_rosparam_bool /optimized_trajectory_continuity/final_gcdf_enabled   "${FINAL_EXECUTABLE_GCDF_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/continuation_enabled   "${COMMITTED_CONTINUATION_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/execution_audit_enabled   "${EXECUTION_AUDIT_STREAM_ENABLED}"
+
 if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
   if ! rosnode list | grep -q '^/probe_single_flight_gate  local topic="$1"; local path="$2"
   setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
@@ -991,7 +983,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1032,8 +1023,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -1164,7 +1154,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1205,8 +1194,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -1337,7 +1325,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1378,8 +1365,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -1510,7 +1496,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1551,8 +1536,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -1637,6 +1621,7 @@ echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
     exit 1
   fi
 fi
+
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 
 cat > "${OUT}/runtime_semantics.txt" <<EOF
@@ -1671,7 +1656,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1712,8 +1696,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -1844,7 +1827,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -1885,8 +1867,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2017,7 +1998,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2058,8 +2038,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2190,7 +2169,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2231,8 +2209,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2337,7 +2314,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2378,8 +2354,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2510,7 +2485,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2551,8 +2525,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2683,7 +2656,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2724,8 +2696,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
@@ -2856,7 +2827,6 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
   record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -2897,8 +2867,7 @@ if [ "${RELEASED}" != "1" ]; then
 fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
-  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+  echo "[ARCH] event-triggered Sparse-SCP local planner -> exact VBC -> committed full-trajectory tracker"
 else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
