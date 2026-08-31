@@ -213,7 +213,10 @@
     <param name="rate" value="20.0" />
     <param name="candidate_unsafe_required" value="$(arg candidate_unsafe_required)" />
     <param name="execution_unsafe_required" value="$(arg execution_unsafe_required)" />
-    <param name="probe_safe_commits_required" value="$(arg probe_safe_commits_required)" />
+    <param name="probe_safe_commits_required"
+           value="$(arg probe_safe_commits_required)" />
+    <param name="probe_completed_prefixes_required"
+           value="$(arg probe_safe_commits_required)" />
     <param name="input_timeout" value="$(arg regime_input_timeout)" />
     <param name="committed_trajectory_timeout" value="0.30" />
     <param name="clear_pulse_s" value="0.12" />
