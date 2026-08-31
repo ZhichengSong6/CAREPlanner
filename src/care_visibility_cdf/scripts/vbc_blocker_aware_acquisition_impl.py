@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
+from collections import OrderedDict
 from typing import Dict, List
 
 import numpy as np
@@ -52,6 +53,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._gcdf_recovery_lock = threading.Lock()
         self._gcdf_recovery_trajectory = None
         self._gcdf_recovery_trajectory_received = None
+        self._gcdf_recovery_trajectory_cache = OrderedDict()
+        self._gcdf_recovery_cache_capacity = 8
         self._pending_gcdf_recovery_event = None
         self._processed_gcdf_recovery_seq = 0
         self._gcdf_recovery_event_count = 0
@@ -59,6 +62,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._gcdf_recovery_match_count = 0
         self._gcdf_recovery_drop_count = 0
         self._last_gcdf_recovery_reason = "startup"
+        self._last_gcdf_recovery_event_stamp = "none"
+        self._last_gcdf_recovery_trajectory_stamp = "none"
+        self._gcdf_recovery_cache_hit_count = 0
+        self._gcdf_recovery_cache_miss_count = 0
         super().__init__()
 
         self.blocker_push_max_sweep_s = float(rospy.get_param(
@@ -95,39 +102,69 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "[vbc_blocker_stack] C4.9 ENABLED max_blocker_sweep=%.3fs confirmations=%d",
             self.blocker_push_max_sweep_s, self.blocker_confirmations)
 
+    @staticmethod
+    def _stamp_key(stamp):
+        if stamp is None:
+            return None
+        return (int(stamp.secs), int(stamp.nsecs))
+
+    @staticmethod
+    def _stamp_text(key) -> str:
+        if key is None:
+            return "none"
+        return "{}.{:09d}".format(int(key[0]), int(key[1]))
+
     def _gcdf_recovery_trajectory_cb(self, msg) -> None:
         if msg is None or not msg.points:
             return
+        key = self._stamp_key(msg.header.stamp)
+        if key is None or (key[0] == 0 and key[1] == 0):
+            self._gcdf_recovery_drop_count += 1
+            self._last_gcdf_recovery_reason = "recovery_trajectory_zero_stamp"
+            return
+        received = rospy.Time.now()
         with self._gcdf_recovery_lock:
             self._gcdf_recovery_trajectory = msg
-            self._gcdf_recovery_trajectory_received = rospy.Time.now()
+            self._gcdf_recovery_trajectory_received = received
+            self._last_gcdf_recovery_trajectory_stamp = self._stamp_text(key)
+            self._gcdf_recovery_trajectory_cache[key] = (msg, received)
+            self._gcdf_recovery_trajectory_cache.move_to_end(key)
+            while (len(self._gcdf_recovery_trajectory_cache) >
+                   self._gcdf_recovery_cache_capacity):
+                self._gcdf_recovery_trajectory_cache.popitem(last=False)
 
     def _gcdf_recovery_event_cb(self, msg) -> None:
         if msg is None:
             return
         values = list(msg.data)
-        if len(values) < 4:
+        if len(values) < 6:
             self._gcdf_recovery_drop_count += 1
             self._last_gcdf_recovery_reason = "malformed_short_event"
             return
 
         try:
             seq = int(round(float(values[0])))
-            sweep_s = float(values[1])
-            timestep = int(round(float(values[2])))
-            count = int(round(float(values[3])))
+            stamp_secs = int(round(float(values[1])))
+            stamp_nsecs = int(round(float(values[2])))
+            sweep_s = float(values[3])
+            timestep = int(round(float(values[4])))
+            count = int(round(float(values[5])))
         except Exception:
             self._gcdf_recovery_drop_count += 1
             self._last_gcdf_recovery_reason = "malformed_header"
             return
 
-        if (seq <= 0 or not math.isfinite(sweep_s) or sweep_s < 0.0 or
-                timestep < 0 or count <= 0 or len(values) != 4 + 3 * count):
+        stamp_key = (stamp_secs, stamp_nsecs)
+        if (seq <= 0 or stamp_secs < 0 or
+                stamp_nsecs < 0 or stamp_nsecs >= 1000000000 or
+                (stamp_secs == 0 and stamp_nsecs == 0) or
+                not math.isfinite(sweep_s) or sweep_s < 0.0 or
+                timestep < 0 or count <= 0 or len(values) != 6 + 3 * count):
             self._gcdf_recovery_drop_count += 1
             self._last_gcdf_recovery_reason = "malformed_shape"
             return
 
-        points = np.asarray(values[4:], dtype=np.float64).reshape(count, 3)
+        points = np.asarray(values[6:], dtype=np.float64).reshape(count, 3)
         if not np.all(np.isfinite(points)):
             self._gcdf_recovery_drop_count += 1
             self._last_gcdf_recovery_reason = "nonfinite_points"
@@ -139,11 +176,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 return
             self._pending_gcdf_recovery_event = {
                 "seq": seq,
+                "stamp_key": stamp_key,
                 "sweep_s": sweep_s,
                 "timestep": timestep,
                 "points": points.copy(),
             }
             self._gcdf_recovery_event_count += 1
+            self._last_gcdf_recovery_event_stamp = self._stamp_text(stamp_key)
             self._last_gcdf_recovery_reason = "event_pending"
 
         # A fresh hard-GCDF blocker defines a new acquisition episode even
@@ -166,24 +205,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             event = (
                 None if self._pending_gcdf_recovery_event is None
                 else dict(self._pending_gcdf_recovery_event))
-            trajectory = self._gcdf_recovery_trajectory
-            trajectory_received = self._gcdf_recovery_trajectory_received
 
         if event is None:
             return
         seq = int(event["seq"])
+        stamp_key = tuple(event["stamp_key"])
         if seq <= self._processed_gcdf_recovery_seq:
             with self._gcdf_recovery_lock:
                 self._pending_gcdf_recovery_event = None
             self._last_gcdf_recovery_reason = "already_processed"
             return
-        if (trajectory is None or not trajectory.points or
-                trajectory_received is None):
-            self._last_gcdf_recovery_reason = "waiting_recovery_trajectory"
-            return
-        if int(getattr(trajectory.header, "seq", 0)) != seq:
+
+        with self._gcdf_recovery_lock:
+            cached = self._gcdf_recovery_trajectory_cache.get(stamp_key)
+        if cached is None:
+            self._gcdf_recovery_cache_miss_count += 1
             self._last_gcdf_recovery_reason = "waiting_matching_recovery_trajectory"
             return
+        trajectory, trajectory_received = cached
+        self._gcdf_recovery_cache_hit_count += 1
+
         if self._latest_measured_q is None:
             self._last_gcdf_recovery_reason = "waiting_measured_q"
             return
@@ -253,6 +294,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._gcdf_recovery_lock:
             self._processed_gcdf_recovery_seq = max(
                 self._processed_gcdf_recovery_seq, seq)
+            self._gcdf_recovery_trajectory_cache.pop(stamp_key, None)
             if (self._pending_gcdf_recovery_event is not None and
                     int(self._pending_gcdf_recovery_event["seq"]) == seq):
                 self._pending_gcdf_recovery_event = None
@@ -500,6 +542,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" gcdf_recovery_drop_count={self._gcdf_recovery_drop_count}"
             f" gcdf_recovery_processed_seq={self._processed_gcdf_recovery_seq}"
             f" gcdf_recovery_reason={self._last_gcdf_recovery_reason}"
+            f" gcdf_recovery_event_stamp={self._last_gcdf_recovery_event_stamp}"
+            f" gcdf_recovery_trajectory_stamp={self._last_gcdf_recovery_trajectory_stamp}"
+            f" gcdf_recovery_cache_size={len(self._gcdf_recovery_trajectory_cache)}"
+            f" gcdf_recovery_cache_hit_count={self._gcdf_recovery_cache_hit_count}"
+            f" gcdf_recovery_cache_miss_count={self._gcdf_recovery_cache_miss_count}"
             f" q_vis_generation_last_ms="
             f"{(qvis_times[-1] if qvis_times else math.nan):.3f}"
             f" q_vis_generation_max_ms="
