@@ -1,15 +1,18 @@
 <launch>
   <!--
-    C5.4 architecture:
+    C5.8 architecture (built on the C5.4 local-SCP backend):
       one-shot nominal task plan
         -> event-triggered sparse SCP local trajectory optimizer
-        -> exact candidate VBC
-        -> committed trajectory
-        -> full-trajectory tracking controller
+        -> build exact executable view (prefix + actual brake + hold)
+        -> final learned-GCDF audit on current confidence map
+        -> exact VBC audit
+        -> publish committed trajectory exactly once
+        -> full-trajectory tracking controller owns execution
+        -> seq-independent completion handshake via committed header.stamp
 
-    The legacy 20 Hz planning MPC is intentionally absent.  Replanning is
-    triggered by new task references, visibility obligations, regime changes,
-    or tracking-error requests.
+    Local SCP and final executable GCDF queries share one GPU worker/client but
+    use independent request slots and batch topics; final executable audit has
+    priority. The legacy 20 Hz planning MPC is intentionally absent.
   -->
   <arg name="config_file"
        default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
