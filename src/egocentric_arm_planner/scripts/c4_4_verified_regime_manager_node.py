@@ -124,6 +124,15 @@ class C44VerifiedRegimeManager:
         self.task_uncertified_topic = str(rospy.get_param(
             "~task_uncertified_topic",
             "/care_planner/local_planner/task_uncertified"))
+        self.visibility_waypoint_active_topic = str(rospy.get_param(
+            "~visibility_waypoint_active_topic",
+            "/care_planner/active_sensing/visibility_waypoint_active"))
+        self.candidate_vbc_summary_topic = str(rospy.get_param(
+            "~candidate_vbc_summary_topic",
+            "/care_planner/candidate_vbc/summary"))
+        self.force_vbc_bootstrap_topic = str(rospy.get_param(
+            "~force_vbc_bootstrap_topic",
+            "/care_planner/trajectory_risk/force_bootstrap"))
 
         self.state = self.NORMAL
         self.execution_ready = False
@@ -183,6 +192,16 @@ class C44VerifiedRegimeManager:
         self.repair_completion_time = None
         self.repair_completion_event_count = 0
 
+        # C5.11: solver failure and active-sensing demand are separate facts.
+        # A failed PROBE task QP may request blocker rediscovery, but REPAIR is
+        # entered only after a persistent visibility waypoint/obligation exists.
+        self.visibility_waypoint_active = False
+        self.blocker_rediscovery_pending = False
+        self.blocker_rediscovery_origin = "none"
+        self.blocker_rediscovery_count = 0
+        self.blocker_rediscovery_vbc_unsafe_count = 0
+        self.blocker_rediscovery_vbc_safe_count = 0
+
         self.clear_until = None
         self.probe_ignore_until = None
         self.last_transition_reason = "startup"
@@ -202,6 +221,8 @@ class C44VerifiedRegimeManager:
             self.summary_topic, String, queue_size=1, latch=True)
         self.replan_request_pub = rospy.Publisher(
             self.replan_request_topic, Bool, queue_size=10, latch=False)
+        self.force_vbc_bootstrap_pub = rospy.Publisher(
+            self.force_vbc_bootstrap_topic, Bool, queue_size=1, latch=True)
 
         rospy.Subscriber(
             self.candidate_outcome_topic, String, self._candidate_outcome_cb,
@@ -227,6 +248,12 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.task_uncertified_topic, Bool, self._task_uncertified_cb,
             queue_size=10)
+        rospy.Subscriber(
+            self.visibility_waypoint_active_topic, Bool,
+            self._visibility_waypoint_active_cb, queue_size=1)
+        rospy.Subscriber(
+            self.candidate_vbc_summary_topic, String,
+            self._candidate_vbc_summary_cb, queue_size=20)
         if self.repair_completion_gate_enabled:
             rospy.Subscriber(
                 self.repair_completion_topic, Bool,
@@ -236,6 +263,7 @@ class C44VerifiedRegimeManager:
         self.probe_active_pub.publish(Bool(data=False))
         self.clear_pub.publish(Bool(data=False))
         self.hold_pub.publish(Bool(data=False))
+        self.force_vbc_bootstrap_pub.publish(Bool(data=False))
         self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate), self._timer_cb)
         self._publish_summary()
 
@@ -336,6 +364,78 @@ class C44VerifiedRegimeManager:
                     self.REPAIR, "task_planner_uncertified_after_gate_release",
                     self.execution_ready_time)
 
+    def _begin_blocker_rediscovery_locked(self, origin):
+        """Fail closed in PROBE while VBC discovers a real sensing obligation."""
+        self.blocker_rediscovery_pending = True
+        self.blocker_rediscovery_origin = str(origin)
+        self.blocker_rediscovery_count += 1
+        self.pending_probe_candidate_seq = 0
+        self.pending_probe_execution_stamp_ns = 0
+        self.last_transition_reason = (
+            "{}_wait_visibility_obligation".format(origin))
+        # Force the candidate VBC selector to audit the task/bootstrap
+        # trajectory rather than any stale failed PROBE prediction.
+        self.force_vbc_bootstrap_pub.publish(Bool(data=True))
+
+    def _visibility_waypoint_active_cb(self, msg):
+        if msg is None:
+            return
+        value = bool(msg.data)
+        now = rospy.Time.now()
+        with self._lock:
+            self.visibility_waypoint_active = value
+            if (not value or not self.blocker_rediscovery_pending or
+                    not self.execution_ready or
+                    self.state != self.PROBE_NORMAL):
+                return
+
+            origin = self.blocker_rediscovery_origin
+            self.blocker_rediscovery_pending = False
+            self.blocker_rediscovery_origin = "none"
+            self._transition_locked(
+                self.REPAIR,
+                "visibility_obligation_ready_after_{}".format(origin),
+                now)
+
+    def _candidate_vbc_summary_cb(self, msg):
+        if msg is None:
+            return
+        f = _tokens(msg.data)
+        if f.get("trajectory_source") != "bootstrap":
+            return
+        has_violation = _as_bool(f.get("has_violation"))
+        if has_violation is None:
+            return
+
+        request_replan = False
+        clear_bootstrap = False
+        with self._lock:
+            if (not self.blocker_rediscovery_pending or
+                    self.state != self.PROBE_NORMAL):
+                return
+
+            if has_violation:
+                self.blocker_rediscovery_vbc_unsafe_count += 1
+                self.last_transition_reason = (
+                    "probe_blocker_confirmed_wait_visibility_waypoint")
+                return
+
+            # A fresh bootstrap VBC SAFE verdict means the task solver failure
+            # was not evidence for active sensing. Stay in PROBE, stop forcing
+            # bootstrap, and request a numerical replanning attempt.
+            self.blocker_rediscovery_vbc_safe_count += 1
+            self.blocker_rediscovery_pending = False
+            self.blocker_rediscovery_origin = "none"
+            self.last_transition_reason = (
+                "probe_no_visibility_blocker_after_solver_failure_replan")
+            request_replan = True
+            clear_bootstrap = True
+
+        if clear_bootstrap:
+            self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+        if request_replan:
+            self.replan_request_pub.publish(Bool(data=True))
+
     def _task_infeasible_cb(self, msg):
         if msg is None or not bool(msg.data):
             return
@@ -360,8 +460,13 @@ class C44VerifiedRegimeManager:
 
             if self.state == self.PROBE_NORMAL:
                 self.probe_failure_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_probe_infeasible", now)
+                if (self.repair_completion_gate_enabled and
+                        not self.visibility_waypoint_active):
+                    self._begin_blocker_rediscovery_locked(
+                        "task_probe_infeasible")
+                else:
+                    self._transition_locked(
+                        self.REPAIR, "task_probe_infeasible", now)
             else:
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible", now)
@@ -374,8 +479,9 @@ class C44VerifiedRegimeManager:
             # "Uncertified" is deliberately distinct from mathematical
             # infeasibility. It means PIQP exhausted its iteration budget and
             # therefore did not provide a hard-GCDF-certified task candidate.
-            # Safety takes priority over task progress, so NORMAL/PROBE both
-            # fall back to REPAIR while preserving the numerical diagnosis.
+            # C5.11 no longer equates this numerical failure with a sensing
+            # request: PROBE fails closed and asks VBC to rediscover a blocker.
+            # Only a real visibility obligation is allowed to enter REPAIR.
             if self.state not in (self.NORMAL, self.PROBE_NORMAL):
                 return
 
@@ -391,8 +497,13 @@ class C44VerifiedRegimeManager:
 
             if self.state == self.PROBE_NORMAL:
                 self.probe_failure_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_probe_uncertified", now)
+                if (self.repair_completion_gate_enabled and
+                        not self.visibility_waypoint_active):
+                    self._begin_blocker_rediscovery_locked(
+                        "task_probe_uncertified")
+                else:
+                    self._transition_locked(
+                        self.REPAIR, "task_probe_uncertified", now)
             else:
                 self._transition_locked(
                     self.REPAIR, "task_planner_uncertified", now)
@@ -761,6 +872,18 @@ class C44VerifiedRegimeManager:
                     int(self.repair_completion_armed)),
                 "repair_completion_event_count={}".format(
                     self.repair_completion_event_count),
+                "visibility_waypoint_active={}".format(
+                    int(self.visibility_waypoint_active)),
+                "blocker_rediscovery_pending={}".format(
+                    int(self.blocker_rediscovery_pending)),
+                "blocker_rediscovery_origin={}".format(
+                    self.blocker_rediscovery_origin),
+                "blocker_rediscovery_count={}".format(
+                    self.blocker_rediscovery_count),
+                "blocker_rediscovery_vbc_unsafe_count={}".format(
+                    self.blocker_rediscovery_vbc_unsafe_count),
+                "blocker_rediscovery_vbc_safe_count={}".format(
+                    self.blocker_rediscovery_vbc_safe_count),
                 "candidate_outcome_age_s={:.6f}".format(
                     age(self.candidate_outcome_time)),
                 "execution_summary_age_s={:.6f}".format(
