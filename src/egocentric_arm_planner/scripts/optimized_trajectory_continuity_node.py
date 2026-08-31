@@ -8,22 +8,21 @@ summaries for the same cached trajectory. Verification is synchronized to
 selector cycles: a candidate dispatched after cycle k may only be decided by a
 strictly later predicted cycle.
 
-C4.8 reactive-repair verification
----------------------------------
-NORMAL candidates still expose their full MPC prediction to exact VBC.
+C5.8 executable safety/commit protocol
+--------------------------------------
+For REPAIR and PROBE_NORMAL, the node first converts the optimizer candidate
+into the exact trajectory that could reach the actuator:
 
-When ``repair_prefix_verification_enabled`` is true and the planner is in REPAIR,
-the verifier does NOT require the whole 1 s hypothetical q_vis prediction to be
-VBC-safe before allowing the first reactive step. Instead it creates a committed
-execution view consisting of:
+    short optimizer prefix + dynamically feasible braking tail + hold tail
 
-    short MPC prefix + dynamically feasible braking tail + hold tail
+When final GCDF is enabled, that exact executable view must first pass the
+current-map learned-GCDF audit. The same q-trajectory is then passed to exact
+VBC. Only a trajectory that passes BOTH gates is committed.
 
-Exact VBC audits that entire executable view. If it is safe, that same view is
-committed. The next MPC cycle replans from measured state. Thus no unverified
-future motion is executed, but a low-confidence sweep farther out in the 1 s
-optimization horizon cannot unnecessarily block a safe local step toward the
-visibility goal.
+In the C5.4+ full-trajectory tracker architecture, the committed trajectory is
+published exactly once; the tracker owns it until completion. ROS Header.seq is
+treated as publisher-local diagnostics only. A committed header timestamp is
+used as the stable execution token for PROBE completion handshakes.
 """
 
 from __future__ import annotations
