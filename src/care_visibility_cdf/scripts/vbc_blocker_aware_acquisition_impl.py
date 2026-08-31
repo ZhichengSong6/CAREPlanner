@@ -177,7 +177,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._pending_gcdf_recovery_event = None
             self._last_gcdf_recovery_reason = "already_processed"
             return
-        if trajectory is None or not trajectory.points:
+        if (trajectory is None or not trajectory.points or
+                trajectory_received is None):
             self._last_gcdf_recovery_reason = "waiting_recovery_trajectory"
             return
         if int(getattr(trajectory.header, "seq", 0)) != seq:
