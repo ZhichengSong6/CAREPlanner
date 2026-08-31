@@ -94,6 +94,8 @@ bool LocalSparseSCPPlanner::initialize(
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
   task_infeasible_pub_ =
       nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
+  task_uncertified_pub_ =
+      nh_.advertise<std_msgs::Bool>(task_uncertified_topic_, 10, false);
   force_vbc_bootstrap_pub_ =
       nh_.advertise<std_msgs::Bool>(force_vbc_bootstrap_topic_, 1, true);
 
@@ -286,6 +288,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/task_infeasible_topic",
                           task_infeasible_topic_,
                           task_infeasible_topic_);
+  pnh_.param<std::string>("local_planner/task_uncertified_topic",
+                          task_uncertified_topic_,
+                          task_uncertified_topic_);
   pnh_.param<std::string>("local_planner/force_vbc_bootstrap_topic",
                           force_vbc_bootstrap_topic_,
                           force_vbc_bootstrap_topic_);
@@ -1070,15 +1075,28 @@ void LocalSparseSCPPlanner::workerLoop() {
       ROS_WARN_STREAM(
           "[LocalSparseSCPPlanner] sparse PIQP failed: "
           << result.status);
-      if (!repair &&
-          result.status.find("primal infeasible") != std::string::npos) {
-        std_msgs::Bool infeasible_msg;
-        infeasible_msg.data = true;
-        task_infeasible_pub_.publish(infeasible_msg);
-        ROS_WARN_STREAM(
-            "[LocalSparseSCPPlanner] task QP infeasible in "
-            << (probe ? "PROBE_NORMAL" : "NORMAL")
-            << " -> request REPAIR regime");
+      if (!repair) {
+        if (result.status.find("primal infeasible") != std::string::npos) {
+          std_msgs::Bool infeasible_msg;
+          infeasible_msg.data = true;
+          task_infeasible_pub_.publish(infeasible_msg);
+          ROS_WARN_STREAM(
+              "[LocalSparseSCPPlanner] task QP infeasible in "
+              << (probe ? "PROBE_NORMAL" : "NORMAL")
+              << " -> request REPAIR regime");
+        } else if (
+            result.status.find("max iterations") != std::string::npos ||
+            result.status.find("maximum iterations") != std::string::npos) {
+          std_msgs::Bool uncertified_msg;
+          uncertified_msg.data = true;
+          task_uncertified_pub_.publish(uncertified_msg);
+          ROS_WARN_STREAM(
+              "[LocalSparseSCPPlanner] task QP uncertified in "
+              << (probe ? "PROBE_NORMAL" : "NORMAL")
+              << " status='" << result.status
+              << "' primal_res=" << result.primal_residual
+              << " -> request REPAIR regime");
+        }
       }
       continue;
     }
