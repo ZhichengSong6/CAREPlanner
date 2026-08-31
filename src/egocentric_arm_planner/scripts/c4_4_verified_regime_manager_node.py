@@ -419,6 +419,7 @@ class C44VerifiedRegimeManager:
         seq = _as_int(f.get("seq"), 0)
         result = f.get("result", "")
         committed = _as_bool(f.get("committed"))
+        verification_view = f.get("verification_view", "none")
         if seq <= 0 or result not in ("safe", "unsafe", "timeout"):
             return
 
@@ -469,20 +470,66 @@ class C44VerifiedRegimeManager:
                 return
 
             if self.state == self.PROBE_NORMAL:
+                # A stale REPAIR verification may arrive just after the regime
+                # transition. Only a candidate explicitly built as a PROBE
+                # executable prefix may arm the PROBE execution handshake.
+                if (result == "safe" and committed is True and
+                        verification_view == "probe_prefix_brake_hold"):
+                    self.last_commit_count += 1
+                    self.last_commit_event_time = now
+                    self.pending_probe_execution_seq = seq
+                    self.last_transition_reason = (
+                        "safe_probe_commit_wait_execution_seq_{}".format(seq))
+                    return
+
                 if self.probe_ignore_until is not None and now < self.probe_ignore_until:
                     return
                 if result == "unsafe":
                     self.probe_failure_count += 1
+                    self.pending_probe_execution_seq = 0
                     self._transition_locked(
                         self.REPAIR, "candidate_probe_unique_unsafe", now)
                     return
-                if result == "safe" and committed is True:
-                    self.last_commit_count += 1
-                    self.last_commit_event_time = now
-                    self.probe_safe_commit_streak += 1
-                    if self.probe_safe_commit_streak >= self.probe_safe_commits_required:
-                        self._transition_locked(
-                            self.NORMAL, "probe_normal_safe_commits", now)
+
+    def _tracker_summary_cb(self, msg):
+        if msg is None:
+            return
+        f = _tokens(msg.data)
+        complete = _as_bool(f.get("complete"))
+        seq = _as_int(f.get("seq"), 0)
+        if complete is not True or seq <= 0:
+            return
+
+        now = rospy.Time.now()
+        request_next_probe = False
+        with self._lock:
+            if seq <= self.last_tracker_complete_seq:
+                return
+            self.last_tracker_complete_seq = seq
+
+            if self.state != self.PROBE_NORMAL:
+                return
+            if self.pending_probe_execution_seq <= 0:
+                return
+            if seq != self.pending_probe_execution_seq:
+                # Exact sequence matching rejects stale completion edges from
+                # the previous REPAIR episode or an older replaced trajectory.
+                return
+
+            self.pending_probe_execution_seq = 0
+            self.probe_safe_commit_streak += 1
+            self.probe_completed_execution_count += 1
+
+            if self.probe_safe_commit_streak >= self.probe_safe_commits_required:
+                self._transition_locked(
+                    self.NORMAL, "probe_normal_completed_prefixes", now)
+            else:
+                self.last_transition_reason = (
+                    "probe_prefix_execution_complete_seq_{}".format(seq))
+                request_next_probe = True
+
+        if request_next_probe:
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _execution_summary_cb(self, msg):
         if msg is None:
@@ -593,6 +640,12 @@ class C44VerifiedRegimeManager:
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
+                "probe_completed_execution_count={}".format(
+                    self.probe_completed_execution_count),
+                "pending_probe_execution_seq={}".format(
+                    self.pending_probe_execution_seq),
+                "last_tracker_complete_seq={}".format(
+                    self.last_tracker_complete_seq),
                 "normal_entry_count={}".format(self.normal_entry_count),
                 "commit_count={}".format(self.last_commit_count),
                 "repair_safe_commit_count={}".format(self.repair_safe_commit_count),
