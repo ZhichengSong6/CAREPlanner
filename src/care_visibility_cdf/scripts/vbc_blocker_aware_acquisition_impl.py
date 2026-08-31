@@ -471,6 +471,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._obligation_lock:
             existing = sorted(int(ob["id"]) for ob in self._obligations)
             stack = [oid for oid in self._repair_stack if oid in set(existing)]
+            qvis_times = [
+                float(ob.get("q_vis_generation_ms", math.nan))
+                for ob in self._obligations
+                if math.isfinite(float(ob.get("q_vis_generation_ms", math.nan)))
+            ]
         msg = String()
         msg.data = (
             "policy=blocker_aware_recursive"
@@ -495,6 +500,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" gcdf_recovery_drop_count={self._gcdf_recovery_drop_count}"
             f" gcdf_recovery_processed_seq={self._processed_gcdf_recovery_seq}"
             f" gcdf_recovery_reason={self._last_gcdf_recovery_reason}"
+            f" q_vis_generation_last_ms="
+            f"{(qvis_times[-1] if qvis_times else math.nan):.3f}"
+            f" q_vis_generation_max_ms="
+            f"{(max(qvis_times) if qvis_times else math.nan):.3f}"
             f" switch_reason={self._last_switch_reason}"
         )
         self.blocker_stack_summary_pub.publish(msg)
