@@ -320,12 +320,12 @@
            value="/care_planner/trajectory_risk/force_bootstrap" />
   </node>
 
-  <!-- C5.7 final executable safety audit. The continuity node first builds
+  <!-- C5.8 final executable safety audit. The continuity node first builds
        the exact trajectory that could be committed (prefix + braking + hold).
        This isolated trajectory-risk instance exports body anchors for that
-       exact view. The anchors intentionally reuse the existing local-SCP CDF
-       selector/GPU client; by this stage the inner SCP plan has finished, and
-       stamp matching keeps the final-audit batch separate from planner batches. -->
+       exact view. One shared GPU selector/client owns two independent request
+       slots and batch topics (local SCP + final executable), with final audit
+       priority; the streams therefore cannot overwrite one another. -->
   <group if="$(arg final_executable_gcdf_enabled)"
          ns="final_executable_gcdf_pair_export">
     <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
