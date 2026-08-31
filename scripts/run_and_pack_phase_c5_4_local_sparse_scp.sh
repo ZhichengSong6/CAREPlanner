@@ -57,6 +57,9 @@ fi
 
 catkin build care_confidence_map care_collision_cdf egocentric_arm_planner
 source devel/setup.bash
+python3 -m py_compile \
+  src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
+  src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py
 
 # Fail before launching the persistent GPU worker if a previous ROS/Gazebo
 # session is still alive. The common runner performs the same safety check,
@@ -344,6 +347,10 @@ repair_brake_dt_s=${REPAIR_BRAKE_DT_S}
 repair_hold_s=${REPAIR_HOLD_S}
 normal_verification_semantics=full_horizon
 repair_verification_semantics=prefix_plus_brake_plus_hold_when_enabled
+probe_verification_semantics=prefix_plus_brake_plus_hold_when_enabled
+probe_mode=task_objective_plus_executable_horizon_gcdf
+cdf_constraint_horizon_steps=from_config:${CONFIG_FILE}
+normal_cdf_horizon=full_planning_horizon
 cdf_variant=signed
 cdf_activation=gelu
 scp_max_iterations=from_config:${CONFIG_FILE}
