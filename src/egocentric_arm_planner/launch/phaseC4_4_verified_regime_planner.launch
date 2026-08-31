@@ -173,6 +173,13 @@
     <param name="global_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
     <param name="summary_topic" value="/care_planner/optimized_trajectory_summary" />
     <param name="verification_event_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="final_gcdf_query_topic"
+           value="/care_planner/final_gcdf/query_trajectory" />
+    <param name="final_gcdf_batch_topic"
+           value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="final_gcdf_timeout_s" value="0.50" />
+    <param name="final_gcdf_safety_margin" value="0.0" />
+    <param name="final_gcdf_stamp_tolerance_s" value="0.000001" />
     <param name="rate" value="20.0" />
     <param name="continuation_start_delay_s" value="0.065" />
     <param name="continuation_timeout_s" value="0.50" />
@@ -296,6 +303,36 @@
     <param name="local_planner/force_vbc_bootstrap_topic"
            value="/care_planner/trajectory_risk/force_bootstrap" />
   </node>
+
+  <!-- C5.7 final executable safety audit. The continuity node first builds
+       the exact trajectory that could be committed (prefix + braking + hold).
+       This isolated trajectory-risk instance exports body anchors for that
+       exact view. The anchors intentionally reuse the existing local-SCP CDF
+       selector/GPU client; by this stage the inner SCP plan has finished, and
+       stamp matching keeps the final-audit batch separate from planner batches. -->
+  <group if="$(arg use_local_sparse_scp)" ns="final_executable_gcdf_pair_export">
+    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="/care_planner/final_gcdf/query_trajectory" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/final_gcdf/unused_target" />
+      <arg name="output_namespace"
+           value="/care_planner/final_gcdf/risk" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="$(arg local_scp_body_anchor_topic)" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="50.0" />
+      <arg name="max_eval_timesteps" value="50" />
+      <arg name="refresh_body_prior_before_query" value="false" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+  </group>
 
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
        RECOVERY_HOLD in planner-mode semantics, so there is nothing to ack. -->
