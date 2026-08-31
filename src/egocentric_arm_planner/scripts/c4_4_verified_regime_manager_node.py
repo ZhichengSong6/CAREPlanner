@@ -545,28 +545,32 @@ class C44VerifiedRegimeManager:
         f = _tokens(msg.data)
         complete = _as_bool(f.get("complete"))
         seq = _as_int(f.get("seq"), 0)
+        execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         source = f.get("source", "")
-        if (complete is not True or seq <= 0 or
+        if (complete is not True or execution_stamp_ns <= 0 or
                 source != "trajectory_complete_hold"):
             return
 
         now = rospy.Time.now()
         request_next_probe = False
         with self._lock:
-            if seq <= self.last_tracker_complete_seq:
-                return
+            # ROS Header.seq is publisher-owned and only diagnostic here.
             self.last_tracker_complete_seq = seq
+            if execution_stamp_ns == self.last_tracker_complete_stamp_ns:
+                return
+            self.last_tracker_complete_stamp_ns = execution_stamp_ns
 
             if self.state != self.PROBE_NORMAL:
                 return
-            if self.pending_probe_candidate_seq <= 0:
+            if self.pending_probe_execution_stamp_ns <= 0:
                 return
-            if seq != self.pending_probe_candidate_seq:
-                # Exact sequence matching rejects stale completion edges from
-                # the previous REPAIR episode or an older replaced trajectory.
+            if execution_stamp_ns != self.pending_probe_execution_stamp_ns:
+                # Stable timestamp matching rejects stale completion edges from
+                # a previous REPAIR episode or any older committed trajectory.
                 return
 
             self.pending_probe_candidate_seq = 0
+            self.pending_probe_execution_stamp_ns = 0
             self.probe_safe_commit_streak += 1
             self.probe_completed_execution_count += 1
 
@@ -692,10 +696,14 @@ class C44VerifiedRegimeManager:
                 "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
                 "probe_completed_execution_count={}".format(
                     self.probe_completed_execution_count),
-                "pending_probe_execution_seq={}".format(
+                "pending_probe_candidate_seq={}".format(
                     self.pending_probe_candidate_seq),
+                "pending_probe_execution_stamp_ns={}".format(
+                    self.pending_probe_execution_stamp_ns),
                 "last_tracker_complete_seq={}".format(
                     self.last_tracker_complete_seq),
+                "last_tracker_complete_stamp_ns={}".format(
+                    self.last_tracker_complete_stamp_ns),
                 "normal_entry_count={}".format(self.normal_entry_count),
                 "commit_count={}".format(self.last_commit_count),
                 "repair_safe_commit_count={}".format(self.repair_safe_commit_count),
