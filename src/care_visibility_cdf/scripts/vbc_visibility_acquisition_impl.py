@@ -31,6 +31,7 @@ which permits the regime manager to PROBE_NORMAL.
 from __future__ import annotations
 
 import math
+import threading
 from typing import Dict, List
 
 import numpy as np
@@ -54,6 +55,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self._seen_obligation_count = 0
         self._last_visibility_check_s = -math.inf
         self._safe_repair_candidate_count = 0
+        # Several ROS subscriber callbacks and the rospy.Timer may all request
+        # schedule publication. Serialize the publication transaction so
+        # q_vis/q_zero/deadline messages from two snapshots cannot interleave.
+        self._schedule_publish_lock = threading.RLock()
+        self._timer_exception_count = 0
         super().__init__()
 
         self.visibility_check_rate = float(rospy.get_param(
@@ -206,6 +212,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" remaining_ids={':'.join(str(int(ob['id'])) for ob in remaining) or 'none'}"
             f" seen_obligation_count={self._seen_obligation_count}"
             f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
+            f" timer_exception_count={self._timer_exception_count}"
             f" region_checks={diag_text or 'none'}"
         )
         self.acquisition_summary_pub.publish(msg)
@@ -222,39 +229,58 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 key=lambda ob: int(ob["id"]))
 
     def _publish_schedule(self) -> None:
-        """Publish only the earliest persistent goal through the legacy q_vis path.
+        """Publish one coherent visibility-acquisition snapshot.
 
-        C4.7 deliberately disables multi-deadline MPC.  q_vis is a visibility
-        acquisition goal, not a point that must be reached at a nominal clock.
-        The REPAIR QP therefore uses its terminal q_vis objective.  Receding safe
-        commits can advance the real robot over multiple cycles until confidence
-        confirms acquisition.
+        Shared parent state is updated only while holding self._lock. All ROS
+        messages are then published from local immutable copies created by this
+        call; publication must never re-read a shared member after unlock.
+
+        The legacy target callback may reset _deadline_abs_s to None concurrently
+        when x* changes. Re-reading that member after unlock is the race that
+        previously killed the timer thread. _schedule_publish_lock also prevents
+        two ROS callback threads from interleaving the q_vis/q_zero/deadline
+        triplet from different obligation snapshots.
         """
         if not getattr(self, "_c47_ready", False):
             return
-        obligations = self._ordered_obligations()
-        if obligations:
-            first = obligations[0]
-            q = np.asarray(first["q_vis"], dtype=np.float64)
-            with self._lock:
-                self._q_vis = q.copy()
-                self._q_zero = np.asarray(first["q_zero"], dtype=np.float64).copy()
-                # Keep a valid timestamp for existing message plumbing only.
-                # REPAIR single-waypoint MPC does not use it as a target time.
-                self._deadline_abs_s = rospy.Time.now().to_sec() + 1.0
-                self._deadline_from_start_s = math.nan
-                self._generation_success = True
-                self._shared_min_f = float(first["final_f_min"])
-                self._shared_solution_mode = "c47_visibility_acquisition"
-                self._summary = "c47_acquisition_goal_ready"
-            self.waypoint_pub.publish(_vector_msg(q))
-            self.zero_pub.publish(_vector_msg(np.asarray(first["q_zero"])))
-            d = Float64(); d.data = float(self._deadline_abs_s)
-            self.deadline_pub.publish(d)
-        else:
-            with self._lock:
-                self._generation_success = False
-                self._summary = "c47_no_visibility_obligations"
+
+        with self._schedule_publish_lock:
+            obligations = self._ordered_obligations()
+            if obligations:
+                first = obligations[0]
+
+                q_vis_snapshot = np.asarray(
+                    first["q_vis"], dtype=np.float64).reshape(7).copy()
+                q_zero_snapshot = np.asarray(
+                    first["q_zero"], dtype=np.float64).reshape(7).copy()
+                deadline_snapshot = float(rospy.Time.now().to_sec() + 1.0)
+                final_f_snapshot = float(first["final_f_min"])
+
+                with self._lock:
+                    self._q_vis = q_vis_snapshot.copy()
+                    self._q_zero = q_zero_snapshot.copy()
+                    # Plumbing timestamp only. REPAIR does not optimize against
+                    # this as a nominal task deadline.
+                    self._deadline_abs_s = deadline_snapshot
+                    self._deadline_from_start_s = math.nan
+                    self._generation_success = True
+                    self._shared_min_f = final_f_snapshot
+                    self._shared_solution_mode = "c47_visibility_acquisition"
+                    self._summary = "c47_acquisition_goal_ready"
+
+                self.waypoint_pub.publish(_vector_msg(q_vis_snapshot))
+                self.zero_pub.publish(_vector_msg(q_zero_snapshot))
+                d = Float64()
+                d.data = deadline_snapshot
+                self.deadline_pub.publish(d)
+            else:
+                with self._lock:
+                    self._q_vis = None
+                    self._q_zero = None
+                    self._deadline_abs_s = None
+                    self._deadline_from_start_s = math.nan
+                    self._generation_success = False
+                    self._summary = "c47_no_visibility_obligations"
 
     def _maybe_generate(self) -> None:
         if not self._c47_ready:
@@ -263,6 +289,27 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self._process_new_active_set()
         self._update_actual_visibility_completion()
         self._publish_schedule()
+
+    def _timer_callback(self, _event) -> None:
+        """Fail closed without permanently killing rospy's timer thread."""
+        try:
+            self._maybe_generate()
+            self._publish_state()
+        except Exception as exc:
+            self._timer_exception_count += 1
+            self._acquisition_complete = False
+            try:
+                self.acquisition_complete_pub.publish(Bool(data=False))
+            except Exception:
+                pass
+            with self._lock:
+                self._generation_success = False
+                self._summary = "c47_timer_exception_fail_closed"
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_acquisition] timer callback exception; keeping "
+                "acquisition incomplete and retrying next cycle: %s",
+                exc)
 
     def _publish_state(self) -> None:
         if not self._c47_ready:
