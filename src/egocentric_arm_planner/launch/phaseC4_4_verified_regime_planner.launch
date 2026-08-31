@@ -186,7 +186,7 @@
   <node if="$(arg probe_single_flight_enabled)"
         pkg="egocentric_arm_planner" type="probe_single_flight_gate_node.py"
         name="probe_single_flight_gate" output="screen">
-    <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
+    <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
     <param name="output_topic" value="$(arg commit_pipeline_candidate_topic)" />
     <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
     <param name="verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
@@ -197,7 +197,7 @@
   <!-- Serial executable safety gate and safe-plan commit memory. -->
   <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
         name="optimized_trajectory_continuity" output="screen">
-    <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
+    <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
     <param name="output_topic" value="$(arg verification_trajectory_topic)" />
     <param name="committed_output_topic" value="$(arg committed_trajectory_topic)" />
     <param name="execution_audit_output_topic"
