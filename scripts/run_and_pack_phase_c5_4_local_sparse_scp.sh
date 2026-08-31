@@ -221,6 +221,7 @@ names = [
     "local_planner_summary.csv",
     "local_cdf_selector_summary.csv",
     "blocker_stack_summary.csv",
+    "waypoint_schedule_summary.csv",
 ]
 R = {n: records(n) for n in names}
 
@@ -282,6 +283,7 @@ for r in trk:
             "t": r.get("_t"),
             "seq": r.get("seq"),
             "execution_stamp_ns": r.get("execution_stamp_ns"),
+            "phase_s": r.get("phase_s"),
         })
 digest["tracker_completions"] = trk_done
 
@@ -390,6 +392,35 @@ for r in R["tracker_summary.csv"]:
         tracker_exec_by_stamp[stamp] = phase * 1000.0
 digest["timing"]["tracker_execution_ms"] = timing_stats(
     list(tracker_exec_by_stamp.values()))
+
+schedule_rows = R["waypoint_schedule_summary.csv"]
+digest["timing"]["q_vis_generation_last_ms"] = timing_stats([
+    as_float(r.get("q_vis_generation_last_ms")) for r in schedule_rows
+])
+digest["timing"]["q_vis_generation_max_ms_observed"] = timing_stats([
+    as_float(r.get("q_vis_generation_max_ms")) for r in schedule_rows
+])
+
+# Acquisition elapsed is physical sensing/execution latency, not pure compute.
+# Record episode durations separately so they are never confused with planner
+# or verifier compute time.
+acq_complete_times = [
+    r.get("_t") for r in acq if r.get("complete") == "1"
+]
+acq_start_times = [
+    r.get("_t") for r in acq if r.get("started") == "1"
+]
+if acq_start_times and acq_complete_times:
+    t0 = min(x for x in acq_start_times if isinstance(x, (int, float)))
+    t1_candidates = [
+        x for x in acq_complete_times
+        if isinstance(x, (int, float)) and x >= t0
+    ]
+    digest["timing"]["first_acquisition_episode_elapsed_ms"] = (
+        1000.0 * (min(t1_candidates) - t0)
+        if t1_candidates else None)
+else:
+    digest["timing"]["first_acquisition_episode_elapsed_ms"] = None
 
 # Per-latest-candidate end-to-end compute estimate excludes physical tracker
 # execution and uses only instrumented online compute/transport stages.
