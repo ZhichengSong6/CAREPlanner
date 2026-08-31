@@ -237,6 +237,7 @@ void TrajectoryExecutionManager::trajectoryCallback(
     active_trajectory_received_time_ = now;
     active_trajectory_duration_s_ = duration;
     active_trajectory_seq_ = msg->header.seq;
+    active_execution_stamp_ns_ = msg->header.stamp.toNSec();
     has_active_trajectory_ = true;
     has_received_trajectory_ = true;
 
@@ -248,7 +249,9 @@ void TrajectoryExecutionManager::trajectoryCallback(
   ROS_INFO_STREAM_THROTTLE(
       0.5,
       "[TrajectoryExecutionManager] accepted committed trajectory seq="
-          << msg->header.seq << " duration="
+          << msg->header.seq
+          << " execution_stamp_ns=" << active_execution_stamp_ns_
+          << " duration="
           << duration << " s points=" << msg->points.size());
 }
 
@@ -266,6 +269,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
   bool active = false;
   bool complete = false;
   uint32_t trajectory_seq = 0;
+  uint64_t execution_stamp_ns = 0;
   bool have_reference = false;
   double phase_s = 0.0;
   double remaining_s = 0.0;
@@ -280,6 +284,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
     if (has_active_trajectory_) {
       trajectory_seq = active_trajectory_seq_;
+      execution_stamp_ns = active_execution_stamp_ns_;
       phase_s = std::max(
           0.0, (now - active_trajectory_start_time_).toSec());
       const double sample_t =
@@ -345,7 +350,8 @@ void TrajectoryExecutionManager::executionTimerCallback(
     } else {
       publishVelocityCommand(dq_zero);
       publishReferenceState(q_measured, dq_zero);
-      publishSummary(false, false, 0, 0.0, 0.0, 0.0, "zero_velocity_hold");
+      publishSummary(
+          false, false, 0, 0, 0.0, 0.0, 0.0, "zero_velocity_hold");
       return;
     }
   }
@@ -365,8 +371,9 @@ void TrajectoryExecutionManager::executionTimerCallback(
       const Eigen::VectorXd dq_zero = makeZeroVelocityCommand();
       publishVelocityCommand(dq_zero);
       publishReferenceState(q_measured, dq_zero);
-      publishSummary(active, complete, trajectory_seq, phase_s, remaining_s,
-                     tracking_error, "tracking_error_hold");
+      publishSummary(
+          active, complete, trajectory_seq, execution_stamp_ns,
+          phase_s, remaining_s, tracking_error, "tracking_error_hold");
       return;
     }
   }
@@ -377,8 +384,9 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
   publishVelocityCommand(dq_cmd);
   publishReferenceState(q_ref, dq_ref);
-  publishSummary(active, complete, trajectory_seq, phase_s, remaining_s,
-                 tracking_error, source);
+  publishSummary(
+      active, complete, trajectory_seq, execution_stamp_ns,
+      phase_s, remaining_s, tracking_error, source);
 }
 
 bool TrajectoryExecutionManager::extractMeasuredState(
@@ -573,6 +581,7 @@ void TrajectoryExecutionManager::publishSummary(
     bool trajectory_active,
     bool trajectory_complete,
     uint32_t trajectory_seq,
+    uint64_t execution_stamp_ns,
     double phase_s,
     double remaining_s,
     double tracking_error_inf,
@@ -583,6 +592,7 @@ void TrajectoryExecutionManager::publishSummary(
       << " active=" << static_cast<int>(trajectory_active)
       << " complete=" << static_cast<int>(trajectory_complete)
       << " seq=" << trajectory_seq
+      << " execution_stamp_ns=" << execution_stamp_ns
       << " phase_s=" << phase_s
       << " remaining_s=" << remaining_s
       << " tracking_error_inf=" << tracking_error_inf
