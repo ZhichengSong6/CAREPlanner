@@ -28,6 +28,10 @@ RUN_LOG="${ROOT_LOG}/run"
 SELECTOR_JSONL="${ROOT_OUT}/local_scp_selector.jsonl"
 ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_4_local_sparse_scp_${CASE_ID}.zip}"
 SUMMARY_JSON="${ROOT_OUT}/c5_4_local_sparse_scp_summary.json"
+# Compact, upload-friendly bundle for ChatGPT/result analysis.  The historical
+# full ZIP is still produced for archival use, but this second ZIP intentionally
+# excludes high-rate actuator streams unless they are directly useful.
+ANALYSIS_ZIP_PATH="${ANALYSIS_ZIP_PATH:-${REPO}/CAREPlanner_C5_analysis_${CASE_ID}.zip}"
 
 cd "${REPO}"
 
@@ -111,9 +115,283 @@ cleanup() {
 }
 pack_debug_bundle() {
   cd "${REPO}"
+
+  # 1) Preserve the historical complete archive for local debugging.
   rm -f "${ZIP_PATH}"
   zip -r "${ZIP_PATH}" "${ROOT_OUT#${REPO}/}" "${ROOT_LOG#${REPO}/}" >/dev/null
-  echo "[C5.4 ZIP] ${ZIP_PATH}"
+  echo "[C5.x FULL ZIP] ${ZIP_PATH}"
+
+  # 2) Build a compact, analysis-oriented archive.  This avoids making the
+  # uploaded bundle depend on very high-rate actuator/joint-state recordings.
+  local stage
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/careplanner_c5_analysis.XXXXXX")"
+  mkdir -p "${stage}/run" "${stage}/logs"
+
+  local f
+  for f in \
+    runtime_semantics.txt \
+    visibility_acquisition_summary.csv \
+    visibility_acquisition_complete.csv \
+    regime_summary.csv \
+    probe_active.csv \
+    probe_single_flight_summary.csv \
+    verification_outcome.csv \
+    tracker_summary.csv \
+    final_gcdf_selector_summary.csv \
+    final_gcdf_risk_summary.csv \
+    commit_summary.csv \
+    candidate_vbc_summary.csv \
+    execution_vbc_summary.csv \
+    local_planner_summary.csv \
+    local_cdf_selector_summary.csv \
+    blocker_stack_summary.csv \
+    waypoint_summary.csv \
+    waypoint_schedule_summary.csv \
+    waypoint_schedule.csv \
+    gate_summary.csv \
+    nominal_progress_summary.csv \
+    task_uncertified.csv \
+    c4_4_verified_regime_summary.json
+  do
+    if [[ -f "${RUN_OUT}/${f}" ]]; then
+      cp -f "${RUN_OUT}/${f}" "${stage}/run/${f}"
+    fi
+  done
+
+  # Keep only the diagnostically useful tails of verbose logs.  Full logs remain
+  # available in the archival ZIP above.
+  for f in waypoint_generator.log controlled.log common_runner.log \
+           low_level_tracker.log gpu_worker.log; do
+    if [[ -f "${ROOT_LOG}/${f}" ]]; then
+      tail -n 8000 "${ROOT_LOG}/${f}" > "${stage}/logs/${f}"
+    elif [[ -f "${RUN_LOG}/${f}" ]]; then
+      tail -n 8000 "${RUN_LOG}/${f}" > "${stage}/logs/${f}"
+    fi
+  done
+
+  # A generic machine-readable digest means the next analysis does not depend
+  # on manually opening every ROS CSV.  It deliberately keeps raw first/last
+  # token dictionaries as well as the key state/execution timelines.
+  python3 - "${stage}" "${REPO}" "${CASE_ID}" <<'PY'
+import csv
+import hashlib
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+
+stage, repo, case_id = sys.argv[1:4]
+run = os.path.join(stage, "run")
+logs = os.path.join(stage, "logs")
+TOK = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+
+def records(name):
+    path = os.path.join(run, name)
+    out = []
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, newline="", errors="replace") as f:
+            rd = csv.reader(f)
+            h = next(rd, [])
+            if not h:
+                return out
+            ti = h.index("%time") if "%time" in h else 0
+            di = h.index("field.data") if "field.data" in h else 1
+            for row in rd:
+                if len(row) <= di:
+                    continue
+                d = dict(TOK.findall(",".join(row[di:])))
+                try:
+                    d["_t"] = float(row[ti]) / 1e9
+                except Exception:
+                    d["_t"] = math.nan
+                if d:
+                    out.append(d)
+    except Exception as exc:
+        return [{"_parse_error": repr(exc)}]
+    return out
+
+def as_int(v, default=0):
+    try:
+        return int(float(v))
+    except Exception:
+        return default
+
+def transition_sequence(rs, key):
+    seq = []
+    last = object()
+    for r in rs:
+        v = r.get(key)
+        if v is None or v == last:
+            continue
+        seq.append({"t": r.get("_t"), key: v, "reason": r.get("reason", r.get("last_transition_reason"))})
+        last = v
+    return seq
+
+names = [
+    "visibility_acquisition_summary.csv",
+    "regime_summary.csv",
+    "probe_single_flight_summary.csv",
+    "verification_outcome.csv",
+    "tracker_summary.csv",
+    "final_gcdf_selector_summary.csv",
+    "final_gcdf_risk_summary.csv",
+    "commit_summary.csv",
+    "candidate_vbc_summary.csv",
+    "execution_vbc_summary.csv",
+    "local_planner_summary.csv",
+    "local_cdf_selector_summary.csv",
+    "blocker_stack_summary.csv",
+]
+R = {n: records(n) for n in names}
+
+digest = {
+    "case_id": case_id,
+    "branch": subprocess.check_output(["git", "-C", repo, "branch", "--show-current"], text=True).strip(),
+    "head": subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip(),
+    "files": {},
+}
+
+for n, rs in R.items():
+    digest["files"][n] = {
+        "records": len(rs),
+        "first": rs[0] if rs else None,
+        "last": rs[-1] if rs else None,
+    }
+
+acq = R["visibility_acquisition_summary.csv"]
+digest["acquisition"] = {
+    "timer_exception_count_max": max([as_int(r.get("timer_exception_count")) for r in acq] or [0]),
+    "started_any": any(r.get("started") == "1" for r in acq),
+    "complete_any": any(r.get("complete") == "1" for r in acq),
+    "complete_transitions": transition_sequence(acq, "complete"),
+    "remaining_count_transitions": transition_sequence(acq, "remaining_obligation_count"),
+    "last": acq[-1] if acq else None,
+}
+
+reg = R["regime_summary.csv"]
+digest["regime"] = {
+    "state_transitions": transition_sequence(reg, "state"),
+    "last": reg[-1] if reg else None,
+}
+
+probe = R["probe_single_flight_summary.csv"]
+digest["probe_single_flight"] = {
+    "phase_transitions": transition_sequence(probe, "phase"),
+    "last": probe[-1] if probe else None,
+}
+
+ver = R["verification_outcome.csv"]
+probe_ver = []
+for r in ver:
+    if r.get("verification_view") == "probe_prefix_brake_hold":
+        probe_ver.append({
+            "t": r.get("_t"),
+            "seq": r.get("seq"),
+            "result": r.get("result"),
+            "committed": r.get("committed"),
+            "safety_gate": r.get("safety_gate"),
+            "execution_stamp_ns": r.get("execution_stamp_ns"),
+        })
+digest["probe_verifications"] = probe_ver
+
+trk = R["tracker_summary.csv"]
+trk_done = []
+for r in trk:
+    if r.get("complete") == "1" and r.get("source") == "trajectory_complete_hold":
+        trk_done.append({
+            "t": r.get("_t"),
+            "seq": r.get("seq"),
+            "execution_stamp_ns": r.get("execution_stamp_ns"),
+        })
+digest["tracker_completions"] = trk_done
+
+probe_stamps = {
+    r["execution_stamp_ns"] for r in probe_ver
+    if r.get("result") == "safe" and r.get("committed") == "1"
+       and r.get("execution_stamp_ns") not in (None, "0")
+}
+tracker_stamps = {
+    r["execution_stamp_ns"] for r in trk_done
+    if r.get("execution_stamp_ns") not in (None, "0")
+}
+digest["matched_probe_completion_stamps"] = sorted(probe_stamps & tracker_stamps)
+
+exe = R["execution_vbc_summary.csv"]
+digest["execution_vbc"] = {
+    "records": len(exe),
+    "unsafe_records": sum(r.get("has_violation") == "1" for r in exe),
+    "last": exe[-1] if exe else None,
+}
+
+# Collect exception/error evidence from the compact log tails.
+err_pat = re.compile(r"(Traceback|Exception|ERROR|FATAL|timer callback exception|stamp_miss|timeout)", re.I)
+errors = {}
+for name in sorted(os.listdir(logs)) if os.path.isdir(logs) else []:
+    path = os.path.join(logs, name)
+    hits = []
+    with open(path, errors="replace") as f:
+        for i, line in enumerate(f, 1):
+            if err_pat.search(line):
+                hits.append({"line": i, "text": line.rstrip()[:1000]})
+    if hits:
+        errors[name] = hits[-200:]
+digest["log_error_evidence"] = errors
+
+with open(os.path.join(stage, "c5_analysis_digest.json"), "w") as f:
+    json.dump(digest, f, indent=2, allow_nan=True)
+
+manifest_lines = [
+    "CAREPlanner compact C5 analysis bundle",
+    f"case_id={case_id}",
+    f"branch={digest['branch']}",
+    f"head={digest['head']}",
+    "",
+    "FILES:",
+]
+for root, _, files in os.walk(stage):
+    for name in sorted(files):
+        p = os.path.join(root, name)
+        if name == "MANIFEST.txt":
+            continue
+        rel = os.path.relpath(p, stage)
+        h = hashlib.sha256()
+        with open(p, "rb") as fp:
+            for chunk in iter(lambda: fp.read(1024 * 1024), b""):
+                h.update(chunk)
+        manifest_lines.append(f"{rel}\t{os.path.getsize(p)}\tsha256={h.hexdigest()}")
+with open(os.path.join(stage, "MANIFEST.txt"), "w") as f:
+    f.write("\n".join(manifest_lines) + "\n")
+PY
+
+  # Use Python's standard ZIP implementation with ordinary deflate and ASCII
+  # member names.  This produces a small, conventional archive that is easier
+  # for chat/file-analysis systems to mount than the full experiment directory.
+  rm -f "${ANALYSIS_ZIP_PATH}"
+  python3 - "${stage}" "${ANALYSIS_ZIP_PATH}" <<'PY'
+import os
+import sys
+import zipfile
+
+stage, dst = sys.argv[1:3]
+with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    for root, dirs, files in os.walk(stage):
+        dirs.sort()
+        files.sort()
+        for name in files:
+            src = os.path.join(root, name)
+            arc = os.path.relpath(src, stage).replace(os.sep, "/")
+            z.write(src, arc)
+print(dst)
+PY
+
+  sha256sum "${ANALYSIS_ZIP_PATH}" > "${ANALYSIS_ZIP_PATH}.sha256"
+  echo "[C5.x ANALYSIS ZIP] ${ANALYSIS_ZIP_PATH}"
+  ls -lh "${ANALYSIS_ZIP_PATH}" "${ANALYSIS_ZIP_PATH}.sha256"
+  rm -rf "${stage}"
 }
 trap 'rc=$?; cleanup || true; if [[ -d "${ROOT_OUT}" || -d "${ROOT_LOG}" ]]; then pack_debug_bundle || true; fi; exit $rc' EXIT
 
@@ -407,5 +685,6 @@ pack_debug_bundle
 echo ""
 echo "[C5.4 COMPLETE]"
 echo "[SUMMARY] ${SUMMARY_JSON}"
-echo "[ZIP] ${ZIP_PATH}"
-ls -lh "${ZIP_PATH}"
+echo "[FULL ZIP] ${ZIP_PATH}"
+echo "[ANALYSIS ZIP] ${ANALYSIS_ZIP_PATH}"
+ls -lh "${ZIP_PATH}" "${ANALYSIS_ZIP_PATH}" "${ANALYSIS_ZIP_PATH}.sha256"
