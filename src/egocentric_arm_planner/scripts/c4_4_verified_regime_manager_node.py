@@ -13,9 +13,11 @@ C4.7 optional visibility-acquisition gate:
     confidence/visibility layer reports acquisition_complete=True after first
     publishing False in the current REPAIR episode.
 
-Candidate safety and committed-execution safety remain separate. Candidate-side
-transitions consume unique verification outcome events; execution VBC continuously
-audits only committed trajectories.
+Candidate certification and committed-execution safety remain separate. A C5.8
+candidate may be rejected by the final executable GCDF gate or by exact VBC.
+PROBE success is NOT counted at commit time: it is counted only when the
+full-trajectory tracker reports trajectory_complete_hold for the exact committed
+header.stamp execution token. ROS Header.seq is diagnostic only.
 """
 
 import math
