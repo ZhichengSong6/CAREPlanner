@@ -162,6 +162,7 @@ class C44VerifiedRegimeManager:
         self.normal_entry_count = 0
         self.probe_failure_count = 0
         self.candidate_repair_entry_count = 0
+        self.gcdf_repair_entry_count = 0
         self.execution_repair_entry_count = 0
         self.task_infeasible_repair_entry_count = 0
         self.task_infeasible_pending = False
@@ -268,6 +269,8 @@ class C44VerifiedRegimeManager:
             self.repair_completion_armed = False
             if reason.startswith("execution_"):
                 self.execution_repair_entry_count += 1
+            elif reason.startswith("final_gcdf_"):
+                self.gcdf_repair_entry_count += 1
             elif reason.startswith("task_"):
                 # Task-QP infeasibility has its own counter and is neither a
                 # candidate-VBC failure nor an execution-VBC failure.
@@ -465,6 +468,13 @@ class C44VerifiedRegimeManager:
                       self.candidate_unsafe_streak >= self.candidate_unsafe_required):
                     self._transition_locked(
                         self.REPAIR, "candidate_unique_unsafe_confirmed", now)
+                elif result == "timeout":
+                    # No candidate was certified or committed. Stay in NORMAL
+                    # and explicitly request a fresh plan; never reuse stale
+                    # execution merely because a safety transport timed out.
+                    self.last_transition_reason = (
+                        "{}_normal_timeout_replan".format(safety_gate))
+                    self.replan_request_pub.publish(Bool(data=True))
                 return
 
             if self.state == self.REPAIR:
@@ -688,6 +698,7 @@ class C44VerifiedRegimeManager:
                 "execution_safety_event_count={}".format(self.execution_safety_event_count),
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
+                "gcdf_repair_entry_count={}".format(self.gcdf_repair_entry_count),
                 "execution_repair_entry_count={}".format(self.execution_repair_entry_count),
                 "task_infeasible_repair_entry_count={}".format(
                     self.task_infeasible_repair_entry_count),
