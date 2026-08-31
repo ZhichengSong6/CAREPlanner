@@ -225,7 +225,6 @@
     <param name="probe_completed_prefixes_required"
            value="$(arg probe_safe_commits_required)" />
     <param name="input_timeout" value="$(arg regime_input_timeout)" />
-    <param name="committed_trajectory_timeout" value="0.30" />
     <param name="clear_pulse_s" value="0.12" />
     <param name="probe_ignore_s" value="0.16" />
     <param name="candidate_outcome_topic" value="$(arg candidate_outcome_topic)" />
