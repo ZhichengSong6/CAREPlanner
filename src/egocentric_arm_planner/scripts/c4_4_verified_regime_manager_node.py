@@ -61,8 +61,10 @@ class C44VerifiedRegimeManager:
             "~candidate_unsafe_required", 2))
         self.execution_unsafe_required = int(rospy.get_param(
             "~execution_unsafe_required", 2))
-        self.probe_safe_commits_required = int(rospy.get_param(
+        legacy_probe_required = int(rospy.get_param(
             "~probe_safe_commits_required", 3))
+        self.probe_completed_prefixes_required = int(rospy.get_param(
+            "~probe_completed_prefixes_required", legacy_probe_required))
         self.input_timeout = float(rospy.get_param("~input_timeout", 0.25))
         self.committed_trajectory_timeout = float(rospy.get_param(
             "~committed_trajectory_timeout", 0.30))
@@ -79,8 +81,8 @@ class C44VerifiedRegimeManager:
             raise ValueError("~rate must be positive")
         if self.candidate_unsafe_required < 1 or self.execution_unsafe_required < 1:
             raise ValueError("unsafe streak requirements must be >= 1")
-        if self.probe_safe_commits_required < 1:
-            raise ValueError("probe_safe_commits_required must be >= 1")
+        if self.probe_completed_prefixes_required < 1:
+            raise ValueError("probe_completed_prefixes_required must be >= 1")
         if min(self.input_timeout, self.committed_trajectory_timeout,
                self.clear_pulse_s, self.probe_ignore_s) <= 0.0:
             raise ValueError("timeouts/pulses must be positive")
@@ -147,7 +149,7 @@ class C44VerifiedRegimeManager:
         self.last_committed_trajectory_time = None
         self.last_commit_count = 0
         self.last_commit_event_time = None
-        self.probe_safe_commit_streak = 0
+        self.probe_completed_prefix_streak = 0
         self.probe_completed_execution_count = 0
         self.pending_probe_candidate_seq = 0
         self.pending_probe_execution_stamp_ns = 0
@@ -232,9 +234,9 @@ class C44VerifiedRegimeManager:
 
         rospy.logwarn(
             "[c4_regime] NORMAL->REPAIR->PROBE_NORMAL->NORMAL; candidate=%s "
-            "execution=%s probe_safe_commits=%d completion_gate=%d completion_topic=%s",
+            "execution=%s probe_completed_prefixes=%d completion_gate=%d completion_topic=%s",
             self.candidate_outcome_topic, self.execution_summary_topic,
-            self.probe_safe_commits_required,
+            self.probe_completed_prefixes_required,
             int(self.repair_completion_gate_enabled),
             self.repair_completion_topic)
 
@@ -257,7 +259,7 @@ class C44VerifiedRegimeManager:
 
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
-            self.probe_safe_commit_streak = 0
+            self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
             self.clear_until = None
@@ -274,14 +276,14 @@ class C44VerifiedRegimeManager:
                 self.candidate_repair_entry_count += 1
         elif new_state == self.PROBE_NORMAL:
             self.probe_entry_count += 1
-            self.probe_safe_commit_streak = 0
+            self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
             self.clear_until = now + rospy.Duration(self.clear_pulse_s)
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
             self.normal_entry_count += 1
-            self.probe_safe_commit_streak = 0
+            self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
             self.clear_until = None
@@ -302,7 +304,7 @@ class C44VerifiedRegimeManager:
                 self.candidate_unsafe_streak = 0
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
-                self.probe_safe_commit_streak = 0
+                self.probe_completed_prefix_streak = 0
                 self.pending_probe_candidate_seq = 0
                 self.pending_probe_execution_stamp_ns = 0
                 self.repair_completion = False
@@ -575,10 +577,10 @@ class C44VerifiedRegimeManager:
 
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
-            self.probe_safe_commit_streak += 1
+            self.probe_completed_prefix_streak += 1
             self.probe_completed_execution_count += 1
 
-            if self.probe_safe_commit_streak >= self.probe_safe_commits_required:
+            if self.probe_completed_prefix_streak >= self.probe_completed_prefixes_required:
                 self._transition_locked(
                     self.NORMAL, "probe_normal_completed_prefixes", now)
             else:
@@ -697,7 +699,13 @@ class C44VerifiedRegimeManager:
                     int(self.task_uncertified_pending)),
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
-                "probe_safe_commit_streak={}".format(self.probe_safe_commit_streak),
+                "probe_completed_prefix_streak={}".format(
+                    self.probe_completed_prefix_streak),
+                # Compatibility alias for older result parsers.
+                "probe_safe_commit_streak={}".format(
+                    self.probe_completed_prefix_streak),
+                "probe_completed_prefixes_required={}".format(
+                    self.probe_completed_prefixes_required),
                 "probe_completed_execution_count={}".format(
                     self.probe_completed_execution_count),
                 "pending_probe_candidate_seq={}".format(
