@@ -80,6 +80,7 @@ private:
 
   void publishSummary(bool trajectory_active,
                       bool trajectory_complete,
+                      uint32_t trajectory_seq,
                       double phase_s,
                       double remaining_s,
                       double tracking_error_inf,
@@ -119,6 +120,7 @@ private:
   ros::Time active_trajectory_start_time_;
   ros::Time active_trajectory_received_time_;
   double active_trajectory_duration_s_ = 0.0;
+  uint32_t active_trajectory_seq_ = 0;
 
   // Last valid reference is retained after trajectory completion so the robot
   // holds its final configuration instead of snapping back to home.
