@@ -332,18 +332,33 @@ fi
 
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 
+RUNTIME_BRANCH="$(git branch --show-current)"
+RUNTIME_HEAD="$(git rev-parse HEAD)"
+RUNTIME_FINAL_GCDF="$(rosparam get /optimized_trajectory_continuity/final_gcdf_enabled)"
+RUNTIME_CONTINUATION="$(rosparam get /optimized_trajectory_continuity/continuation_enabled)"
+RUNTIME_EXEC_AUDIT="$(rosparam get /optimized_trajectory_continuity/execution_audit_enabled)"
+RUNTIME_PROBE_NODE_COUNT="$(rosnode list | grep -c '^/probe_single_flight_gate$' || true)"
+
 cat > "${OUT}/runtime_semantics.txt" <<EOF
-branch=$(git branch --show-current)
-head=$(git rev-parse HEAD)
+branch=${RUNTIME_BRANCH}
+head=${RUNTIME_HEAD}
+case_id=${CASE_ID}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
 commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
-final_gcdf_enabled=$(rosparam get /optimized_trajectory_continuity/final_gcdf_enabled)
-continuation_enabled=$(rosparam get /optimized_trajectory_continuity/continuation_enabled)
-execution_audit_enabled=$(rosparam get /optimized_trajectory_continuity/execution_audit_enabled)
+final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
+continuation_enabled=${RUNTIME_CONTINUATION}
+execution_audit_enabled=${RUNTIME_EXEC_AUDIT}
 execution_vbc_trajectory_topic=${EXECUTION_VBC_TRAJECTORY_TOPIC}
 probe_single_flight_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
-probe_single_flight_node=$(rosnode list | grep -c '^/probe_single_flight_gate
+probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
+probe_repair_requires_visibility_obligation=true
+probe_solver_failure_uses_blocker_rediscovery=true
+probe_vbc_unsafe_uses_blocker_rediscovery=true
+probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
+final_gcdf_recovery_trajectory_topic=/care_planner/final_gcdf/recovery_trajectory
+final_gcdf_recovery_event_topic=/care_planner/final_gcdf/recovery_visibility_event
+EOF
 
 record_topic() {
   local topic="$1"; local path="$2"
