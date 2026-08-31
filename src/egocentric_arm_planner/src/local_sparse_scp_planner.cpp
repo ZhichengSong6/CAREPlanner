@@ -215,6 +215,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<bool>("local_planner/cdf/slack_enabled",
                    cdf_slack_enabled_,
                    cdf_slack_enabled_);
+  pnh_.param<bool>("local_planner/cdf/task_failure_slack_diagnostic_enabled",
+                   task_failure_slack_diagnostic_enabled_,
+                   task_failure_slack_diagnostic_enabled_);
+  pnh_.param<double>("local_planner/cdf/task_failure_slack_diagnostic_weight",
+                     task_failure_slack_diagnostic_weight_,
+                     task_failure_slack_diagnostic_weight_);
   pnh_.param<bool>("local_planner/cdf/adaptive_slack_penalty",
                    cdf_adaptive_slack_penalty_,
                    cdf_adaptive_slack_penalty_);
@@ -1076,6 +1082,37 @@ void LocalSparseSCPPlanner::workerLoop() {
       ROS_WARN_STREAM(
           "[LocalSparseSCPPlanner] sparse PIQP failed: "
           << result.status);
+
+      if (!repair && task_failure_slack_diagnostic_enabled_) {
+        const SparseSolveResult diagnostic =
+            solveSparseSubproblem(
+                *batch,
+                q_bar,
+                u_bar,
+                q_ref,
+                u_ref,
+                previous_command,
+                schedule,
+                repair,
+                probe,
+                trust,
+                task_failure_slack_diagnostic_weight_,
+                true);
+        publishSummary(
+            "task_failure_slack_diagnostic",
+            &diagnostic,
+            0.0);
+        ROS_WARN_STREAM(
+            "[LocalSparseSCPPlanner] task failure slack diagnostic: "
+            << "mode=" << (probe ? "PROBE_NORMAL" : "NORMAL")
+            << " hard_status='" << result.status << "'"
+            << " soft_solved=" << (diagnostic.solved ? 1 : 0)
+            << " soft_status='" << diagnostic.status << "'"
+            << " required_max_slack=" << diagnostic.max_slack
+            << " required_mean_slack=" << diagnostic.mean_slack
+            << " soft_primal=" << diagnostic.primal_residual);
+      }
+
       if (!repair) {
         if (result.status.find("primal infeasible") != std::string::npos) {
           std_msgs::Bool infeasible_msg;
@@ -1084,7 +1121,7 @@ void LocalSparseSCPPlanner::workerLoop() {
           ROS_WARN_STREAM(
               "[LocalSparseSCPPlanner] task QP infeasible in "
               << (probe ? "PROBE_NORMAL" : "NORMAL")
-              << " -> request REPAIR regime");
+              << " -> publish task infeasible signal");
         } else if (
             result.status.find("max iterations") != std::string::npos ||
             result.status.find("maximum iterations") != std::string::npos) {
@@ -1096,7 +1133,7 @@ void LocalSparseSCPPlanner::workerLoop() {
               << (probe ? "PROBE_NORMAL" : "NORMAL")
               << " status='" << result.status
               << "' primal_res=" << result.primal_residual
-              << " -> request REPAIR regime");
+              << " -> publish task uncertified signal");
         }
       }
       continue;
@@ -1145,8 +1182,13 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     bool repair_mode,
     bool probe_mode,
     double trust_radius,
-    double slack_linear_weight) const {
+    double slack_linear_weight,
+    bool force_diagnostic_slack) const {
   SparseSolveResult out;
+  const bool slack_enabled =
+      cdf_slack_enabled_ || force_diagnostic_slack;
+  const bool per_constraint_slack =
+      cdf_per_constraint_slack_ || force_diagnostic_slack;
   out.slack_linear_weight_used = slack_linear_weight;
   out.batch_pairs = batch.num_pairs;
   out.min_distance = std::numeric_limits<double>::infinity();
@@ -1267,8 +1309,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   std::vector<int> step_to_slack(
       static_cast<std::size_t>(num_intervals_ + 1), -1);
   int n_s = 0;
-  if (cdf_slack_enabled_) {
-    if (cdf_per_constraint_slack_) {
+  if (slack_enabled) {
+    if (per_constraint_slack) {
       n_s = static_cast<int>(selected.size());
     } else {
       for (const auto& row : selected) {
@@ -1418,7 +1460,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     p_triplets.emplace_back(
         si, si, 2.0 * cdf_slack_quadratic_weight_);
     x_l[si] = 0.0;
-    if (cdf_slack_use_upper_bound_)
+    if (cdf_slack_use_upper_bound_ && !force_diagnostic_slack)
       x_u[si] = cdf_slack_upper_bound_;
   }
 
@@ -1495,9 +1537,9 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           qIndex(row_data.k, j),
           row_data.g[j]);
     }
-    if (cdf_slack_enabled_) {
+    if (slack_enabled) {
       const int slack_slot =
-          cdf_per_constraint_slack_
+          per_constraint_slack
               ? r
               : step_to_slack[static_cast<std::size_t>(row_data.k)];
       if (slack_slot < 0 || slack_slot >= n_s) {
@@ -1531,8 +1573,9 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " q_vars=" << n_q
       << " u_vars=" << n_u
       << " cdf_slacks=" << n_s
-      << " slack_enabled=" << (cdf_slack_enabled_ ? 1 : 0)
-      << " per_constraint_slack=" << (cdf_per_constraint_slack_ ? 1 : 0)
+      << " slack_enabled=" << (slack_enabled ? 1 : 0)
+      << " per_constraint_slack=" << (per_constraint_slack ? 1 : 0)
+      << " diagnostic_slack=" << (force_diagnostic_slack ? 1 : 0)
       << " accel_constraints="
       << (enforce_acceleration_constraints_ ? 1 : 0)
       << " eq=" << n_eq
