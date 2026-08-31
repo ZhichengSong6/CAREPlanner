@@ -202,6 +202,7 @@ class C44VerifiedRegimeManager:
                 self._repair_completion_cb, queue_size=1)
 
         self.trigger_pub.publish(Bool(data=False))
+        self.probe_active_pub.publish(Bool(data=False))
         self.clear_pub.publish(Bool(data=False))
         self.hold_pub.publish(Bool(data=False))
         self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate), self._timer_cb)
