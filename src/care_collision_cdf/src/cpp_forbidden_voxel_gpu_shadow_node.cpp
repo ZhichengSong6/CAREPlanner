@@ -882,6 +882,7 @@ class CppForbiddenVoxelGpuShadow {
   }
 
   void publishConstraintBatch(
+      bool final_channel,
       const std_msgs::Header& source_header,
       const std::vector<PairMeta>& pairs,
       const std::vector<float>& distance,
@@ -938,11 +939,17 @@ class CppForbiddenVoxelGpuShadow {
     msg.gpu_worker_total_ms = gpu.worker_total_ms;
     msg.online_pipeline_ms = pipeline_ms;
 
-    constraint_batch_pub_.publish(msg);
-    ++constraint_batch_publish_count_;
+    if (final_channel) {
+      final_constraint_batch_pub_.publish(msg);
+      ++final_constraint_batch_publish_count_;
+    } else {
+      constraint_batch_pub_.publish(msg);
+      ++constraint_batch_publish_count_;
+    }
   }
 
   void publishSummary(
+      bool final_channel,
       std::size_t pair_count,
       int active_step_count,
       double d_min,
@@ -970,13 +977,25 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
         << " map_index_ms=" << map_index_ms
-        << " batch_topic=" << constraint_batch_topic_
-        << " batch_subscribers=" << constraint_batch_pub_.getNumSubscribers()
-        << " batch_publish_count=" << constraint_batch_publish_count_;
+        << " channel=" << (final_channel ? "final" : "local")
+        << " batch_topic="
+        << (final_channel ? final_constraint_batch_topic_ : constraint_batch_topic_)
+        << " batch_subscribers="
+        << (final_channel
+                ? final_constraint_batch_pub_.getNumSubscribers()
+                : constraint_batch_pub_.getNumSubscribers())
+        << " batch_publish_count="
+        << (final_channel
+                ? final_constraint_batch_publish_count_
+                : constraint_batch_publish_count_);
 
     std_msgs::String msg;
     msg.data = oss.str();
-    summary_pub_.publish(msg);
+    if (final_channel) {
+      final_summary_pub_.publish(msg);
+    } else {
+      summary_pub_.publish(msg);
+    }
   }
 
   void timerCallback(const ros::TimerEvent&) {
