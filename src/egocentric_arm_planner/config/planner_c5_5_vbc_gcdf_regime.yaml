@@ -140,6 +140,13 @@ local_planner:
     slack_penalty_max: 100000000.0
     slack_tolerance: 0.005
 
+    # Current low-confidence/unknown space is a hard constraint only over
+    # the trajectory segment that may actually be executed before the next
+    # sense/replan cycle. With dt=0.05 s, 5 steps = 0.25 s, covering the
+    # 0.15 s committed prefix plus braking margin.
+    # REPAIR and PROBE_NORMAL use this horizon; NORMAL keeps all 20 steps.
+    constraint_horizon_steps: 5
+
     safe_row_screening: true
     linearization_tolerance_inf: 0.0001
 
