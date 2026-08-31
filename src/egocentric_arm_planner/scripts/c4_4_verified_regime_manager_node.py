@@ -107,6 +107,9 @@ class C44VerifiedRegimeManager:
         self.verification_hold_topic = str(rospy.get_param(
             "~verification_hold_topic",
             "/care_planner/execution/predicted_vbc_verification_hold"))
+        self.probe_active_topic = str(rospy.get_param(
+            "~probe_active_topic",
+            "/care_planner/c4_4/probe_active"))
         self.summary_topic = str(rospy.get_param(
             "~summary_topic", "/care_planner/c4_4/regime_summary"))
         self.task_infeasible_topic = str(rospy.get_param(
@@ -168,6 +171,8 @@ class C44VerifiedRegimeManager:
             self.clear_topic, Bool, queue_size=1, latch=True)
         self.hold_pub = rospy.Publisher(
             self.verification_hold_topic, Bool, queue_size=1, latch=True)
+        self.probe_active_pub = rospy.Publisher(
+            self.probe_active_topic, Bool, queue_size=1, latch=True)
         self.deadline_pub = rospy.Publisher(
             self.effective_deadline_topic, Float64, queue_size=1)
         self.summary_pub = rospy.Publisher(
@@ -447,6 +452,7 @@ class C44VerifiedRegimeManager:
         now = rospy.Time.now()
         with self._lock:
             trigger = self.execution_ready and self.state == self.REPAIR
+            probe_active = self.execution_ready and self.state == self.PROBE_NORMAL
             clear = (
                 self.execution_ready and self.state == self.PROBE_NORMAL and
                 self.clear_until is not None and now <= self.clear_until)
@@ -466,6 +472,7 @@ class C44VerifiedRegimeManager:
             deadline = self.physical_deadline_abs
 
         self.trigger_pub.publish(Bool(data=trigger))
+        self.probe_active_pub.publish(Bool(data=probe_active))
         self.clear_pub.publish(Bool(data=clear))
         self.hold_pub.publish(Bool(data=hold))
         if deadline is not None:
