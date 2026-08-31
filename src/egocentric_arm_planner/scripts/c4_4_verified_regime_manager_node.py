@@ -148,6 +148,12 @@ class C44VerifiedRegimeManager:
         self.execution_safety_event_count = 0
         self.execution_safe_count = 0
 
+        self.tracker_summary_time = None
+        self.tracker_active = False
+        self.tracker_complete = False
+        self.tracker_execution_stamp_ns = 0
+        self.tracker_source = "none"
+
         self.last_committed_trajectory_time = None
         self.last_commit_count = 0
         self.last_commit_event_time = None
@@ -561,18 +567,29 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
+        active = _as_bool(f.get("active"))
         complete = _as_bool(f.get("complete"))
         seq = _as_int(f.get("seq"), 0)
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         source = f.get("source", "")
-        if (complete is not True or execution_stamp_ns <= 0 or
-                source != "trajectory_complete_hold"):
-            return
 
         now = rospy.Time.now()
         request_next_probe = False
         with self._lock:
-            # ROS Header.seq is publisher-owned and only diagnostic here.
+            # Tracker liveness/ownership is the execution freshness signal in
+            # the single-publish architecture. A committed topic message is no
+            # longer expected to refresh while a trajectory is running.
+            self.tracker_summary_time = now
+            self.tracker_active = bool(active) if active is not None else False
+            self.tracker_complete = bool(complete) if complete is not None else False
+            self.tracker_execution_stamp_ns = execution_stamp_ns
+            self.tracker_source = source
+
+            if (complete is not True or execution_stamp_ns <= 0 or
+                    source != "trajectory_complete_hold"):
+                return
+
+            # ROS Header.seq is publisher-owned and diagnostic only.
             self.last_tracker_complete_seq = seq
             if execution_stamp_ns == self.last_tracker_complete_stamp_ns:
                 return
@@ -653,16 +670,17 @@ class C44VerifiedRegimeManager:
 
             exec_summary_fresh = self._fresh(
                 self.execution_summary_time, now, self.input_timeout)
-            committed_fresh = self._fresh(
-                self.last_committed_trajectory_time, now,
-                self.committed_trajectory_timeout)
+            tracker_summary_fresh = self._fresh(
+                self.tracker_summary_time, now, self.input_timeout)
             startup_grace = (
                 self.execution_ready_time is not None and
                 (now - self.execution_ready_time).to_sec() < self.input_timeout)
-            has_committed = self.last_committed_trajectory_time is not None
+            execution_in_progress = bool(
+                self.tracker_active and self.tracker_execution_stamp_ns > 0)
             hold = bool(
-                self.execution_ready and has_committed and not startup_grace and
-                (not exec_summary_fresh or not committed_fresh))
+                self.execution_ready and execution_in_progress and
+                not startup_grace and
+                (not exec_summary_fresh or not tracker_summary_fresh))
             deadline = self.physical_deadline_abs
 
         self.trigger_pub.publish(Bool(data=trigger))
@@ -699,6 +717,11 @@ class C44VerifiedRegimeManager:
                 "execution_unsafe_streak={}".format(self.execution_unsafe_streak),
                 "execution_event_latched={}".format(int(self.execution_event_latched)),
                 "execution_safety_event_count={}".format(self.execution_safety_event_count),
+                "tracker_active={}".format(int(self.tracker_active)),
+                "tracker_complete={}".format(int(self.tracker_complete)),
+                "tracker_execution_stamp_ns={}".format(
+                    self.tracker_execution_stamp_ns),
+                "tracker_source={}".format(self.tracker_source),
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
                 "gcdf_repair_entry_count={}".format(self.gcdf_repair_entry_count),
@@ -744,6 +767,8 @@ class C44VerifiedRegimeManager:
                     age(self.candidate_outcome_time)),
                 "execution_summary_age_s={:.6f}".format(
                     age(self.execution_summary_time)),
+                "tracker_summary_age_s={:.6f}".format(
+                    age(self.tracker_summary_time)),
                 "committed_trajectory_age_s={:.6f}".format(
                     age(self.last_committed_trajectory_time)),
                 "repair_completion_age_s={:.6f}".format(
