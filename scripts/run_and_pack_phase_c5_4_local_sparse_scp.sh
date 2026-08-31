@@ -2,7 +2,11 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-CASE_ID="${CASE_ID:-case_003}"
+if [[ -z "${CASE_ID:-}" ]]; then
+  _RUN_STAMP="$(date +%Y%m%d-%H%M%S-%3N)"
+  _GIT_SHORT="$(git -C "${REPO}" rev-parse --short=8 HEAD)"
+  CASE_ID="case_003_${_RUN_STAMP}_${_GIT_SHORT}"
+fi
 RUN_SECONDS="${RUN_SECONDS:-20.0}"
 
 GPU_ENV="${GPU_ENV:-viscdf}"
@@ -26,12 +30,8 @@ ROOT_LOG="${ROOT_LOG:-${REPO}/logs/phase_c5_4_local_sparse_scp/${CASE_ID}}"
 RUN_OUT="${ROOT_OUT}/run"
 RUN_LOG="${ROOT_LOG}/run"
 SELECTOR_JSONL="${ROOT_OUT}/local_scp_selector.jsonl"
-ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_4_local_sparse_scp_${CASE_ID}.zip}"
+ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${CASE_ID}.zip}"
 SUMMARY_JSON="${ROOT_OUT}/c5_4_local_sparse_scp_summary.json"
-# Compact, upload-friendly bundle for ChatGPT/result analysis.  The historical
-# full ZIP is still produced for archival use, but this second ZIP intentionally
-# excludes high-rate actuator streams unless they are directly useful.
-ANALYSIS_ZIP_PATH="${ANALYSIS_ZIP_PATH:-${REPO}/CAREPlanner_C5_analysis_${CASE_ID}.zip}"
 
 cd "${REPO}"
 
@@ -116,62 +116,38 @@ cleanup() {
 pack_debug_bundle() {
   cd "${REPO}"
 
-  # 1) Preserve the historical complete archive for local debugging.
-  rm -f "${ZIP_PATH}"
-  zip -r "${ZIP_PATH}" "${ROOT_OUT#${REPO}/}" "${ROOT_LOG#${REPO}/}" >/dev/null
-  echo "[C5.x FULL ZIP] ${ZIP_PATH}"
-
-  # 2) Build a compact, analysis-oriented archive.  This avoids making the
-  # uploaded bundle depend on very high-rate actuator/joint-state recordings.
+  # One run -> one uniquely named upload bundle.
   local stage
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/careplanner_c5_analysis.XXXXXX")"
-  mkdir -p "${stage}/run" "${stage}/logs"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/careplanner_c5_bundle.XXXXXX")"
+  mkdir -p "${stage}/run" "${stage}/logs" "${stage}/root"
 
-  local f
-  for f in \
-    runtime_semantics.txt \
-    visibility_acquisition_summary.csv \
-    visibility_acquisition_complete.csv \
-    regime_summary.csv \
-    probe_active.csv \
-    probe_single_flight_summary.csv \
-    verification_outcome.csv \
-    tracker_summary.csv \
-    final_gcdf_selector_summary.csv \
-    final_gcdf_risk_summary.csv \
-    commit_summary.csv \
-    candidate_vbc_summary.csv \
-    execution_vbc_summary.csv \
-    local_planner_summary.csv \
-    local_cdf_selector_summary.csv \
-    blocker_stack_summary.csv \
-    waypoint_summary.csv \
-    waypoint_schedule_summary.csv \
-    waypoint_schedule.csv \
-    gate_summary.csv \
-    nominal_progress_summary.csv \
-    task_uncertified.csv \
-    c4_4_verified_regime_summary.json
-  do
-    if [[ -f "${RUN_OUT}/${f}" ]]; then
-      cp -f "${RUN_OUT}/${f}" "${stage}/run/${f}"
-    fi
-  done
+  if [[ -d "${RUN_OUT}" ]]; then
+    cp -a "${RUN_OUT}/." "${stage}/run/"
+  fi
 
-  # Keep only the diagnostically useful tails of verbose logs.  Full logs remain
-  # available in the archival ZIP above.
+  if [[ -f "${SUMMARY_JSON}" ]]; then
+    cp -f "${SUMMARY_JSON}" "${stage}/root/"
+  fi
+  if [[ -f "${SELECTOR_JSONL}" ]]; then
+    cp -f "${SELECTOR_JSONL}" "${stage}/root/"
+  fi
+
+  # Keep full key logs. Raw high-rate CSVs (joint states, tracker/actuator
+  # streams, etc.) are already included via RUN_OUT above.
+  local f src
   for f in waypoint_generator.log controlled.log common_runner.log \
            low_level_tracker.log gpu_worker.log; do
+    src=""
     if [[ -f "${ROOT_LOG}/${f}" ]]; then
-      tail -n 8000 "${ROOT_LOG}/${f}" > "${stage}/logs/${f}"
+      src="${ROOT_LOG}/${f}"
     elif [[ -f "${RUN_LOG}/${f}" ]]; then
-      tail -n 8000 "${RUN_LOG}/${f}" > "${stage}/logs/${f}"
+      src="${RUN_LOG}/${f}"
+    fi
+    if [[ -n "${src}" ]]; then
+      cp -f "${src}" "${stage}/logs/${f}"
     fi
   done
 
-  # A generic machine-readable digest means the next analysis does not depend
-  # on manually opening every ROS CSV.  It deliberately keeps raw first/last
-  # token dictionaries as well as the key state/execution timelines.
   python3 - "${stage}" "${REPO}" "${CASE_ID}" <<'PY'
 import csv
 import hashlib
@@ -443,11 +419,10 @@ with open(os.path.join(stage, "MANIFEST.txt"), "w") as f:
     f.write("\n".join(manifest_lines) + "\n")
 PY
 
-  # Use Python's standard ZIP implementation with ordinary deflate and ASCII
-  # member names.  This produces a small, conventional archive that is easier
-  # for chat/file-analysis systems to mount than the full experiment directory.
-  rm -f "${ANALYSIS_ZIP_PATH}"
-  python3 - "${stage}" "${ANALYSIS_ZIP_PATH}" <<'PY'
+
+  # MANIFEST.txt inside the archive contains per-file hashes; no sidecar file.
+  rm -f "${ZIP_PATH}"
+  python3 - "${stage}" "${ZIP_PATH}" <<'PY'
 import os
 import sys
 import zipfile
@@ -464,9 +439,8 @@ with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6
 print(dst)
 PY
 
-  sha256sum "${ANALYSIS_ZIP_PATH}" > "${ANALYSIS_ZIP_PATH}.sha256"
-  echo "[C5.x ANALYSIS ZIP] ${ANALYSIS_ZIP_PATH}"
-  ls -lh "${ANALYSIS_ZIP_PATH}" "${ANALYSIS_ZIP_PATH}.sha256"
+  echo "[C5.x SINGLE UPLOAD ZIP] ${ZIP_PATH}"
+  ls -lh "${ZIP_PATH}"
   rm -rf "${stage}"
 }
 trap 'rc=$?; cleanup || true; if [[ -d "${ROOT_OUT}" || -d "${ROOT_LOG}" ]]; then pack_debug_bundle || true; fi; exit $rc' EXIT
@@ -761,6 +735,5 @@ pack_debug_bundle
 echo ""
 echo "[C5.4 COMPLETE]"
 echo "[SUMMARY] ${SUMMARY_JSON}"
-echo "[FULL ZIP] ${ZIP_PATH}"
-echo "[ANALYSIS ZIP] ${ANALYSIS_ZIP_PATH}"
-ls -lh "${ZIP_PATH}" "${ANALYSIS_ZIP_PATH}" "${ANALYSIS_ZIP_PATH}.sha256"
+echo "[UPLOAD ZIP] ${ZIP_PATH}"
+ls -lh "${ZIP_PATH}"
