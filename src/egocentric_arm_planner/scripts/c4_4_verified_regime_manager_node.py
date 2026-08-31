@@ -223,8 +223,11 @@ class C44VerifiedRegimeManager:
         self.state = new_state
         self.last_transition_reason = reason
 
-        # Publish mode immediately on transition so the local planner/verifier
-        # cannot race a PROBE plan before the next 20 Hz timer tick.
+        # Publish planner modes immediately on transition so subscribers cannot
+        # race against stale REPAIR/PROBE state before the next 20 Hz timer tick.
+        if hasattr(self, "trigger_pub"):
+            self.trigger_pub.publish(Bool(
+                data=bool(self.execution_ready and new_state == self.REPAIR)))
         if hasattr(self, "probe_active_pub"):
             self.probe_active_pub.publish(Bool(
                 data=bool(self.execution_ready and new_state == self.PROBE_NORMAL)))
