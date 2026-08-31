@@ -351,27 +351,41 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         with self._lock:
-            self.execution_ready = bool(msg.data)
+            was_ready = bool(self.execution_ready)
+            new_ready = bool(msg.data)
+            self.execution_ready = new_ready
             self.execution_ready_time = rospy.Time.now()
-            if not self.execution_ready:
-                self.state = self.NORMAL
-                self.candidate_unsafe_streak = 0
-                self.candidate_outcome_pending_gate_replay = False
-                self.execution_unsafe_streak = 0
-                self.execution_event_latched = False
-                self.probe_completed_prefix_streak = 0
-                self.pending_probe_candidate_seq = 0
-                self.pending_probe_execution_stamp_ns = 0
-                self.repair_completion = False
-                self.repair_completion_armed = False
-                self.blocker_rediscovery_pending = False
-                self.blocker_rediscovery_origin = "none"
-                self.blocker_rediscovery_force_bootstrap = False
-                self.force_vbc_bootstrap_pub.publish(Bool(data=False))
-                self.clear_until = None
-                self.probe_ignore_until = None
+
+            if not new_ready:
+                # Repeated startup/not-ready heartbeats must NOT erase a safety
+                # outcome that arrived while the gate was closed. Only a true
+                # ready->not-ready falling edge starts a new execution epoch.
+                if was_ready:
+                    self.state = self.NORMAL
+                    self.candidate_unsafe_streak = 0
+                    self.candidate_outcome_pending_gate_replay = False
+                    self.execution_unsafe_streak = 0
+                    self.execution_event_latched = False
+                    self.probe_completed_prefix_streak = 0
+                    self.pending_probe_candidate_seq = 0
+                    self.pending_probe_execution_stamp_ns = 0
+                    self.repair_completion = False
+                    self.repair_completion_armed = False
+                    self.blocker_rediscovery_pending = False
+                    self.blocker_rediscovery_origin = "none"
+                    self.blocker_rediscovery_force_bootstrap = False
+                    self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+                    self.clear_until = None
+                    self.probe_ignore_until = None
                 self.last_transition_reason = "execution_not_ready"
-            elif self.task_infeasible_pending and self.state == self.NORMAL:
+                return
+
+            # Ignore ready=True heartbeats. Replay pending decisions only on the
+            # actual not-ready -> ready edge.
+            if was_ready:
+                return
+
+            if self.task_infeasible_pending and self.state == self.NORMAL:
                 self.task_infeasible_pending = False
                 self.task_uncertified_pending = False
                 self.task_infeasible_repair_entry_count += 1
