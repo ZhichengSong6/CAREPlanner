@@ -18,9 +18,11 @@ CASE_ID="${RUN_ID}"
 export CONFIG_FILE="${REPO}/src/egocentric_arm_planner/config/planner_c5_5_vbc_gcdf_regime.yaml"
 export CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 export GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_5.sock}"
-export ROOT_OUT="${ROOT_OUT:-${REPO}/outputs/c5_5_vbc_gcdf_regime/${CASE_ID}}"
-export ROOT_LOG="${ROOT_LOG:-${REPO}/logs/c5_5_vbc_gcdf_regime/${CASE_ID}}"
-export ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${CASE_ID}.zip}"
+# Paths are intentionally derived from RUN_ID every time.  Do not inherit a
+# stale ROOT_OUT/ROOT_LOG/ZIP_PATH from a previous shell session.
+export ROOT_OUT="${REPO}/outputs/c5_5_vbc_gcdf_regime/${CASE_ID}"
+export ROOT_LOG="${REPO}/logs/c5_5_vbc_gcdf_regime/${CASE_ID}"
+export ZIP_PATH="${REPO}/CAREPlanner_C5_RESULT_${CASE_ID}.zip"
 export INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-100}"
 export INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-0.20}"
 
