@@ -259,6 +259,7 @@ class C44VerifiedRegimeManager:
             self.repair_entry_count += 1
             self.probe_safe_commit_streak = 0
             self.pending_probe_candidate_seq = 0
+            self.pending_probe_execution_stamp_ns = 0
             self.clear_until = None
             self.probe_ignore_until = None
             self.repair_completion = False
@@ -275,12 +276,14 @@ class C44VerifiedRegimeManager:
             self.probe_entry_count += 1
             self.probe_safe_commit_streak = 0
             self.pending_probe_candidate_seq = 0
+            self.pending_probe_execution_stamp_ns = 0
             self.clear_until = now + rospy.Duration(self.clear_pulse_s)
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
             self.normal_entry_count += 1
             self.probe_safe_commit_streak = 0
             self.pending_probe_candidate_seq = 0
+            self.pending_probe_execution_stamp_ns = 0
             self.clear_until = None
             self.probe_ignore_until = None
 
@@ -301,6 +304,7 @@ class C44VerifiedRegimeManager:
                 self.execution_event_latched = False
                 self.probe_safe_commit_streak = 0
                 self.pending_probe_candidate_seq = 0
+                self.pending_probe_execution_stamp_ns = 0
                 self.repair_completion = False
                 self.repair_completion_armed = False
                 self.clear_until = None
