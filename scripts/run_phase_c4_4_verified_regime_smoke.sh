@@ -282,6 +282,7 @@ record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_pr
 record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
 record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
 record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
 record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
 record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
 record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
