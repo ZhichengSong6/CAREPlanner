@@ -516,18 +516,103 @@ class OptimizedTrajectoryContinuityNode:
             self._last_committed_age_s = float(age_s)
             self._publish_summary_locked()
 
-    def _make_verification_event(self, seq, result, committed, age_s, view):
+    def _make_verification_event(
+            self, seq, result, committed, age_s, view, safety_gate="vbc"):
         msg = String()
         msg.data = (
             "seq={} result={} committed={} verification_age_s={:.6f} "
-            "verification_view={} outcome_count={} safe_count={} unsafe_count={} "
-            "timeout_count={} commit_count={}"
+            "verification_view={} safety_gate={} outcome_count={} safe_count={} "
+            "unsafe_count={} timeout_count={} commit_count={}"
         ).format(
             int(seq), result, int(bool(committed)), float(age_s), view,
-            self._verification_outcome_count, self._verification_safe_count,
-            self._verification_unsafe_count, self._verification_timeout_count,
-            self._commit_count)
+            safety_gate, self._verification_outcome_count,
+            self._verification_safe_count, self._verification_unsafe_count,
+            self._verification_timeout_count, self._commit_count)
         return msg
+
+    def _final_gcdf_batch_cb(self, msg):
+        if msg is None:
+            return
+
+        now = rospy.Time.now()
+        verification_to_publish = None
+        next_gcdf_to_publish = None
+        event_to_publish = None
+
+        with self._lock:
+            if (self._gcdf_outstanding is None or
+                    self._gcdf_outstanding_sent is None):
+                return
+
+            expected_stamp = self._gcdf_outstanding.header.stamp
+            dt = abs((msg.header.stamp - expected_stamp).to_sec())
+            if dt > self.final_gcdf_stamp_tolerance_s:
+                self._final_gcdf_stamp_miss_count += 1
+                self._publish_summary_locked()
+                return
+
+            candidate = copy.deepcopy(self._gcdf_outstanding)
+            seq = int(self._gcdf_outstanding_seq)
+            was_repair = bool(self._gcdf_outstanding_repair)
+            was_probe = bool(self._gcdf_outstanding_probe)
+            view = str(self._gcdf_outstanding_view)
+            age = max(0.0, (now - self._gcdf_outstanding_sent).to_sec())
+
+            self._gcdf_outstanding = None
+            self._gcdf_outstanding_sent = None
+            self._gcdf_outstanding_seq = 0
+            self._gcdf_outstanding_repair = False
+            self._gcdf_outstanding_probe = False
+            self._gcdf_outstanding_view = "none"
+
+            distances = [float(d) for d in msg.distance]
+            finite_distances = [d for d in distances if math.isfinite(d)]
+            malformed = len(finite_distances) != len(distances)
+            min_d = min(finite_distances) if finite_distances else math.inf
+            self._last_final_gcdf_min_d = min_d
+
+            gcdf_safe = (
+                not malformed and
+                (int(msg.num_pairs) == 0 or
+                 min_d >= self.final_gcdf_safety_margin))
+
+            if gcdf_safe:
+                self._final_gcdf_safe_count += 1
+                self._outstanding = candidate
+                self._outstanding_sent = now
+                self._outstanding_seq = seq
+                self._outstanding_dispatch_cycle = self._selector_cycle_count
+                self._outstanding_repair = was_repair
+                self._outstanding_probe = was_probe
+                self._outstanding_view = view
+                self._verification_publish_count += 1
+                self._last_source = "final_gcdf_safe_sent_to_exact_vbc"
+                verification_to_publish = copy.deepcopy(candidate)
+            else:
+                self._final_gcdf_unsafe_count += 1
+                self._verification_outcome_count += 1
+                self._verification_unsafe_count += 1
+                if was_repair and view == "repair_prefix_brake_hold":
+                    self._repair_prefix_unsafe_count += 1
+                if was_probe and view == "probe_prefix_brake_hold":
+                    self._probe_prefix_unsafe_count += 1
+                self._last_verification_seq = seq
+                self._last_verification_result = "unsafe"
+                self._last_verification_age_s = age
+                self._last_verification_view = view
+                self._last_source = "candidate_rejected_final_gcdf_unsafe"
+                event_to_publish = self._make_verification_event(
+                    seq, "unsafe", False, age, view, safety_gate="gcdf")
+                next_gcdf_to_publish = self._dispatch_pending_locked(now)
+
+            self._publish_summary_locked()
+
+        if verification_to_publish is not None:
+            self.verification_pub.publish(verification_to_publish)
+        if event_to_publish is not None:
+            self.verification_event_pub.publish(event_to_publish)
+        if next_gcdf_to_publish is not None:
+            self.final_gcdf_query_pub.publish(next_gcdf_to_publish)
 
     def _global_summary_cb(self, msg):
         if msg is None:
