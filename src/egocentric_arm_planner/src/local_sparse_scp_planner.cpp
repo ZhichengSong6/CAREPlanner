@@ -763,6 +763,9 @@ bool LocalSparseSCPPlanner::startPlan() {
       std::lock_guard<std::mutex> lock(mutex_);
       plan_running_ = false;
       waiting_for_cdf_ = false;
+      plan_repair_mode_ = true;
+      plan_initialization_mode_ = "waiting_visibility_obligation";
+      plan_schedule_.clear();
       last_plan_finish_time_ = ros::Time::now();
     }
     std_msgs::Bool bootstrap_msg;
