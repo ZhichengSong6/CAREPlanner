@@ -84,6 +84,8 @@ class OptimizedTrajectoryContinuityNode:
             "/care_planner/c4_4/probe_active"))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
+        self.continuation_enabled = bool(rospy.get_param(
+            "~continuation_enabled", False))
         self.continuation_start_delay_s = float(rospy.get_param(
             "~continuation_start_delay_s", 0.065))
         self.continuation_timeout_s = float(rospy.get_param(
@@ -112,10 +114,11 @@ class OptimizedTrajectoryContinuityNode:
 
         if self.rate <= 0.0:
             raise ValueError("~rate must be positive")
-        if self.continuation_start_delay_s <= 0.0:
-            raise ValueError("~continuation_start_delay_s must be positive")
-        if self.continuation_timeout_s <= self.continuation_start_delay_s:
-            raise ValueError("~continuation_timeout_s must exceed start delay")
+        if self.continuation_enabled:
+            if self.continuation_start_delay_s <= 0.0:
+                raise ValueError("~continuation_start_delay_s must be positive")
+            if self.continuation_timeout_s <= self.continuation_start_delay_s:
+                raise ValueError("~continuation_timeout_s must exceed start delay")
         if self.verification_timeout_s <= 0.0:
             raise ValueError("~verification_timeout_s must be positive")
         if self.final_gcdf_timeout_s <= 0.0:
@@ -222,10 +225,11 @@ class OptimizedTrajectoryContinuityNode:
         self._publish_summary()
         rospy.logwarn(
             "[optimized_trajectory_continuity] SELECTOR-CYCLE VERIFY raw=%s "
-            "final_gcdf=%s verify=%s committed=%s repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
-            "hold=%.3fs timeout=%.3fs",
+            "final_gcdf=%s verify=%s committed=%s continuation=%d repair_prefix=%d "
+            "prefix=%.3fs brake_dt=%.3fs hold=%.3fs timeout=%.3fs",
             self.input_topic, self.final_gcdf_query_topic,
             self.verification_topic, self.committed_topic,
+            int(self.continuation_enabled),
             int(self.repair_prefix_verification_enabled),
             self.repair_execution_prefix_s, self.repair_brake_dt_s,
             self.repair_hold_s, self.verification_timeout_s)
@@ -775,7 +779,9 @@ class OptimizedTrajectoryContinuityNode:
                     timeout_event = self._make_verification_event(
                         seq, "timeout", False, age, view)
 
-            if self._committed_master is not None and self._committed_received is not None:
+            if (self.continuation_enabled and
+                    self._committed_master is not None and
+                    self._committed_received is not None):
                 continuation_age = (now - self._committed_received).to_sec()
                 if (continuation_age >= self.continuation_start_delay_s and
                         continuation_age <= self.continuation_timeout_s):
@@ -841,6 +847,7 @@ class OptimizedTrajectoryContinuityNode:
                 "nan" if not math.isfinite(self._last_repair_brake_duration_s)
                 else "{:.6f}".format(self._last_repair_brake_duration_s)),
             "commit_count={}".format(self._commit_count),
+            "continuation_enabled={}".format(int(self.continuation_enabled)),
             "has_committed_plan={}".format(int(self._committed_master is not None)),
             "committed_publish_count={}".format(self._committed_publish_count),
             "continuation_count={}".format(self._continuation_count),
