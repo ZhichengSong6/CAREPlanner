@@ -602,6 +602,7 @@ class OptimizedTrajectoryContinuityNode:
                     self._outstanding_seq = 0
                     self._outstanding_dispatch_cycle = -1
                     self._outstanding_repair = False
+                    self._outstanding_probe = False
                     self._outstanding_view = "none"
                     self._verification_timeout_count += 1
                     self._verification_outcome_count += 1
