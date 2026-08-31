@@ -91,6 +91,12 @@ bool LocalSparseSCPPlanner::initialize(
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
   task_infeasible_pub_ =
       nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
+  force_vbc_bootstrap_pub_ =
+      nh_.advertise<std_msgs::Bool>(force_vbc_bootstrap_topic_, 1, true);
+
+  std_msgs::Bool bootstrap_init;
+  bootstrap_init.data = false;
+  force_vbc_bootstrap_pub_.publish(bootstrap_init);
 
   timer_ = nh_.createTimer(
       ros::Duration(1.0 / planner_poll_rate_),
@@ -272,6 +278,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/task_infeasible_topic",
                           task_infeasible_topic_,
                           task_infeasible_topic_);
+  pnh_.param<std::string>("local_planner/force_vbc_bootstrap_topic",
+                          force_vbc_bootstrap_topic_,
+                          force_vbc_bootstrap_topic_);
 
   if (planner_poll_rate_ <= 0.0 ||
       max_scp_iterations_ < 1 ||
@@ -427,11 +436,20 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
 void LocalSparseSCPPlanner::recoveryCallback(
     const std_msgs::BoolConstPtr& msg) {
   if (!msg) return;
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (repair_mode_ != msg->data) {
-    repair_mode_ = msg->data;
-    requestPlanLocked(
-        repair_mode_ ? "enter_repair" : "leave_repair");
+  bool clear_bootstrap = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (repair_mode_ != msg->data) {
+      repair_mode_ = msg->data;
+      requestPlanLocked(
+          repair_mode_ ? "enter_repair" : "leave_repair");
+      clear_bootstrap = !repair_mode_;
+    }
+  }
+  if (clear_bootstrap) {
+    std_msgs::Bool bootstrap_msg;
+    bootstrap_msg.data = false;
+    force_vbc_bootstrap_pub_.publish(bootstrap_msg);
   }
 }
 
@@ -733,6 +751,36 @@ bool LocalSparseSCPPlanner::startPlan() {
     wp.q = single_waypoint_q;
     schedule.push_back(std::move(wp));
   }
+
+  // A REPAIR plan without an active visibility obligation has no steering
+  // objective. Solving it would produce a no-op hold candidate, which then
+  // stays "fresh" on the predicted-trajectory topic and prevents the VBC
+  // selector from falling back to the task trajectory to discover the next
+  // blocker. Treat this as a normal waiting state instead: request an immediate
+  // task-trajectory bootstrap and publish no candidate until q_vis arrives.
+  if (repair && schedule.empty()) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      plan_running_ = false;
+      waiting_for_cdf_ = false;
+      last_plan_finish_time_ = ros::Time::now();
+    }
+    std_msgs::Bool bootstrap_msg;
+    bootstrap_msg.data = true;
+    force_vbc_bootstrap_pub_.publish(bootstrap_msg);
+    publishSummary("waiting_visibility_obligation");
+    ROS_INFO_THROTTLE(
+        0.5,
+        "[LocalSparseSCPPlanner] REPAIR waiting for visibility obligation; "
+        "forcing task-trajectory VBC bootstrap");
+    return false;
+  }
+
+  // A real visibility target is available, so normal predicted-trajectory VBC
+  // selection may resume.
+  std_msgs::Bool bootstrap_msg;
+  bootstrap_msg.data = false;
+  force_vbc_bootstrap_pub_.publish(bootstrap_msg);
 
   Eigen::VectorXd q_current;
   if (!extractMeasuredQ(joint_state, q_current)) {
