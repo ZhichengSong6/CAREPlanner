@@ -55,6 +55,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self._seen_obligation_count = 0
         self._last_visibility_check_s = -math.inf
         self._safe_repair_candidate_count = 0
+        self._visibility_episode_reopen_count = 0
         # Several ROS subscriber callbacks and the rospy.Timer may all request
         # schedule publication. Serialize the publication transaction so
         # q_vis/q_zero/deadline messages from two snapshots cannot interleave.
@@ -90,6 +91,33 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             "obligations clear only from actual confidence, seen_threshold=%.3f "
             "required_fraction=%.2f",
             self.seen_threshold, self.required_seen_fraction)
+
+    def _active_set_callback(self, msg) -> None:
+        """A fresh unsafe active set starts a new acquisition episode.
+
+        C4.7 completion is latched True after all current obligations are seen.
+        If VBC later discovers a new non-empty unsafe active set, that True must
+        no longer describe the current world state.  Reopen the episode
+        immediately (False) while q_vis generation catches up.  The regime
+        manager still waits for visibility_waypoint_active before entering
+        REPAIR, so this edge cannot create a repair without a steering target.
+        """
+        super()._active_set_callback(msg)
+        if msg is None or len(getattr(msg, "data", [])) == 0:
+            return
+
+        with self._obligation_lock:
+            no_obligations = len(self._obligations) == 0
+        if self._acquisition_complete and no_obligations:
+            self._acquisition_started = True
+            self._acquisition_complete = False
+            self._visibility_episode_reopen_count += 1
+            if hasattr(self, "acquisition_complete_pub"):
+                self.acquisition_complete_pub.publish(Bool(data=False))
+            rospy.logwarn(
+                "[vbc_acquisition] NEW UNSAFE ACTIVE SET reopens acquisition "
+                "episode count=%d while waiting for q_vis obligation",
+                self._visibility_episode_reopen_count)
 
     # ------------------------------------------------------------------
     # Candidate VBC verdict semantics
@@ -213,6 +241,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" seen_obligation_count={self._seen_obligation_count}"
             f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
             f" timer_exception_count={self._timer_exception_count}"
+            f" episode_reopen_count={self._visibility_episode_reopen_count}"
             f" region_checks={diag_text or 'none'}"
         )
         self.acquisition_summary_pub.publish(msg)
