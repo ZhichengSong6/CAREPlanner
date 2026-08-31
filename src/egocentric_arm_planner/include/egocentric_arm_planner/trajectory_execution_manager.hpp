@@ -11,6 +11,7 @@
 
 #include <Eigen/Dense>
 
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
