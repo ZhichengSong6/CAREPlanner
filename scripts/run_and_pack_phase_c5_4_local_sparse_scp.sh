@@ -15,6 +15,7 @@ GPU_ENV="${GPU_ENV:-viscdf}"
 GPU_DEVICE="${GPU_DEVICE:-cuda}"
 CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt}"
 GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
+LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
@@ -47,6 +48,7 @@ echo "[C5.4] case:   ${CASE_ID}"
 echo "[C5.4] run:    ${RUN_ID}"
 echo "[C5.8] architecture: Sparse SCP -> executable GCDF -> exact VBC -> single commit -> tracker"
 echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
+echo "[C5.27 PARAM] local+final GCDF proximity margin: ${LOCAL_SCP_PROXIMITY_MARGIN} m"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[ERROR] signed CDF checkpoint not found: ${CHECKPOINT}"
@@ -868,6 +870,7 @@ PROBE_SINGLE_FLIGHT_ENABLED=true \
 PROBE_SINGLE_FLIGHT_TOPIC="/care_planner/local_planner/candidate_trajectory_single_flight" \
 LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" \
 LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" \
+LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN}" \
 LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" \
 LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" \
 LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" \
