@@ -14,7 +14,7 @@ import os
 import re
 from collections import Counter
 
-TOK = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+TOK = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 
 def as_float(v, default=math.nan):
