@@ -267,6 +267,25 @@ digest["probe_single_flight"] = {
     "last": probe[-1] if probe else None,
 }
 
+reg_last = reg[-1] if reg else {}
+digest["probe_decision_single_flight"] = {
+    "phase": reg_last.get("probe_single_flight_phase"),
+    "execution_stamp_ns": reg_last.get(
+        "probe_single_flight_execution_stamp_ns"),
+    "reason": reg_last.get("probe_single_flight_reason"),
+    "suppressed_busy_count": as_int(
+        reg_last.get("probe_failure_suppressed_busy_count"), 0),
+    "suppressed_infeasible_count": as_int(
+        reg_last.get("probe_infeasible_suppressed_busy_count"), 0),
+    "suppressed_uncertified_count": as_int(
+        reg_last.get("probe_uncertified_suppressed_busy_count"), 0),
+    "candidate_drop_busy_count": (
+        as_int(probe[-1].get("drop_busy_count"), 0) if probe else 0),
+    "execution_complete_count": (
+        as_int(probe[-1].get("execution_complete_count"), 0)
+        if probe else 0),
+}
+
 ver = R["verification_outcome.csv"]
 probe_ver = []
 for r in ver:
