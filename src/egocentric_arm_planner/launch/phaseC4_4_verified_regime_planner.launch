@@ -197,6 +197,13 @@
   <!-- Serial executable safety gate and safe-plan commit memory. -->
   <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
         name="optimized_trajectory_continuity" output="screen">
+    <!-- C5.20: load joint-position limits so PROBE measured-state rebasing
+         cannot translate the certified executable outside configured limits. -->
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="probe_start_rebase_enabled" value="true" />
+    <param name="probe_rebase_max_shift_inf" value="0.10" />
+    <param name="probe_start_joint_state_max_age_s" value="0.05" />
+    <param name="probe_commit_start_mismatch_max" value="0.03" />
     <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
     <param name="output_topic" value="$(arg verification_trajectory_topic)" />
     <param name="committed_output_topic" value="$(arg committed_trajectory_topic)" />
