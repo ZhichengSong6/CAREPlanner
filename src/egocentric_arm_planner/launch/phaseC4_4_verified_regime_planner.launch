@@ -87,6 +87,10 @@
        body approximation. This one parameter is used by the C5.4 selector for
        BOTH local and final GCDF channels. -->
   <arg name="local_scp_proximity_margin" default="0.025" />
+  <!-- C5.28 occupancy consistency: current (timestep-0) robot body interior
+       cannot simultaneously be interpreted as an external unknown obstacle. -->
+  <arg name="local_scp_self_body_exclusion_enabled" default="true" />
+  <arg name="local_scp_self_body_exclusion_inset_m" default="0.0" />
 
   <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
   <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
@@ -461,6 +465,10 @@
            value="$(arg forbidden_space_confidence_threshold)" />
     <param name="map_resolution" value="0.05" />
     <param name="proximity_margin" value="$(arg local_scp_proximity_margin)" />
+    <param name="self_body_exclusion_enabled"
+           value="$(arg local_scp_self_body_exclusion_enabled)" />
+    <param name="self_body_exclusion_inset_m"
+           value="$(arg local_scp_self_body_exclusion_inset_m)" />
     <param name="max_pairs_per_step" value="250" />
     <param name="signed_zero_band" value="0.05" />
     <param name="max_pairs" value="8000" />
