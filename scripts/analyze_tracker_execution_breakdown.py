@@ -172,6 +172,15 @@ def main():
                 r.get("probe_rebase_residual_inf")),
             "probe_rebase_joint_state_age_ms": as_float(
                 r.get("probe_rebase_joint_state_age_ms")),
+            "probe_speed_max_before": as_float(
+                r.get("probe_speed_max_before")),
+            "probe_speed_max_after": as_float(
+                r.get("probe_speed_max_after")),
+            "probe_time_scale": as_float(r.get("probe_time_scale")),
+            "probe_time_scale_clamped": as_int(
+                r.get("probe_time_scale_clamped"), 0),
+            "probe_effective_prefix_s": as_float(
+                r.get("probe_effective_prefix_s")),
             "precommit_suffix_phase_s": as_float(
                 r.get("precommit_suffix_phase_s")),
             "precommit_suffix_start_shift_inf": as_float(
@@ -260,6 +269,11 @@ def main():
             "probe_rebase_shift_inf": None,
             "probe_rebase_residual_inf": None,
             "probe_rebase_joint_state_age_ms": None,
+            "probe_speed_max_before": None,
+            "probe_speed_max_after": None,
+            "probe_time_scale": None,
+            "probe_time_scale_clamped": 0,
+            "probe_effective_prefix_s": None,
             "precommit_suffix_phase_s": None,
             "precommit_suffix_start_shift_inf": None,
             "total_start_shift_inf": None,
@@ -364,6 +378,14 @@ def main():
                 e.get("probe_rebase_shift_inf") for e in exs]),
             "probe_rebase_residual_inf": stats([
                 e.get("probe_rebase_residual_inf") for e in exs]),
+            "probe_speed_max_before": stats([
+                e.get("probe_speed_max_before") for e in exs]),
+            "probe_speed_max_after": stats([
+                e.get("probe_speed_max_after") for e in exs]),
+            "probe_time_scale": stats([
+                e.get("probe_time_scale") for e in exs]),
+            "probe_effective_prefix_s": stats([
+                e.get("probe_effective_prefix_s") for e in exs]),
             "precommit_suffix_start_shift_inf": stats([
                 e.get("precommit_suffix_start_shift_inf") for e in exs]),
             "total_start_shift_inf": stats([
@@ -416,6 +438,12 @@ def main():
             [e.get("initial_error_inf") for e in probe_executions],
             [e.get("commit_start_measured_mismatch_inf")
              for e in probe_executions]),
+        "max_error_vs_probe_speed_after": pearson(
+            [e.get("max_error_inf") for e in probe_executions],
+            [e.get("probe_speed_max_after") for e in probe_executions]),
+        "max_error_vs_probe_time_scale": pearson(
+            [e.get("max_error_inf") for e in probe_executions],
+            [e.get("probe_time_scale") for e in probe_executions]),
         "max_error_vs_prefix_endpoint_velocity": pearson(
             [e.get("max_error_inf") for e in probe_executions],
             [e.get("prefix_endpoint_max_abs_velocity")
@@ -451,6 +479,16 @@ def main():
             [float(e.get("commit_start_measured_mismatch_inf"))
              for e in probe_executions
              if e.get("commit_start_measured_mismatch_inf") is not None],
+            default=None),
+        "max_probe_speed_after": max(
+            [float(e.get("probe_speed_max_after"))
+             for e in probe_executions
+             if e.get("probe_speed_max_after") is not None],
+            default=None),
+        "max_prefix_endpoint_velocity": max(
+            [float(e.get("prefix_endpoint_max_abs_velocity"))
+             for e in probe_executions
+             if e.get("prefix_endpoint_max_abs_velocity") is not None],
             default=None),
     }
     if probe_start_continuity["max_commit_start_mismatch_inf"] is None:
@@ -495,6 +533,9 @@ def main():
         "probe_rebase_clamped", "probe_rebase_target_shift_inf",
         "probe_rebase_shift_inf", "probe_rebase_residual_inf",
         "probe_rebase_joint_state_age_ms",
+        "probe_speed_max_before", "probe_speed_max_after",
+        "probe_time_scale", "probe_time_scale_clamped",
+        "probe_effective_prefix_s",
         "precommit_suffix_phase_s",
         "precommit_suffix_start_shift_inf", "total_start_shift_inf",
         "raw_start_measured_mismatch_inf_at_dispatch",
