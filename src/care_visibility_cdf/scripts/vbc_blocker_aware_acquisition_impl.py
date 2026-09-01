@@ -32,6 +32,21 @@ from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
     def __init__(self) -> None:
         self._c49_ready = False
+
+        # C5.26: candidate VBC active-set geometry and sweep time are consumed
+        # as one coherent message. Legacy split active-set/sweep topics remain
+        # subscribed for diagnostics, but they do not own obligation lifetime.
+        self._coherent_bundle_enabled = True
+        self._coherent_bundle_lock = threading.Lock()
+        self._coherent_bundle_seq = 0
+        self._coherent_bundle_sweep_s = math.nan
+        self._coherent_bundle_points = np.zeros((0, 3), dtype=np.float64)
+        self._coherent_bundle_pending_nonempty = False
+        self._coherent_bundle_received_count = 0
+        self._coherent_bundle_processed_count = 0
+        self._coherent_bundle_drop_count = 0
+        self._coherent_bundle_last_reason = "startup"
+
         self._repair_stack: List[int] = []
         self._pending_blocker_id = None
         self._pending_blocker_count = 0
@@ -75,6 +90,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
             "/care_planner/active_sensing/blocker_stack_summary"))
+        self.active_set_bundle_topic = str(rospy.get_param(
+            "~active_set_bundle_topic",
+            "/care_planner/trajectory_risk/vbc_active_set_bundle"))
         self.gcdf_recovery_trajectory_topic = str(rospy.get_param(
             "~gcdf_recovery_trajectory_topic",
             "/care_planner/final_gcdf/recovery_trajectory"))
@@ -88,6 +106,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
+        self.active_set_bundle_sub = rospy.Subscriber(
+            self.active_set_bundle_topic, Float64MultiArray,
+            self._active_set_bundle_cb, queue_size=1)
         self.gcdf_recovery_trajectory_sub = rospy.Subscriber(
             self.gcdf_recovery_trajectory_topic, JointTrajectory,
             self._gcdf_recovery_trajectory_cb, queue_size=1)
@@ -99,8 +120,95 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._publish_schedule()
         self._publish_blocker_stack_summary()
         rospy.logwarn(
-            "[vbc_blocker_stack] C4.9 ENABLED max_blocker_sweep=%.3fs confirmations=%d",
-            self.blocker_push_max_sweep_s, self.blocker_confirmations)
+            "[vbc_blocker_stack] C4.9/C5.26 ENABLED max_blocker_sweep=%.3fs "
+            "confirmations=%d coherent_bundle=%s",
+            self.blocker_push_max_sweep_s, self.blocker_confirmations,
+            self.active_set_bundle_topic)
+
+    def _active_set_callback(self, msg: Float64MultiArray) -> None:
+        """Ignore the legacy split active-set stream in C5.26 blocker mode.
+
+        The legacy topic is intentionally kept alive for diagnostics and older
+        modes. Letting it mutate _raw_active_set/_sweep_time_s would reintroduce
+        the exact cross-topic race that C5.26 removes.
+        """
+        if getattr(self, "_coherent_bundle_enabled", False):
+            return
+        super()._active_set_callback(msg)
+
+    def _active_set_bundle_cb(self, msg: Float64MultiArray) -> None:
+        if msg is None:
+            return
+        values = np.asarray(list(msg.data), dtype=np.float64)
+        if values.size < 3:
+            self._coherent_bundle_drop_count += 1
+            self._coherent_bundle_last_reason = "malformed_short_bundle"
+            return
+
+        seq_f, sweep, count_f = values[:3]
+        if (not math.isfinite(float(seq_f)) or
+                not math.isfinite(float(count_f))):
+            self._coherent_bundle_drop_count += 1
+            self._coherent_bundle_last_reason = "nonfinite_header"
+            return
+        seq = int(round(float(seq_f)))
+        count = int(round(float(count_f)))
+        if (seq <= 0 or count < 0 or
+                abs(float(count_f) - count) > 1e-6 or
+                values.size != 3 + 3 * count):
+            self._coherent_bundle_drop_count += 1
+            self._coherent_bundle_last_reason = "malformed_shape"
+            return
+        if count > 0 and (not math.isfinite(float(sweep)) or float(sweep) < 0.0):
+            self._coherent_bundle_drop_count += 1
+            self._coherent_bundle_last_reason = "invalid_nonempty_sweep"
+            return
+
+        points = (
+            values[3:].reshape(count, 3)
+            if count else np.zeros((0, 3), dtype=np.float64))
+        if count and not np.all(np.isfinite(points)):
+            self._coherent_bundle_drop_count += 1
+            self._coherent_bundle_last_reason = "nonfinite_points"
+            return
+
+        by_key = {}
+        for point in points:
+            by_key[self._cell_key(point)] = point.copy()
+        ordered_keys = tuple(sorted(by_key.keys()))
+        canonical = (
+            np.asarray([by_key[k] for k in ordered_keys], dtype=np.float64)
+            if ordered_keys else np.zeros((0, 3), dtype=np.float64))
+
+        with self._coherent_bundle_lock:
+            if seq <= self._coherent_bundle_seq:
+                self._coherent_bundle_last_reason = "stale_bundle"
+                return
+            was_pending = self._coherent_bundle_pending_nonempty
+            self._coherent_bundle_seq = seq
+            self._coherent_bundle_sweep_s = (
+                float(sweep) if canonical.shape[0] else math.nan)
+            self._coherent_bundle_points = canonical
+            self._coherent_bundle_pending_nonempty = canonical.shape[0] > 0
+            self._coherent_bundle_received_count += 1
+            self._coherent_bundle_last_reason = (
+                "pending_nonempty" if canonical.shape[0] else "empty_bundle")
+
+        # Keep legacy summary serials meaningful, but derive them from the
+        # coherent generation ID rather than from split-topic callback count.
+        with self._obligation_lock:
+            self._raw_active_set = canonical.copy()
+            self._raw_active_set_serial = seq
+            no_obligations = len(self._obligations) == 0
+
+        if canonical.shape[0] > 0:
+            # A fresh confirmed blocker must keep acquisition incomplete until
+            # this exact bundle has materialized into an obligation.
+            if self._acquisition_complete and no_obligations and not was_pending:
+                self._visibility_episode_reopen_count += 1
+            self._acquisition_started = True
+            self._acquisition_complete = False
+            self.acquisition_complete_pub.publish(Bool(data=False))
 
     @staticmethod
     def _stamp_key(stamp):
@@ -410,27 +518,45 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if not self._c49_ready:
             self._last_process_reason = "not_ready"
             return
-        with self._obligation_lock:
-            serial = self._raw_active_set_serial
-            processed = self._processed_active_set_serial
-            if serial == processed:
-                self._last_process_reason = "duplicate_serial"
-                return
-            raw = self._raw_active_set.copy()
+        if self._coherent_bundle_enabled:
+            with self._coherent_bundle_lock:
+                serial = self._coherent_bundle_seq
+                raw = self._coherent_bundle_points.copy()
+                sweep = self._coherent_bundle_sweep_s
+            with self._obligation_lock:
+                processed = self._processed_active_set_serial
+        else:
+            with self._obligation_lock:
+                serial = self._raw_active_set_serial
+                processed = self._processed_active_set_serial
+                raw = self._raw_active_set.copy()
+            with self._lock:
+                sweep = self._sweep_time_s
+
+        if serial == processed:
+            self._last_process_reason = "duplicate_serial"
+            return
 
         self._process_attempt_count += 1
         if raw.shape[0] == 0:
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
+            if self._coherent_bundle_enabled:
+                with self._coherent_bundle_lock:
+                    if self._coherent_bundle_seq == serial:
+                        self._coherent_bundle_pending_nonempty = False
+                        self._coherent_bundle_processed_count += 1
+                        self._coherent_bundle_last_reason = "processed_empty"
             self._last_process_reason = "empty_active_set"
             return
 
         with self._lock:
-            sweep = self._sweep_time_s
             trajectory, trajectory_received, trajectory_source = (
                 self._preferred_trajectory_locked())
-        if sweep is None:
+        if not math.isfinite(float(sweep)) or float(sweep) < 0.0:
+            # This should be unreachable for a validated coherent non-empty
+            # bundle; keep fail-closed behavior for legacy mode/malformed state.
             self._last_process_reason = "waiting_sweep"
             return
         if trajectory is None:
@@ -486,6 +612,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             with self._obligation_lock:
                 self._processed_active_set_serial = max(
                     self._processed_active_set_serial, serial)
+            if self._coherent_bundle_enabled:
+                with self._coherent_bundle_lock:
+                    if self._coherent_bundle_seq == serial:
+                        self._coherent_bundle_pending_nonempty = False
+                        self._coherent_bundle_processed_count += 1
+                        self._coherent_bundle_last_reason = "materialized"
             self._process_success_count += 1
             self._last_process_reason = "handled"
         else:
@@ -496,6 +628,24 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._publish_blocker_stack_summary()
 
     def _update_actual_visibility_completion(self) -> None:
+        # C5.26 fail-closed pending semantics: a confirmed non-empty coherent
+        # bundle that has not yet materialized into an obligation is itself an
+        # outstanding acquisition responsibility. Empty obligation storage must
+        # not be misread as "everything has been seen".
+        with self._coherent_bundle_lock:
+            pending_nonempty = self._coherent_bundle_pending_nonempty
+        with self._obligation_lock:
+            no_obligations = len(self._obligations) == 0
+        if self._coherent_bundle_enabled and pending_nonempty and no_obligations:
+            self._acquisition_started = True
+            self._acquisition_complete = False
+            self.acquisition_complete_pub.publish(Bool(data=False))
+            self._publish_acquisition_summary([])
+            self._prune_or_initialize_stack()
+            self._publish_schedule()
+            self._publish_blocker_stack_summary()
+            return
+
         super()._update_actual_visibility_completion()
         self._prune_or_initialize_stack()
         self._publish_schedule()
@@ -551,6 +701,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f"{(qvis_times[-1] if qvis_times else math.nan):.3f}"
             f" q_vis_generation_max_ms="
             f"{(max(qvis_times) if qvis_times else math.nan):.3f}"
+            f" coherent_bundle_enabled={int(self._coherent_bundle_enabled)}"
+            f" coherent_bundle_seq={self._coherent_bundle_seq}"
+            f" coherent_bundle_pending={int(self._coherent_bundle_pending_nonempty)}"
+            f" coherent_bundle_received_count={self._coherent_bundle_received_count}"
+            f" coherent_bundle_processed_count={self._coherent_bundle_processed_count}"
+            f" coherent_bundle_drop_count={self._coherent_bundle_drop_count}"
+            f" coherent_bundle_reason={self._coherent_bundle_last_reason}"
             f" switch_reason={self._last_switch_reason}"
         )
         self.blocker_stack_summary_pub.publish(msg)
