@@ -93,6 +93,18 @@ class OptimizedTrajectoryContinuityNode:
             "/care_planner/c4_4/probe_active"))
         self.joint_state_topic = str(rospy.get_param(
             "~joint_state_topic", "/care_arm/joint_states"))
+        self.probe_start_rebase_enabled = bool(rospy.get_param(
+            "~probe_start_rebase_enabled", True))
+        self.probe_rebase_max_shift_inf = float(rospy.get_param(
+            "~probe_rebase_max_shift_inf", 0.10))
+        self.probe_start_joint_state_max_age_s = float(rospy.get_param(
+            "~probe_start_joint_state_max_age_s", 0.05))
+        self.probe_commit_start_mismatch_max = float(rospy.get_param(
+            "~probe_commit_start_mismatch_max", 0.03))
+        self.joint_position_margin = float(rospy.get_param(
+            "~joint_position_margin", 0.01))
+        self.joint_position_limits = dict(rospy.get_param(
+            "~joint_position_limits", {}))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_enabled = bool(rospy.get_param(
@@ -152,6 +164,14 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~repair_brake_max_steps must be >= 1")
         if any(v <= 0.0 for v in self.repair_acceleration_limits):
             raise ValueError("~repair_acceleration_limits must be positive")
+        if self.probe_rebase_max_shift_inf <= 0.0:
+            raise ValueError("~probe_rebase_max_shift_inf must be positive")
+        if self.probe_start_joint_state_max_age_s <= 0.0:
+            raise ValueError(
+                "~probe_start_joint_state_max_age_s must be positive")
+        if self.probe_commit_start_mismatch_max <= 0.0:
+            raise ValueError(
+                "~probe_commit_start_mismatch_max must be positive")
 
         self._repair_active = False
         self._probe_active = False
@@ -236,6 +256,13 @@ class OptimizedTrajectoryContinuityNode:
         self._last_prefix_endpoint_max_abs_velocity = math.nan
         self._last_brake_displacement_inf = math.nan
         self._last_constructed_executable_duration_s = math.nan
+        self._probe_rebase_count = 0
+        self._probe_rebase_clamp_count = 0
+        self._probe_start_continuity_reject_count = 0
+        self._last_probe_rebase_shift_inf = math.nan
+        self._last_probe_rebase_target_shift_inf = math.nan
+        self._last_probe_rebase_residual_inf = math.nan
+        self._last_probe_commit_start_mismatch_inf = math.nan
         self._gcdf_outstanding_diag = None
         self._outstanding_diag = None
         self._last_verification_diag = None
@@ -326,6 +353,130 @@ class OptimizedTrajectoryContinuityNode:
             return math.nan
         return 1000.0 * max(
             0.0, (now - self._latest_joint_state_received).to_sec())
+
+    def _measured_positions_locked(self, joint_names):
+        if not joint_names or not self._latest_measured_q_by_name:
+            return None
+        measured = []
+        for name in joint_names:
+            if name not in self._latest_measured_q_by_name:
+                return None
+            measured.append(float(self._latest_measured_q_by_name[name]))
+        return measured
+
+    def _probe_rebase_candidate_locked(self, raw, now):
+        """Translate PROBE q(t) so q(0) matches the latest measured q.
+
+        A constant configuration translation preserves dq/ddq and the local
+        trajectory shape.  The translated candidate is constructed BEFORE
+        final GCDF/VBC, so the exact rebased executable is what gets audited.
+        Translation is clipped by both a small max shift and any configured
+        joint-position limits.  Any residual start mismatch is checked again
+        immediately before commit.
+        """
+        out = copy.deepcopy(raw)
+        if (not self.probe_start_rebase_enabled or raw is None or
+                not raw.points or not raw.joint_names):
+            return out, {
+                "enabled": 0,
+                "applied": 0,
+                "clamped": 0,
+                "target_shift_inf": math.nan,
+                "applied_shift_inf": math.nan,
+                "residual_inf": math.nan,
+                "joint_state_age_ms":
+                    self._joint_state_age_ms_locked(now),
+            }
+
+        measured = self._measured_positions_locked(raw.joint_names)
+        joint_state_age_ms = self._joint_state_age_ms_locked(now)
+        if (measured is None or not math.isfinite(joint_state_age_ms) or
+                joint_state_age_ms >
+                1000.0 * self.probe_start_joint_state_max_age_s):
+            return out, {
+                "enabled": 1,
+                "applied": 0,
+                "clamped": 0,
+                "target_shift_inf": math.nan,
+                "applied_shift_inf": 0.0,
+                "residual_inf": self._measured_mismatch_inf_locked(
+                    raw.joint_names, raw.points[0].positions),
+                "joint_state_age_ms": joint_state_age_ms,
+            }
+
+        if len(raw.points[0].positions) != len(raw.joint_names):
+            return out, {
+                "enabled": 1,
+                "applied": 0,
+                "clamped": 0,
+                "target_shift_inf": math.nan,
+                "applied_shift_inf": 0.0,
+                "residual_inf": math.nan,
+                "joint_state_age_ms": joint_state_age_ms,
+            }
+
+        target_delta = [
+            measured[j] - float(raw.points[0].positions[j])
+            for j in range(len(raw.joint_names))
+        ]
+        applied_delta = []
+        clamped = False
+        for j, name in enumerate(raw.joint_names):
+            delta = max(
+                -self.probe_rebase_max_shift_inf,
+                min(self.probe_rebase_max_shift_inf, target_delta[j]))
+            if abs(delta - target_delta[j]) > 1e-12:
+                clamped = True
+
+            limit = self.joint_position_limits.get(name)
+            if isinstance(limit, dict):
+                try:
+                    lower = float(limit["lower"]) + self.joint_position_margin
+                    upper = float(limit["upper"]) - self.joint_position_margin
+                    positions = [
+                        float(p.positions[j]) for p in raw.points
+                        if len(p.positions) == len(raw.joint_names)
+                    ]
+                    if len(positions) == len(raw.points):
+                        delta_lo = max(lower - q for q in positions)
+                        delta_hi = min(upper - q for q in positions)
+                        clipped = max(delta_lo, min(delta_hi, delta))
+                        if abs(clipped - delta) > 1e-12:
+                            clamped = True
+                        delta = clipped
+                except Exception:
+                    pass
+            applied_delta.append(delta)
+
+        for p in out.points:
+            if len(p.positions) != len(raw.joint_names):
+                continue
+            p.positions = [
+                float(p.positions[j]) + applied_delta[j]
+                for j in range(len(raw.joint_names))
+            ]
+
+        applied_inf = max(abs(v) for v in applied_delta) if applied_delta else 0.0
+        target_inf = max(abs(v) for v in target_delta) if target_delta else 0.0
+        residual_inf = self._measured_mismatch_inf_locked(
+            out.joint_names, out.points[0].positions)
+
+        self._probe_rebase_count += 1
+        if clamped:
+            self._probe_rebase_clamp_count += 1
+        self._last_probe_rebase_shift_inf = applied_inf
+        self._last_probe_rebase_target_shift_inf = target_inf
+        self._last_probe_rebase_residual_inf = residual_inf
+
+        return out, {
+            "enabled": 1,
+            "applied": 1,
+            "clamped": int(clamped),
+            "target_shift_inf": target_inf,
+            "applied_shift_inf": applied_inf,
+            "residual_inf": residual_inf,
+            "joint_state_age_ms": joint_state_age_ms,
+        }
 
     def _repair_active_cb(self, msg):
         if msg is None:
@@ -583,7 +734,25 @@ class OptimizedTrajectoryContinuityNode:
             list(raw.points[0].positions)
             if raw.points and raw.points[0].positions else [])
         raw_duration_s = self._duration(raw)
-        candidate = self._suffix_from_phase(raw, age)
+        rebase_diag = {
+            "enabled": 0,
+            "applied": 0,
+            "clamped": 0,
+            "target_shift_inf": math.nan,
+            "applied_shift_inf": math.nan,
+            "residual_inf": math.nan,
+            "joint_state_age_ms": self._joint_state_age_ms_locked(now),
+        }
+        if pending_probe:
+            # A candidate is NOT being executed while it waits for admission.
+            # Do not advance it by wall-clock age. Rebase its q-origin to the
+            # latest measured state, then audit that exact geometry.
+            candidate, rebase_diag = self._probe_rebase_candidate_locked(
+                raw, now)
+            dispatch_suffix_phase_s = 0.0
+        else:
+            candidate = self._suffix_from_phase(raw, age)
+            dispatch_suffix_phase_s = float(age)
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
             return None, "none"
@@ -593,10 +762,22 @@ class OptimizedTrajectoryContinuityNode:
             if candidate.points[0].positions else [])
         diag = {
             "raw_candidate_age_s": float(age),
-            "dispatch_suffix_phase_s": float(age),
+            "dispatch_suffix_phase_s": dispatch_suffix_phase_s,
             "raw_candidate_duration_s": float(raw_duration_s),
-            "dispatch_suffix_start_shift_inf": self._position_shift_inf(
-                dispatch_start_positions, raw_start_positions),
+            "dispatch_suffix_start_shift_inf": (
+                0.0 if pending_probe else self._position_shift_inf(
+                    dispatch_start_positions, raw_start_positions)),
+            "probe_rebase_enabled": int(rebase_diag.get("enabled", 0)),
+            "probe_rebase_applied": int(rebase_diag.get("applied", 0)),
+            "probe_rebase_clamped": int(rebase_diag.get("clamped", 0)),
+            "probe_rebase_target_shift_inf": rebase_diag.get(
+                "target_shift_inf", math.nan),
+            "probe_rebase_shift_inf": rebase_diag.get(
+                "applied_shift_inf", math.nan),
+            "probe_rebase_residual_inf": rebase_diag.get(
+                "residual_inf", math.nan),
+            "probe_rebase_joint_state_age_ms": rebase_diag.get(
+                "joint_state_age_ms", math.nan),
             "raw_start_measured_mismatch_inf_at_dispatch":
                 self._measured_mismatch_inf_locked(
                     raw.joint_names, raw_start_positions),
@@ -715,6 +896,11 @@ class OptimizedTrajectoryContinuityNode:
             "commit_count={} "
             "raw_candidate_age_s={} dispatch_suffix_phase_s={} "
             "dispatch_suffix_start_shift_inf={} "
+            "probe_rebase_enabled={} probe_rebase_applied={} "
+            "probe_rebase_clamped={} "
+            "probe_rebase_target_shift_inf={} probe_rebase_shift_inf={} "
+            "probe_rebase_residual_inf={} "
+            "probe_rebase_joint_state_age_ms={} "
             "precommit_suffix_phase_s={} precommit_suffix_start_shift_inf={} "
             "total_start_shift_inf={} "
             "raw_start_measured_mismatch_inf_at_dispatch={} "
@@ -735,6 +921,13 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "raw_candidate_age_s"),
             self._diag_value(diag, "dispatch_suffix_phase_s"),
             self._diag_value(diag, "dispatch_suffix_start_shift_inf"),
+            self._diag_value(diag, "probe_rebase_enabled"),
+            self._diag_value(diag, "probe_rebase_applied"),
+            self._diag_value(diag, "probe_rebase_clamped"),
+            self._diag_value(diag, "probe_rebase_target_shift_inf"),
+            self._diag_value(diag, "probe_rebase_shift_inf"),
+            self._diag_value(diag, "probe_rebase_residual_inf"),
+            self._diag_value(diag, "probe_rebase_joint_state_age_ms"),
             self._diag_value(diag, "precommit_suffix_phase_s"),
             self._diag_value(diag, "precommit_suffix_start_shift_inf"),
             self._diag_value(diag, "total_start_shift_inf"),
@@ -1033,7 +1226,14 @@ class OptimizedTrajectoryContinuityNode:
                             seq, "unsafe", False, verification_age, view,
                             diag=diag)
                     else:
-                        committed = self._suffix_from_phase(candidate, verification_age)
+                        if was_probe:
+                            # The exact candidate that passed GCDF + VBC is the
+                            # one we may execute.  Verification wall time is
+                            # NOT execution time, so do not suffix it again.
+                            committed = copy.deepcopy(candidate)
+                        else:
+                            committed = self._suffix_from_phase(
+                                candidate, verification_age)
                         if committed is not None and committed.points:
                             if diag is None:
                                 diag = {}
@@ -1045,45 +1245,74 @@ class OptimizedTrajectoryContinuityNode:
                                 if committed.points[0].positions else [])
                             raw_start_positions = list(
                                 diag.get("raw_start_positions", []))
-                            diag["precommit_suffix_phase_s"] = float(
-                                verification_age)
+                            diag["precommit_suffix_phase_s"] = (
+                                0.0 if was_probe else float(verification_age))
                             diag["precommit_suffix_start_shift_inf"] = (
-                                self._position_shift_inf(
+                                0.0 if was_probe else self._position_shift_inf(
                                     committed_start_positions,
                                     candidate_start_positions))
                             diag["total_start_shift_inf"] = (
                                 self._position_shift_inf(
                                     committed_start_positions,
                                     raw_start_positions))
-                            diag["commit_start_measured_mismatch_inf"] = (
+                            commit_start_mismatch = (
                                 self._measured_mismatch_inf_locked(
                                     committed.joint_names,
                                     committed_start_positions))
+                            diag["commit_start_measured_mismatch_inf"] = (
+                                commit_start_mismatch)
                             diag["commit_joint_state_age_ms"] = (
                                 self._joint_state_age_ms_locked(now))
                             diag["committed_duration_s"] = float(
                                 self._duration(committed))
+                            self._last_probe_commit_start_mismatch_inf = (
+                                commit_start_mismatch
+                                if was_probe else
+                                self._last_probe_commit_start_mismatch_inf)
                             self._last_verification_diag = copy.deepcopy(diag)
-                            self._verification_safe_count += 1
-                            if was_repair and view == "repair_prefix_brake_hold":
-                                self._repair_prefix_safe_count += 1
-                            if was_probe and view == "probe_prefix_brake_hold":
-                                self._probe_prefix_safe_count += 1
-                            self._last_verification_result = "safe"
-                            committed.header.seq = seq
-                            committed.header.stamp = now
-                            execution_stamp_ns = int(committed.header.stamp.to_nsec())
-                            self._last_execution_stamp_ns = execution_stamp_ns
-                            self._committed_master = copy.deepcopy(committed)
-                            self._committed_received = now
-                            self._commit_count += 1
-                            self._last_committed_age_s = 0.0
-                            self._last_source = "candidate_verified_safe_committed"
-                            committed_to_publish = copy.deepcopy(committed)
-                            event_to_publish = self._make_verification_event(
-                                seq, "safe", True, verification_age, view,
-                                execution_stamp_ns=execution_stamp_ns,
-                                diag=diag)
+
+                            if (was_probe and
+                                    (not math.isfinite(commit_start_mismatch) or
+                                     commit_start_mismatch >
+                                     self.probe_commit_start_mismatch_max)):
+                                # Fail closed: the certified geometry no longer
+                                # starts close enough to the robot.  Do not
+                                # mutate it after certification; ask for a fresh
+                                # measured-state plan instead.
+                                self._probe_start_continuity_reject_count += 1
+                                self._verification_timeout_count += 1
+                                self._last_verification_result = "timeout"
+                                self._last_source = (
+                                    "probe_start_continuity_rejected_replan")
+                                event_to_publish = self._make_verification_event(
+                                    seq, "timeout", False, verification_age,
+                                    view, safety_gate="start_continuity",
+                                    diag=diag)
+                                committed = None
+                            else:
+                                self._verification_safe_count += 1
+                            if committed is not None:
+                                if was_repair and view == "repair_prefix_brake_hold":
+                                    self._repair_prefix_safe_count += 1
+                                if was_probe and view == "probe_prefix_brake_hold":
+                                    self._probe_prefix_safe_count += 1
+                                self._last_verification_result = "safe"
+                                committed.header.seq = seq
+                                committed.header.stamp = now
+                                execution_stamp_ns = int(
+                                    committed.header.stamp.to_nsec())
+                                self._last_execution_stamp_ns = execution_stamp_ns
+                                self._committed_master = copy.deepcopy(committed)
+                                self._committed_received = now
+                                self._commit_count += 1
+                                self._last_committed_age_s = 0.0
+                                self._last_source = (
+                                    "candidate_verified_safe_committed")
+                                committed_to_publish = copy.deepcopy(committed)
+                                event_to_publish = self._make_verification_event(
+                                    seq, "safe", True, verification_age, view,
+                                    execution_stamp_ns=execution_stamp_ns,
+                                    diag=diag)
                         else:
                             self._verification_timeout_count += 1
                             self._last_verification_result = "expired_safe"
@@ -1279,6 +1508,28 @@ class OptimizedTrajectoryContinuityNode:
             "probe_prefix_build_count={}".format(self._probe_prefix_build_count),
             "probe_prefix_safe_count={}".format(self._probe_prefix_safe_count),
             "probe_prefix_unsafe_count={}".format(self._probe_prefix_unsafe_count),
+            "probe_rebase_count={}".format(self._probe_rebase_count),
+            "probe_rebase_clamp_count={}".format(
+                self._probe_rebase_clamp_count),
+            "probe_start_continuity_reject_count={}".format(
+                self._probe_start_continuity_reject_count),
+            "probe_rebase_shift_inf={}".format(
+                "nan" if not math.isfinite(self._last_probe_rebase_shift_inf)
+                else "{:.6f}".format(self._last_probe_rebase_shift_inf)),
+            "probe_rebase_target_shift_inf={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_rebase_target_shift_inf)
+                else "{:.6f}".format(
+                    self._last_probe_rebase_target_shift_inf)),
+            "probe_rebase_residual_inf={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_rebase_residual_inf)
+                else "{:.6f}".format(self._last_probe_rebase_residual_inf)),
+            "probe_commit_start_mismatch_inf={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_commit_start_mismatch_inf)
+                else "{:.6f}".format(
+                    self._last_probe_commit_start_mismatch_inf)),
             "repair_prefix_duration_s={}".format(
                 "nan" if not math.isfinite(self._last_repair_prefix_duration_s)
                 else "{:.6f}".format(self._last_repair_prefix_duration_s)),
