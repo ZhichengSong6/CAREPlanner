@@ -351,13 +351,26 @@ void TrajectoryExecutionManager::executionTimerCallback(
       publishVelocityCommand(dq_zero);
       publishReferenceState(q_measured, dq_zero);
       publishSummary(
-          false, false, 0, 0, 0.0, 0.0, 0.0, "zero_velocity_hold");
+          false, false, 0, 0, 0.0, 0.0, 0.0,
+          -1, std::numeric_limits<double>::quiet_NaN(),
+          std::numeric_limits<double>::quiet_NaN(),
+          "zero_velocity_hold");
       return;
     }
   }
 
+  const Eigen::VectorXd tracking_error_vec = q_ref - q_measured;
+  Eigen::Index tracking_error_joint_index = -1;
   const double tracking_error =
-      (q_ref - q_measured).lpNorm<Eigen::Infinity>();
+      tracking_error_vec.cwiseAbs().maxCoeff(&tracking_error_joint_index);
+  const double tracking_error_q_ref =
+      (tracking_error_joint_index >= 0)
+          ? q_ref[tracking_error_joint_index]
+          : std::numeric_limits<double>::quiet_NaN();
+  const double tracking_error_q_measured =
+      (tracking_error_joint_index >= 0)
+          ? q_measured[tracking_error_joint_index]
+          : std::numeric_limits<double>::quiet_NaN();
 
   maybePublishReplanRequest(tracking_error);
 
@@ -373,7 +386,10 @@ void TrajectoryExecutionManager::executionTimerCallback(
       publishReferenceState(q_measured, dq_zero);
       publishSummary(
           active, complete, trajectory_seq, execution_stamp_ns,
-          phase_s, remaining_s, tracking_error, "tracking_error_hold");
+          phase_s, remaining_s, tracking_error,
+          static_cast<int>(tracking_error_joint_index),
+          tracking_error_q_ref, tracking_error_q_measured,
+          "tracking_error_hold");
       return;
     }
   }
@@ -386,7 +402,9 @@ void TrajectoryExecutionManager::executionTimerCallback(
   publishReferenceState(q_ref, dq_ref);
   publishSummary(
       active, complete, trajectory_seq, execution_stamp_ns,
-      phase_s, remaining_s, tracking_error, source);
+      phase_s, remaining_s, tracking_error,
+      static_cast<int>(tracking_error_joint_index),
+      tracking_error_q_ref, tracking_error_q_measured, source);
 }
 
 bool TrajectoryExecutionManager::extractMeasuredState(
@@ -585,6 +603,9 @@ void TrajectoryExecutionManager::publishSummary(
     double phase_s,
     double remaining_s,
     double tracking_error_inf,
+    int tracking_error_joint_index,
+    double tracking_error_q_ref,
+    double tracking_error_q_measured,
     const std::string& source) {
   std_msgs::String msg;
   std::ostringstream oss;
@@ -596,6 +617,14 @@ void TrajectoryExecutionManager::publishSummary(
       << " phase_s=" << phase_s
       << " remaining_s=" << remaining_s
       << " tracking_error_inf=" << tracking_error_inf
+      << " tracking_error_joint_index=" << tracking_error_joint_index
+      << " tracking_error_joint_name="
+      << ((tracking_error_joint_index >= 0 &&
+           static_cast<std::size_t>(tracking_error_joint_index) < joint_names_.size())
+              ? joint_names_[static_cast<std::size_t>(tracking_error_joint_index)]
+              : "none")
+      << " tracking_error_q_ref=" << tracking_error_q_ref
+      << " tracking_error_q_measured=" << tracking_error_q_measured
       << " source=" << source;
   msg.data = oss.str();
   summary_pub_.publish(msg);
