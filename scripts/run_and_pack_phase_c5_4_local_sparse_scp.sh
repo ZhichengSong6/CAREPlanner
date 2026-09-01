@@ -68,6 +68,7 @@ python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
   src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py \
   src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py \
+  scripts/analyze_tracker_execution_breakdown.py \
   src/care_visibility_cdf/scripts/vbc_visibility_acquisition_impl.py \
   src/care_visibility_cdf/scripts/vbc_blocker_aware_acquisition_impl.py
 python3 - <<'PY'
@@ -311,6 +312,45 @@ for r in trk:
             "phase_s": r.get("phase_s"),
         })
 digest["tracker_completions"] = trk_done
+
+breakdown_path = os.path.join(run, "tracker_execution_breakdown.json")
+if os.path.isfile(breakdown_path):
+    try:
+        with open(breakdown_path) as f:
+            tracker_breakdown = json.load(f)
+        executions = tracker_breakdown.get("executions", [])
+        worst_by_max = sorted(
+            executions,
+            key=lambda e: float(e.get("max_error_inf") or -1.0),
+            reverse=True)[:8]
+        worst_by_terminal = sorted(
+            executions,
+            key=lambda e: float(e.get("terminal_error_inf") or -1.0),
+            reverse=True)[:8]
+        compact_keys = (
+            "execution_stamp_ns", "tracker_seq", "mode", "verification_seq",
+            "duration_s", "initial_error_inf", "mean_error_inf",
+            "p95_error_inf", "max_error_inf", "terminal_error_inf",
+            "max_error_phase_s", "max_error_phase_fraction",
+            "fraction_error_gt_0p10", "fraction_error_gt_0p25",
+            "max_error_source", "terminal_source")
+        digest["tracker_error_decomposition"] = {
+            "execution_count": tracker_breakdown.get("execution_count", 0),
+            "by_mode": tracker_breakdown.get("by_mode", {}),
+            "worst_by_max_error": [
+                {k: e.get(k) for k in compact_keys} for e in worst_by_max
+            ],
+            "worst_by_terminal_error": [
+                {k: e.get(k) for k in compact_keys}
+                for e in worst_by_terminal
+            ],
+        }
+    except Exception as exc:
+        digest["tracker_error_decomposition"] = {
+            "error": "failed_to_load_breakdown: {}".format(exc)}
+else:
+    digest["tracker_error_decomposition"] = {
+        "error": "tracker_execution_breakdown.json missing"}
 
 probe_stamps = {
     r["execution_stamp_ns"] for r in probe_ver
@@ -714,6 +754,14 @@ OUT="${RUN_OUT}" LOG="${RUN_LOG}" \
   bash scripts/run_phase_c4_4_verified_regime_smoke.sh 2>&1 | tee "${ROOT_LOG}/common_runner.log"
 
 cleanup
+
+# C5.18: decompose tracker error by committed execution stamp before packing.
+# This is offline analysis only; it never changes planner/controller behavior.
+if ! python3 scripts/analyze_tracker_execution_breakdown.py \
+    --run-dir "${RUN_OUT}" \
+    > "${ROOT_LOG}/tracker_execution_breakdown.log" 2>&1; then
+  echo "[WARN] tracker execution breakdown failed; preserving raw CSVs" >&2
+fi
 
 python3 - "${RUN_OUT}" "${SUMMARY_JSON}" <<'PY'
 import csv
