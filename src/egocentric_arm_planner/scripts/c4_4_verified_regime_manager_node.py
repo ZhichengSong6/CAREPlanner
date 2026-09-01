@@ -93,6 +93,9 @@ class C44VerifiedRegimeManager:
             "~execution_summary_topic", "/care_planner/execution_vbc/summary"))
         self.tracker_summary_topic = str(rospy.get_param(
             "~tracker_summary_topic", "/care_planner/execution/tracker_summary"))
+        self.probe_single_flight_summary_topic = str(rospy.get_param(
+            "~probe_single_flight_summary_topic",
+            "/care_planner/execution/probe_single_flight_summary"))
         self.replan_request_topic = str(rospy.get_param(
             "~replan_request_topic", "/care_planner/local_planner/replan_request"))
         self.committed_trajectory_topic = str(rospy.get_param(
@@ -164,6 +167,18 @@ class C44VerifiedRegimeManager:
         self.tracker_complete = False
         self.tracker_execution_stamp_ns = 0
         self.tracker_source = "none"
+
+        # C5.17 decision-level PROBE single-flight. Candidate admission is
+        # serialized by probe_single_flight_gate_node; mirror its phase here so
+        # later planner failures cannot preempt an already certified/in-flight
+        # PROBE decision.
+        self.probe_single_flight_phase = "IDLE"
+        self.probe_single_flight_execution_stamp_ns = 0
+        self.probe_single_flight_reason = "startup"
+        self.probe_single_flight_summary_time = None
+        self.probe_failure_suppressed_busy_count = 0
+        self.probe_infeasible_suppressed_busy_count = 0
+        self.probe_uncertified_suppressed_busy_count = 0
 
         self.last_committed_trajectory_time = None
         self.last_commit_count = 0
@@ -238,6 +253,9 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.tracker_summary_topic, String, self._tracker_summary_cb,
             queue_size=20)
+        rospy.Subscriber(
+            self.probe_single_flight_summary_topic, String,
+            self._probe_single_flight_summary_cb, queue_size=20)
         rospy.Subscriber(
             self.committed_trajectory_topic, rospy.AnyMsg,
             self._committed_trajectory_cb, queue_size=1)
@@ -499,6 +517,24 @@ class C44VerifiedRegimeManager:
         if request_replan:
             self.replan_request_pub.publish(Bool(data=True))
 
+    def _probe_single_flight_busy_locked(self):
+        return self.probe_single_flight_phase in ("VERIFYING", "EXECUTING")
+
+    def _probe_single_flight_summary_cb(self, msg):
+        if msg is None:
+            return
+        f = _tokens(msg.data)
+        phase = f.get("phase", "IDLE")
+        if phase not in ("IDLE", "VERIFYING", "EXECUTING"):
+            return
+        execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
+        reason = f.get("reason", "none")
+        with self._lock:
+            self.probe_single_flight_phase = phase
+            self.probe_single_flight_execution_stamp_ns = execution_stamp_ns
+            self.probe_single_flight_reason = reason
+            self.probe_single_flight_summary_time = rospy.Time.now()
+
     def _task_infeasible_cb(self, msg):
         if msg is None or not bool(msg.data):
             return
@@ -521,6 +557,18 @@ class C44VerifiedRegimeManager:
             self.task_uncertified_pending = False
 
             if self.state == self.PROBE_NORMAL:
+                if self._probe_single_flight_busy_locked():
+                    # A prior PROBE decision already owns the downstream
+                    # verification/execution flight. A later planner attempt
+                    # may fail, but that stale failure must not cancel or
+                    # reinterpret the certified flight currently in progress.
+                    self.probe_failure_suppressed_busy_count += 1
+                    self.probe_infeasible_suppressed_busy_count += 1
+                    self.last_transition_reason = (
+                        "task_probe_infeasible_suppressed_single_flight_{}".format(
+                            self.probe_single_flight_phase.lower()))
+                    self._publish_summary_locked()
+                    return
                 self.probe_failure_count += 1
                 if (self.repair_completion_gate_enabled and
                         not self.visibility_waypoint_active):
@@ -559,6 +607,14 @@ class C44VerifiedRegimeManager:
             self.task_infeasible_pending = False
 
             if self.state == self.PROBE_NORMAL:
+                if self._probe_single_flight_busy_locked():
+                    self.probe_failure_suppressed_busy_count += 1
+                    self.probe_uncertified_suppressed_busy_count += 1
+                    self.last_transition_reason = (
+                        "task_probe_uncertified_suppressed_single_flight_{}".format(
+                            self.probe_single_flight_phase.lower()))
+                    self._publish_summary_locked()
+                    return
                 self.probe_failure_count += 1
                 if (self.repair_completion_gate_enabled and
                         not self.visibility_waypoint_active):
@@ -950,6 +1006,18 @@ class C44VerifiedRegimeManager:
                     int(self.task_uncertified_pending)),
                 "probe_entry_count={}".format(self.probe_entry_count),
                 "probe_failure_count={}".format(self.probe_failure_count),
+                "probe_single_flight_phase={}".format(
+                    self.probe_single_flight_phase),
+                "probe_single_flight_execution_stamp_ns={}".format(
+                    self.probe_single_flight_execution_stamp_ns),
+                "probe_single_flight_reason={}".format(
+                    self.probe_single_flight_reason),
+                "probe_failure_suppressed_busy_count={}".format(
+                    self.probe_failure_suppressed_busy_count),
+                "probe_infeasible_suppressed_busy_count={}".format(
+                    self.probe_infeasible_suppressed_busy_count),
+                "probe_uncertified_suppressed_busy_count={}".format(
+                    self.probe_uncertified_suppressed_busy_count),
                 "probe_completed_prefix_streak={}".format(
                     self.probe_completed_prefix_streak),
                 # Compatibility alias for older result parsers.
