@@ -455,7 +455,8 @@ class CppForbiddenVoxelGpuShadow {
       const MapIndex& map,
       std::size_t* raw_pair_count,
       int* active_step_count,
-      std::size_t* self_body_filtered_voxel_count) {
+      std::size_t* self_body_filtered_voxel_count,
+      std::size_t* current_body_anchor_count) {
     std::unordered_map<int, std::vector<const Anchor*>> by_step;
     by_step.reserve(32);
     std::vector<const Anchor*> current_body_anchors;
@@ -504,6 +505,7 @@ class CppForbiddenVoxelGpuShadow {
 
     std::size_t raw_total = 0;
     std::size_t self_body_filtered = 0;
+    std::vector<uint8_t> self_body_filtered_seen(grid_size_, 0);
     int active_steps = 0;
     std::vector<int> touched;
     touched.reserve(1024);
@@ -559,7 +561,10 @@ class CppForbiddenVoxelGpuShadow {
               // are low-confidence. This is occupancy consistency, not a free
               // space inflation: only timestep-0 body interior is excluded.
               if (insideCurrentBody(px, py, pz)) {
-                ++self_body_filtered;
+                if (self_body_filtered_seen[ulinear] == 0) {
+                  self_body_filtered_seen[ulinear] = 1;
+                  ++self_body_filtered;
+                }
                 continue;
               }
 
@@ -650,6 +655,9 @@ class CppForbiddenVoxelGpuShadow {
     }
     if (self_body_filtered_voxel_count) {
       *self_body_filtered_voxel_count = self_body_filtered;
+    }
+    if (current_body_anchor_count) {
+      *current_body_anchor_count = current_body_anchors.size();
     }
     return pairs;
   }
@@ -784,6 +792,7 @@ class CppForbiddenVoxelGpuShadow {
       std::size_t raw_pair_count,
       int active_step_count,
       std::size_t self_body_filtered_voxel_count,
+      std::size_t current_body_anchor_count,
       const std::vector<PairMeta>& pairs,
       const std::vector<float>& distance,
       const std::vector<float>& gradient,
@@ -864,6 +873,8 @@ class CppForbiddenVoxelGpuShadow {
     out << "\"active_step_count\":" << active_step_count << ",";
     out << "\"self_body_filtered_voxel_count\":"
         << self_body_filtered_voxel_count << ",";
+    out << "\"current_body_anchor_count\":"
+        << current_body_anchor_count << ",";
 
     out << "\"distance\":{";
     out << "\"min\":" << d_stats.min << ",";
@@ -1014,6 +1025,7 @@ class CppForbiddenVoxelGpuShadow {
       std::size_t pair_count,
       int active_step_count,
       std::size_t self_body_filtered_voxel_count,
+      std::size_t current_body_anchor_count,
       double d_min,
       double negative_rate,
       double anchor_decode_ms,
@@ -1029,6 +1041,7 @@ class CppForbiddenVoxelGpuShadow {
         << "pairs=" << pair_count
         << " steps=" << active_step_count
         << " self_body_filtered=" << self_body_filtered_voxel_count
+        << " current_body_anchors=" << current_body_anchor_count
         << " d_min=" << d_min
         << " neg_rate=" << negative_rate
         << " anchor_decode_ms=" << anchor_decode_ms
@@ -1120,11 +1133,12 @@ class CppForbiddenVoxelGpuShadow {
 
     std::size_t raw_pair_count = 0;
     std::size_t self_body_filtered_voxel_count = 0;
+    std::size_t current_body_anchor_count = 0;
     int active_step_count = 0;
     const auto selection_t0 = Clock::now();
     std::vector<PairMeta> pairs = buildPairs(
         anchors, *map, &raw_pair_count, &active_step_count,
-        &self_body_filtered_voxel_count);
+        &self_body_filtered_voxel_count, &current_body_anchor_count);
     const auto selection_t1 = Clock::now();
 
     // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
@@ -1151,6 +1165,7 @@ class CppForbiddenVoxelGpuShadow {
           0,
           0,
           self_body_filtered_voxel_count,
+          current_body_anchor_count,
           std::numeric_limits<double>::quiet_NaN(),
           0.0,
           msBetween(decode_t0, decode_t1),
@@ -1230,6 +1245,7 @@ class CppForbiddenVoxelGpuShadow {
         raw_pair_count,
         active_step_count,
         self_body_filtered_voxel_count,
+        current_body_anchor_count,
         pairs,
         distance,
         gradient,
@@ -1245,6 +1261,7 @@ class CppForbiddenVoxelGpuShadow {
         pairs.size(),
         active_step_count,
         self_body_filtered_voxel_count,
+        current_body_anchor_count,
         d_stats.min,
         negative_rate,
         anchor_decode_ms,
@@ -1260,6 +1277,7 @@ class CppForbiddenVoxelGpuShadow {
         "[C5.8 C++] channel=" << (final_channel ? "final" : "local")
         << " pairs=" << pairs.size()
         << " self_body_filtered=" << self_body_filtered_voxel_count
+        << " current_body_anchors=" << current_body_anchor_count
         << " pipeline=" << pipeline_ms << " ms"
         << " selection=" << selection_ms << " ms"
         << " ipc=" << ipc_ms << " ms"
