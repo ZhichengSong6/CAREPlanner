@@ -39,6 +39,8 @@
   <arg name="region_max_diameter_m" default="0.12" />
   <arg name="active_set_points_topic"
        default="/care_planner/trajectory_risk/vbc_active_set_points" />
+  <arg name="active_set_bundle_topic"
+       default="/care_planner/trajectory_risk/vbc_active_set_bundle" />
   <arg name="force_bootstrap_topic"
        default="/care_planner/trajectory_risk/force_bootstrap" />
 
@@ -83,6 +85,7 @@
     <param name="trajectory_vbc/temporal_layer_mpc_steps" value="$(arg temporal_layer_mpc_steps)" />
     <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
     <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />
+    <param name="trajectory_vbc/active_set_bundle_topic" value="$(arg active_set_bundle_topic)" />
     <param name="trajectory_vbc/force_bootstrap_topic" value="$(arg force_bootstrap_topic)" />
   </node>
 </launch>
