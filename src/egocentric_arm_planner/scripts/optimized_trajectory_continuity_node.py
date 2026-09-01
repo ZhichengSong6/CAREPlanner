@@ -34,6 +34,7 @@ import threading
 
 import rospy
 from care_collision_cdf.msg import CollisionCDFConstraintBatch
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
@@ -90,6 +91,8 @@ class OptimizedTrajectoryContinuityNode:
         self.probe_active_topic = str(rospy.get_param(
             "~probe_active_topic",
             "/care_planner/c4_4/probe_active"))
+        self.joint_state_topic = str(rospy.get_param(
+            "~joint_state_topic", "/care_arm/joint_states"))
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.continuation_enabled = bool(rospy.get_param(
@@ -159,6 +162,8 @@ class OptimizedTrajectoryContinuityNode:
         self._last_raw_received = None
         self._last_input_gap_s = math.nan
         self._max_input_gap_s = 0.0
+        self._latest_measured_q_by_name = {}
+        self._latest_joint_state_received = None
 
         self._selector_cycle_count = 0
         self._last_selector_cycle_time = None
@@ -268,6 +273,8 @@ class OptimizedTrajectoryContinuityNode:
             self.repair_active_topic, Bool, self._repair_active_cb, queue_size=1)
         self.probe_sub = rospy.Subscriber(
             self.probe_active_topic, Bool, self._probe_active_cb, queue_size=1)
+        self.joint_state_sub = rospy.Subscriber(
+            self.joint_state_topic, JointState, self._joint_state_cb, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
 
@@ -285,6 +292,40 @@ class OptimizedTrajectoryContinuityNode:
             int(self.repair_prefix_verification_enabled),
             self.repair_execution_prefix_s, self.repair_brake_dt_s,
             self.repair_hold_s, self.verification_timeout_s)
+
+    def _joint_state_cb(self, msg):
+        if msg is None or len(msg.name) != len(msg.position):
+            return
+        now = rospy.Time.now()
+        measured = {}
+        try:
+            for name, position in zip(msg.name, msg.position):
+                measured[str(name)] = float(position)
+        except Exception:
+            return
+        with self._lock:
+            self._latest_measured_q_by_name = measured
+            self._latest_joint_state_received = now
+
+    def _measured_mismatch_inf_locked(self, joint_names, positions):
+        if (not joint_names or not positions or
+                len(joint_names) != len(positions) or
+                not self._latest_measured_q_by_name):
+            return math.nan
+        errors = []
+        for name, position in zip(joint_names, positions):
+            if name not in self._latest_measured_q_by_name:
+                return math.nan
+            errors.append(
+                abs(float(position) -
+                    float(self._latest_measured_q_by_name[name])))
+        return max(errors) if errors else math.nan
+
+    def _joint_state_age_ms_locked(self, now):
+        if self._latest_joint_state_received is None:
+            return math.nan
+        return 1000.0 * max(
+            0.0, (now - self._latest_joint_state_received).to_sec())
 
     def _repair_active_cb(self, msg):
         if msg is None:
@@ -556,6 +597,14 @@ class OptimizedTrajectoryContinuityNode:
             "raw_candidate_duration_s": float(raw_duration_s),
             "dispatch_suffix_start_shift_inf": self._position_shift_inf(
                 dispatch_start_positions, raw_start_positions),
+            "raw_start_measured_mismatch_inf_at_dispatch":
+                self._measured_mismatch_inf_locked(
+                    raw.joint_names, raw_start_positions),
+            "dispatch_start_measured_mismatch_inf":
+                self._measured_mismatch_inf_locked(
+                    candidate.joint_names, dispatch_start_positions),
+            "dispatch_joint_state_age_ms":
+                self._joint_state_age_ms_locked(now),
             "raw_start_positions": raw_start_positions,
             "dispatch_start_positions": dispatch_start_positions,
             "prefix_endpoint_max_abs_velocity": math.nan,
@@ -565,6 +614,8 @@ class OptimizedTrajectoryContinuityNode:
             "precommit_suffix_phase_s": math.nan,
             "precommit_suffix_start_shift_inf": math.nan,
             "total_start_shift_inf": math.nan,
+            "commit_start_measured_mismatch_inf": math.nan,
+            "commit_joint_state_age_ms": math.nan,
             "committed_duration_s": math.nan,
         }
 
@@ -665,7 +716,13 @@ class OptimizedTrajectoryContinuityNode:
             "raw_candidate_age_s={} dispatch_suffix_phase_s={} "
             "dispatch_suffix_start_shift_inf={} "
             "precommit_suffix_phase_s={} precommit_suffix_start_shift_inf={} "
-            "total_start_shift_inf={} raw_candidate_duration_s={} "
+            "total_start_shift_inf={} "
+            "raw_start_measured_mismatch_inf_at_dispatch={} "
+            "dispatch_start_measured_mismatch_inf={} "
+            "dispatch_joint_state_age_ms={} "
+            "commit_start_measured_mismatch_inf={} "
+            "commit_joint_state_age_ms={} "
+            "raw_candidate_duration_s={} "
             "constructed_executable_duration_s={} committed_duration_s={} "
             "prefix_endpoint_max_abs_velocity={} brake_duration_s={} "
             "brake_displacement_inf={}"
@@ -681,6 +738,14 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "precommit_suffix_phase_s"),
             self._diag_value(diag, "precommit_suffix_start_shift_inf"),
             self._diag_value(diag, "total_start_shift_inf"),
+            self._diag_value(
+                diag, "raw_start_measured_mismatch_inf_at_dispatch"),
+            self._diag_value(
+                diag, "dispatch_start_measured_mismatch_inf"),
+            self._diag_value(diag, "dispatch_joint_state_age_ms"),
+            self._diag_value(
+                diag, "commit_start_measured_mismatch_inf"),
+            self._diag_value(diag, "commit_joint_state_age_ms"),
             self._diag_value(diag, "raw_candidate_duration_s"),
             self._diag_value(diag, "constructed_executable_duration_s"),
             self._diag_value(diag, "committed_duration_s"),
@@ -990,6 +1055,12 @@ class OptimizedTrajectoryContinuityNode:
                                 self._position_shift_inf(
                                     committed_start_positions,
                                     raw_start_positions))
+                            diag["commit_start_measured_mismatch_inf"] = (
+                                self._measured_mismatch_inf_locked(
+                                    committed.joint_names,
+                                    committed_start_positions))
+                            diag["commit_joint_state_age_ms"] = (
+                                self._joint_state_age_ms_locked(now))
                             diag["committed_duration_s"] = float(
                                 self._duration(committed))
                             self._last_verification_diag = copy.deepcopy(diag)
