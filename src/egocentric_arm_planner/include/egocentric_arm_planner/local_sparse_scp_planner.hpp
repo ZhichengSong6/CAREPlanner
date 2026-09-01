@@ -94,6 +94,7 @@ private:
       const Eigen::VectorXd& q_current,
       const trajectory_msgs::JointTrajectory& reference,
       const ros::Time& now,
+      bool probe_mode,
       Eigen::MatrixXd& q_ref,
       Eigen::MatrixXd& u_ref,
       Eigen::MatrixXd& q_init,
@@ -253,6 +254,10 @@ private:
   // outward only as far as hard GCDF safety permits.
   bool repair_hold_initialization_enabled_ = false;
   double repair_task_tracking_scale_ = 0.0;
+  // C5.24: PROBE advances only a short task-reference horizon and holds the
+  // remaining tail at that local target. This is deliberately separate from
+  // the GCDF constraint horizon even when both are configured to five steps.
+  int probe_task_horizon_steps_ = 5;
   double visibility_waypoint_weight_ = 3000.0;
 
   double cdf_safety_margin_ = 0.0;
