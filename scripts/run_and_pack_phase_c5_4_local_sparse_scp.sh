@@ -269,7 +269,8 @@ digest["probe_single_flight"] = {
 }
 
 reg_last = reg[-1] if reg else {}
-commit_last = commit[-1] if commit else {}
+commit_rows_for_c520 = R["commit_summary.csv"]
+commit_last = commit_rows_for_c520[-1] if commit_rows_for_c520 else {}
 digest["c5_20_probe_start_continuity"] = {
     "probe_rebase_count": as_int(
         commit_last.get("probe_rebase_count"), 0),
