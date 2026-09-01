@@ -567,7 +567,7 @@ class C44VerifiedRegimeManager:
                     self.last_transition_reason = (
                         "task_probe_infeasible_suppressed_single_flight_{}".format(
                             self.probe_single_flight_phase.lower()))
-                    self._publish_summary_locked()
+                    self._publish_summary()
                     return
                 self.probe_failure_count += 1
                 if (self.repair_completion_gate_enabled and
@@ -613,7 +613,7 @@ class C44VerifiedRegimeManager:
                     self.last_transition_reason = (
                         "task_probe_uncertified_suppressed_single_flight_{}".format(
                             self.probe_single_flight_phase.lower()))
-                    self._publish_summary_locked()
+                    self._publish_summary()
                     return
                 self.probe_failure_count += 1
                 if (self.repair_completion_gate_enabled and
