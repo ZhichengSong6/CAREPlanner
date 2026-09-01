@@ -101,6 +101,12 @@ class OptimizedTrajectoryContinuityNode:
             "~probe_start_joint_state_max_age_s", 0.05))
         self.probe_commit_start_mismatch_max = float(rospy.get_param(
             "~probe_commit_start_mismatch_max", 0.03))
+        # C5.21: slow only PROBE task motion before prefix/brake construction.
+        # Time scaling preserves q-path geometry and scales dq/ddq consistently.
+        self.probe_velocity_cap = float(rospy.get_param(
+            "~probe_velocity_cap", 0.50))
+        self.probe_time_scale_max = float(rospy.get_param(
+            "~probe_time_scale_max", 5.0))
         self.joint_position_margin = float(rospy.get_param(
             "~joint_position_margin", 0.01))
         self.joint_position_limits = dict(rospy.get_param(
@@ -172,6 +178,10 @@ class OptimizedTrajectoryContinuityNode:
         if self.probe_commit_start_mismatch_max <= 0.0:
             raise ValueError(
                 "~probe_commit_start_mismatch_max must be positive")
+        if self.probe_velocity_cap <= 0.0:
+            raise ValueError("~probe_velocity_cap must be positive")
+        if self.probe_time_scale_max < 1.0:
+            raise ValueError("~probe_time_scale_max must be >= 1")
 
         self._repair_active = False
         self._probe_active = False
@@ -263,6 +273,12 @@ class OptimizedTrajectoryContinuityNode:
         self._last_probe_rebase_target_shift_inf = math.nan
         self._last_probe_rebase_residual_inf = math.nan
         self._last_probe_commit_start_mismatch_inf = math.nan
+        self._probe_speed_scale_count = 0
+        self._probe_speed_scale_clamp_count = 0
+        self._last_probe_speed_scale = 1.0
+        self._last_probe_speed_max_before = math.nan
+        self._last_probe_speed_max_after = math.nan
+        self._last_probe_effective_prefix_s = math.nan
         self._gcdf_outstanding_diag = None
         self._outstanding_diag = None
         self._last_verification_diag = None
@@ -587,13 +603,99 @@ class OptimizedTrajectoryContinuityNode:
             out.points.append(endpoint)
         return out
 
-    def _repair_prefix_with_braking_tail(self, candidate):
+    @staticmethod
+    def _trajectory_max_abs_velocity(candidate):
+        if candidate is None or not candidate.points:
+            return math.nan
+        vmax = 0.0
+        found = False
+        n = len(candidate.joint_names)
+        for p in candidate.points:
+            if p.velocities and (n == 0 or len(p.velocities) == n):
+                for v in p.velocities:
+                    try:
+                        vmax = max(vmax, abs(float(v)))
+                        found = True
+                    except Exception:
+                        pass
+        if found:
+            return vmax
+
+        # Fallback for trajectories without explicit velocity fields.
+        for i in range(1, len(candidate.points)):
+            p0 = candidate.points[i - 1]
+            p1 = candidate.points[i]
+            if (not p0.positions or not p1.positions or
+                    len(p0.positions) != len(p1.positions)):
+                continue
+            dt = (p1.time_from_start - p0.time_from_start).to_sec()
+            if dt <= 1e-9:
+                continue
+            for q0, q1 in zip(p0.positions, p1.positions):
+                vmax = max(vmax, abs((float(q1) - float(q0)) / dt))
+                found = True
+        return vmax if found else math.nan
+
+    @staticmethod
+    def _time_scale_trajectory(candidate, scale):
+        if candidate is None or not candidate.points:
+            return None
+        scale = max(1.0, float(scale))
+        out = copy.deepcopy(candidate)
+        inv = 1.0 / scale
+        inv2 = inv * inv
+        for p in out.points:
+            p.time_from_start = rospy.Duration(
+                p.time_from_start.to_sec() * scale)
+            if p.velocities:
+                p.velocities = [float(v) * inv for v in p.velocities]
+            if p.accelerations:
+                p.accelerations = [float(a) * inv2 for a in p.accelerations]
+        out.header.stamp = rospy.Time.now()
+        return out
+
+    def _slow_probe_candidate(self, candidate):
+        vmax_before = self._trajectory_max_abs_velocity(candidate)
+        if not math.isfinite(vmax_before) or vmax_before <= 0.0:
+            return copy.deepcopy(candidate), {
+                "speed_max_before": vmax_before,
+                "speed_max_after": vmax_before,
+                "time_scale": 1.0,
+                "time_scale_clamped": 0,
+            }
+
+        requested = max(1.0, vmax_before / self.probe_velocity_cap)
+        scale = min(requested, self.probe_time_scale_max)
+        clamped = requested > self.probe_time_scale_max + 1e-12
+        out = self._time_scale_trajectory(candidate, scale)
+        vmax_after = self._trajectory_max_abs_velocity(out)
+
+        if scale > 1.0 + 1e-12:
+            self._probe_speed_scale_count += 1
+        if clamped:
+            self._probe_speed_scale_clamp_count += 1
+        self._last_probe_speed_scale = scale
+        self._last_probe_speed_max_before = vmax_before
+        self._last_probe_speed_max_after = vmax_after
+
+        return out, {
+            "speed_max_before": vmax_before,
+            "speed_max_after": vmax_after,
+            "time_scale": scale,
+            "time_scale_clamped": int(clamped),
+        }
+
+    def _repair_prefix_with_braking_tail(
+            self, candidate, prefix_duration_s=None):
         if candidate is None or not candidate.points:
             return None
         duration = self._duration(candidate)
         if duration <= 0.0:
             return None
-        prefix_t = min(self.repair_execution_prefix_s, duration)
+        requested_prefix_s = (
+            self.repair_execution_prefix_s
+            if prefix_duration_s is None else float(prefix_duration_s))
+        prefix_t = min(max(1e-6, requested_prefix_s), duration)
         endpoint = self._point_at_time(candidate, prefix_t)
         if endpoint is None or not endpoint.positions:
             return None
@@ -743,12 +845,20 @@ class OptimizedTrajectoryContinuityNode:
             "residual_inf": math.nan,
             "joint_state_age_ms": self._joint_state_age_ms_locked(now),
         }
+        speed_diag = {
+            "speed_max_before": math.nan,
+            "speed_max_after": math.nan,
+            "time_scale": 1.0,
+            "time_scale_clamped": 0,
+        }
         if pending_probe:
             # A candidate is NOT being executed while it waits for admission.
             # Do not advance it by wall-clock age. Rebase its q-origin to the
-            # latest measured state, then audit that exact geometry.
+            # latest measured state, then slow its time parameterization before
+            # building/auditing the exact executable.
             candidate, rebase_diag = self._probe_rebase_candidate_locked(
                 raw, now)
+            candidate, speed_diag = self._slow_probe_candidate(candidate)
             dispatch_suffix_phase_s = 0.0
         else:
             candidate = self._suffix_from_phase(raw, age)
@@ -778,6 +888,17 @@ class OptimizedTrajectoryContinuityNode:
                 "residual_inf", math.nan),
             "probe_rebase_joint_state_age_ms": rebase_diag.get(
                 "joint_state_age_ms", math.nan),
+            "probe_speed_max_before": speed_diag.get(
+                "speed_max_before", math.nan),
+            "probe_speed_max_after": speed_diag.get(
+                "speed_max_after", math.nan),
+            "probe_time_scale": speed_diag.get("time_scale", 1.0),
+            "probe_time_scale_clamped": int(
+                speed_diag.get("time_scale_clamped", 0)),
+            "probe_effective_prefix_s": (
+                self.repair_execution_prefix_s *
+                float(speed_diag.get("time_scale", 1.0))
+                if pending_probe else self.repair_execution_prefix_s),
             "raw_start_measured_mismatch_inf_at_dispatch":
                 self._measured_mismatch_inf_locked(
                     raw.joint_names, raw_start_positions),
@@ -803,7 +924,15 @@ class OptimizedTrajectoryContinuityNode:
         view = "full_horizon"
         prefix_mode = bool(pending_repair or pending_probe)
         if self.repair_prefix_verification_enabled and prefix_mode:
-            candidate = self._repair_prefix_with_braking_tail(candidate)
+            effective_prefix_s = (
+                self.repair_execution_prefix_s *
+                float(speed_diag.get("time_scale", 1.0))
+                if pending_probe else self.repair_execution_prefix_s)
+            self._last_probe_effective_prefix_s = (
+                effective_prefix_s if pending_probe
+                else self._last_probe_effective_prefix_s)
+            candidate = self._repair_prefix_with_braking_tail(
+                candidate, prefix_duration_s=effective_prefix_s)
             if candidate is None or not candidate.points:
                 self._last_source = "prefix_build_failed"
                 return None, "none"
@@ -901,6 +1030,9 @@ class OptimizedTrajectoryContinuityNode:
             "probe_rebase_target_shift_inf={} probe_rebase_shift_inf={} "
             "probe_rebase_residual_inf={} "
             "probe_rebase_joint_state_age_ms={} "
+            "probe_speed_max_before={} probe_speed_max_after={} "
+            "probe_time_scale={} probe_time_scale_clamped={} "
+            "probe_effective_prefix_s={} "
             "precommit_suffix_phase_s={} precommit_suffix_start_shift_inf={} "
             "total_start_shift_inf={} "
             "raw_start_measured_mismatch_inf_at_dispatch={} "
@@ -928,6 +1060,11 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "probe_rebase_shift_inf"),
             self._diag_value(diag, "probe_rebase_residual_inf"),
             self._diag_value(diag, "probe_rebase_joint_state_age_ms"),
+            self._diag_value(diag, "probe_speed_max_before"),
+            self._diag_value(diag, "probe_speed_max_after"),
+            self._diag_value(diag, "probe_time_scale"),
+            self._diag_value(diag, "probe_time_scale_clamped"),
+            self._diag_value(diag, "probe_effective_prefix_s"),
             self._diag_value(diag, "precommit_suffix_phase_s"),
             self._diag_value(diag, "precommit_suffix_start_shift_inf"),
             self._diag_value(diag, "total_start_shift_inf"),
@@ -1530,6 +1667,27 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_probe_commit_start_mismatch_inf)
                 else "{:.6f}".format(
                     self._last_probe_commit_start_mismatch_inf)),
+            "probe_speed_scale_count={}".format(
+                self._probe_speed_scale_count),
+            "probe_speed_scale_clamp_count={}".format(
+                self._probe_speed_scale_clamp_count),
+            "probe_speed_time_scale={:.6f}".format(
+                self._last_probe_speed_scale),
+            "probe_speed_max_before={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_speed_max_before)
+                else "{:.6f}".format(
+                    self._last_probe_speed_max_before)),
+            "probe_speed_max_after={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_speed_max_after)
+                else "{:.6f}".format(
+                    self._last_probe_speed_max_after)),
+            "probe_effective_prefix_s={}".format(
+                "nan" if not math.isfinite(
+                    self._last_probe_effective_prefix_s)
+                else "{:.6f}".format(
+                    self._last_probe_effective_prefix_s)),
             "repair_prefix_duration_s={}".format(
                 "nan" if not math.isfinite(self._last_repair_prefix_duration_s)
                 else "{:.6f}".format(self._last_repair_prefix_duration_s)),
