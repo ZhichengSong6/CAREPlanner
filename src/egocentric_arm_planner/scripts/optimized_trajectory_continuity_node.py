@@ -226,6 +226,14 @@ class OptimizedTrajectoryContinuityNode:
         # C5.13 stage timing (wall-clock durations measured by ROS time in the
         # same process, reported in milliseconds).
         self._last_raw_to_safety_dispatch_ms = math.nan
+        # C5.19 executable-construction diagnostics. These are observational
+        # only and never modify the candidate trajectory.
+        self._last_prefix_endpoint_max_abs_velocity = math.nan
+        self._last_brake_displacement_inf = math.nan
+        self._last_constructed_executable_duration_s = math.nan
+        self._gcdf_outstanding_diag = None
+        self._outstanding_diag = None
+        self._last_verification_diag = None
         self._last_final_gcdf_roundtrip_ms = math.nan
         self._last_exact_vbc_roundtrip_ms = math.nan
         self._last_candidate_total_safety_pipeline_ms = math.nan
@@ -340,6 +348,15 @@ class OptimizedTrajectoryContinuityNode:
         out.time_from_start = rospy.Duration(t)
         return out
 
+    @staticmethod
+    def _position_shift_inf(a, b):
+        if a is None or b is None or len(a) != len(b) or not a:
+            return math.nan
+        try:
+            return max(abs(float(a[i]) - float(b[i])) for i in range(len(a)))
+        except Exception:
+            return math.nan
+
     @classmethod
     def _suffix_from_phase(cls, master, phase_s):
         if master is None or not master.points:
@@ -415,6 +432,7 @@ class OptimizedTrajectoryContinuityNode:
         out.points.append(endpoint)
 
         q = [float(v) for v in endpoint.positions]
+        prefix_endpoint_q = list(q)
         if len(endpoint.velocities) == n:
             vel = [float(v) for v in endpoint.velocities]
         elif len(out.points) >= 2:
@@ -427,6 +445,8 @@ class OptimizedTrajectoryContinuityNode:
         else:
             vel = [0.0] * n
 
+        self._last_prefix_endpoint_max_abs_velocity = (
+            max(abs(v) for v in vel) if vel else 0.0)
         t = prefix_t
         brake_start = t
         for _ in range(self.repair_brake_max_steps):
@@ -475,6 +495,9 @@ class OptimizedTrajectoryContinuityNode:
         self._last_repair_prefix_duration_s = prefix_t
         self._last_repair_brake_duration_s = max(
             0.0, t - self.repair_hold_s - brake_start)
+        self._last_brake_displacement_inf = self._position_shift_inf(
+            q, prefix_endpoint_q)
+        self._last_constructed_executable_duration_s = t
         return out
 
     def _raw_cb(self, msg):
@@ -515,10 +538,35 @@ class OptimizedTrajectoryContinuityNode:
 
         age = max(0.0, (now - raw_received).to_sec())
         self._last_raw_to_safety_dispatch_ms = 1000.0 * age
+        raw_start_positions = (
+            list(raw.points[0].positions)
+            if raw.points and raw.points[0].positions else [])
+        raw_duration_s = self._duration(raw)
         candidate = self._suffix_from_phase(raw, age)
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
             return None, "none"
+
+        dispatch_start_positions = (
+            list(candidate.points[0].positions)
+            if candidate.points[0].positions else [])
+        diag = {
+            "raw_candidate_age_s": float(age),
+            "dispatch_suffix_phase_s": float(age),
+            "raw_candidate_duration_s": float(raw_duration_s),
+            "dispatch_suffix_start_shift_inf": self._position_shift_inf(
+                dispatch_start_positions, raw_start_positions),
+            "raw_start_positions": raw_start_positions,
+            "dispatch_start_positions": dispatch_start_positions,
+            "prefix_endpoint_max_abs_velocity": math.nan,
+            "brake_duration_s": math.nan,
+            "brake_displacement_inf": math.nan,
+            "constructed_executable_duration_s": float(self._duration(candidate)),
+            "precommit_suffix_phase_s": math.nan,
+            "precommit_suffix_start_shift_inf": math.nan,
+            "total_start_shift_inf": math.nan,
+            "committed_duration_s": math.nan,
+        }
 
         view = "full_horizon"
         prefix_mode = bool(pending_repair or pending_probe)
@@ -527,6 +575,12 @@ class OptimizedTrajectoryContinuityNode:
             if candidate is None or not candidate.points:
                 self._last_source = "prefix_build_failed"
                 return None, "none"
+            diag["prefix_endpoint_max_abs_velocity"] = (
+                self._last_prefix_endpoint_max_abs_velocity)
+            diag["brake_duration_s"] = self._last_repair_brake_duration_s
+            diag["brake_displacement_inf"] = self._last_brake_displacement_inf
+            diag["constructed_executable_duration_s"] = (
+                self._last_constructed_executable_duration_s)
             if pending_repair:
                 view = "repair_prefix_brake_hold"
                 self._repair_prefix_build_count += 1
@@ -549,6 +603,7 @@ class OptimizedTrajectoryContinuityNode:
             self._gcdf_outstanding_probe = bool(pending_probe)
             self._gcdf_outstanding_view = view
             self._gcdf_outstanding_raw_received = raw_received
+            self._gcdf_outstanding_diag = copy.deepcopy(diag)
             self._final_gcdf_query_count += 1
             self._last_source = "candidate_sent_to_final_gcdf"
             self._last_verification_view = view
@@ -565,6 +620,7 @@ class OptimizedTrajectoryContinuityNode:
         self._outstanding_probe = bool(pending_probe)
         self._outstanding_view = view
         self._outstanding_raw_received = raw_received
+        self._outstanding_diag = copy.deepcopy(diag)
         self._verification_publish_count += 1
         self._last_source = "candidate_sent_directly_to_exact_vbc"
         self._last_verification_view = view
@@ -587,21 +643,50 @@ class OptimizedTrajectoryContinuityNode:
             self._last_committed_age_s = float(age_s)
             self._publish_summary_locked()
 
+    @staticmethod
+    def _diag_value(diag, key):
+        if not diag:
+            return "nan"
+        try:
+            value = float(diag.get(key, math.nan))
+            return "nan" if not math.isfinite(value) else "{:.6f}".format(value)
+        except Exception:
+            return "nan"
+
     def _make_verification_event(
             self, seq, result, committed, age_s, view, safety_gate="vbc",
-            execution_stamp_ns=0):
+            execution_stamp_ns=0, diag=None):
         msg = String()
         msg.data = (
             "seq={} result={} committed={} verification_age_s={:.6f} "
             "verification_view={} safety_gate={} execution_stamp_ns={} "
             "outcome_count={} safe_count={} unsafe_count={} timeout_count={} "
-            "commit_count={}"
+            "commit_count={} "
+            "raw_candidate_age_s={} dispatch_suffix_phase_s={} "
+            "dispatch_suffix_start_shift_inf={} "
+            "precommit_suffix_phase_s={} precommit_suffix_start_shift_inf={} "
+            "total_start_shift_inf={} raw_candidate_duration_s={} "
+            "constructed_executable_duration_s={} committed_duration_s={} "
+            "prefix_endpoint_max_abs_velocity={} brake_duration_s={} "
+            "brake_displacement_inf={}"
         ).format(
             int(seq), result, int(bool(committed)), float(age_s), view,
             safety_gate, int(execution_stamp_ns),
             self._verification_outcome_count,
             self._verification_safe_count, self._verification_unsafe_count,
-            self._verification_timeout_count, self._commit_count)
+            self._verification_timeout_count, self._commit_count,
+            self._diag_value(diag, "raw_candidate_age_s"),
+            self._diag_value(diag, "dispatch_suffix_phase_s"),
+            self._diag_value(diag, "dispatch_suffix_start_shift_inf"),
+            self._diag_value(diag, "precommit_suffix_phase_s"),
+            self._diag_value(diag, "precommit_suffix_start_shift_inf"),
+            self._diag_value(diag, "total_start_shift_inf"),
+            self._diag_value(diag, "raw_candidate_duration_s"),
+            self._diag_value(diag, "constructed_executable_duration_s"),
+            self._diag_value(diag, "committed_duration_s"),
+            self._diag_value(diag, "prefix_endpoint_max_abs_velocity"),
+            self._diag_value(diag, "brake_duration_s"),
+            self._diag_value(diag, "brake_displacement_inf"))
         return msg
 
     def _build_final_gcdf_recovery_evidence(
@@ -708,6 +793,7 @@ class OptimizedTrajectoryContinuityNode:
             was_probe = bool(self._gcdf_outstanding_probe)
             view = str(self._gcdf_outstanding_view)
             raw_received = self._gcdf_outstanding_raw_received
+            diag = copy.deepcopy(self._gcdf_outstanding_diag)
             age = max(0.0, (now - self._gcdf_outstanding_sent).to_sec())
             self._last_final_gcdf_roundtrip_ms = 1000.0 * age
 
@@ -718,6 +804,7 @@ class OptimizedTrajectoryContinuityNode:
             self._gcdf_outstanding_probe = False
             self._gcdf_outstanding_view = "none"
             self._gcdf_outstanding_raw_received = None
+            self._gcdf_outstanding_diag = None
 
             distances = [float(d) for d in msg.distance]
             finite_distances = [d for d in distances if math.isfinite(d)]
@@ -745,6 +832,7 @@ class OptimizedTrajectoryContinuityNode:
                 self._outstanding_probe = was_probe
                 self._outstanding_view = view
                 self._outstanding_raw_received = raw_received
+                self._outstanding_diag = copy.deepcopy(diag)
                 self._verification_publish_count += 1
                 self._last_source = "final_gcdf_safe_sent_to_exact_vbc"
                 verification_to_publish = copy.deepcopy(candidate)
@@ -781,7 +869,8 @@ class OptimizedTrajectoryContinuityNode:
                     self._final_gcdf_recovery_event_drop_count += 1
 
                 event_to_publish = self._make_verification_event(
-                    seq, "unsafe", False, age, view, safety_gate="gcdf")
+                    seq, "unsafe", False, age, view, safety_gate="gcdf",
+                    diag=diag)
                 dispatched, route = self._dispatch_pending_locked(now)
                 if route == "gcdf":
                     next_gcdf_to_publish = dispatched
@@ -844,6 +933,7 @@ class OptimizedTrajectoryContinuityNode:
                         0.0, (now - self._outstanding_sent).to_sec())
                     self._last_exact_vbc_roundtrip_ms = 1000.0 * verification_age
                     raw_received = self._outstanding_raw_received
+                    diag = copy.deepcopy(self._outstanding_diag)
                     if raw_received is not None:
                         self._last_candidate_total_safety_pipeline_ms = (
                             1000.0 * max(0.0, (now - raw_received).to_sec()))
@@ -860,6 +950,7 @@ class OptimizedTrajectoryContinuityNode:
                     self._outstanding_probe = False
                     self._outstanding_view = "none"
                     self._outstanding_raw_received = None
+                    self._outstanding_diag = None
                     self._last_verification_age_s = verification_age
                     self._last_verification_seq = seq
                     self._last_verification_view = view
@@ -874,10 +965,34 @@ class OptimizedTrajectoryContinuityNode:
                         self._last_verification_result = "unsafe"
                         self._last_source = "candidate_rejected_vbc_unsafe"
                         event_to_publish = self._make_verification_event(
-                            seq, "unsafe", False, verification_age, view)
+                            seq, "unsafe", False, verification_age, view,
+                            diag=diag)
                     else:
                         committed = self._suffix_from_phase(candidate, verification_age)
                         if committed is not None and committed.points:
+                            if diag is None:
+                                diag = {}
+                            candidate_start_positions = (
+                                list(candidate.points[0].positions)
+                                if candidate.points[0].positions else [])
+                            committed_start_positions = (
+                                list(committed.points[0].positions)
+                                if committed.points[0].positions else [])
+                            raw_start_positions = list(
+                                diag.get("raw_start_positions", []))
+                            diag["precommit_suffix_phase_s"] = float(
+                                verification_age)
+                            diag["precommit_suffix_start_shift_inf"] = (
+                                self._position_shift_inf(
+                                    committed_start_positions,
+                                    candidate_start_positions))
+                            diag["total_start_shift_inf"] = (
+                                self._position_shift_inf(
+                                    committed_start_positions,
+                                    raw_start_positions))
+                            diag["committed_duration_s"] = float(
+                                self._duration(committed))
+                            self._last_verification_diag = copy.deepcopy(diag)
                             self._verification_safe_count += 1
                             if was_repair and view == "repair_prefix_brake_hold":
                                 self._repair_prefix_safe_count += 1
@@ -896,13 +1011,15 @@ class OptimizedTrajectoryContinuityNode:
                             committed_to_publish = copy.deepcopy(committed)
                             event_to_publish = self._make_verification_event(
                                 seq, "safe", True, verification_age, view,
-                                execution_stamp_ns=execution_stamp_ns)
+                                execution_stamp_ns=execution_stamp_ns,
+                                diag=diag)
                         else:
                             self._verification_timeout_count += 1
                             self._last_verification_result = "expired_safe"
                             self._last_source = "candidate_safe_but_expired_before_commit"
                             event_to_publish = self._make_verification_event(
-                                seq, "timeout", False, verification_age, view)
+                                seq, "timeout", False, verification_age, view,
+                                diag=diag)
 
                     dispatched, route = self._dispatch_pending_locked(now)
                     if route == "gcdf":
