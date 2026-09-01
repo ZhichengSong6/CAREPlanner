@@ -93,6 +93,31 @@ def stats(xs):
     }
 
 
+def pearson(xs, ys):
+    pairs = [
+        (float(x), float(y))
+        for x, y in zip(xs, ys)
+        if x is not None and y is not None
+        and math.isfinite(float(x)) and math.isfinite(float(y))
+    ]
+    if len(pairs) < 2:
+        return None
+    xv = [p[0] for p in pairs]
+    yv = [p[1] for p in pairs]
+    mx = sum(xv) / len(xv)
+    my = sum(yv) / len(yv)
+    dx = [x - mx for x in xv]
+    dy = [y - my for y in yv]
+    denx = math.sqrt(sum(x * x for x in dx))
+    deny = math.sqrt(sum(y * y for y in dy))
+    if denx <= 1e-12 or deny <= 1e-12:
+        return None
+    return {
+        "count": len(pairs),
+        "r": sum(x * y for x, y in zip(dx, dy)) / (denx * deny),
+    }
+
+
 def mode_from_view(view):
     if view == "repair_prefix_brake_hold":
         return "REPAIR"
@@ -131,6 +156,26 @@ def main():
             "result": r.get("result", "none"),
             "mode": mode_from_view(r.get("verification_view", "none")),
             "verification_t": as_float(r.get("_t")),
+            "raw_candidate_age_s": as_float(r.get("raw_candidate_age_s")),
+            "dispatch_suffix_phase_s": as_float(
+                r.get("dispatch_suffix_phase_s")),
+            "dispatch_suffix_start_shift_inf": as_float(
+                r.get("dispatch_suffix_start_shift_inf")),
+            "precommit_suffix_phase_s": as_float(
+                r.get("precommit_suffix_phase_s")),
+            "precommit_suffix_start_shift_inf": as_float(
+                r.get("precommit_suffix_start_shift_inf")),
+            "total_start_shift_inf": as_float(r.get("total_start_shift_inf")),
+            "raw_candidate_duration_s": as_float(
+                r.get("raw_candidate_duration_s")),
+            "constructed_executable_duration_s": as_float(
+                r.get("constructed_executable_duration_s")),
+            "committed_duration_s": as_float(r.get("committed_duration_s")),
+            "prefix_endpoint_max_abs_velocity": as_float(
+                r.get("prefix_endpoint_max_abs_velocity")),
+            "brake_duration_s": as_float(r.get("brake_duration_s")),
+            "brake_displacement_inf": as_float(
+                r.get("brake_displacement_inf")),
         }
 
     groups = defaultdict(list)
@@ -184,6 +229,18 @@ def main():
             "result": "unknown",
             "mode": "UNKNOWN",
             "verification_t": None,
+            "raw_candidate_age_s": None,
+            "dispatch_suffix_phase_s": None,
+            "dispatch_suffix_start_shift_inf": None,
+            "precommit_suffix_phase_s": None,
+            "precommit_suffix_start_shift_inf": None,
+            "total_start_shift_inf": None,
+            "raw_candidate_duration_s": None,
+            "constructed_executable_duration_s": None,
+            "committed_duration_s": None,
+            "prefix_endpoint_max_abs_velocity": None,
+            "brake_duration_s": None,
+            "brake_displacement_inf": None,
         })
 
         over_010 = sum(e > 0.10 for e in errs)
@@ -212,6 +269,29 @@ def main():
             "max_error_phase_fraction": max_phase_fraction,
             "fraction_error_gt_0p10": over_010 / len(errs) if errs else None,
             "fraction_error_gt_0p25": over_025 / len(errs) if errs else None,
+            "initial_error_joint_index": as_int(
+                rows[0].get("tracking_error_joint_index"), -1),
+            "initial_error_joint_name": rows[0].get(
+                "tracking_error_joint_name", "unknown"),
+            "initial_error_q_ref": as_float(
+                rows[0].get("tracking_error_q_ref")),
+            "initial_error_q_measured": as_float(
+                rows[0].get("tracking_error_q_measured")),
+            "max_error_joint_index": as_int(
+                max_row.get("tracking_error_joint_index"), -1),
+            "max_error_joint_name": max_row.get(
+                "tracking_error_joint_name", "unknown"),
+            "max_error_q_ref": as_float(max_row.get("tracking_error_q_ref")),
+            "max_error_q_measured": as_float(
+                max_row.get("tracking_error_q_measured")),
+            "terminal_error_joint_index": as_int(
+                terminal_row.get("tracking_error_joint_index"), -1),
+            "terminal_error_joint_name": terminal_row.get(
+                "tracking_error_joint_name", "unknown"),
+            "terminal_error_q_ref": as_float(
+                terminal_row.get("tracking_error_q_ref")),
+            "terminal_error_q_measured": as_float(
+                terminal_row.get("tracking_error_q_measured")),
             "terminal_source": terminal_row.get("source"),
             "max_error_source": max_row.get("source"),
             "first_t": rows[0]["_t_num"],
@@ -241,12 +321,55 @@ def main():
                 e["fraction_error_gt_0p10"] for e in exs]),
             "fraction_error_gt_0p25": stats([
                 e["fraction_error_gt_0p25"] for e in exs]),
+            "raw_candidate_age_s": stats([
+                e.get("raw_candidate_age_s") for e in exs]),
+            "dispatch_suffix_start_shift_inf": stats([
+                e.get("dispatch_suffix_start_shift_inf") for e in exs]),
+            "precommit_suffix_start_shift_inf": stats([
+                e.get("precommit_suffix_start_shift_inf") for e in exs]),
+            "total_start_shift_inf": stats([
+                e.get("total_start_shift_inf") for e in exs]),
+            "prefix_endpoint_max_abs_velocity": stats([
+                e.get("prefix_endpoint_max_abs_velocity") for e in exs]),
+            "brake_duration_s": stats([
+                e.get("brake_duration_s") for e in exs]),
+            "brake_displacement_inf": stats([
+                e.get("brake_displacement_inf") for e in exs]),
         }
+
+    probe_executions = [e for e in executions if e["mode"] == "PROBE"]
+    probe_correlations = {
+        "initial_error_vs_dispatch_suffix_shift": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("dispatch_suffix_start_shift_inf")
+             for e in probe_executions]),
+        "initial_error_vs_precommit_suffix_shift": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("precommit_suffix_start_shift_inf")
+             for e in probe_executions]),
+        "initial_error_vs_total_start_shift": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("total_start_shift_inf") for e in probe_executions]),
+        "max_error_vs_prefix_endpoint_velocity": pearson(
+            [e.get("max_error_inf") for e in probe_executions],
+            [e.get("prefix_endpoint_max_abs_velocity")
+             for e in probe_executions]),
+        "max_error_vs_brake_duration": pearson(
+            [e.get("max_error_inf") for e in probe_executions],
+            [e.get("brake_duration_s") for e in probe_executions]),
+        "max_error_vs_brake_displacement": pearson(
+            [e.get("max_error_inf") for e in probe_executions],
+            [e.get("brake_displacement_inf") for e in probe_executions]),
+        "terminal_error_vs_brake_duration": pearson(
+            [e.get("terminal_error_inf") for e in probe_executions],
+            [e.get("brake_duration_s") for e in probe_executions]),
+    }
 
     out = {
         "run_dir": run_dir,
         "execution_count": len(executions),
         "by_mode": by_mode,
+        "probe_correlations": probe_correlations,
         "executions": executions,
     }
 
@@ -267,6 +390,18 @@ def main():
         "active_p95_error_inf", "active_max_error_inf",
         "max_error_phase_s", "max_error_phase_fraction",
         "fraction_error_gt_0p10", "fraction_error_gt_0p25",
+        "raw_candidate_age_s", "dispatch_suffix_phase_s",
+        "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
+        "precommit_suffix_start_shift_inf", "total_start_shift_inf",
+        "raw_candidate_duration_s", "constructed_executable_duration_s",
+        "committed_duration_s", "prefix_endpoint_max_abs_velocity",
+        "brake_duration_s", "brake_displacement_inf",
+        "initial_error_joint_index", "initial_error_joint_name",
+        "initial_error_q_ref", "initial_error_q_measured",
+        "max_error_joint_index", "max_error_joint_name",
+        "max_error_q_ref", "max_error_q_measured",
+        "terminal_error_joint_index", "terminal_error_joint_name",
+        "terminal_error_q_ref", "terminal_error_q_measured",
         "terminal_source", "max_error_source", "first_t", "last_t",
     ]
     with open(csv_out, "w", newline="") as f:
