@@ -306,6 +306,16 @@ for r in ver:
             "precommit_suffix_start_shift_inf": r.get(
                 "precommit_suffix_start_shift_inf"),
             "total_start_shift_inf": r.get("total_start_shift_inf"),
+            "raw_start_measured_mismatch_inf_at_dispatch": r.get(
+                "raw_start_measured_mismatch_inf_at_dispatch"),
+            "dispatch_start_measured_mismatch_inf": r.get(
+                "dispatch_start_measured_mismatch_inf"),
+            "dispatch_joint_state_age_ms": r.get(
+                "dispatch_joint_state_age_ms"),
+            "commit_start_measured_mismatch_inf": r.get(
+                "commit_start_measured_mismatch_inf"),
+            "commit_joint_state_age_ms": r.get(
+                "commit_joint_state_age_ms"),
             "prefix_endpoint_max_abs_velocity": r.get(
                 "prefix_endpoint_max_abs_velocity"),
             "brake_duration_s": r.get("brake_duration_s"),
@@ -351,6 +361,11 @@ if os.path.isfile(breakdown_path):
             "raw_candidate_age_s", "dispatch_suffix_phase_s",
             "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
             "precommit_suffix_start_shift_inf", "total_start_shift_inf",
+            "raw_start_measured_mismatch_inf_at_dispatch",
+            "dispatch_start_measured_mismatch_inf",
+            "dispatch_joint_state_age_ms",
+            "commit_start_measured_mismatch_inf",
+            "commit_joint_state_age_ms",
             "prefix_endpoint_max_abs_velocity", "brake_duration_s",
             "brake_displacement_inf", "constructed_executable_duration_s",
             "committed_duration_s",
