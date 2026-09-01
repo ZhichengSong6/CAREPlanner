@@ -224,10 +224,10 @@ def classify_episode(ep):
             return "verified_commit_missing_matching_tracker_completion"
         if ep["single_flight_final_phase"] == "EXECUTING":
             return "single_flight_stuck_executing"
-        if ep["probe_candidate_published_count"] == 0:
-            return "no_probe_candidate_generated"
         if ep["probe_scp_failed_count"] > 0 and ep["probe_candidate_published_count"] == 0:
             return "probe_planner_failed_no_candidate"
+        if ep["probe_candidate_published_count"] == 0:
+            return "no_probe_candidate_generated"
         return "probe_streak_incomplete_at_run_end"
 
     return "other"
