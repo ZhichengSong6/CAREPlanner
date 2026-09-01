@@ -253,6 +253,8 @@
     <param name="execution_summary_topic" value="$(arg execution_vbc_summary_topic)" />
     <param name="tracker_summary_topic"
            value="/care_planner/execution/tracker_summary" />
+    <param name="probe_single_flight_summary_topic"
+           value="$(arg probe_single_flight_summary_topic)" />
     <param name="replan_request_topic"
            value="$(arg local_scp_replan_request_topic)" />
     <param name="committed_trajectory_topic" value="$(arg committed_trajectory_topic)" />
