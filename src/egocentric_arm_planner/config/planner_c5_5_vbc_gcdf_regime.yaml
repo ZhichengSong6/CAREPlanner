@@ -82,6 +82,12 @@ receding_horizon:
 local_planner:
   num_intervals: 20
   horizon_duration: 1.0
+
+  # C5.24 PROBE semantics: only the first 5 x 0.05 s = 0.25 s of the nominal
+  # task reference advances. The remaining optimization tail holds the step-5
+  # target. NORMAL still uses all 20 task-reference steps; REPAIR is unchanged.
+  probe_task_horizon_steps: 5
+
   poll_rate: 50.0
   min_replan_interval: 0.10
   cdf_wait_timeout: 0.50
@@ -153,6 +159,8 @@ local_planner:
     # sense/replan cycle. With dt=0.05 s, 5 steps = 0.25 s, covering the
     # 0.15 s committed prefix plus braking margin.
     # REPAIR and PROBE_NORMAL use this horizon; NORMAL keeps all 20 steps.
+    # This safety horizon is intentionally configured separately from
+    # local_planner/probe_task_horizon_steps even though both are 5 in C5.24.
     constraint_horizon_steps: 5
 
     safe_row_screening: true
