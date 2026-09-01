@@ -161,6 +161,17 @@ def main():
                 r.get("dispatch_suffix_phase_s")),
             "dispatch_suffix_start_shift_inf": as_float(
                 r.get("dispatch_suffix_start_shift_inf")),
+            "probe_rebase_enabled": as_int(r.get("probe_rebase_enabled"), 0),
+            "probe_rebase_applied": as_int(r.get("probe_rebase_applied"), 0),
+            "probe_rebase_clamped": as_int(r.get("probe_rebase_clamped"), 0),
+            "probe_rebase_target_shift_inf": as_float(
+                r.get("probe_rebase_target_shift_inf")),
+            "probe_rebase_shift_inf": as_float(
+                r.get("probe_rebase_shift_inf")),
+            "probe_rebase_residual_inf": as_float(
+                r.get("probe_rebase_residual_inf")),
+            "probe_rebase_joint_state_age_ms": as_float(
+                r.get("probe_rebase_joint_state_age_ms")),
             "precommit_suffix_phase_s": as_float(
                 r.get("precommit_suffix_phase_s")),
             "precommit_suffix_start_shift_inf": as_float(
@@ -242,6 +253,13 @@ def main():
             "raw_candidate_age_s": None,
             "dispatch_suffix_phase_s": None,
             "dispatch_suffix_start_shift_inf": None,
+            "probe_rebase_enabled": 0,
+            "probe_rebase_applied": 0,
+            "probe_rebase_clamped": 0,
+            "probe_rebase_target_shift_inf": None,
+            "probe_rebase_shift_inf": None,
+            "probe_rebase_residual_inf": None,
+            "probe_rebase_joint_state_age_ms": None,
             "precommit_suffix_phase_s": None,
             "precommit_suffix_start_shift_inf": None,
             "total_start_shift_inf": None,
@@ -340,6 +358,12 @@ def main():
                 e.get("raw_candidate_age_s") for e in exs]),
             "dispatch_suffix_start_shift_inf": stats([
                 e.get("dispatch_suffix_start_shift_inf") for e in exs]),
+            "probe_rebase_target_shift_inf": stats([
+                e.get("probe_rebase_target_shift_inf") for e in exs]),
+            "probe_rebase_shift_inf": stats([
+                e.get("probe_rebase_shift_inf") for e in exs]),
+            "probe_rebase_residual_inf": stats([
+                e.get("probe_rebase_residual_inf") for e in exs]),
             "precommit_suffix_start_shift_inf": stats([
                 e.get("precommit_suffix_start_shift_inf") for e in exs]),
             "total_start_shift_inf": stats([
@@ -367,6 +391,12 @@ def main():
             [e.get("initial_error_inf") for e in probe_executions],
             [e.get("dispatch_suffix_start_shift_inf")
              for e in probe_executions]),
+        "initial_error_vs_probe_rebase_shift": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("probe_rebase_shift_inf") for e in probe_executions]),
+        "initial_error_vs_probe_rebase_residual": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("probe_rebase_residual_inf") for e in probe_executions]),
         "initial_error_vs_precommit_suffix_shift": pearson(
             [e.get("initial_error_inf") for e in probe_executions],
             [e.get("precommit_suffix_start_shift_inf")
@@ -401,11 +431,44 @@ def main():
             [e.get("brake_duration_s") for e in probe_executions]),
     }
 
+    probe_start_continuity = {
+        "execution_count": len(probe_executions),
+        "all_dispatch_suffix_disabled": bool(probe_executions) and all(
+            abs(float(e.get("dispatch_suffix_phase_s") or 0.0)) <= 1e-9
+            for e in probe_executions),
+        "all_precommit_suffix_disabled": bool(probe_executions) and all(
+            abs(float(e.get("precommit_suffix_phase_s") or 0.0)) <= 1e-9
+            for e in probe_executions),
+        "all_rebase_applied": bool(probe_executions) and all(
+            int(e.get("probe_rebase_applied") or 0) == 1
+            for e in probe_executions),
+        "max_rebase_residual_inf": max(
+            [float(e.get("probe_rebase_residual_inf"))
+             for e in probe_executions
+             if e.get("probe_rebase_residual_inf") is not None],
+            default=None),
+        "max_commit_start_mismatch_inf": max(
+            [float(e.get("commit_start_measured_mismatch_inf"))
+             for e in probe_executions
+             if e.get("commit_start_measured_mismatch_inf") is not None],
+            default=None),
+    }
+    if probe_start_continuity["max_commit_start_mismatch_inf"] is None:
+        probe_start_continuity["pass_0p03"] = False
+    else:
+        probe_start_continuity["pass_0p03"] = (
+            probe_start_continuity["all_dispatch_suffix_disabled"] and
+            probe_start_continuity["all_precommit_suffix_disabled"] and
+            probe_start_continuity["all_rebase_applied"] and
+            probe_start_continuity["max_commit_start_mismatch_inf"] <= 0.03
+        )
+
     out = {
         "run_dir": run_dir,
         "execution_count": len(executions),
         "by_mode": by_mode,
         "probe_correlations": probe_correlations,
+        "probe_start_continuity": probe_start_continuity,
         "executions": executions,
     }
 
@@ -427,7 +490,12 @@ def main():
         "max_error_phase_s", "max_error_phase_fraction",
         "fraction_error_gt_0p10", "fraction_error_gt_0p25",
         "raw_candidate_age_s", "dispatch_suffix_phase_s",
-        "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
+        "dispatch_suffix_start_shift_inf",
+        "probe_rebase_enabled", "probe_rebase_applied",
+        "probe_rebase_clamped", "probe_rebase_target_shift_inf",
+        "probe_rebase_shift_inf", "probe_rebase_residual_inf",
+        "probe_rebase_joint_state_age_ms",
+        "precommit_suffix_phase_s",
         "precommit_suffix_start_shift_inf", "total_start_shift_inf",
         "raw_start_measured_mismatch_inf_at_dispatch",
         "dispatch_start_measured_mismatch_inf", "dispatch_joint_state_age_ms",
