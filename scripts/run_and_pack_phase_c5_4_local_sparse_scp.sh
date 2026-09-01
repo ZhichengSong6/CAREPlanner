@@ -269,6 +269,35 @@ digest["regime"] = {
     "last": reg[-1] if reg else None,
 }
 
+# C5.22: NORMAL candidate-unsafe hysteresis must not deadlock after the
+# first rejected VBC candidate. The first unsafe should request a fresh plan;
+# only a confirmed consecutive unsafe should transition to REPAIR.
+normal_retry_rows = [
+    r for r in reg
+    if str(r.get("reason", "")).startswith("candidate_unsafe_retry_")
+]
+digest["c5_22_normal_unsafe_retry"] = {
+    "normal_unsafe_retry_count": max(
+        [as_int(r.get("normal_unsafe_retry_count"), 0) for r in reg] or [0]),
+    "normal_unsafe_confirmed_repair_count": max(
+        [as_int(r.get("normal_unsafe_confirmed_repair_count"), 0)
+         for r in reg] or [0]),
+    "max_candidate_unsafe_streak": max(
+        [as_int(r.get("candidate_unsafe_streak"), 0) for r in reg] or [0]),
+    "retry_events": [
+        {
+            "t": r.get("_t"),
+            "reason": r.get("reason"),
+            "last_candidate_seq": r.get("last_candidate_seq"),
+            "candidate_unsafe_streak": r.get("candidate_unsafe_streak"),
+        }
+        for r in normal_retry_rows
+    ],
+    "final_state": reg[-1].get("state") if reg else None,
+    "final_candidate_unsafe_streak": as_int(
+        reg[-1].get("candidate_unsafe_streak"), 0) if reg else 0,
+}
+
 probe = R["probe_single_flight_summary.csv"]
 digest["probe_single_flight"] = {
     "phase_transitions": transition_sequence(probe, "phase"),
