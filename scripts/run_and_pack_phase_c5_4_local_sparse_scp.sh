@@ -269,6 +269,24 @@ digest["probe_single_flight"] = {
 }
 
 reg_last = reg[-1] if reg else {}
+commit_last = commit[-1] if commit else {}
+digest["c5_20_probe_start_continuity"] = {
+    "probe_rebase_count": as_int(
+        commit_last.get("probe_rebase_count"), 0),
+    "probe_rebase_clamp_count": as_int(
+        commit_last.get("probe_rebase_clamp_count"), 0),
+    "probe_start_continuity_reject_count": as_int(
+        commit_last.get("probe_start_continuity_reject_count"), 0),
+    "last_probe_rebase_shift_inf": as_float(
+        commit_last.get("probe_rebase_shift_inf")),
+    "last_probe_rebase_target_shift_inf": as_float(
+        commit_last.get("probe_rebase_target_shift_inf")),
+    "last_probe_rebase_residual_inf": as_float(
+        commit_last.get("probe_rebase_residual_inf")),
+    "last_probe_commit_start_mismatch_inf": as_float(
+        commit_last.get("probe_commit_start_mismatch_inf")),
+}
+
 digest["probe_decision_single_flight"] = {
     "phase": reg_last.get("probe_single_flight_phase"),
     "execution_stamp_ns": reg_last.get(
@@ -302,6 +320,15 @@ for r in ver:
             "dispatch_suffix_phase_s": r.get("dispatch_suffix_phase_s"),
             "dispatch_suffix_start_shift_inf": r.get(
                 "dispatch_suffix_start_shift_inf"),
+            "probe_rebase_enabled": r.get("probe_rebase_enabled"),
+            "probe_rebase_applied": r.get("probe_rebase_applied"),
+            "probe_rebase_clamped": r.get("probe_rebase_clamped"),
+            "probe_rebase_target_shift_inf": r.get(
+                "probe_rebase_target_shift_inf"),
+            "probe_rebase_shift_inf": r.get("probe_rebase_shift_inf"),
+            "probe_rebase_residual_inf": r.get("probe_rebase_residual_inf"),
+            "probe_rebase_joint_state_age_ms": r.get(
+                "probe_rebase_joint_state_age_ms"),
             "precommit_suffix_phase_s": r.get("precommit_suffix_phase_s"),
             "precommit_suffix_start_shift_inf": r.get(
                 "precommit_suffix_start_shift_inf"),
@@ -359,7 +386,12 @@ if os.path.isfile(breakdown_path):
             "max_error_phase_s", "max_error_phase_fraction",
             "fraction_error_gt_0p10", "fraction_error_gt_0p25",
             "raw_candidate_age_s", "dispatch_suffix_phase_s",
-            "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
+            "dispatch_suffix_start_shift_inf",
+            "probe_rebase_enabled", "probe_rebase_applied",
+            "probe_rebase_clamped", "probe_rebase_target_shift_inf",
+            "probe_rebase_shift_inf", "probe_rebase_residual_inf",
+            "probe_rebase_joint_state_age_ms",
+            "precommit_suffix_phase_s",
             "precommit_suffix_start_shift_inf", "total_start_shift_inf",
             "raw_start_measured_mismatch_inf_at_dispatch",
             "dispatch_start_measured_mismatch_inf",
@@ -380,6 +412,8 @@ if os.path.isfile(breakdown_path):
             "by_mode": tracker_breakdown.get("by_mode", {}),
             "probe_correlations": tracker_breakdown.get(
                 "probe_correlations", {}),
+            "probe_start_continuity": tracker_breakdown.get(
+                "probe_start_continuity", {}),
             "worst_by_max_error": [
                 {k: e.get(k) for k in compact_keys} for e in worst_by_max
             ],
