@@ -201,6 +201,13 @@ def as_int(v, default=0):
     except Exception:
         return default
 
+def as_float(v):
+    try:
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except Exception:
+        return None
+
 def transition_sequence(rs, key):
     seq = []
     last = object()
@@ -447,13 +454,6 @@ digest["execution_vbc"] = {
     "unsafe_records": sum(r.get("has_violation") == "1" for r in exe),
     "last": exe[-1] if exe else None,
 }
-
-def as_float(v):
-    try:
-        x = float(v)
-        return x if math.isfinite(x) else None
-    except Exception:
-        return None
 
 def timing_stats(values):
     xs = sorted(x for x in values if x is not None and math.isfinite(x))
