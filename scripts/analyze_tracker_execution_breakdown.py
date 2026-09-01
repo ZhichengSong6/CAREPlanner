@@ -23,7 +23,7 @@ def as_int(v, default=0):
         return default
 
 
-TOK = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+TOK = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 
 def read_csv(path):
