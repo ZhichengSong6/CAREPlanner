@@ -298,6 +298,21 @@ for r in ver:
             "committed": r.get("committed"),
             "safety_gate": r.get("safety_gate"),
             "execution_stamp_ns": r.get("execution_stamp_ns"),
+            "raw_candidate_age_s": r.get("raw_candidate_age_s"),
+            "dispatch_suffix_phase_s": r.get("dispatch_suffix_phase_s"),
+            "dispatch_suffix_start_shift_inf": r.get(
+                "dispatch_suffix_start_shift_inf"),
+            "precommit_suffix_phase_s": r.get("precommit_suffix_phase_s"),
+            "precommit_suffix_start_shift_inf": r.get(
+                "precommit_suffix_start_shift_inf"),
+            "total_start_shift_inf": r.get("total_start_shift_inf"),
+            "prefix_endpoint_max_abs_velocity": r.get(
+                "prefix_endpoint_max_abs_velocity"),
+            "brake_duration_s": r.get("brake_duration_s"),
+            "brake_displacement_inf": r.get("brake_displacement_inf"),
+            "constructed_executable_duration_s": r.get(
+                "constructed_executable_duration_s"),
+            "committed_duration_s": r.get("committed_duration_s"),
         })
 digest["probe_verifications"] = probe_ver
 
@@ -333,10 +348,23 @@ if os.path.isfile(breakdown_path):
             "p95_error_inf", "max_error_inf", "terminal_error_inf",
             "max_error_phase_s", "max_error_phase_fraction",
             "fraction_error_gt_0p10", "fraction_error_gt_0p25",
+            "raw_candidate_age_s", "dispatch_suffix_phase_s",
+            "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
+            "precommit_suffix_start_shift_inf", "total_start_shift_inf",
+            "prefix_endpoint_max_abs_velocity", "brake_duration_s",
+            "brake_displacement_inf", "constructed_executable_duration_s",
+            "committed_duration_s",
+            "initial_error_joint_name", "initial_error_q_ref",
+            "initial_error_q_measured", "max_error_joint_name",
+            "max_error_q_ref", "max_error_q_measured",
+            "terminal_error_joint_name", "terminal_error_q_ref",
+            "terminal_error_q_measured",
             "max_error_source", "terminal_source")
         digest["tracker_error_decomposition"] = {
             "execution_count": tracker_breakdown.get("execution_count", 0),
             "by_mode": tracker_breakdown.get("by_mode", {}),
+            "probe_correlations": tracker_breakdown.get(
+                "probe_correlations", {}),
             "worst_by_max_error": [
                 {k: e.get(k) for k in compact_keys} for e in worst_by_max
             ],
