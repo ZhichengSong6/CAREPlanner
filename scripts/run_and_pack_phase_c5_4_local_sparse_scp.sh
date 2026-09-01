@@ -293,6 +293,18 @@ digest["c5_20_probe_start_continuity"] = {
         commit_last.get("probe_rebase_residual_inf")),
     "last_probe_commit_start_mismatch_inf": as_float(
         commit_last.get("probe_commit_start_mismatch_inf")),
+    "probe_speed_scale_count": as_int(
+        commit_last.get("probe_speed_scale_count"), 0),
+    "probe_speed_scale_clamp_count": as_int(
+        commit_last.get("probe_speed_scale_clamp_count"), 0),
+    "last_probe_speed_time_scale": as_float(
+        commit_last.get("probe_speed_time_scale")),
+    "last_probe_speed_max_before": as_float(
+        commit_last.get("probe_speed_max_before")),
+    "last_probe_speed_max_after": as_float(
+        commit_last.get("probe_speed_max_after")),
+    "last_probe_effective_prefix_s": as_float(
+        commit_last.get("probe_effective_prefix_s")),
 }
 
 digest["probe_decision_single_flight"] = {
@@ -337,6 +349,13 @@ for r in ver:
             "probe_rebase_residual_inf": r.get("probe_rebase_residual_inf"),
             "probe_rebase_joint_state_age_ms": r.get(
                 "probe_rebase_joint_state_age_ms"),
+            "probe_speed_max_before": r.get("probe_speed_max_before"),
+            "probe_speed_max_after": r.get("probe_speed_max_after"),
+            "probe_time_scale": r.get("probe_time_scale"),
+            "probe_time_scale_clamped": r.get(
+                "probe_time_scale_clamped"),
+            "probe_effective_prefix_s": r.get(
+                "probe_effective_prefix_s"),
             "precommit_suffix_phase_s": r.get("precommit_suffix_phase_s"),
             "precommit_suffix_start_shift_inf": r.get(
                 "precommit_suffix_start_shift_inf"),
@@ -399,6 +418,9 @@ if os.path.isfile(breakdown_path):
             "probe_rebase_clamped", "probe_rebase_target_shift_inf",
             "probe_rebase_shift_inf", "probe_rebase_residual_inf",
             "probe_rebase_joint_state_age_ms",
+            "probe_speed_max_before", "probe_speed_max_after",
+            "probe_time_scale", "probe_time_scale_clamped",
+            "probe_effective_prefix_s",
             "precommit_suffix_phase_s",
             "precommit_suffix_start_shift_inf", "total_start_shift_inf",
             "raw_start_measured_mismatch_inf_at_dispatch",
