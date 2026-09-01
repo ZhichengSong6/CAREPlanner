@@ -204,6 +204,10 @@
     <param name="probe_rebase_max_shift_inf" value="0.10" />
     <param name="probe_start_joint_state_max_age_s" value="0.05" />
     <param name="probe_commit_start_mismatch_max" value="0.03" />
+    <!-- C5.21: preserve the same PROBE path segment, but time-scale it so
+         joint speeds are capped near 0.5 rad/s before brake construction. -->
+    <param name="probe_velocity_cap" value="0.50" />
+    <param name="probe_time_scale_max" value="5.0" />
     <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
     <param name="output_topic" value="$(arg verification_trajectory_topic)" />
     <param name="committed_output_topic" value="$(arg committed_trajectory_topic)" />
