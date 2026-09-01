@@ -7,7 +7,12 @@ TRIAL_ID="${TRIAL_ID:-probe_diag_00}"
 
 cd "${REPO}"
 
-CASES=(case_006 case_007 case_009)
+PROBE_DIAG_CASES="${PROBE_DIAG_CASES:-case_006 case_007 case_009}"
+read -r -a CASES <<< "${PROBE_DIAG_CASES}"
+if [[ "${#CASES[@]}" -eq 0 ]]; then
+  echo "[ERROR] PROBE_DIAG_CASES resolved to an empty case list" >&2
+  exit 2
+fi
 STAMP="${DIAG_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 GIT_SHORT="$(git rev-parse --short=8 HEAD)"
 DIAG_ID="${DIAG_ID:-${TRIAL_ID}_${STAMP}_${GIT_SHORT}}"
