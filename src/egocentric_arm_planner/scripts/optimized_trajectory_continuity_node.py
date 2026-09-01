@@ -101,6 +101,8 @@ class OptimizedTrajectoryContinuityNode:
             "~probe_start_joint_state_max_age_s", 0.05))
         self.probe_commit_start_mismatch_max = float(rospy.get_param(
             "~probe_commit_start_mismatch_max", 0.03))
+        self.normal_commit_start_mismatch_max = float(rospy.get_param(
+            "~normal_commit_start_mismatch_max", 0.03))
         # C5.21: slow only PROBE task motion before prefix/brake construction.
         # Time scaling preserves q-path geometry and scales dq/ddq consistently.
         self.probe_velocity_cap = float(rospy.get_param(
@@ -178,6 +180,9 @@ class OptimizedTrajectoryContinuityNode:
         if self.probe_commit_start_mismatch_max <= 0.0:
             raise ValueError(
                 "~probe_commit_start_mismatch_max must be positive")
+        if self.normal_commit_start_mismatch_max <= 0.0:
+            raise ValueError(
+                "~normal_commit_start_mismatch_max must be positive")
         if self.probe_velocity_cap <= 0.0:
             raise ValueError("~probe_velocity_cap must be positive")
         if self.probe_time_scale_max < 1.0:
@@ -860,9 +865,16 @@ class OptimizedTrajectoryContinuityNode:
                 raw, now)
             candidate, speed_diag = self._slow_probe_candidate(candidate)
             dispatch_suffix_phase_s = 0.0
-        else:
+        elif pending_repair:
+            # Keep existing REPAIR semantics unchanged in C5.23.
             candidate = self._suffix_from_phase(raw, age)
             dispatch_suffix_phase_s = float(age)
+        else:
+            # C5.23 NORMAL: verification latency is not execution time.
+            # Audit the exact raw full-horizon candidate produced from the
+            # latest measured state instead of advancing it by wall-clock age.
+            candidate = copy.deepcopy(raw)
+            dispatch_suffix_phase_s = 0.0
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
             return None, "none"
@@ -875,8 +887,9 @@ class OptimizedTrajectoryContinuityNode:
             "dispatch_suffix_phase_s": dispatch_suffix_phase_s,
             "raw_candidate_duration_s": float(raw_duration_s),
             "dispatch_suffix_start_shift_inf": (
-                0.0 if pending_probe else self._position_shift_inf(
-                    dispatch_start_positions, raw_start_positions)),
+                self._position_shift_inf(
+                    dispatch_start_positions, raw_start_positions)
+                if pending_repair else 0.0),
             "probe_rebase_enabled": int(rebase_diag.get("enabled", 0)),
             "probe_rebase_applied": int(rebase_diag.get("applied", 0)),
             "probe_rebase_clamped": int(rebase_diag.get("clamped", 0)),
@@ -1363,10 +1376,11 @@ class OptimizedTrajectoryContinuityNode:
                             seq, "unsafe", False, verification_age, view,
                             diag=diag)
                     else:
-                        if was_probe:
+                        was_normal = (not was_probe and not was_repair)
+                        if was_probe or was_normal:
                             # The exact candidate that passed GCDF + VBC is the
-                            # one we may execute.  Verification wall time is
-                            # NOT execution time, so do not suffix it again.
+                            # one we may execute. Verification wall time is not
+                            # robot execution time, so do not suffix it again.
                             committed = copy.deepcopy(candidate)
                         else:
                             committed = self._suffix_from_phase(
@@ -1383,9 +1397,11 @@ class OptimizedTrajectoryContinuityNode:
                             raw_start_positions = list(
                                 diag.get("raw_start_positions", []))
                             diag["precommit_suffix_phase_s"] = (
-                                0.0 if was_probe else float(verification_age))
+                                0.0 if (was_probe or was_normal)
+                                else float(verification_age))
                             diag["precommit_suffix_start_shift_inf"] = (
-                                0.0 if was_probe else self._position_shift_inf(
+                                0.0 if (was_probe or was_normal)
+                                else self._position_shift_inf(
                                     committed_start_positions,
                                     candidate_start_positions))
                             diag["total_start_shift_inf"] = (
@@ -1408,19 +1424,31 @@ class OptimizedTrajectoryContinuityNode:
                                 self._last_probe_commit_start_mismatch_inf)
                             self._last_verification_diag = copy.deepcopy(diag)
 
-                            if (was_probe and
+                            start_gate_limit = None
+                            start_gate_source = None
+                            if was_probe:
+                                start_gate_limit = (
+                                    self.probe_commit_start_mismatch_max)
+                                start_gate_source = (
+                                    "probe_start_continuity_rejected_replan")
+                            elif was_normal:
+                                start_gate_limit = (
+                                    self.normal_commit_start_mismatch_max)
+                                start_gate_source = (
+                                    "normal_start_continuity_rejected_replan")
+
+                            if (start_gate_limit is not None and
                                     (not math.isfinite(commit_start_mismatch) or
                                      commit_start_mismatch >
-                                     self.probe_commit_start_mismatch_max)):
-                                # Fail closed: the certified geometry no longer
-                                # starts close enough to the robot.  Do not
-                                # mutate it after certification; ask for a fresh
-                                # measured-state plan instead.
-                                self._probe_start_continuity_reject_count += 1
+                                     start_gate_limit)):
+                                # Fail closed: never mutate a certified
+                                # trajectory after safety audit. Ask the planner
+                                # for a fresh measured-state candidate instead.
+                                if was_probe:
+                                    self._probe_start_continuity_reject_count += 1
                                 self._verification_timeout_count += 1
                                 self._last_verification_result = "timeout"
-                                self._last_source = (
-                                    "probe_start_continuity_rejected_replan")
+                                self._last_source = start_gate_source
                                 event_to_publish = self._make_verification_event(
                                     seq, "timeout", False, verification_age,
                                     view, safety_gate="start_continuity",
