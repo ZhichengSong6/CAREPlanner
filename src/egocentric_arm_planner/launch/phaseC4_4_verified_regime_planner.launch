@@ -538,6 +538,7 @@
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/trajectory_risk/vbc_active_set_points" />
+      <arg name="active_set_bundle_topic" value="/care_planner/trajectory_risk/vbc_active_set_bundle" />
       <arg name="force_bootstrap_topic" value="/care_planner/trajectory_risk/force_bootstrap" />
     </include>
   </group>
@@ -568,6 +569,7 @@
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/execution_vbc/audit_active_set_unused" />
+      <arg name="active_set_bundle_topic" value="/care_planner/execution_vbc/audit_active_set_bundle_unused" />
       <arg name="force_bootstrap_topic" value="/care_planner/execution_vbc/audit_force_bootstrap_unused" />
     </include>
   </group>
