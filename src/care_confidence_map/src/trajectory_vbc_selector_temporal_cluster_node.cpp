@@ -116,9 +116,12 @@ public:
         "/care_planner/trajectory_risk/vbc_selected_see_time_s", 1, true);
     active_set_points_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
         active_set_points_topic_, 1, true);
+    active_set_bundle_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
+        active_set_bundle_topic_, 1, true);
 
     publishCandidateActive(false);
     publishActiveSet({});
+    publishActiveSetBundle({}, std::numeric_limits<double>::quiet_NaN());
 
     timer_ = nh_.createTimer(
         ros::Duration(1.0 / std::max(0.1, eval_rate_)),
@@ -196,6 +199,10 @@ private:
         "trajectory_vbc/active_set_points_topic",
         active_set_points_topic_,
         "/care_planner/trajectory_risk/vbc_active_set_points");
+    pnh_.param<std::string>(
+        "trajectory_vbc/active_set_bundle_topic",
+        active_set_bundle_topic_,
+        "/care_planner/trajectory_risk/vbc_active_set_bundle");
     pnh_.param<std::string>(
         "trajectory_vbc/force_bootstrap_topic",
         force_bootstrap_topic_,
@@ -688,6 +695,39 @@ private:
     active_set_points_pub_.publish(msg);
   }
 
+  // C5.26 coherent blocker handoff.  Geometry and sweep metadata must travel
+  // in one ROS message; publish order across two independent topics is not an
+  // atomic transaction at the subscriber.
+  //
+  // data = [generation_seq, sweep_time_s, point_count, x0,y0,z0, ...]
+  // An empty/Safe bundle uses point_count=0 and sweep_time_s=NaN.
+  void publishActiveSetBundle(
+      const std::vector<const Candidate*>& points,
+      double sweep_time_s)
+  {
+    std::vector<const Candidate*> ordered = points;
+    std::sort(
+        ordered.begin(), ordered.end(),
+        [this](const Candidate* a, const Candidate* b) {
+          return candidateKey(a->point_base) < candidateKey(b->point_base);
+        });
+
+    ++active_set_bundle_seq_;
+    std_msgs::Float64MultiArray msg;
+    msg.data.reserve(3 + ordered.size() * 3);
+    msg.data.push_back(static_cast<double>(active_set_bundle_seq_));
+    msg.data.push_back(sweep_time_s);
+    msg.data.push_back(static_cast<double>(ordered.size()));
+    for (const Candidate* c : ordered)
+    {
+      if (!c) continue;
+      msg.data.push_back(c->point_base.x());
+      msg.data.push_back(c->point_base.y());
+      msg.data.push_back(c->point_base.z());
+    }
+    active_set_bundle_pub_.publish(msg);
+  }
+
   static std::string joinInts(const std::vector<int>& values)
   {
     std::ostringstream oss;
@@ -706,6 +746,7 @@ private:
   {
     publishCandidateActive(false);
     publishActiveSet({});
+    publishActiveSetBundle({}, std::numeric_limits<double>::quiet_NaN());
     has_selected_key_ = false;
 
     std::ostringstream oss;
@@ -760,8 +801,10 @@ private:
     for (const int idx : active_layer.member_indices)
       active_points.push_back(&candidates[static_cast<std::size_t>(idx)]);
     publishActiveSet(active_points);
+    publishActiveSetBundle(active_points, active_layer.min_sweep_time_s);
 
-    // The steering deadline is tied to the earliest point in the active layer.
+    // Legacy split-topic metadata remains for diagnostics/backward-compatible
+    // consumers. C5.26 blocker acquisition consumes the coherent bundle above.
     std_msgs::Float32 sweep_msg;
     sweep_msg.data = static_cast<float>(active_layer.min_sweep_time_s);
     selected_sweep_time_pub_.publish(sweep_msg);
@@ -1154,6 +1197,7 @@ private:
   ros::Publisher selected_sweep_time_pub_;
   ros::Publisher selected_see_time_pub_;
   ros::Publisher active_set_points_pub_;
+  ros::Publisher active_set_bundle_pub_;
   ros::Timer timer_;
 
   care_confidence_map::TrajectoryRiskEvaluator evaluator_;
@@ -1164,6 +1208,7 @@ private:
   bool has_traj_ = false;
   bool has_predicted_traj_ = false;
   bool force_bootstrap_ = false;
+  unsigned long long active_set_bundle_seq_ = 0;
 
   bool has_selected_key_ = false;
   CandidateKey selected_key_;
@@ -1195,6 +1240,8 @@ private:
       "/care_planner/confidence_map/query";
   std::string active_set_points_topic_ =
       "/care_planner/trajectory_risk/vbc_active_set_points";
+  std::string active_set_bundle_topic_ =
+      "/care_planner/trajectory_risk/vbc_active_set_bundle";
   std::string force_bootstrap_topic_ =
       "/care_planner/trajectory_risk/force_bootstrap";
 
