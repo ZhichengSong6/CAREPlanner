@@ -318,10 +318,6 @@ def main():
             r for r in ll
             if r.get("event") == "probe_feasibility_restore_applied"
         ]
-        restore_hard_success_totals = [
-            as_int(r.get("probe_restore_hard_success_total"), 0)
-            for r in ll
-        ]
         soft_diag_solved = [
             r for r in soft_diag if r.get("solved") == "1"
         ]
@@ -404,10 +400,9 @@ def main():
             "soft_slack_required_mean": (
                 sum(soft_slacks) / len(soft_slacks) if soft_slacks else None),
             "probe_feasibility_restore_applied_count": len(restore_applied),
-            "probe_feasibility_restore_hard_success_delta": (
-                max(restore_hard_success_totals) -
-                min(restore_hard_success_totals)
-                if restore_hard_success_totals else 0),
+            "probe_feasibility_restore_hard_success_delta":
+                counter_delta(
+                    local, "probe_restore_hard_success_total", t0, t1),
             "max_remaining_obligation_count": max(remaining) if remaining else 0,
             "last_remaining_obligation_count": remaining[-1] if remaining else None,
             "blocker_target_sequence": targets,
