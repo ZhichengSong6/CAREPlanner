@@ -310,6 +310,25 @@ def main():
         failed_statuses = Counter(
             r.get("status", "unknown") for r in ll
             if r.get("event") == "scp_failed")
+        soft_diag = [
+            r for r in ll
+            if r.get("event") == "task_failure_slack_diagnostic"
+        ]
+        soft_diag_solved = [
+            r for r in soft_diag if r.get("solved") == "1"
+        ]
+        soft_slacks = [
+            as_float(r.get("max_slack")) for r in soft_diag
+            if math.isfinite(as_float(r.get("max_slack")))
+        ]
+        task_ref_horizons = sorted({
+            as_int(r.get("task_ref_horizon_steps"), 0) for r in ll
+            if as_int(r.get("task_ref_horizon_steps"), 0) > 0
+        })
+        probe_hold_tail_values = sorted({
+            as_int(r.get("probe_hold_tail"), 0) for r in ll
+            if "probe_hold_tail" in r
+        })
 
         remaining = [
             as_int(r.get("remaining_obligation_count"), -1) for r in aa
@@ -367,6 +386,15 @@ def main():
                 "candidate_published", 0),
             "probe_planner_event_counts": dict(local_events),
             "probe_scp_failed_statuses": dict(failed_statuses),
+            "task_ref_horizon_steps_seen": task_ref_horizons,
+            "probe_hold_tail_values_seen": probe_hold_tail_values,
+            "soft_slack_diagnostic_count": len(soft_diag),
+            "soft_slack_diagnostic_solved_count": len(soft_diag_solved),
+            "soft_slack_diagnostic_statuses": dict(Counter(
+                r.get("status", "unknown") for r in soft_diag)),
+            "soft_slack_required_max": max(soft_slacks) if soft_slacks else None,
+            "soft_slack_required_mean": (
+                sum(soft_slacks) / len(soft_slacks) if soft_slacks else None),
             "max_remaining_obligation_count": max(remaining) if remaining else 0,
             "last_remaining_obligation_count": remaining[-1] if remaining else None,
             "blocker_target_sequence": targets,
@@ -436,6 +464,9 @@ def main():
         "tracker_completion_count", "unmatched_verified_commit_count",
         "probe_plan_started_count", "probe_scp_solved_count",
         "probe_scp_failed_count", "probe_candidate_published_count",
+        "task_ref_horizon_steps_seen", "probe_hold_tail_values_seen",
+        "soft_slack_diagnostic_count", "soft_slack_diagnostic_solved_count",
+        "soft_slack_required_max", "soft_slack_required_mean",
         "max_remaining_obligation_count", "last_remaining_obligation_count",
     ]
     with open(out_csv, "w", newline="") as f:
@@ -460,6 +491,9 @@ def main():
             "tracker_complete={tracker_completion_count} "
             "unmatched={unmatched_verified_commit_count} "
             "scp_failed={probe_scp_failed_count} "
+            "ref_steps={task_ref_horizon_steps_seen} "
+            "hold_tail={probe_hold_tail_values_seen} "
+            "soft_slack_max={soft_slack_required_max} "
             "exit={exit_state} reason={exit_reason} diagnosis={diagnosis}".format(
                 **ep))
     print("[JSON]", out_json)
