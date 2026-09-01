@@ -166,6 +166,16 @@ def main():
             "precommit_suffix_start_shift_inf": as_float(
                 r.get("precommit_suffix_start_shift_inf")),
             "total_start_shift_inf": as_float(r.get("total_start_shift_inf")),
+            "raw_start_measured_mismatch_inf_at_dispatch": as_float(
+                r.get("raw_start_measured_mismatch_inf_at_dispatch")),
+            "dispatch_start_measured_mismatch_inf": as_float(
+                r.get("dispatch_start_measured_mismatch_inf")),
+            "dispatch_joint_state_age_ms": as_float(
+                r.get("dispatch_joint_state_age_ms")),
+            "commit_start_measured_mismatch_inf": as_float(
+                r.get("commit_start_measured_mismatch_inf")),
+            "commit_joint_state_age_ms": as_float(
+                r.get("commit_joint_state_age_ms")),
             "raw_candidate_duration_s": as_float(
                 r.get("raw_candidate_duration_s")),
             "constructed_executable_duration_s": as_float(
@@ -235,6 +245,11 @@ def main():
             "precommit_suffix_phase_s": None,
             "precommit_suffix_start_shift_inf": None,
             "total_start_shift_inf": None,
+            "raw_start_measured_mismatch_inf_at_dispatch": None,
+            "dispatch_start_measured_mismatch_inf": None,
+            "dispatch_joint_state_age_ms": None,
+            "commit_start_measured_mismatch_inf": None,
+            "commit_joint_state_age_ms": None,
             "raw_candidate_duration_s": None,
             "constructed_executable_duration_s": None,
             "committed_duration_s": None,
@@ -329,6 +344,15 @@ def main():
                 e.get("precommit_suffix_start_shift_inf") for e in exs]),
             "total_start_shift_inf": stats([
                 e.get("total_start_shift_inf") for e in exs]),
+            "raw_start_measured_mismatch_inf_at_dispatch": stats([
+                e.get("raw_start_measured_mismatch_inf_at_dispatch")
+                for e in exs]),
+            "dispatch_start_measured_mismatch_inf": stats([
+                e.get("dispatch_start_measured_mismatch_inf")
+                for e in exs]),
+            "commit_start_measured_mismatch_inf": stats([
+                e.get("commit_start_measured_mismatch_inf")
+                for e in exs]),
             "prefix_endpoint_max_abs_velocity": stats([
                 e.get("prefix_endpoint_max_abs_velocity") for e in exs]),
             "brake_duration_s": stats([
@@ -350,6 +374,18 @@ def main():
         "initial_error_vs_total_start_shift": pearson(
             [e.get("initial_error_inf") for e in probe_executions],
             [e.get("total_start_shift_inf") for e in probe_executions]),
+        "initial_error_vs_raw_start_measured_mismatch_at_dispatch": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("raw_start_measured_mismatch_inf_at_dispatch")
+             for e in probe_executions]),
+        "initial_error_vs_dispatch_start_measured_mismatch": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("dispatch_start_measured_mismatch_inf")
+             for e in probe_executions]),
+        "initial_error_vs_commit_start_measured_mismatch": pearson(
+            [e.get("initial_error_inf") for e in probe_executions],
+            [e.get("commit_start_measured_mismatch_inf")
+             for e in probe_executions]),
         "max_error_vs_prefix_endpoint_velocity": pearson(
             [e.get("max_error_inf") for e in probe_executions],
             [e.get("prefix_endpoint_max_abs_velocity")
@@ -393,6 +429,9 @@ def main():
         "raw_candidate_age_s", "dispatch_suffix_phase_s",
         "dispatch_suffix_start_shift_inf", "precommit_suffix_phase_s",
         "precommit_suffix_start_shift_inf", "total_start_shift_inf",
+        "raw_start_measured_mismatch_inf_at_dispatch",
+        "dispatch_start_measured_mismatch_inf", "dispatch_joint_state_age_ms",
+        "commit_start_measured_mismatch_inf", "commit_joint_state_age_ms",
         "raw_candidate_duration_s", "constructed_executable_duration_s",
         "committed_duration_s", "prefix_endpoint_max_abs_velocity",
         "brake_duration_s", "brake_displacement_inf",
