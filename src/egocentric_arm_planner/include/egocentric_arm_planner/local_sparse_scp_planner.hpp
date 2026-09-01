@@ -212,6 +212,11 @@ private:
   bool plan_repair_mode_ = false;
   bool plan_probe_mode_ = false;
   std::string plan_initialization_mode_ = "task_reference";
+  // C5.25: a failed PROBE hard-QP may use one soft solve only as an
+  // internal feasibility-restoration iterate. The soft trajectory is never
+  // executable and must be followed by a fresh GCDF query + hard solve.
+  int plan_probe_feasibility_restore_attempts_ = 0;
+  bool plan_probe_restore_pending_hard_recheck_ = false;
 
   // One CDF batch per SCP iterate. The callback only hands ownership to the
   // worker; PIQP never runs in a ROS callback.
@@ -258,6 +263,10 @@ private:
   // remaining tail at that local target. This is deliberately separate from
   // the GCDF constraint horizon even when both are configured to five steps.
   int probe_task_horizon_steps_ = 5;
+  // C5.25 PROBE-only hard-GCDF feasibility restoration. A soft-QP solution
+  // may seed the next SCP linearization, but can never be published.
+  bool probe_feasibility_restoration_enabled_ = false;
+  int probe_feasibility_restoration_max_attempts_ = 1;
   double visibility_waypoint_weight_ = 3000.0;
 
   double cdf_safety_margin_ = 0.0;
@@ -338,6 +347,8 @@ private:
   unsigned long long cdf_stamp_miss_ = 0;
   unsigned long long solve_count_ = 0;
   unsigned long long solve_failure_count_ = 0;
+  unsigned long long probe_feasibility_restore_count_ = 0;
+  unsigned long long probe_feasibility_restore_success_count_ = 0;
 };
 
 }  // namespace egocentric_arm_planner
