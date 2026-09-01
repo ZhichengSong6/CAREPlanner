@@ -191,6 +191,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<double>("local_planner/repair_task_tracking_scale",
                      repair_task_tracking_scale_,
                      repair_task_tracking_scale_);
+  pnh_.param<int>("local_planner/probe_task_horizon_steps",
+                  probe_task_horizon_steps_,
+                  probe_task_horizon_steps_);
   pnh_.param<double>("local_planner/visibility_waypoint_weight",
                      visibility_waypoint_weight_,
                      visibility_waypoint_weight_);
@@ -312,6 +315,8 @@ bool LocalSparseSCPPlanner::loadConfig() {
       cdf_slack_penalty_multiplier_ < 1.0 ||
       cdf_slack_penalty_max_ < cdf_slack_linear_weight_ ||
       cdf_slack_tolerance_ < 0.0 ||
+      probe_task_horizon_steps_ < 1 ||
+      probe_task_horizon_steps_ > num_intervals_ ||
       cdf_constraint_horizon_steps_ < 1 ||
       cdf_constraint_horizon_steps_ > num_intervals_) {
     ROS_ERROR("[LocalSparseSCPPlanner] invalid local_planner parameters");
@@ -668,6 +673,7 @@ bool LocalSparseSCPPlanner::buildReferenceHorizon(
     const Eigen::VectorXd& q_current,
     const trajectory_msgs::JointTrajectory& reference,
     const ros::Time& now,
+    bool probe_mode,
     Eigen::MatrixXd& q_ref,
     Eigen::MatrixXd& u_ref,
     Eigen::MatrixXd& q_init,
@@ -696,6 +702,21 @@ bool LocalSparseSCPPlanner::buildReferenceHorizon(
       return false;
     }
     q_ref.col(k) = qk;
+  }
+
+  // C5.24: a PROBE is a local task-continuation test, not a full NORMAL
+  // horizon solve whose suffix happens to be discarded later. Advance the
+  // nominal task reference only through probe_task_horizon_steps_, then hold
+  // that local target for the rest of the optimization horizon. This keeps the
+  // fixed QP dimension while making terminal/state tracking consistent with
+  // the short executable PROBE semantics.
+  if (probe_mode) {
+    const int hold_k =
+        std::max(1, std::min(probe_task_horizon_steps_, num_intervals_));
+    const Eigen::VectorXd q_hold = q_ref.col(hold_k);
+    for (int k = hold_k + 1; k <= num_intervals_; ++k) {
+      q_ref.col(k) = q_hold;
+    }
   }
 
   for (int k = 0; k < num_intervals_; ++k) {
@@ -829,13 +850,14 @@ bool LocalSparseSCPPlanner::startPlan() {
 
   Eigen::MatrixXd q_ref, u_ref, q_init, u_init;
   if (!buildReferenceHorizon(
-          q_current, reference, ros::Time::now(),
+          q_current, reference, ros::Time::now(), probe,
           q_ref, u_ref, q_init, u_init)) {
     abortPlan("reference_horizon_failed");
     return false;
   }
 
-  std::string initialization_mode = "task_reference";
+  std::string initialization_mode =
+      probe ? "probe_short_horizon_hold_tail" : "task_reference";
   if (repair && repair_hold_initialization_enabled_) {
     for (int k = 0; k <= num_intervals_; ++k) {
       q_init.col(k) = q_current;
@@ -1758,6 +1780,10 @@ void LocalSparseSCPPlanner::publishSummary(
       << " running=" << static_cast<int>(running)
       << " repair=" << static_cast<int>(repair)
       << " probe=" << static_cast<int>(probe)
+      << " task_ref_horizon_steps="
+      << (probe ? probe_task_horizon_steps_ : num_intervals_)
+      << " probe_hold_tail="
+      << static_cast<int>(probe && probe_task_horizon_steps_ < num_intervals_)
       << " cdf_horizon_steps="
       << ((repair || probe) ? cdf_constraint_horizon_steps_ : num_intervals_)
       << " init=" << init_mode
