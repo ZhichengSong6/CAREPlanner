@@ -4,6 +4,7 @@ import csv
 import json
 import math
 import os
+import re
 from collections import defaultdict
 
 
@@ -22,10 +23,45 @@ def as_int(v, default=0):
         return default
 
 
+TOK = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+
+
 def read_csv(path):
+    """Read either flattened CSVs or rostopic-style recorder CSVs.
+
+    CAREPlanner run CSVs are typically recorded as:
+        %time,field.data
+        <ns>,TRACKER active=1 complete=0 ...
+    so the semantic fields live inside field.data as key=value tokens.
+    Some derived CSVs are already flattened. Support both formats.
+    """
     if not os.path.exists(path):
         return []
-    with open(path, newline="") as f:
+
+    with open(path, newline="", errors="replace") as f:
+        rd = csv.reader(f)
+        header = next(rd, [])
+        if not header:
+            return []
+
+        if "field.data" in header:
+            ti = header.index("%time") if "%time" in header else 0
+            di = header.index("field.data")
+            out = []
+            for row in rd:
+                if len(row) <= di:
+                    continue
+                payload = ",".join(row[di:])
+                rec = dict(TOK.findall(payload))
+                try:
+                    rec["_t"] = float(row[ti]) / 1e9
+                except Exception:
+                    rec["_t"] = None
+                if rec:
+                    out.append(rec)
+            return out
+
+        f.seek(0)
         return list(csv.DictReader(f))
 
 
