@@ -107,7 +107,7 @@ json.dump({
     "difficulty": None,
     "task_success": False,
     "overall_safe": False,
-    "benchmark_runner_failur": True,
+    "benchmark_runner_failure": True,
     "runner_return_code": int(run_rc),
     "evaluator_return_code": int(eval_rc),
 }, open(path, "w"), indent=2)
@@ -124,7 +124,7 @@ json.dump({
 }, open(path, "w"), indent=2)
 PY
 
-  if [[ "${KEEP_CASE_ZIPS" != "1" ]]; then
+  if [[ "${KEEP_CASE_ZIPS}" != "1" ]]; then
     rm -f "${CASE_ZIP}"
   fi
 
