@@ -143,6 +143,13 @@ local_planner:
     task_failure_slack_diagnostic_enabled: true
     task_failure_slack_diagnostic_weight: 10000.0
 
+    # C5.25: if a PROBE hard QP fails, the existing soft diagnostic may be
+    # reused exactly once as an INTERNAL SCP feasibility-restoration iterate.
+    # It is never published/executed. A fresh GCDF query and a later hard QP
+    # must succeed before any candidate can leave the local planner.
+    probe_feasibility_restoration_enabled: true
+    probe_feasibility_restoration_max_attempts: 1
+
     slack_linear_weight: 10.0
     slack_quadratic_weight: 0.0
     per_constraint_slack: true
