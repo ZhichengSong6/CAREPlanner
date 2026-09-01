@@ -154,6 +154,10 @@ class C44VerifiedRegimeManager:
         self.candidate_safe_count = 0
         self.candidate_timeout_count = 0
         self.candidate_event_count = 0
+        # C5.22: NORMAL VBC-unsafe hysteresis must keep producing fresh
+        # candidates; otherwise streak=1 can deadlock forever with no commit.
+        self.normal_unsafe_retry_count = 0
+        self.normal_unsafe_confirmed_repair_count = 0
 
         self.execution_summary_time = None
         self.execution_last_unsafe = False
@@ -663,20 +667,45 @@ class C44VerifiedRegimeManager:
 
     def _handle_normal_candidate_result_locked(
             self, result, safety_gate, now, replay=False):
-        """Apply NORMAL candidate safety semantics from live or replayed input."""
+        """Apply NORMAL candidate safety semantics from live or replayed input.
+
+        C5.22: ordinary VBC unsafe uses hysteresis, but every rejected candidate
+        before the threshold must explicitly request a fresh NORMAL plan.
+        Otherwise no candidate is committed and there may be no later event to
+        advance candidate_unsafe_streak from 1 to the configured threshold.
+        Final-GCDF unsafe remains fail-closed and transitions immediately.
+        """
         source = "after_gate_release" if replay else "live"
         if result == "unsafe" and safety_gate == "gcdf":
             self._transition_locked(
                 self.REPAIR,
                 "final_gcdf_normal_unsafe_{}".format(source),
                 now)
-        elif (result == "unsafe" and
-              self.candidate_unsafe_streak >= self.candidate_unsafe_required):
-            self._transition_locked(
-                self.REPAIR,
-                "candidate_unique_unsafe_confirmed_{}".format(source),
-                now)
-        elif result == "timeout":
+            return
+
+        if result == "unsafe":
+            if self.candidate_unsafe_streak >= self.candidate_unsafe_required:
+                self.normal_unsafe_confirmed_repair_count += 1
+                self._transition_locked(
+                    self.REPAIR,
+                    "candidate_unique_unsafe_confirmed_{}".format(source),
+                    now)
+                return
+
+            # Hysteresis not yet confirmed: stay NORMAL, but the rejected
+            # candidate produced no commit/tracker-complete trigger. Request a
+            # fresh plan from the latest measured state so a subsequent safe
+            # result can clear the streak or a second unsafe can confirm REPAIR.
+            self.normal_unsafe_retry_count += 1
+            self.last_transition_reason = (
+                "candidate_unsafe_retry_{}/{}_{}".format(
+                    self.candidate_unsafe_streak,
+                    self.candidate_unsafe_required,
+                    source))
+            self.replan_request_pub.publish(Bool(data=True))
+            return
+
+        if result == "timeout":
             # No candidate was certified or committed. Stay in NORMAL and
             # explicitly request a fresh plan; never reuse stale execution.
             self.last_transition_reason = (
@@ -983,6 +1012,10 @@ class C44VerifiedRegimeManager:
                 "candidate_unsafe_count={}".format(self.candidate_unsafe_count),
                 "candidate_safe_count={}".format(self.candidate_safe_count),
                 "candidate_timeout_count={}".format(self.candidate_timeout_count),
+                "normal_unsafe_retry_count={}".format(
+                    self.normal_unsafe_retry_count),
+                "normal_unsafe_confirmed_repair_count={}".format(
+                    self.normal_unsafe_confirmed_repair_count),
                 "execution_last_unsafe={}".format(int(self.execution_last_unsafe)),
                 "execution_unsafe_streak={}".format(self.execution_unsafe_streak),
                 "execution_event_latched={}".format(int(self.execution_event_latched)),
