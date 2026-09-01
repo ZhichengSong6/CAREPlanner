@@ -224,6 +224,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<double>("local_planner/cdf/task_failure_slack_diagnostic_weight",
                      task_failure_slack_diagnostic_weight_,
                      task_failure_slack_diagnostic_weight_);
+  pnh_.param<bool>("local_planner/cdf/probe_feasibility_restoration_enabled",
+                   probe_feasibility_restoration_enabled_,
+                   probe_feasibility_restoration_enabled_);
+  pnh_.param<int>("local_planner/cdf/probe_feasibility_restoration_max_attempts",
+                  probe_feasibility_restoration_max_attempts_,
+                  probe_feasibility_restoration_max_attempts_);
   pnh_.param<bool>("local_planner/cdf/adaptive_slack_penalty",
                    cdf_adaptive_slack_penalty_,
                    cdf_adaptive_slack_penalty_);
@@ -315,6 +321,7 @@ bool LocalSparseSCPPlanner::loadConfig() {
       cdf_slack_penalty_multiplier_ < 1.0 ||
       cdf_slack_penalty_max_ < cdf_slack_linear_weight_ ||
       cdf_slack_tolerance_ < 0.0 ||
+      probe_feasibility_restoration_max_attempts_ < 0 ||
       probe_task_horizon_steps_ < 1 ||
       probe_task_horizon_steps_ > num_intervals_ ||
       cdf_constraint_horizon_steps_ < 1 ||
@@ -878,6 +885,8 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_repair_mode_ = repair;
     plan_probe_mode_ = probe;
     plan_initialization_mode_ = initialization_mode;
+    plan_probe_feasibility_restore_attempts_ = 0;
+    plan_probe_restore_pending_hard_recheck_ = false;
     scp_iteration_ = 0;
     trust_radius_ = trust_region_initial_;
     plan_cdf_slack_linear_weight_ = cdf_slack_linear_weight_;
@@ -1038,8 +1047,33 @@ void LocalSparseSCPPlanner::workerLoop() {
             trust,
             slack_linear_weight);
 
+    // C5.25: compute the existing soft diagnostic before deciding whether a
+    // failed PROBE plan is terminal. The soft solve is NON-EXECUTABLE; when
+    // enabled it may only provide the next SCP linearization point.
+    SparseSolveResult diagnostic;
+    bool diagnostic_ran = false;
+    if (!result.solved && !repair &&
+        task_failure_slack_diagnostic_enabled_) {
+      diagnostic =
+          solveSparseSubproblem(
+              *batch,
+              q_bar,
+              u_bar,
+              q_ref,
+              u_ref,
+              previous_command,
+              schedule,
+              repair,
+              probe,
+              trust,
+              task_failure_slack_diagnostic_weight_,
+              true);
+      diagnostic_ran = true;
+    }
+
     bool publish_candidate = false;
     bool publish_next_query = false;
+    bool restoration_applied = false;
     Eigen::MatrixXd q_next, u_next;
     std::string frame;
     double total_ms = 0.0;
@@ -1049,10 +1083,42 @@ void LocalSparseSCPPlanner::workerLoop() {
       ++solve_count_;
       if (!result.solved) {
         ++solve_failure_count_;
-        plan_running_ = false;
-        waiting_for_cdf_ = false;
-        last_plan_finish_time_ = ros::Time::now();
+
+        const bool restoration_available =
+            probe &&
+            probe_feasibility_restoration_enabled_ &&
+            diagnostic_ran &&
+            diagnostic.solved &&
+            plan_probe_feasibility_restore_attempts_ <
+                probe_feasibility_restoration_max_attempts_;
+
+        if (restoration_available) {
+          // The soft trajectory stays internal. Re-query GCDF at this iterate,
+          // then require a hard-QP solve before any candidate publication.
+          plan_q_bar_ = diagnostic.q;
+          plan_u_bar_ = diagnostic.u;
+          previous_query_min_distance_ =
+              std::numeric_limits<double>::quiet_NaN();
+          ++plan_probe_feasibility_restore_attempts_;
+          ++probe_feasibility_restore_count_;
+          plan_probe_restore_pending_hard_recheck_ = true;
+          restoration_applied = true;
+          publish_next_query = true;
+          q_next = plan_q_bar_;
+          u_next = plan_u_bar_;
+          frame = current_frame_id_;
+        } else {
+          plan_running_ = false;
+          waiting_for_cdf_ = false;
+          plan_probe_restore_pending_hard_recheck_ = false;
+          last_plan_finish_time_ = ros::Time::now();
+        }
       } else {
+        if (probe && plan_probe_restore_pending_hard_recheck_) {
+          ++probe_feasibility_restore_success_count_;
+          plan_probe_restore_pending_hard_recheck_ = false;
+        }
+
         plan_q_bar_ = result.q;
         plan_u_bar_ = result.u;
         previous_query_min_distance_ = result.min_distance;
@@ -1105,21 +1171,7 @@ void LocalSparseSCPPlanner::workerLoop() {
           "[LocalSparseSCPPlanner] sparse PIQP failed: "
           << result.status);
 
-      if (!repair && task_failure_slack_diagnostic_enabled_) {
-        const SparseSolveResult diagnostic =
-            solveSparseSubproblem(
-                *batch,
-                q_bar,
-                u_bar,
-                q_ref,
-                u_ref,
-                previous_command,
-                schedule,
-                repair,
-                probe,
-                trust,
-                task_failure_slack_diagnostic_weight_,
-                true);
+      if (diagnostic_ran) {
         publishSummary(
             "task_failure_slack_diagnostic",
             &diagnostic,
@@ -1133,6 +1185,27 @@ void LocalSparseSCPPlanner::workerLoop() {
             << " required_max_slack=" << diagnostic.max_slack
             << " required_mean_slack=" << diagnostic.mean_slack
             << " soft_primal=" << diagnostic.primal_residual);
+      }
+
+      if (restoration_applied) {
+        publishSummary(
+            "probe_feasibility_restore_applied",
+            diagnostic_ran ? &diagnostic : nullptr,
+            0.0);
+        ROS_WARN_STREAM(
+            "[LocalSparseSCPPlanner] C5.25 PROBE feasibility restoration "
+            "applied; soft iterate is internal only, fresh GCDF + hard solve "
+            "required before candidate publication");
+
+        const ros::Time stamp =
+            publishQueryTrajectory(q_next, u_next, frame);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (plan_running_) {
+          current_query_stamp_ = stamp;
+          current_query_wall_ = ros::WallTime::now();
+          waiting_for_cdf_ = true;
+        }
+        continue;
       }
 
       if (!repair) {
@@ -1754,6 +1827,10 @@ void LocalSparseSCPPlanner::publishSummary(
   bool running = false;
   bool repair = false;
   bool probe = false;
+  int probe_restore_attempts = 0;
+  bool probe_restore_pending_recheck = false;
+  unsigned long long probe_restore_total = 0;
+  unsigned long long probe_restore_hard_success_total = 0;
   double active_slack_weight = 0.0;
   std::string init_mode = "unknown";
 
@@ -1769,6 +1846,12 @@ void LocalSparseSCPPlanner::publishSummary(
     running = plan_running_;
     repair = plan_repair_mode_;
     probe = plan_probe_mode_;
+    probe_restore_attempts = plan_probe_feasibility_restore_attempts_;
+    probe_restore_pending_recheck =
+        plan_probe_restore_pending_hard_recheck_;
+    probe_restore_total = probe_feasibility_restore_count_;
+    probe_restore_hard_success_total =
+        probe_feasibility_restore_success_count_;
     active_slack_weight = plan_cdf_slack_linear_weight_;
     init_mode = plan_initialization_mode_;
   }
@@ -1784,6 +1867,14 @@ void LocalSparseSCPPlanner::publishSummary(
       << (probe ? probe_task_horizon_steps_ : num_intervals_)
       << " probe_hold_tail="
       << static_cast<int>(probe && probe_task_horizon_steps_ < num_intervals_)
+      << " probe_restore_enabled="
+      << static_cast<int>(probe_feasibility_restoration_enabled_)
+      << " probe_restore_attempts=" << probe_restore_attempts
+      << " probe_restore_pending_recheck="
+      << static_cast<int>(probe_restore_pending_recheck)
+      << " probe_restore_total=" << probe_restore_total
+      << " probe_restore_hard_success_total="
+      << probe_restore_hard_success_total
       << " cdf_horizon_steps="
       << ((repair || probe) ? cdf_constraint_horizon_steps_ : num_intervals_)
       << " init=" << init_mode
