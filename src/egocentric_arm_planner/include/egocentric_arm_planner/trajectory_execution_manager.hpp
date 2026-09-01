@@ -86,6 +86,9 @@ private:
                       double phase_s,
                       double remaining_s,
                       double tracking_error_inf,
+                      int tracking_error_joint_index,
+                      double tracking_error_q_ref,
+                      double tracking_error_q_measured,
                       const std::string& source);
 
   void maybePublishReplanRequest(double tracking_error_inf);
