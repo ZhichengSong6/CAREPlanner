@@ -314,6 +314,14 @@ def main():
             r for r in ll
             if r.get("event") == "task_failure_slack_diagnostic"
         ]
+        restore_applied = [
+            r for r in ll
+            if r.get("event") == "probe_feasibility_restore_applied"
+        ]
+        restore_hard_success_totals = [
+            as_int(r.get("probe_restore_hard_success_total"), 0)
+            for r in ll
+        ]
         soft_diag_solved = [
             r for r in soft_diag if r.get("solved") == "1"
         ]
@@ -395,6 +403,11 @@ def main():
             "soft_slack_required_max": max(soft_slacks) if soft_slacks else None,
             "soft_slack_required_mean": (
                 sum(soft_slacks) / len(soft_slacks) if soft_slacks else None),
+            "probe_feasibility_restore_applied_count": len(restore_applied),
+            "probe_feasibility_restore_hard_success_delta": (
+                max(restore_hard_success_totals) -
+                min(restore_hard_success_totals)
+                if restore_hard_success_totals else 0),
             "max_remaining_obligation_count": max(remaining) if remaining else 0,
             "last_remaining_obligation_count": remaining[-1] if remaining else None,
             "blocker_target_sequence": targets,
@@ -467,6 +480,8 @@ def main():
         "task_ref_horizon_steps_seen", "probe_hold_tail_values_seen",
         "soft_slack_diagnostic_count", "soft_slack_diagnostic_solved_count",
         "soft_slack_required_max", "soft_slack_required_mean",
+        "probe_feasibility_restore_applied_count",
+        "probe_feasibility_restore_hard_success_delta",
         "max_remaining_obligation_count", "last_remaining_obligation_count",
     ]
     with open(out_csv, "w", newline="") as f:
@@ -494,6 +509,8 @@ def main():
             "ref_steps={task_ref_horizon_steps_seen} "
             "hold_tail={probe_hold_tail_values_seen} "
             "soft_slack_max={soft_slack_required_max} "
+            "restore={probe_feasibility_restore_applied_count} "
+            "restore_hard_ok={probe_feasibility_restore_hard_success_delta} "
             "exit={exit_state} reason={exit_reason} diagnosis={diagnosis}".format(
                 **ep))
     print("[JSON]", out_json)
