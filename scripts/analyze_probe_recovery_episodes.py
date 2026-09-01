@@ -339,6 +339,24 @@ def main():
             if as_int(r.get("remaining_obligation_count"), -1) >= 0
         ]
         targets = compress_values(bb, "current_target_id")
+        coherent_raw = [
+            as_int(r.get("raw_active_set_serial"), 0) for r in bb
+            if "raw_active_set_serial" in r
+        ]
+        coherent_processed = [
+            as_int(r.get("processed_active_set_serial"), 0) for r in bb
+            if "processed_active_set_serial" in r
+        ]
+        coherent_pending = [
+            as_int(r.get("coherent_bundle_pending"), 0) for r in bb
+            if "coherent_bundle_pending" in r
+        ]
+        coherent_drops = [
+            as_int(r.get("coherent_bundle_drop_count"), 0) for r in bb
+            if "coherent_bundle_drop_count" in r
+        ]
+        coherent_reasons = compress_values(bb, "coherent_bundle_reason")
+        process_reasons = compress_values(bb, "process_reason")
 
         ep = {
             "episode": idx,
@@ -406,6 +424,19 @@ def main():
             "max_remaining_obligation_count": max(remaining) if remaining else 0,
             "last_remaining_obligation_count": remaining[-1] if remaining else None,
             "blocker_target_sequence": targets,
+            "blocker_process_reason_sequence": process_reasons,
+            "coherent_bundle_reason_sequence": coherent_reasons,
+            "coherent_bundle_pending_last": (
+                coherent_pending[-1] if coherent_pending else None),
+            "coherent_bundle_drop_count_max": (
+                max(coherent_drops) if coherent_drops else 0),
+            "coherent_bundle_raw_serial_last": (
+                coherent_raw[-1] if coherent_raw else None),
+            "coherent_bundle_processed_serial_last": (
+                coherent_processed[-1] if coherent_processed else None),
+            "coherent_bundle_serial_lag_last": (
+                max(0, coherent_raw[-1] - coherent_processed[-1])
+                if coherent_raw and coherent_processed else None),
         }
         ep["diagnosis"] = classify_episode(ep)
         episodes.append(ep)
@@ -506,6 +537,9 @@ def main():
             "soft_slack_max={soft_slack_required_max} "
             "restore={probe_feasibility_restore_applied_count} "
             "restore_hard_ok={probe_feasibility_restore_hard_success_delta} "
+            "bundle_lag={coherent_bundle_serial_lag_last} "
+            "bundle_pending={coherent_bundle_pending_last} "
+            "bundle_drops={coherent_bundle_drop_count_max} "
             "exit={exit_state} reason={exit_reason} diagnosis={diagnosis}".format(
                 **ep))
     print("[JSON]", out_json)
