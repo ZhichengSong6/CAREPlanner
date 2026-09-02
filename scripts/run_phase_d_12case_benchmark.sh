@@ -87,6 +87,8 @@ for CASE_ID in "${CASES[@]}"; do
 
     for name in \
       joint_states.csv \
+      task_trajectory.csv \
+      committed_trajectory.csv \
       regime_summary.csv \
       visibility_acquisition_summary.csv \
       candidate_vbc_summary.csv \
