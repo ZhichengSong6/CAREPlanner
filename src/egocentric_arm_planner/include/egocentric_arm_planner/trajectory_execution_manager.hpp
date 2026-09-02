@@ -92,6 +92,11 @@ private:
                       const std::string& source);
 
   void maybePublishReplanRequest(double tracking_error_inf);
+  void maybePublishSmoothHandoffReplanRequest(
+      bool trajectory_active,
+      uint64_t execution_stamp_ns,
+      double phase_s,
+      double remaining_s);
 
   Eigen::VectorXd makeZeroVelocityCommand() const;
 
@@ -106,6 +111,7 @@ private:
   ros::Publisher reference_state_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher replan_request_pub_;
+  ros::Publisher smooth_replan_request_pub_;
 
   ros::Timer execution_timer_;
 
@@ -161,6 +167,16 @@ private:
   double replan_request_min_interval_s_ = 0.50;
   ros::Time last_replan_request_time_;
 
+  // Smooth certified receding-horizon handoff. The current certified
+  // trajectory always remains executable through its own braking/hold tail;
+  // this look-ahead request only asks the planner to prepare a replacement
+  // before that tail is normally reached.
+  bool smooth_handoff_enabled_ = false;
+  double smooth_replan_lead_time_s_ = 0.35;
+  double smooth_replan_min_phase_s_ = 0.08;
+  uint64_t last_smooth_replan_execution_stamp_ns_ = 0;
+  unsigned long long smooth_replan_request_count_ = 0;
+
   std::string joint_state_topic_ = "/care_arm/joint_states";
   std::string input_trajectory_topic_ =
       "/care_planner/committed_trajectory";
@@ -172,6 +188,8 @@ private:
       "/care_planner/execution/tracker_summary";
   std::string replan_request_topic_ =
       "/care_planner/local_planner/replan_request";
+  std::string smooth_replan_request_topic_ =
+      "/care_planner/local_planner/smooth_handoff_replan_request";
 };
 
 }  // namespace egocentric_arm_planner
