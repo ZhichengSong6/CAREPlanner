@@ -16,6 +16,7 @@ REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
 CASE_ID="${CASE_ID:-case_014}"
 RUN_SECONDS="${RUN_SECONDS:-25.0}"
 CARE_RUN_DIR="${CARE_RUN_DIR:-}"
+BASELINE_RUN_DIR="${BASELINE_RUN_DIR:-}"
 PLAYBACK_SPEED="${PLAYBACK_SPEED:-2.0}"
 FPS="${FPS:-20}"
 
@@ -36,17 +37,25 @@ if [[ -z "${CARE_RUN_DIR}" || ! -f "${CARE_RUN_DIR}/joint_states.csv" ]]; then
 fi
 
 echo "[A/B] CAREPlanner run: ${CARE_RUN_DIR}"
-echo "[A/B] Running clean task-only baseline..."
 
-CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" \
-  bash scripts/run_phase_d_nominal_baseline.sh
+if [[ -n "${BASELINE_RUN_DIR}" ]]; then
+  if [[ ! -f "${BASELINE_RUN_DIR}/joint_states.csv" ]]; then
+    echo "[ERROR] BASELINE_RUN_DIR does not contain joint_states.csv: ${BASELINE_RUN_DIR}" >&2
+    exit 3
+  fi
+  echo "[A/B] Reusing task-only baseline: ${BASELINE_RUN_DIR}"
+else
+  echo "[A/B] Running clean task-only baseline..."
+  CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" \
+    bash scripts/run_phase_d_nominal_baseline.sh
 
-LATEST_FILE="${REPO}/outputs/phase_d_nominal_baseline/latest_${CASE_ID}.txt"
-if [[ ! -f "${LATEST_FILE}" ]]; then
-  echo "[ERROR] baseline runner did not write ${LATEST_FILE}" >&2
-  exit 3
+  LATEST_FILE="${REPO}/outputs/phase_d_nominal_baseline/latest_${CASE_ID}.txt"
+  if [[ ! -f "${LATEST_FILE}" ]]; then
+    echo "[ERROR] baseline runner did not write ${LATEST_FILE}" >&2
+    exit 3
+  fi
+  BASELINE_RUN_DIR="$(cat "${LATEST_FILE}")"
 fi
-BASELINE_RUN_DIR="$(cat "${LATEST_FILE}")"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO}/outputs/phase_d_visualization/${CASE_ID}_ab_${STAMP}}"
