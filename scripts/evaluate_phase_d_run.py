@@ -165,6 +165,29 @@ def main():
     exact_vbc_ms=stats(r.get("exact_vbc_roundtrip_ms") for r in timing_commit)
     safety_pipeline_ms=stats(r.get("candidate_total_safety_pipeline_ms") for r in timing_commit)
 
+    predicted_vbc_rows=[
+        r for r in cand if r.get("trajectory_source")=="predicted"]
+    event_vbc_rows=[
+        r for r in predicted_vbc_rows
+        if r.get("evaluation_trigger")=="predicted_callback"]
+    timer_vbc_rows=[
+        r for r in predicted_vbc_rows
+        if r.get("evaluation_trigger")=="timer"]
+    vbc_stage_keys=(
+        "trajectory_convert_ms","body_fk_ms","swept_voxel_build_ms",
+        "confidence_query_ms","candidate_filter_ms","sensor_fk_ms",
+        "visibility_scan_ms","cluster_ms","total_eval_ms")
+    vbc_event_stage_ms={
+        k:stats(r.get(k) for r in event_vbc_rows) for k in vbc_stage_keys}
+    vbc_all_predicted_stage_ms={
+        k:stats(r.get(k) for r in predicted_vbc_rows) for k in vbc_stage_keys}
+    predicted_periodic_skip_max=max(
+        [integer(r.get("predicted_periodic_skip_count"),0)
+         for r in predicted_vbc_rows] or [0])
+    predicted_periodic_refresh_max=max(
+        [integer(r.get("predicted_periodic_refresh_count"),0)
+         for r in predicted_vbc_rows] or [0])
+
     # This combines independently summarized stages, so label it an estimate
     # rather than pretending that the samples are candidate-by-candidate paired.
     certified_compute_est=None
@@ -200,6 +223,14 @@ def main():
          "exact_vbc_roundtrip_ms":exact_vbc_ms,
          "candidate_safety_pipeline_ms":safety_pipeline_ms,
          "candidate_safety_pipeline_equivalent_hz":hz_from_ms(safety_pipeline_ms),
+         "candidate_vbc_evaluation_counts":{
+             "predicted_total":len(predicted_vbc_rows),
+             "predicted_event_driven":len(event_vbc_rows),
+             "predicted_timer":len(timer_vbc_rows),
+             "predicted_periodic_skip_count_max":predicted_periodic_skip_max,
+             "predicted_periodic_refresh_count_max":predicted_periodic_refresh_max},
+         "candidate_vbc_event_stage_ms":vbc_event_stage_ms,
+         "candidate_vbc_all_predicted_stage_ms":vbc_all_predicted_stage_ms,
          "certified_candidate_compute_ms_estimate":certified_compute_est,
          "certified_candidate_equivalent_hz_estimate":hz_from_ms(certified_compute_est)}
     dst=a.output_json or os.path.join(run,"phase_d_run_summary.json"); os.makedirs(os.path.dirname(os.path.abspath(dst)),exist_ok=True)
