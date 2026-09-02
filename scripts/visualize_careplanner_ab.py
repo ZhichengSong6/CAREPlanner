@@ -18,6 +18,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib import animation
+# Older Ubuntu/ROS matplotlib builds do not always auto-register the "3d"
+# projection. Importing mplot3d explicitly registers it with matplotlib.
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import numpy as np
 from urdf_parser_py.urdf import URDF
 
@@ -419,6 +422,18 @@ def main():
     args = ap.parse_args()
 
     repo = os.path.abspath(args.repo)
+
+    # Fail early with a useful message on legacy matplotlib installations.
+    try:
+        test_fig = plt.figure()
+        test_fig.add_subplot(111, projection="3d")
+        plt.close(test_fig)
+    except Exception as exc:
+        raise RuntimeError(
+            "Matplotlib 3D projection is unavailable even after importing "
+            "mpl_toolkits.mplot3d. Check the system matplotlib installation."
+        ) from exc
+
     baseline = os.path.abspath(args.baseline_run_dir)
     care = os.path.abspath(args.care_run_dir)
     outdir = os.path.abspath(
