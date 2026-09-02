@@ -148,7 +148,10 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
     def _query_region_seen(self, ob: Dict[str, object]):
         points = np.asarray(ob["points"], dtype=np.float64).reshape(-1, 3)
         if points.shape[0] == 0:
-            return False, 0.0, math.nan, math.nan
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, 0,
+                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
+                math.nan)
         req = QueryConfidenceRequest()
         req.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
                       for p in points]
@@ -157,23 +160,53 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         except Exception as exc:
             rospy.logwarn_throttle(
                 1.0, "[vbc_acquisition] confidence query failed: %s", exc)
-            return False, 0.0, math.nan, math.nan
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, int(points.shape[0]),
+                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
+                math.nan)
         n = points.shape[0]
         if (len(res.confidence) != n or len(res.inside_map) != n or
                 len(res.current_visibility) != n):
-            return False, 0.0, math.nan, math.nan
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, int(n),
+                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
+                math.nan)
 
         conf = np.asarray(res.confidence, dtype=np.float64)
         inside = np.asarray(res.inside_map, dtype=bool)
         current_vis = np.asarray(res.current_visibility, dtype=np.float64)
-        good = inside & np.isfinite(conf) & (conf >= self.seen_threshold)
+        finite_inside = inside & np.isfinite(conf)
+        good = finite_inside & (conf >= self.seen_threshold)
         fraction = float(np.mean(good)) if n else 0.0
         seen = fraction + 1e-12 >= self.required_seen_fraction
+
+        min_conf = (
+            float(np.min(conf[finite_inside]))
+            if np.any(finite_inside) else math.nan)
+        mean_conf = (
+            float(np.mean(conf[finite_inside]))
+            if np.any(finite_inside) else math.nan)
+        max_vis = (
+            float(np.nanmax(current_vis))
+            if current_vis.size else math.nan)
+
+        worst_point = np.asarray(
+            [math.nan, math.nan, math.nan], dtype=np.float64)
+        if np.any(finite_inside):
+            valid_indices = np.where(finite_inside)[0]
+            worst_idx = int(valid_indices[np.argmin(conf[valid_indices])])
+            worst_point = points[worst_idx].copy()
+
+        q_dist_inf = math.nan
+        measured = self._latest_measured_q
+        q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
+        if (measured is not None and measured.shape == (7,) and
+                q_vis.shape == (7,) and np.all(np.isfinite(q_vis))):
+            q_dist_inf = float(np.max(np.abs(measured - q_vis)))
+
         return (
-            bool(seen), fraction,
-            float(np.nanmin(conf)) if conf.size else math.nan,
-            float(np.nanmax(current_vis)) if current_vis.size else math.nan,
-        )
+            bool(seen), fraction, min_conf, mean_conf, max_vis, int(n),
+            worst_point, q_dist_inf)
 
     def _update_actual_visibility_completion(self) -> None:
         if not self._c47_ready:
@@ -199,9 +232,12 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         seen_ids: List[int] = []
         diagnostics = []
         for ob in snapshot:
-            seen, frac, min_conf, max_vis = self._query_region_seen(ob)
+            (seen, frac, min_conf, mean_conf, max_vis, point_count,
+             worst_point, q_dist_inf) = self._query_region_seen(ob)
             oid = int(ob["id"])
-            diagnostics.append((oid, seen, frac, min_conf, max_vis))
+            diagnostics.append((
+                oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
+                q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy()))
             if seen:
                 seen_ids.append(oid)
 
@@ -230,8 +266,46 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         remaining = self._ordered_obligations()
         msg = String()
         diag_text = ";".join(
-            f"{oid}:{int(seen)}:{frac:.3f}:{min_conf:.3f}:{max_vis:.3f}"
-            for oid, seen, frac, min_conf, max_vis in diagnostics)
+            (
+                f"{oid}:{int(seen)}:{point_count}:{frac:.3f}:"
+                f"{min_conf:.3f}:{mean_conf:.3f}:{max_vis:.3f}:"
+                f"{q_dist_inf:.4f}:"
+                f"{float(worst_point[0]):.3f},"
+                f"{float(worst_point[1]):.3f},"
+                f"{float(worst_point[2]):.3f}"
+            )
+            for (oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
+                 q_dist_inf, worst_point) in diagnostics)
+
+        if diagnostics:
+            (active_oid, active_seen, active_point_count, active_frac,
+             active_min_conf, active_mean_conf, active_max_vis,
+             active_q_dist_inf, active_worst_point) = diagnostics[0]
+        else:
+            active_oid = -1
+            active_seen = False
+            active_point_count = 0
+            active_frac = math.nan
+            active_min_conf = math.nan
+            active_mean_conf = math.nan
+            active_max_vis = math.nan
+            active_q_dist_inf = math.nan
+            active_worst_point = np.asarray(
+                [math.nan, math.nan, math.nan], dtype=np.float64)
+
+        measured = self._latest_measured_q
+        measured_text = (
+            ",".join(f"{float(v):.4f}" for v in measured)
+            if measured is not None and measured.shape == (7,)
+            else "none")
+        active_q_vis_text = "none"
+        if remaining:
+            q_vis = np.asarray(
+                remaining[0].get("q_vis", []), dtype=np.float64).reshape(-1)
+            if q_vis.shape == (7,) and np.all(np.isfinite(q_vis)):
+                active_q_vis_text = ",".join(
+                    f"{float(v):.4f}" for v in q_vis)
+
         msg.data = (
             "policy=visibility_acquisition"
             f" started={int(self._acquisition_started)}"
@@ -242,6 +316,20 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
             f" timer_exception_count={self._timer_exception_count}"
             f" episode_reopen_count={self._visibility_episode_reopen_count}"
+            f" active_obligation_id={active_oid}"
+            f" active_seen={int(active_seen)}"
+            f" active_point_count={active_point_count}"
+            f" active_seen_fraction={active_frac:.6f}"
+            f" active_min_confidence={active_min_conf:.6f}"
+            f" active_mean_confidence={active_mean_conf:.6f}"
+            f" active_max_current_visibility={active_max_vis:.6f}"
+            f" active_q_distance_inf={active_q_dist_inf:.6f}"
+            f" active_worst_point_xyz="
+            f"{float(active_worst_point[0]):.4f},"
+            f"{float(active_worst_point[1]):.4f},"
+            f"{float(active_worst_point[2]):.4f}"
+            f" measured_q={measured_text}"
+            f" active_q_vis={active_q_vis_text}"
             f" region_checks={diag_text or 'none'}"
         )
         self.acquisition_summary_pub.publish(msg)
