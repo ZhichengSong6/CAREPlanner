@@ -65,6 +65,7 @@ public:
 
     if (candidate_resolution_ <= 0.0 || fallback_dt_ <= 0.0 ||
         predicted_trajectory_timeout_ <= 0.0 ||
+        rediscovery_trajectory_timeout_ <= 0.0 ||
         temporal_layer_mpc_steps_ < 0 || region_max_diameter_m_ <= 0.0 ||
         tof_min_range_ < 0.0 || tof_max_range_ <= tof_min_range_ ||
         horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0 ||
@@ -104,6 +105,12 @@ public:
     predicted_trajectory_sub_ = nh_.subscribe(
         predicted_trajectory_topic_, 1,
         &TrajectoryVbcTemporalClusterNode::predictedTrajectoryCallback, this);
+    if (!rediscovery_trajectory_topic_.empty())
+    {
+      rediscovery_trajectory_sub_ = nh_.subscribe(
+          rediscovery_trajectory_topic_, 1,
+          &TrajectoryVbcTemporalClusterNode::rediscoveryTrajectoryCallback, this);
+    }
     force_bootstrap_sub_ = nh_.subscribe(
         force_bootstrap_topic_, 1,
         &TrajectoryVbcTemporalClusterNode::forceBootstrapCallback, this);
@@ -225,6 +232,12 @@ private:
         "trajectory_vbc/force_bootstrap_topic",
         force_bootstrap_topic_,
         "/care_planner/trajectory_risk/force_bootstrap");
+    pnh_.param<std::string>(
+        "trajectory_vbc/rediscovery_trajectory_topic",
+        rediscovery_trajectory_topic_, "");
+    pnh_.param(
+        "trajectory_vbc/rediscovery_trajectory_timeout",
+        rediscovery_trajectory_timeout_, 1.0);
 
     pnh_.param("trajectory_vbc/enabled", enabled_, true);
     pnh_.param("trajectory_vbc/eval_rate", eval_rate_, 20.0);
@@ -1245,6 +1258,16 @@ private:
     has_predicted_traj_ = true;
   }
 
+  void rediscoveryTrajectoryCallback(
+      const trajectory_msgs::JointTrajectoryConstPtr& msg)
+  {
+    if (!msg || msg->points.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    latest_rediscovery_traj_ = *msg;
+    rediscovery_traj_received_ = ros::Time::now();
+    has_rediscovery_traj_ = true;
+  }
+
   void forceBootstrapCallback(const std_msgs::BoolConstPtr& msg)
   {
     if (!msg) return;
@@ -1266,29 +1289,62 @@ private:
     const ros::Time now = ros::Time::now();
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      const bool predicted_fresh =
-          !force_bootstrap_ &&
-          prefer_predicted_trajectory_ && has_predicted_traj_ &&
-          (now - predicted_traj_received_).toSec() >= 0.0 &&
-          (now - predicted_traj_received_).toSec() <=
-              predicted_trajectory_timeout_;
-      if (predicted_fresh)
+
+      // C5.30: a PROBE solver failure must be rediscovered on the SAME
+      // trajectory that produced the local-GCDF batch. Sparse-SCP publishes
+      // that linearization before requesting GCDF. If this dedicated
+      // rediscovery trajectory is missing or stale, fail closed and wait;
+      // never substitute a task-bootstrap SAFE verdict from another path.
+      if (force_bootstrap_ && !rediscovery_trajectory_topic_.empty())
       {
-        traj = latest_predicted_traj_;
-        source = "predicted";
-      }
-      else if (has_traj_)
-      {
-        traj = latest_traj_;
-        source = "bootstrap";
+        const double age_s = has_rediscovery_traj_
+            ? (now - rediscovery_traj_received_).toSec()
+            : std::numeric_limits<double>::infinity();
+        const bool rediscovery_fresh =
+            has_rediscovery_traj_ &&
+            age_s >= 0.0 &&
+            age_s <= rediscovery_trajectory_timeout_;
+        if (!rediscovery_fresh)
+        {
+          ROS_WARN_THROTTLE(
+              1.0,
+              "[trajectory_vbc_temporal] waiting for fresh SCP rediscovery "
+              "trajectory on %s (has=%d age=%.3f timeout=%.3f)",
+              rediscovery_trajectory_topic_.c_str(),
+              static_cast<int>(has_rediscovery_traj_),
+              age_s,
+              rediscovery_trajectory_timeout_);
+          return;
+        }
+        traj = latest_rediscovery_traj_;
+        source = "scp_rediscovery";
       }
       else
       {
-        ROS_WARN_THROTTLE(
-            2.0,
-            "[trajectory_vbc_temporal] waiting for bootstrap trajectory on %s",
-            input_trajectory_topic_.c_str());
-        return;
+        const bool predicted_fresh =
+            !force_bootstrap_ &&
+            prefer_predicted_trajectory_ && has_predicted_traj_ &&
+            (now - predicted_traj_received_).toSec() >= 0.0 &&
+            (now - predicted_traj_received_).toSec() <=
+                predicted_trajectory_timeout_;
+        if (predicted_fresh)
+        {
+          traj = latest_predicted_traj_;
+          source = "predicted";
+        }
+        else if (has_traj_)
+        {
+          traj = latest_traj_;
+          source = "bootstrap";
+        }
+        else
+        {
+          ROS_WARN_THROTTLE(
+              2.0,
+              "[trajectory_vbc_temporal] waiting for bootstrap trajectory on %s",
+              input_trajectory_topic_.c_str());
+          return;
+        }
       }
     }
     evaluate(traj, source);
@@ -1302,6 +1358,11 @@ private:
     ROS_INFO_STREAM("enabled: " << enabled_);
     ROS_INFO_STREAM("bootstrap trajectory: " << input_trajectory_topic_);
     ROS_INFO_STREAM("predicted trajectory: " << predicted_trajectory_topic_);
+    ROS_INFO_STREAM("rediscovery trajectory: "
+                    << (rediscovery_trajectory_topic_.empty()
+                            ? std::string("disabled")
+                            : rediscovery_trajectory_topic_)
+                    << ", timeout=" << rediscovery_trajectory_timeout_ << " s");
     ROS_INFO_STREAM("prefer predicted: " << prefer_predicted_trajectory_
                     << ", timeout=" << predicted_trajectory_timeout_ << " s");
     ROS_INFO_STREAM("candidate resolution: " << candidate_resolution_ << " m");
@@ -1329,6 +1390,7 @@ private:
   ros::NodeHandle pnh_;
   ros::Subscriber trajectory_sub_;
   ros::Subscriber predicted_trajectory_sub_;
+  ros::Subscriber rediscovery_trajectory_sub_;
   ros::Subscriber force_bootstrap_sub_;
   ros::ServiceClient confidence_query_client_;
   ros::Publisher target_pub_;
@@ -1345,9 +1407,12 @@ private:
   std::mutex mutex_;
   trajectory_msgs::JointTrajectory latest_traj_;
   trajectory_msgs::JointTrajectory latest_predicted_traj_;
+  trajectory_msgs::JointTrajectory latest_rediscovery_traj_;
   ros::Time predicted_traj_received_;
+  ros::Time rediscovery_traj_received_;
   bool has_traj_ = false;
   bool has_predicted_traj_ = false;
+  bool has_rediscovery_traj_ = false;
   bool force_bootstrap_ = false;
   unsigned long long active_set_bundle_seq_ = 0;
 
@@ -1361,6 +1426,7 @@ private:
   double query_timeout_ = 0.10;
   double fallback_dt_ = 0.05;
   double predicted_trajectory_timeout_ = 0.20;
+  double rediscovery_trajectory_timeout_ = 1.0;
   double frontier_confidence_threshold_ = 0.50;
   double candidate_resolution_ = 0.05;
   double swept_volume_margin_m_ = 0.025;
@@ -1382,6 +1448,7 @@ private:
   std::string input_trajectory_topic_ = "/care_planner/task_trajectory";
   std::string predicted_trajectory_topic_ =
       "/care_planner/mpc/predicted_trajectory";
+  std::string rediscovery_trajectory_topic_;
   std::string output_target_topic_ =
       "/care_planner/active_sensing/target_candidate";
   std::string candidate_active_topic_ =
