@@ -42,6 +42,8 @@ def summarize(group):
             "mean_local_plan_p95_ms":mean(fnum(nested(r,"local_plan_ms","p95")) for r in group),
             "mean_local_plan_equivalent_hz_from_mean_ms":mean(fnum(nested(r,"local_plan_equivalent_hz","mean")) for r in group),
             "mean_local_plan_equivalent_hz_from_median_ms":mean(fnum(nested(r,"local_plan_equivalent_hz","median")) for r in group),
+            "mean_local_cdf_roundtrip_mean_ms":mean(fnum(nested(r,"local_cdf_roundtrip_mean_ms","mean")) for r in group),
+            "mean_local_cdf_roundtrip_p95_ms":mean(fnum(nested(r,"local_cdf_roundtrip_mean_ms","p95")) for r in group),
             "mean_safety_pipeline_mean_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","mean")) for r in group),
             "mean_safety_pipeline_p95_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","p95")) for r in group),
             "mean_certified_candidate_compute_mean_ms_estimate":mean(fnum(nested(r,"certified_candidate_compute_ms_estimate","mean")) for r in group),
@@ -68,6 +70,7 @@ def main():
             "commit_gate_rejection_count","candidate_vbc_unsafe_records","execution_vbc_unsafe_records","tracking_error_max_rad",
             "tracking_error_p95_rad","local_plan_mean_ms","local_plan_median_ms","local_plan_p95_ms",
             "local_plan_equivalent_hz_from_mean_ms","local_plan_equivalent_hz_from_median_ms",
+            "local_cdf_roundtrip_mean_ms","local_cdf_roundtrip_p95_ms",
             "piqp_final_solve_mean_ms","final_gcdf_mean_ms","exact_vbc_mean_ms","safety_pipeline_mean_ms",
             "certified_candidate_compute_mean_ms_estimate","certified_candidate_equivalent_hz_estimate"]
     with open(oc,"w",newline="") as f:
@@ -85,6 +88,8 @@ def main():
                         "local_plan_p95_ms":nested(r,"local_plan_ms","p95"),
                         "local_plan_equivalent_hz_from_mean_ms":nested(r,"local_plan_equivalent_hz","mean"),
                         "local_plan_equivalent_hz_from_median_ms":nested(r,"local_plan_equivalent_hz","median"),
+                        "local_cdf_roundtrip_mean_ms":nested(r,"local_cdf_roundtrip_mean_ms","mean"),
+                        "local_cdf_roundtrip_p95_ms":nested(r,"local_cdf_roundtrip_mean_ms","p95"),
                         "piqp_final_solve_mean_ms":nested(r,"sparse_piqp_final_solve_ms","mean"),
                         "final_gcdf_mean_ms":nested(r,"final_gcdf_roundtrip_ms","mean"),
                         "exact_vbc_mean_ms":nested(r,"exact_vbc_roundtrip_ms","mean"),
