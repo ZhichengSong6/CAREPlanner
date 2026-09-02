@@ -46,6 +46,11 @@ def summarize(group):
             "mean_local_cdf_roundtrip_p95_ms":mean(fnum(nested(r,"local_cdf_roundtrip_mean_ms","p95")) for r in group),
             "mean_safety_pipeline_mean_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","mean")) for r in group),
             "mean_safety_pipeline_p95_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","p95")) for r in group),
+            "mean_vbc_event_total_eval_ms":mean(fnum(nested(r,"candidate_vbc_event_stage_ms","total_eval_ms","mean")) for r in group),
+            "mean_vbc_event_confidence_query_ms":mean(fnum(nested(r,"candidate_vbc_event_stage_ms","confidence_query_ms","mean")) for r in group),
+            "mean_vbc_event_body_fk_ms":mean(fnum(nested(r,"candidate_vbc_event_stage_ms","body_fk_ms","mean")) for r in group),
+            "mean_vbc_event_sensor_fk_ms":mean(fnum(nested(r,"candidate_vbc_event_stage_ms","sensor_fk_ms","mean")) for r in group),
+            "mean_vbc_event_visibility_scan_ms":mean(fnum(nested(r,"candidate_vbc_event_stage_ms","visibility_scan_ms","mean")) for r in group),
             "mean_certified_candidate_compute_mean_ms_estimate":mean(fnum(nested(r,"certified_candidate_compute_ms_estimate","mean")) for r in group),
             "mean_certified_candidate_equivalent_hz_estimate":mean(fnum(nested(r,"certified_candidate_equivalent_hz_estimate","mean")) for r in group)}
 
@@ -72,6 +77,8 @@ def main():
             "local_plan_equivalent_hz_from_mean_ms","local_plan_equivalent_hz_from_median_ms",
             "local_cdf_roundtrip_mean_ms","local_cdf_roundtrip_p95_ms",
             "piqp_final_solve_mean_ms","final_gcdf_mean_ms","exact_vbc_mean_ms","safety_pipeline_mean_ms",
+            "vbc_event_total_eval_mean_ms","vbc_event_confidence_query_mean_ms",
+            "vbc_event_body_fk_mean_ms","vbc_event_sensor_fk_mean_ms","vbc_event_visibility_scan_mean_ms",
             "certified_candidate_compute_mean_ms_estimate","certified_candidate_equivalent_hz_estimate"]
     with open(oc,"w",newline="") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
@@ -94,6 +101,11 @@ def main():
                         "final_gcdf_mean_ms":nested(r,"final_gcdf_roundtrip_ms","mean"),
                         "exact_vbc_mean_ms":nested(r,"exact_vbc_roundtrip_ms","mean"),
                         "safety_pipeline_mean_ms":nested(r,"candidate_safety_pipeline_ms","mean"),
+                        "vbc_event_total_eval_mean_ms":nested(r,"candidate_vbc_event_stage_ms","total_eval_ms","mean"),
+                        "vbc_event_confidence_query_mean_ms":nested(r,"candidate_vbc_event_stage_ms","confidence_query_ms","mean"),
+                        "vbc_event_body_fk_mean_ms":nested(r,"candidate_vbc_event_stage_ms","body_fk_ms","mean"),
+                        "vbc_event_sensor_fk_mean_ms":nested(r,"candidate_vbc_event_stage_ms","sensor_fk_ms","mean"),
+                        "vbc_event_visibility_scan_mean_ms":nested(r,"candidate_vbc_event_stage_ms","visibility_scan_ms","mean"),
                         "certified_candidate_compute_mean_ms_estimate":nested(r,"certified_candidate_compute_ms_estimate","mean"),
                         "certified_candidate_equivalent_hz_estimate":nested(r,"certified_candidate_equivalent_hz_estimate","mean")})
     print(json.dumps(out["overall"],indent=2)); print("[PHASE D BENCHMARK JSON]",oj); print("[PHASE D BENCHMARK CSV]",oc)
