@@ -313,6 +313,8 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" remaining_obligation_count={len(remaining)}"
             f" remaining_ids={':'.join(str(int(ob['id'])) for ob in remaining) or 'none'}"
             f" seen_obligation_count={self._seen_obligation_count}"
+            f" seen_threshold={self.seen_threshold:.6f}"
+            f" required_seen_fraction={self.required_seen_fraction:.6f}"
             f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
             f" timer_exception_count={self._timer_exception_count}"
             f" episode_reopen_count={self._visibility_episode_reopen_count}"
