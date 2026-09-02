@@ -9,11 +9,19 @@ KEEP_CASE_ZIPS="${KEEP_CASE_ZIPS:-0}"
 
 cd "${REPO}"
 
-CASES=(
+DEFAULT_CASES=(
   case_014 case_018 case_017 case_008
   case_006 case_003 case_000 case_001
   case_009 case_013 case_015 case_007
 )
+
+# Optional targeted Phase-D rerun without changing the canonical default.
+# Example: PHASE_D_CASES="case_014 case_008 case_007"
+if [[ -n "${PHASE_D_CASES:-}" ]]; then
+  read -r -a CASES <<< "${PHASE_D_CASES}"
+else
+  CASES=("${DEFAULT_CASES[@]}")
+fi
 
 STAMP="${BATCH_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 GIT_SHORT="$(git rev-parse --short=8 HEAD)"
