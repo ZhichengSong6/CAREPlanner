@@ -19,6 +19,10 @@ def nested(row,*keys):
         cur=cur.get(k)
     return cur
 
+def reciprocal_hz(ms):
+    x=fnum(ms)
+    return (1000.0/x) if x is not None and x>0 else None
+
 def summarize(group):
     ok=[r for r in group if r.get("task_success")]
     n=len(group)
@@ -33,7 +37,15 @@ def summarize(group):
             "mean_repair_time_s":mean(fnum(r.get("repair_time_s")) for r in group),
             "mean_probe_time_s":mean(fnum(r.get("probe_time_s")) for r in group),
             "mean_tracking_error_max_rad":mean(fnum(nested(r,"tracking_error_inf","max")) for r in group),
-            "mean_local_plan_p95_ms":mean(fnum(nested(r,"local_plan_ms","p95")) for r in group)}
+            "mean_local_plan_mean_ms":mean(fnum(nested(r,"local_plan_ms","mean")) for r in group),
+            "mean_local_plan_median_ms":mean(fnum(nested(r,"local_plan_ms","median")) for r in group),
+            "mean_local_plan_p95_ms":mean(fnum(nested(r,"local_plan_ms","p95")) for r in group),
+            "mean_local_plan_equivalent_hz_from_mean_ms":mean(fnum(nested(r,"local_plan_equivalent_hz","mean")) for r in group),
+            "mean_local_plan_equivalent_hz_from_median_ms":mean(fnum(nested(r,"local_plan_equivalent_hz","median")) for r in group),
+            "mean_safety_pipeline_mean_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","mean")) for r in group),
+            "mean_safety_pipeline_p95_ms":mean(fnum(nested(r,"candidate_safety_pipeline_ms","p95")) for r in group),
+            "mean_certified_candidate_compute_mean_ms_estimate":mean(fnum(nested(r,"certified_candidate_compute_ms_estimate","mean")) for r in group),
+            "mean_certified_candidate_equivalent_hz_estimate":mean(fnum(nested(r,"certified_candidate_equivalent_hz_estimate","mean")) for r in group)}
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--input-root",required=True); ap.add_argument("--output-json",default=""); ap.add_argument("--output-csv",default="")
@@ -54,7 +66,10 @@ def main():
     fields=["case_id","difficulty","task_success","overall_safe","time_to_success_s","final_position_error_m","final_orientation_error_rad",
             "final_task_phase_s","repair_count","probe_count","normal_time_s","repair_time_s","probe_time_s","commit_count",
             "commit_gate_rejection_count","candidate_vbc_unsafe_records","execution_vbc_unsafe_records","tracking_error_max_rad",
-            "tracking_error_p95_rad","local_plan_mean_ms","local_plan_p95_ms"]
+            "tracking_error_p95_rad","local_plan_mean_ms","local_plan_median_ms","local_plan_p95_ms",
+            "local_plan_equivalent_hz_from_mean_ms","local_plan_equivalent_hz_from_median_ms",
+            "piqp_final_solve_mean_ms","final_gcdf_mean_ms","exact_vbc_mean_ms","safety_pipeline_mean_ms",
+            "certified_candidate_compute_mean_ms_estimate","certified_candidate_equivalent_hz_estimate"]
     with open(oc,"w",newline="") as f:
         w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
         for r in rows:
@@ -66,6 +81,15 @@ def main():
                         "commit_count":r.get("commit_count"),"commit_gate_rejection_count":r.get("commit_gate_rejection_count"),
                         "candidate_vbc_unsafe_records":r.get("candidate_vbc_unsafe_records"),"execution_vbc_unsafe_records":r.get("execution_vbc_unsafe_records"),
                         "tracking_error_max_rad":nested(r,"tracking_error_inf","max"),"tracking_error_p95_rad":nested(r,"tracking_error_inf","p95"),
-                        "local_plan_mean_ms":nested(r,"local_plan_ms","mean"),"local_plan_p95_ms":nested(r,"local_plan_ms","p95")})
+                        "local_plan_mean_ms":nested(r,"local_plan_ms","mean"),"local_plan_median_ms":nested(r,"local_plan_ms","median"),
+                        "local_plan_p95_ms":nested(r,"local_plan_ms","p95"),
+                        "local_plan_equivalent_hz_from_mean_ms":nested(r,"local_plan_equivalent_hz","mean"),
+                        "local_plan_equivalent_hz_from_median_ms":nested(r,"local_plan_equivalent_hz","median"),
+                        "piqp_final_solve_mean_ms":nested(r,"sparse_piqp_final_solve_ms","mean"),
+                        "final_gcdf_mean_ms":nested(r,"final_gcdf_roundtrip_ms","mean"),
+                        "exact_vbc_mean_ms":nested(r,"exact_vbc_roundtrip_ms","mean"),
+                        "safety_pipeline_mean_ms":nested(r,"candidate_safety_pipeline_ms","mean"),
+                        "certified_candidate_compute_mean_ms_estimate":nested(r,"certified_candidate_compute_ms_estimate","mean"),
+                        "certified_candidate_equivalent_hz_estimate":nested(r,"certified_candidate_equivalent_hz_estimate","mean")})
     print(json.dumps(out["overall"],indent=2)); print("[PHASE D BENCHMARK JSON]",oj); print("[PHASE D BENCHMARK CSV]",oc)
 if __name__=="__main__": main()
