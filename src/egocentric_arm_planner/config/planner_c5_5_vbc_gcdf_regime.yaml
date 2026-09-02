@@ -105,6 +105,11 @@ local_planner:
   # Keep the GCDF-style control magnitude objective for this integration test.
   u_smooth_weight: 0.0
 
+  # Smooth certified handoff: only the replacement boundary is regularized
+  # against the actually rate-limited actuator command. This does not restore
+  # the old whole-horizon smoothness objective or hard acceleration rows.
+  handoff_velocity_weight: 1.0
+
   # Leave CARE acceleration/terminal-braking rows off for now; the previous G0
   # diagnostics showed they are the dominant PIQP convergence failure source.
   # The low-level tracker/rate limiter still enforces executable commands.
@@ -184,6 +189,7 @@ local_planner:
   waypoint_schedule_topic: /care_planner/active_sensing/visibility_waypoint_schedule
   recovery_topic: /care_planner/execution/predicted_vbc_recovery_triggered
   replan_request_topic: /care_planner/local_planner/replan_request
+  smooth_replan_request_topic: /care_planner/local_planner/smooth_handoff_replan_request
   executed_command_topic: /care_arm/arm_group_velocity_controller/command
   execution_summary_topic: /care_planner/execution/tracker_summary
   cdf_batch_topic: /care_planner/local_planner/cdf_constraint_batch
@@ -309,6 +315,15 @@ execution:
   reference_timeout: 0.15
   replan_tracking_error_inf: 0.25
   replan_request_min_interval: 0.50
+
+  # Smooth certified receding-horizon execution. Each committed trajectory
+  # remains safe through its own brake/hold tail; this merely starts preparing
+  # a replacement early enough to hand off before that tail in normal operation.
+  smooth_handoff_enabled: true
+  smooth_replan_lead_time: 0.35
+  smooth_replan_min_phase: 0.08
+  smooth_replan_request_topic: /care_planner/local_planner/smooth_handoff_replan_request
+
   summary_topic: /care_planner/execution/tracker_summary
   replan_request_topic: /care_planner/local_planner/replan_request
   position_feedback_gain: 2.5
