@@ -26,8 +26,11 @@
 
 // C4.3 selector with bounded temporal clustering.
 //
-// Safety semantics remain point-wise: every low-confidence future body-sweep
-// candidate is evaluated independently with analytic VBC.  Steering semantics
+// C5.29 spatial semantics: each robot body sample is a sphere (center+radius).
+// VBC candidates are confidence-map voxel centers swept by the FULL future body
+// sphere volume (plus the same margin used by GCDF), not merely sphere centers.
+// Every low-confidence swept voxel is then evaluated independently with analytic
+// VBC. Steering semantics
 // are coarser: violating candidates are first grouped into ordered temporal
 // layers, each layer spanning at most temporal_layer_mpc_steps original MPC
 // intervals.  Every temporal layer is then spatially clustered only for
@@ -64,7 +67,10 @@ public:
         predicted_trajectory_timeout_ <= 0.0 ||
         temporal_layer_mpc_steps_ < 0 || region_max_diameter_m_ <= 0.0 ||
         tof_min_range_ < 0.0 || tof_max_range_ <= tof_min_range_ ||
-        horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0)
+        horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0 ||
+        swept_volume_margin_m_ < 0.0 || map_resolution_ <= 0.0 ||
+        map_x_max_ < map_x_min_ || map_y_max_ < map_y_min_ ||
+        map_z_max_ < map_z_min_)
     {
       ROS_ERROR(
           "[trajectory_vbc_temporal] Invalid geometry/timing/cluster parameters.");
@@ -132,6 +138,18 @@ public:
   }
 
 private:
+  struct SweepVoxel
+  {
+    Eigen::Vector3d point_base = Eigen::Vector3d::Zero();
+    std::string link_name = "none";
+    int sample_index_in_link = -1;
+    int sweep_eval_timestep = -1;
+    int sweep_original_timestep = -1;
+    double sweep_time_s = 0.0;
+  };
+
+  using GridKey = std::tuple<int, int, int>;
+
   struct Candidate
   {
     Eigen::Vector3d point_base = Eigen::Vector3d::Zero();
@@ -225,6 +243,18 @@ private:
     pnh_.param(
         "trajectory_vbc/candidate_resolution",
         candidate_resolution_, 0.05);
+    pnh_.param(
+        "trajectory_vbc/swept_volume_margin_m",
+        swept_volume_margin_m_, 0.025);
+    pnh_.param(
+        "trajectory_vbc/map_resolution",
+        map_resolution_, 0.05);
+    pnh_.param("trajectory_vbc/map_x_min", map_x_min_, -0.95);
+    pnh_.param("trajectory_vbc/map_x_max", map_x_max_, 0.95);
+    pnh_.param("trajectory_vbc/map_y_min", map_y_min_, -0.95);
+    pnh_.param("trajectory_vbc/map_y_max", map_y_max_, 0.95);
+    pnh_.param("trajectory_vbc/map_z_min", map_z_min_, 0.0);
+    pnh_.param("trajectory_vbc/map_z_max", map_z_max_, 1.15);
     pnh_.param(
         "trajectory_vbc/min_visibility_before_sweep_margin_s",
         min_margin_s_, 0.30);
@@ -405,22 +435,19 @@ private:
     return !q_traj->empty();
   }
 
-  bool queryConfidence(
-      const care_confidence_map::TrajectorySampleResult& samples,
+  bool queryConfidencePoints(
+      const std::vector<SweepVoxel>& voxels,
       care_confidence_map::QueryConfidence* srv)
   {
     srv->request.points.clear();
-    srv->request.points.reserve(static_cast<std::size_t>(samples.total_samples));
-    for (const auto& frame : samples.frames)
+    srv->request.points.reserve(voxels.size());
+    for (const auto& voxel : voxels)
     {
-      for (const auto& sample : frame.samples)
-      {
-        geometry_msgs::Point p;
-        p.x = sample.center_base.x();
-        p.y = sample.center_base.y();
-        p.z = sample.center_base.z();
-        srv->request.points.push_back(p);
-      }
+      geometry_msgs::Point p;
+      p.x = voxel.point_base.x();
+      p.y = voxel.point_base.y();
+      p.z = voxel.point_base.z();
+      srv->request.points.push_back(p);
     }
 
     if (!confidence_query_client_.waitForExistence(ros::Duration(query_timeout_)))
@@ -430,6 +457,115 @@ private:
     return srv->response.confidence.size() == n &&
            srv->response.current_visibility.size() == n &&
            srv->response.inside_map.size() == n;
+  }
+
+  int clampGridIndex(int value, int max_index) const
+  {
+    return std::max(0, std::min(max_index, value));
+  }
+
+  std::vector<SweepVoxel> buildSweptVolumeVoxels(
+      const care_confidence_map::TrajectorySampleResult& sample_result,
+      const std::vector<int>& original_indices,
+      const std::vector<double>& eval_times_s) const
+  {
+    const int nx = static_cast<int>(
+        std::floor((map_x_max_ - map_x_min_) / map_resolution_)) + 1;
+    const int ny = static_cast<int>(
+        std::floor((map_y_max_ - map_y_min_) / map_resolution_)) + 1;
+    const int nz = static_cast<int>(
+        std::floor((map_z_max_ - map_z_min_) / map_resolution_)) + 1;
+
+    std::map<GridKey, SweepVoxel> earliest;
+    for (const auto& frame : sample_result.frames)
+    {
+      const int k = frame.timestep_index;
+      if (k < 0 || k >= static_cast<int>(eval_times_s.size()) ||
+          k >= static_cast<int>(original_indices.size()))
+        continue;
+
+      for (const auto& sample : frame.samples)
+      {
+        if (isIgnoredRiskLink(sample.link_name)) continue;
+
+        const double radius =
+            std::max(0.0, sample.radius + swept_volume_margin_m_);
+        if (radius <= 0.0) continue;
+
+        const int ix0 = clampGridIndex(
+            static_cast<int>(std::ceil(
+                (sample.center_base.x() - radius - map_x_min_) /
+                map_resolution_)),
+            nx - 1);
+        const int ix1 = clampGridIndex(
+            static_cast<int>(std::floor(
+                (sample.center_base.x() + radius - map_x_min_) /
+                map_resolution_)),
+            nx - 1);
+        const int iy0 = clampGridIndex(
+            static_cast<int>(std::ceil(
+                (sample.center_base.y() - radius - map_y_min_) /
+                map_resolution_)),
+            ny - 1);
+        const int iy1 = clampGridIndex(
+            static_cast<int>(std::floor(
+                (sample.center_base.y() + radius - map_y_min_) /
+                map_resolution_)),
+            ny - 1);
+        const int iz0 = clampGridIndex(
+            static_cast<int>(std::ceil(
+                (sample.center_base.z() - radius - map_z_min_) /
+                map_resolution_)),
+            nz - 1);
+        const int iz1 = clampGridIndex(
+            static_cast<int>(std::floor(
+                (sample.center_base.z() + radius - map_z_min_) /
+                map_resolution_)),
+            nz - 1);
+
+        if (ix0 > ix1 || iy0 > iy1 || iz0 > iz1) continue;
+
+        const double radius_sq = radius * radius + 1e-12;
+        for (int ix = ix0; ix <= ix1; ++ix)
+        {
+          const double x = map_x_min_ + ix * map_resolution_;
+          for (int iy = iy0; iy <= iy1; ++iy)
+          {
+            const double y = map_y_min_ + iy * map_resolution_;
+            for (int iz = iz0; iz <= iz1; ++iz)
+            {
+              const double z = map_z_min_ + iz * map_resolution_;
+              const Eigen::Vector3d point(x, y, z);
+              if ((point - sample.center_base).squaredNorm() > radius_sq)
+                continue;
+
+              const GridKey key(ix, iy, iz);
+              const double sweep_time =
+                  eval_times_s[static_cast<std::size_t>(k)];
+              const auto it = earliest.find(key);
+              if (it != earliest.end() &&
+                  it->second.sweep_time_s <= sweep_time + 1e-12)
+                continue;
+
+              SweepVoxel voxel;
+              voxel.point_base = point;
+              voxel.link_name = sample.link_name;
+              voxel.sample_index_in_link = sample.sample_index_in_link;
+              voxel.sweep_eval_timestep = k;
+              voxel.sweep_original_timestep =
+                  original_indices[static_cast<std::size_t>(k)];
+              voxel.sweep_time_s = sweep_time;
+              earliest[key] = voxel;
+            }
+          }
+        }
+      }
+    }
+
+    std::vector<SweepVoxel> voxels;
+    voxels.reserve(earliest.size());
+    for (const auto& item : earliest) voxels.push_back(item.second);
+    return voxels;
   }
 
   CandidateKey candidateKey(const Eigen::Vector3d& p) const
@@ -751,6 +887,9 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=0"
+        << " spatial_support=body_sphere_volume"
+        << " swept_voxel_query_count=" << last_swept_voxel_query_count_
+        << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=" << reason
         << " trajectory_source=" << trajectory_source
         << " candidate_count=" << candidate_count
@@ -848,6 +987,9 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=1"
+        << " spatial_support=body_sphere_volume"
+        << " swept_voxel_query_count=" << last_swept_voxel_query_count_
+        << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=selected_temporal_cluster"
         << " trajectory_source=" << trajectory_source
         << " candidate_count=" << candidates.size()
@@ -945,68 +1087,64 @@ private:
       return;
     }
 
+    const std::vector<SweepVoxel> swept_voxels =
+        buildSweptVolumeVoxels(sample_result, original_indices, eval_times_s);
+    last_swept_voxel_query_count_ = swept_voxels.size();
+    if (swept_voxels.empty())
+    {
+      publishNoTargetSummary("empty_swept_volume", trajectory_source, 0);
+      return;
+    }
+
     care_confidence_map::QueryConfidence confidence_srv;
-    if (!queryConfidence(sample_result, &confidence_srv))
+    if (!queryConfidencePoints(swept_voxels, &confidence_srv))
     {
       ROS_WARN_THROTTLE(
           2.0,
-          "[trajectory_vbc_temporal] confidence query failed or returned invalid sizes");
+          "[trajectory_vbc_temporal] swept-volume confidence query failed "
+          "or returned invalid sizes");
       return;
     }
 
     std::map<CandidateKey, Candidate> candidate_map;
-    std::size_t flat_index = 0;
-    for (const auto& frame : sample_result.frames)
+    for (std::size_t i = 0; i < swept_voxels.size(); ++i)
     {
-      const int k = frame.timestep_index;
-      if (k < 0 || k >= static_cast<int>(eval_times_s.size()))
+      const bool inside = confidence_srv.response.inside_map[i] != 0;
+      const double confidence = static_cast<double>(
+          confidence_srv.response.confidence[i]);
+      const double current_visibility = static_cast<double>(
+          confidence_srv.response.current_visibility[i]);
+      if (!inside) continue;
+      if (confidence > frontier_confidence_threshold_ ||
+          current_visibility > 0.5) continue;
+
+      const SweepVoxel& voxel = swept_voxels[i];
+      const CandidateKey key = candidateKey(voxel.point_base);
+      auto it = candidate_map.find(key);
+      if (it == candidate_map.end())
       {
-        flat_index += frame.samples.size();
-        continue;
+        Candidate candidate;
+        candidate.point_base = voxel.point_base;
+        candidate.link_name = voxel.link_name;
+        candidate.sample_index_in_link = voxel.sample_index_in_link;
+        candidate.confidence = confidence;
+        candidate.current_visibility = current_visibility;
+        candidate.sweep_eval_timestep = voxel.sweep_eval_timestep;
+        candidate.sweep_original_timestep = voxel.sweep_original_timestep;
+        candidate.sweep_time_s = voxel.sweep_time_s;
+        candidate_map.emplace(key, candidate);
       }
-
-      for (const auto& sample : frame.samples)
+      else
       {
-        const bool inside = confidence_srv.response.inside_map[flat_index] != 0;
-        const double confidence = static_cast<double>(
-            confidence_srv.response.confidence[flat_index]);
-        const double current_visibility = static_cast<double>(
-            confidence_srv.response.current_visibility[flat_index]);
-        flat_index += 1;
-
-        if (isIgnoredRiskLink(sample.link_name) || !inside) continue;
-        if (confidence > frontier_confidence_threshold_ ||
-            current_visibility > 0.5) continue;
-
-        const CandidateKey key = candidateKey(sample.center_base);
-        auto it = candidate_map.find(key);
-        if (it == candidate_map.end())
+        it->second.confidence = std::min(it->second.confidence, confidence);
+        if (voxel.sweep_time_s < it->second.sweep_time_s)
         {
-          Candidate c;
-          c.point_base = sample.center_base;
-          c.link_name = sample.link_name;
-          c.sample_index_in_link = sample.sample_index_in_link;
-          c.confidence = confidence;
-          c.current_visibility = current_visibility;
-          c.sweep_eval_timestep = k;
-          c.sweep_original_timestep =
-              original_indices[static_cast<std::size_t>(k)];
-          c.sweep_time_s = eval_times_s[static_cast<std::size_t>(k)];
-          candidate_map.emplace(key, c);
-        }
-        else
-        {
-          it->second.confidence = std::min(it->second.confidence, confidence);
-          if (eval_times_s[static_cast<std::size_t>(k)] < it->second.sweep_time_s)
-          {
-            it->second.point_base = sample.center_base;
-            it->second.link_name = sample.link_name;
-            it->second.sample_index_in_link = sample.sample_index_in_link;
-            it->second.sweep_eval_timestep = k;
-            it->second.sweep_original_timestep =
-                original_indices[static_cast<std::size_t>(k)];
-            it->second.sweep_time_s = eval_times_s[static_cast<std::size_t>(k)];
-          }
+          it->second.point_base = voxel.point_base;
+          it->second.link_name = voxel.link_name;
+          it->second.sample_index_in_link = voxel.sample_index_in_link;
+          it->second.sweep_eval_timestep = voxel.sweep_eval_timestep;
+          it->second.sweep_original_timestep = voxel.sweep_original_timestep;
+          it->second.sweep_time_s = voxel.sweep_time_s;
         }
       }
     }
@@ -1167,6 +1305,9 @@ private:
     ROS_INFO_STREAM("prefer predicted: " << prefer_predicted_trajectory_
                     << ", timeout=" << predicted_trajectory_timeout_ << " s");
     ROS_INFO_STREAM("candidate resolution: " << candidate_resolution_ << " m");
+    ROS_INFO_STREAM("spatial support: full body-sphere volume, margin="
+                    << swept_volume_margin_m_ << " m, map_resolution="
+                    << map_resolution_ << " m");
     ROS_INFO_STREAM("temporal layer maximum span: "
                     << temporal_layer_mpc_steps_ << " MPC steps");
     ROS_INFO_STREAM("spatial region maximum diameter: "
@@ -1222,6 +1363,15 @@ private:
   double predicted_trajectory_timeout_ = 0.20;
   double frontier_confidence_threshold_ = 0.50;
   double candidate_resolution_ = 0.05;
+  double swept_volume_margin_m_ = 0.025;
+  double map_resolution_ = 0.05;
+  double map_x_min_ = -0.95;
+  double map_x_max_ = 0.95;
+  double map_y_min_ = -0.95;
+  double map_y_max_ = 0.95;
+  double map_z_min_ = 0.0;
+  double map_z_max_ = 1.15;
+  std::size_t last_swept_voxel_query_count_ = 0;
   double min_margin_s_ = 0.30;
   int temporal_layer_mpc_steps_ = 2;
   double region_max_diameter_m_ = 0.12;
