@@ -518,6 +518,7 @@ void LocalSparseSCPPlanner::recoveryCallback(
     std::lock_guard<std::mutex> lock(mutex_);
     if (repair_mode_ != msg->data) {
       repair_mode_ = msg->data;
+      ++mode_epoch_;
       if (repair_mode_) {
         // C5.32: the execution that was already active/completed before REPAIR
         // is not a REPAIR completion event. Baseline the stamp here so a
@@ -549,6 +550,7 @@ void LocalSparseSCPPlanner::probeActiveCallback(
 
   const bool was_probe = probe_mode_;
   probe_mode_ = msg->data;
+  ++mode_epoch_;
 
   if (probe_mode_) {
     normal_reference_refresh_pending_ = false;
@@ -1090,6 +1092,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_repair_mode_ = repair;
     plan_probe_mode_ = probe;
     plan_initialization_mode_ = initialization_mode;
+    plan_mode_epoch_ = mode_epoch_;
     plan_probe_feasibility_restore_attempts_ = 0;
     plan_probe_restore_pending_hard_recheck_ = false;
     scp_iteration_ = 0;
@@ -1429,6 +1432,25 @@ void LocalSparseSCPPlanner::workerLoop() {
     }
 
     if (publish_candidate) {
+      bool mode_stale = false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        mode_stale =
+            plan_mode_epoch_ != mode_epoch_ ||
+            repair != repair_mode_ ||
+            probe != probe_mode_;
+        if (mode_stale) {
+          ++stale_mode_candidate_discard_count_;
+        }
+      }
+      if (mode_stale) {
+        publishSummary("stale_mode_candidate_discarded", &result, total_ms);
+        ROS_INFO_STREAM(
+            "[LocalSparseSCPPlanner] stale-mode candidate discarded before "
+            "commit pipeline");
+        continue;
+      }
+
       publishCandidateTrajectory(
           result.q, result.u, current_frame_id_);
       publishSummary("candidate_published", &result, total_ms);
