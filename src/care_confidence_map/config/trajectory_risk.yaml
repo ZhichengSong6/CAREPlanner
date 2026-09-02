@@ -65,6 +65,18 @@ trajectory_vbc:
   # Spatial de-duplication at confidence-map resolution.
   candidate_resolution: 0.05
 
+  # C5.29: use the full future body-sphere volume on the same voxel grid as
+  # GCDF. The runtime launch overrides swept_volume_margin_m with the GCDF
+  # proximity margin so the two modules share the same spatial support.
+  swept_volume_margin_m: 0.025
+  map_resolution: 0.05
+  map_x_min: -0.95
+  map_x_max: 0.95
+  map_y_min: -0.95
+  map_y_max: 0.95
+  map_z_min: 0.0
+  map_z_max: 1.15
+
   # Required lead time between first visibility and first sweep.
   min_visibility_before_sweep_margin_s: 0.30
 
