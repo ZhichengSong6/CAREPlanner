@@ -3,10 +3,10 @@
 
 C4.4 verification protocol
 --------------------------
-The C++ VBC selector runs on its own periodic timer and may publish repeated
-summaries for the same cached trajectory. Verification is synchronized to
-selector cycles: a candidate dispatched after cycle k may only be decided by a
-strictly later predicted cycle.
+The C++ VBC selector may publish periodic refreshes for a cached trajectory and,
+in C5.34, may also evaluate a freshly-arrived predicted trajectory immediately.
+Verification is synchronized by exact trajectory header.stamp transaction
+identity; selector-cycle ordering remains a secondary stale-cycle guard.
 
 C5.8 executable safety/commit protocol
 --------------------------------------
@@ -241,6 +241,7 @@ class OptimizedTrajectoryContinuityNode:
         self._verification_safe_count = 0
         self._verification_unsafe_count = 0
         self._verification_timeout_count = 0
+        self._exact_vbc_stamp_miss_count = 0
         self._verification_outcome_count = 0
         self._commit_count = 0
         self._committed_publish_count = 0
@@ -1307,6 +1308,10 @@ class OptimizedTrajectoryContinuityNode:
         source = fields.get("trajectory_source", "")
         if source not in ("bootstrap", "predicted"):
             return
+        try:
+            trajectory_stamp_ns = int(fields.get("trajectory_stamp_ns", "0"))
+        except Exception:
+            trajectory_stamp_ns = 0
         violation = _as_bool(fields.get("has_violation"))
         if violation is None:
             return
@@ -1334,9 +1339,25 @@ class OptimizedTrajectoryContinuityNode:
             else:
                 if source != "predicted":
                     self._publish_summary_locked()
-                elif self._selector_cycle_count <= self._outstanding_dispatch_cycle:
-                    self._publish_summary_locked()
                 else:
+                    expected_stamp_ns = int(
+                        self._outstanding.header.stamp.to_nsec())
+                    if (trajectory_stamp_ns <= 0 or
+                            trajectory_stamp_ns != expected_stamp_ns):
+                        # C5.34 transaction identity: periodic VBC refreshes may
+                        # still publish summaries for an older cached predicted
+                        # trajectory. They must never decide a newer outstanding
+                        # executable candidate.
+                        self._exact_vbc_stamp_miss_count += 1
+                        self._last_source = (
+                            "exact_vbc_stamp_mismatch_ignored")
+                        self._publish_summary_locked()
+                        return
+                    if (self._selector_cycle_count <=
+                            self._outstanding_dispatch_cycle):
+                        self._publish_summary_locked()
+                        return
+
                     verification_age = max(
                         0.0, (now - self._outstanding_sent).to_sec())
                     self._last_exact_vbc_roundtrip_ms = 1000.0 * verification_age
@@ -1663,6 +1684,8 @@ class OptimizedTrajectoryContinuityNode:
             "verification_safe_count={}".format(self._verification_safe_count),
             "verification_unsafe_count={}".format(self._verification_unsafe_count),
             "verification_timeout_count={}".format(self._verification_timeout_count),
+            "exact_vbc_stamp_miss_count={}".format(
+                self._exact_vbc_stamp_miss_count),
             "last_verification_seq={}".format(self._last_verification_seq),
             "last_verification_result={}".format(self._last_verification_result),
             "last_verification_view={}".format(self._last_verification_view),
