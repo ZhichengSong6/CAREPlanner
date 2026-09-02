@@ -459,6 +459,7 @@
     <param name="output_jsonl" value="$(arg local_scp_selector_jsonl)" />
     <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
     <param name="rate" value="50.0" />
+    <param name="process_on_input_callback" value="true" />
     <param name="confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
     <param name="map_resolution" value="0.05" />
