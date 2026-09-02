@@ -197,17 +197,49 @@ rospy.sleep(0.2)
 print("[BASELINE] published EE goal")
 PY
 
-READY=0
-for _ in $(seq 1 100); do
-  if timeout 1 rostopic echo -n 1 "${TASK_TOPIC}" >/dev/null 2>&1; then
-    READY=1
-    break
-  fi
-  sleep 0.05
-done
-if [ "${READY}" != "1" ]; then
-  echo "[ERROR] EE goal did not produce ${TASK_TOPIC}" >&2
-  tail -n 160 "${LOG}/task_planner.log" || true
+# /care_planner/task_trajectory is intentionally a one-shot, non-latched
+# publication.  A new 'rostopic echo' subscriber started after the goal can
+# therefore miss the valid trajectory even though the tracker and recorder
+# (which were subscribed before the goal) received it.  Verify the downstream
+# tracker instead: it publishes at controller rate and carries the accepted
+# trajectory's nonzero execution_stamp_ns.
+if ! python3 - <<'PY'
+import re
+import rospy
+from std_msgs.msg import String
+
+rospy.init_node(
+    "careplanner_nominal_baseline_tracker_wait",
+    anonymous=True,
+    disable_signals=True,
+)
+topic = "/care_planner/execution/tracker_summary"
+deadline = rospy.Time.now() + rospy.Duration(4.0)
+last = ""
+stamp_re = re.compile(r"execution_stamp_ns=([0-9]+)")
+
+while not rospy.is_shutdown() and rospy.Time.now() < deadline:
+    try:
+        msg = rospy.wait_for_message(topic, String, timeout=0.25)
+        last = str(msg.data)
+    except rospy.ROSException:
+        continue
+
+    m = stamp_re.search(last)
+    if m is not None and int(m.group(1)) > 0:
+        print("[BASELINE] tracker accepted one-shot task trajectory: " + last)
+        raise SystemExit(0)
+
+print("[ERROR] tracker never accepted the one-shot task trajectory")
+if last:
+    print("[LAST TRACKER SUMMARY] " + last)
+raise SystemExit(1)
+PY
+then
+  echo "[ERROR] nominal task trajectory was not accepted by the tracker" >&2
+  echo "[DEBUG] task topic is transient/non-latched; inspect generation below" >&2
+  grep -E 'New EE target|Cached one-shot nominal command|generation failed|intervention failed|Rejecting dynamically invalid|task_trajectory_topic|command_trajectory_topic' \
+    "${LOG}/task_planner.log" | tail -n 80 || true
   exit 1
 fi
 
