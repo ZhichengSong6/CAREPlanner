@@ -25,6 +25,24 @@ def stats(xs):
         return a[i]*(1-w)+a[j]*w
     return {"min":a[0],"median":statistics.median(a),"mean":statistics.fmean(a),"p95":q(.95),"max":a[-1]}
 
+def hz_from_ms(ms_stats):
+    if not isinstance(ms_stats,dict): return None
+    out={}
+    for k in ("min","median","mean","p95","max"):
+        v=num(ms_stats.get(k))
+        out[k]=(1000.0/v) if math.isfinite(v) and v>0 else None
+    return out
+
+def unique_commit_timing_rows(rows):
+    # commit_summary is a high-rate state stream. Timing fields persist after a
+    # verdict, so retain only the first row for each completed verification seq.
+    by_seq={}
+    for r in rows:
+        seq=integer(r.get("last_verification_seq"),0)
+        if seq>0 and seq not in by_seq:
+            by_seq[seq]=r
+    return [by_seq[k] for k in sorted(by_seq)]
+
 def tokens(path):
     if not os.path.isfile(path): return []
     out=[]
@@ -132,6 +150,26 @@ def main():
     er=[r for r in exe if r.get("trajectory_source") in ("predicted","committed")]; eu=sum(r.get("has_violation")=="1" for r in er)
     gcdf_ok=commits>0 and integer(lc.get("final_gcdf_enabled"))==1 and gs>=commits; vbc_ok=commits>0 and vs>=commits; exe_ok=len(er)>0 and eu==0
     rem=[integer(r.get("remaining_obligation_count"),-1) for r in acq]; rem=[x for x in rem if x>=0]
+
+    # Phase-D timing: distinguish optimizer latency from post-plan certification.
+    candidate_plans=[r for r in loc if r.get("event")=="candidate_published"]
+    timing_commit=unique_commit_timing_rows(com)
+    local_plan_ms=stats(r.get("total_plan_ms") for r in candidate_plans)
+    piqp_final_ms=stats(r.get("solve_ms") for r in candidate_plans)
+    raw_to_safety_ms=stats(r.get("raw_to_safety_dispatch_ms") for r in timing_commit)
+    final_gcdf_ms=stats(r.get("final_gcdf_roundtrip_ms") for r in timing_commit)
+    exact_vbc_ms=stats(r.get("exact_vbc_roundtrip_ms") for r in timing_commit)
+    safety_pipeline_ms=stats(r.get("candidate_total_safety_pipeline_ms") for r in timing_commit)
+
+    # This combines independently summarized stages, so label it an estimate
+    # rather than pretending that the samples are candidate-by-candidate paired.
+    certified_compute_est=None
+    if isinstance(local_plan_ms,dict) and isinstance(safety_pipeline_ms,dict):
+        certified_compute_est={}
+        for k in ("min","median","mean","p95","max"):
+            x=num(local_plan_ms.get(k)); y=num(safety_pipeline_ms.get(k))
+            certified_compute_est[k]=(x+y) if math.isfinite(x) and math.isfinite(y) else None
+
     out={"phase":"D.1","method":a.method,"trial_id":a.trial_id,"case_id":a.case_id,"difficulty":case.get("difficulty_bin"),
          "goal_position":case["goal_position"],"goal_orientation_xyzw":case["goal_orientation"],
          "success_thresholds":{"position_tolerance_m":a.position_tolerance_m,"orientation_tolerance_rad":a.orientation_tolerance_rad,"required_hold_s":a.success_hold_s},**goal,
@@ -146,8 +184,18 @@ def main():
          **regime_times(reg,goal.get("trace_end_time_s")),"max_remaining_obligation_count":max(rem) if rem else 0,
          "obligation_clear_events":sum(x>0 and y==0 for x,y in zip(rem,rem[1:])),
          "tracking_error_inf":stats(r.get("tracking_error_inf") for r in trk),
-         "local_plan_ms":stats(r.get("total_plan_ms") for r in loc if r.get("event")=="candidate_published"),
-         "sparse_piqp_solve_ms":stats(r.get("solve_ms") for r in loc if r.get("event")=="scp_solved")}
+         "timing_sample_counts":{"candidate_plans":len(candidate_plans),"completed_verifications":len(timing_commit)},
+         "local_plan_ms":local_plan_ms,
+         "local_plan_equivalent_hz":hz_from_ms(local_plan_ms),
+         "sparse_piqp_final_solve_ms":piqp_final_ms,
+         "sparse_piqp_final_solve_equivalent_hz":hz_from_ms(piqp_final_ms),
+         "raw_to_safety_dispatch_ms":raw_to_safety_ms,
+         "final_gcdf_roundtrip_ms":final_gcdf_ms,
+         "exact_vbc_roundtrip_ms":exact_vbc_ms,
+         "candidate_safety_pipeline_ms":safety_pipeline_ms,
+         "candidate_safety_pipeline_equivalent_hz":hz_from_ms(safety_pipeline_ms),
+         "certified_candidate_compute_ms_estimate":certified_compute_est,
+         "certified_candidate_equivalent_hz_estimate":hz_from_ms(certified_compute_est)}
     dst=a.output_json or os.path.join(run,"phase_d_run_summary.json"); os.makedirs(os.path.dirname(os.path.abspath(dst)),exist_ok=True)
     with open(dst,"w") as f: json.dump(out,f,indent=2)
     print(json.dumps(out,indent=2)); print("[PHASE D RUN SUMMARY]",dst)
