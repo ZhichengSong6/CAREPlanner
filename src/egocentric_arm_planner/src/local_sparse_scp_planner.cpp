@@ -563,6 +563,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
 
   bool request_repair_replan = false;
   bool duplicate_completion = false;
+  unsigned long long repair_completion_replan_count_snapshot = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -586,6 +587,8 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
           last_repair_completed_execution_stamp_ns_ =
               execution_stamp_ns;
           ++repair_completion_replan_count_;
+          repair_completion_replan_count_snapshot =
+              repair_completion_replan_count_;
           request_repair_replan = true;
         } else {
           ++repair_completion_duplicate_count_;
@@ -594,6 +597,8 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       } else if (rising) {
         // Backward-compatible fallback for an old tracker summary producer.
         ++repair_completion_replan_count_;
+        repair_completion_replan_count_snapshot =
+            repair_completion_replan_count_;
         request_repair_replan = true;
       }
     }
@@ -608,7 +613,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
         "[LocalSparseSCPPlanner] REPAIR execution completion -> replan"
         << " stamp_ns="
         << (has_execution_stamp ? execution_stamp_ns : 0ULL)
-        << " count=" << repair_completion_replan_count_);
+        << " count=" << repair_completion_replan_count_snapshot);
   } else if (duplicate_completion) {
     ROS_DEBUG_STREAM_THROTTLE(
         1.0,
