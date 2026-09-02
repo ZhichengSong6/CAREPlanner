@@ -423,6 +423,10 @@ record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv
 record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
 record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
 record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+# Visualization artifacts: preserve the upstream nominal task reference and the
+# exact safety-certified trajectory that the tracker receives.
+record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
+record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
 record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
 record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 
