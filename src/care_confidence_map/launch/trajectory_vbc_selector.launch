@@ -18,6 +18,7 @@
        immediately; the periodic timer remains active for acquisition refresh
        and as a fail-closed fallback. -->
   <arg name="event_driven_eval" default="false" />
+  <arg name="predicted_periodic_refresh_rate" default="5.0" />
   <!-- C5.30: optional, temporal-selector-only trajectory used while
        force_bootstrap=true. Candidate VBC binds this to Sparse-SCP q_lin. -->
   <arg name="rediscovery_trajectory_topic" default="" />
@@ -90,6 +91,8 @@
     <param name="trajectory_vbc/prefer_predicted_trajectory" value="$(arg prefer_predicted_trajectory)" />
     <param name="trajectory_vbc/predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
     <param name="trajectory_vbc/event_driven_eval" value="$(arg event_driven_eval)" />
+    <param name="trajectory_vbc/predicted_periodic_refresh_rate"
+           value="$(arg predicted_periodic_refresh_rate)" />
     <param name="trajectory_vbc/rediscovery_trajectory_topic" value="$(arg rediscovery_trajectory_topic)" />
     <param name="trajectory_vbc/rediscovery_trajectory_timeout" value="$(arg rediscovery_trajectory_timeout)" />
     <param name="trajectory_vbc/output_target_topic" value="$(arg output_target_topic)" />
