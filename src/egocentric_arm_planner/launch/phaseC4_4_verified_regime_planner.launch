@@ -548,8 +548,9 @@
     </include>
   </group>
 
-  <!-- Execution auditor: identical pointwise VBC geometry, but it reads only
-       committed execution plans and all steering-side outputs are isolated. -->
+  <!-- Execution auditor: identical full body-sphere swept-volume VBC geometry,
+       but it reads only committed execution plans and all steering-side outputs
+       are isolated. -->
   <group ns="execution_vbc_audit">
     <remap from="/care_planner/trajectory_risk/vbc_summary"
            to="$(arg execution_vbc_summary_topic)" />
