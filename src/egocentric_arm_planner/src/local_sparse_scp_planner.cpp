@@ -402,7 +402,20 @@ void LocalSparseSCPPlanner::referenceCallback(
   latest_reference_ = *msg;
   latest_reference_received_ = ros::Time::now();
   has_reference_ = true;
-  requestPlanLocked("new_nominal_reference");
+
+  if (normal_reference_refresh_pending_) {
+    // C5.33: the first fresh /task_trajectory after PROBE->NORMAL is the
+    // measured-state task rebase. Baseline the just-completed PROBE execution
+    // stamp so a delayed duplicate tracker summary cannot be interpreted as a
+    // NORMAL completion event.
+    normal_reference_refresh_pending_ = false;
+    last_normal_completed_execution_stamp_ns_ =
+        latest_execution_stamp_ns_;
+    ++normal_reference_refresh_count_;
+    requestPlanLocked("fresh_normal_task_reference");
+  } else {
+    requestPlanLocked("new_nominal_reference");
+  }
 }
 
 void LocalSparseSCPPlanner::waypointScheduleCallback(
@@ -504,6 +517,9 @@ void LocalSparseSCPPlanner::recoveryCallback(
         // spurious REPAIR replan.
         last_repair_completed_execution_stamp_ns_ =
             latest_execution_stamp_ns_;
+        // PROBE->REPAIR owns its next plan through the REPAIR trigger, so any
+        // pending wait for a fresh NORMAL task reference is cancelled.
+        normal_reference_refresh_pending_ = false;
       }
       requestPlanLocked(
           repair_mode_ ? "enter_repair" : "leave_repair");
@@ -522,15 +538,40 @@ void LocalSparseSCPPlanner::probeActiveCallback(
   if (!msg) return;
   std::lock_guard<std::mutex> lock(mutex_);
   if (probe_mode_ == msg->data) return;
+
+  const bool was_probe = probe_mode_;
   probe_mode_ = msg->data;
-  requestPlanLocked(
-      probe_mode_ ? "enter_probe_normal" : "leave_probe_normal");
+
+  if (probe_mode_) {
+    normal_reference_refresh_pending_ = false;
+    requestPlanLocked("enter_probe_normal");
+    return;
+  }
+
+  if (!was_probe) return;
+
+  if (repair_mode_) {
+    // PROBE->REPAIR is already replanned by recoveryCallback().
+    normal_reference_refresh_pending_ = false;
+    return;
+  }
+
+  // C5.33 PROBE->NORMAL: do NOT immediately plan against the stale one-shot
+  // task trajectory. Wait for the regime-manager pulse -> repeated EE goal ->
+  // fresh measured-state /task_trajectory callback.
+  normal_reference_refresh_pending_ = true;
+  plan_requested_ = false;
+  plan_request_reason_ = "waiting_fresh_normal_task_reference";
 }
 
 void LocalSparseSCPPlanner::replanRequestCallback(
     const std_msgs::BoolConstPtr& msg) {
   if (!msg || !msg->data) return;
   std::lock_guard<std::mutex> lock(mutex_);
+  if (normal_reference_refresh_pending_ && !repair_mode_ && !probe_mode_) {
+    ++normal_refresh_blocked_replan_count_;
+    return;
+  }
   requestPlanLocked("external_replan_request");
 }
 
@@ -562,8 +603,11 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       execution_stamp_ns > 0;
 
   bool request_repair_replan = false;
-  bool duplicate_completion = false;
+  bool request_normal_replan = false;
+  bool duplicate_repair_completion = false;
+  bool duplicate_normal_completion = false;
   unsigned long long repair_completion_replan_count_snapshot = 0;
+  unsigned long long normal_completion_replan_count_snapshot = 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
@@ -579,9 +623,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
         // C5.32: completion identity is the immutable committed execution
         // stamp, not a lossy Boolean edge. Faster C5.31 planning can replace
         // trajectories quickly enough that an intermediate complete=0 tracker
-        // sample is dropped. The old rising-edge logic then permanently loses
-        // the next REPAIR replan. Exactly-once stamp handling is insensitive to
-        // that dropped sample while still rejecting repeated complete=1 rows.
+        // sample is dropped.
         if (execution_stamp_ns !=
             last_repair_completed_execution_stamp_ns_) {
           last_repair_completed_execution_stamp_ns_ =
@@ -592,19 +634,45 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
           request_repair_replan = true;
         } else {
           ++repair_completion_duplicate_count_;
-          duplicate_completion = true;
+          duplicate_repair_completion = true;
         }
       } else if (rising) {
-        // Backward-compatible fallback for an old tracker summary producer.
         ++repair_completion_replan_count_;
         repair_completion_replan_count_snapshot =
             repair_completion_replan_count_;
         request_repair_replan = true;
       }
+    } else if (complete && !probe_mode_ &&
+               !normal_reference_refresh_pending_) {
+      // C5.33: NORMAL is also a receding-horizon execution mode. Once one
+      // certified local trajectory finishes, request the next plan from the
+      // latest measured state/reference. Use execution_stamp_ns exactly once,
+      // mirroring C5.32, so dropped complete=0 samples cannot deadlock NORMAL.
+      if (has_execution_stamp) {
+        if (execution_stamp_ns !=
+            last_normal_completed_execution_stamp_ns_) {
+          last_normal_completed_execution_stamp_ns_ =
+              execution_stamp_ns;
+          ++normal_completion_replan_count_;
+          normal_completion_replan_count_snapshot =
+              normal_completion_replan_count_;
+          request_normal_replan = true;
+        } else {
+          ++normal_completion_duplicate_count_;
+          duplicate_normal_completion = true;
+        }
+      } else if (rising) {
+        ++normal_completion_replan_count_;
+        normal_completion_replan_count_snapshot =
+            normal_completion_replan_count_;
+        request_normal_replan = true;
+      }
     }
 
     if (request_repair_replan) {
       requestPlanLocked("repair_trajectory_complete");
+    } else if (request_normal_replan) {
+      requestPlanLocked("normal_trajectory_complete");
     }
   }
 
@@ -614,15 +682,26 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
         << " stamp_ns="
         << (has_execution_stamp ? execution_stamp_ns : 0ULL)
         << " count=" << repair_completion_replan_count_snapshot);
-  } else if (duplicate_completion) {
+  } else if (request_normal_replan) {
+    ROS_INFO_STREAM(
+        "[LocalSparseSCPPlanner] NORMAL execution completion -> replan"
+        << " stamp_ns="
+        << (has_execution_stamp ? execution_stamp_ns : 0ULL)
+        << " count=" << normal_completion_replan_count_snapshot);
+  } else if (duplicate_repair_completion) {
     ROS_DEBUG_STREAM_THROTTLE(
         1.0,
         "[LocalSparseSCPPlanner] duplicate REPAIR completion ignored stamp_ns="
             << execution_stamp_ns);
+  } else if (duplicate_normal_completion) {
+    ROS_DEBUG_STREAM_THROTTLE(
+        1.0,
+        "[LocalSparseSCPPlanner] duplicate NORMAL completion ignored stamp_ns="
+            << execution_stamp_ns);
   }
 
-  // PROBE_NORMAL replanning is owned by the regime manager and is released
-  // only after tracker complete=1 for the exact committed trajectory seq.
+  // PROBE_NORMAL replanning remains owned by the regime manager and is
+  // released only after tracker complete=1 for the exact committed token.
 }
 
 void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
@@ -1932,6 +2011,12 @@ void LocalSparseSCPPlanner::publishSummary(
   unsigned long long last_repair_completion_stamp_ns = 0;
   unsigned long long repair_completion_replan_count = 0;
   unsigned long long repair_completion_duplicate_count = 0;
+  unsigned long long last_normal_completion_stamp_ns = 0;
+  unsigned long long normal_completion_replan_count = 0;
+  unsigned long long normal_completion_duplicate_count = 0;
+  unsigned long long normal_reference_refresh_count = 0;
+  unsigned long long normal_refresh_blocked_replan_count = 0;
+  bool normal_reference_refresh_pending = false;
   double last_cdf_roundtrip_ms = 0.0;
   double plan_cdf_roundtrip_sum_ms = 0.0;
   double plan_cdf_roundtrip_max_ms = 0.0;
@@ -1963,6 +2048,18 @@ void LocalSparseSCPPlanner::publishSummary(
     repair_completion_replan_count = repair_completion_replan_count_;
     repair_completion_duplicate_count =
         repair_completion_duplicate_count_;
+    last_normal_completion_stamp_ns =
+        last_normal_completed_execution_stamp_ns_;
+    normal_completion_replan_count =
+        normal_completion_replan_count_;
+    normal_completion_duplicate_count =
+        normal_completion_duplicate_count_;
+    normal_reference_refresh_count =
+        normal_reference_refresh_count_;
+    normal_refresh_blocked_replan_count =
+        normal_refresh_blocked_replan_count_;
+    normal_reference_refresh_pending =
+        normal_reference_refresh_pending_;
     last_cdf_roundtrip_ms = last_cdf_roundtrip_ms_;
     plan_cdf_roundtrip_sum_ms = plan_cdf_roundtrip_sum_ms_;
     plan_cdf_roundtrip_max_ms = plan_cdf_roundtrip_max_ms_;
@@ -2002,6 +2099,18 @@ void LocalSparseSCPPlanner::publishSummary(
       << repair_completion_replan_count
       << " repair_completion_duplicate_count="
       << repair_completion_duplicate_count
+      << " last_normal_completion_stamp_ns="
+      << last_normal_completion_stamp_ns
+      << " normal_completion_replan_count="
+      << normal_completion_replan_count
+      << " normal_completion_duplicate_count="
+      << normal_completion_duplicate_count
+      << " normal_reference_refresh_pending="
+      << static_cast<int>(normal_reference_refresh_pending)
+      << " normal_reference_refresh_count="
+      << normal_reference_refresh_count
+      << " normal_refresh_blocked_replan_count="
+      << normal_refresh_blocked_replan_count
       << " batches=" << batches
       << " cdf_roundtrip_ms=" << last_cdf_roundtrip_ms
       << " cdf_roundtrip_count=" << plan_cdf_roundtrip_count
