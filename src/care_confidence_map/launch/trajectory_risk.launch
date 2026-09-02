@@ -39,6 +39,9 @@
   <!-- ========================= -->
 
   <arg name="eval_rate" default="20.0" />
+  <!-- C5.31: evaluate immediately when a fresh trajectory arrives. Keep false
+       by default; latency-sensitive local/final GCDF exporters opt in. -->
+  <arg name="event_driven_eval" default="false" />
   <arg name="max_eval_timesteps" default="50" />
   <arg name="query_timeout" default="0.10" />
   <arg name="refresh_body_prior_before_query" default="true" />
@@ -107,6 +110,9 @@
 
     <param name="trajectory_risk/eval_rate"
            value="$(arg eval_rate)" />
+
+    <param name="trajectory_risk/event_driven_eval"
+           value="$(arg event_driven_eval)" />
 
     <param name="trajectory_risk/max_eval_timesteps"
            value="$(arg max_eval_timesteps)" />
