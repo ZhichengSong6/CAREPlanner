@@ -97,6 +97,9 @@ bool LocalSparseSCPPlanner::initialize(
   replan_request_sub_ = nh_.subscribe(
       replan_request_topic_, 10,
       &LocalSparseSCPPlanner::replanRequestCallback, this);
+  smooth_replan_request_sub_ = nh_.subscribe(
+      smooth_replan_request_topic_, 10,
+      &LocalSparseSCPPlanner::smoothReplanRequestCallback, this);
   executed_command_sub_ = nh_.subscribe(
       executed_command_topic_, 2,
       &LocalSparseSCPPlanner::executedCommandCallback, this);
@@ -205,6 +208,8 @@ bool LocalSparseSCPPlanner::loadConfig() {
                    u_reference_tracking_enabled_);
   pnh_.param<double>("local_planner/u_smooth_weight",
                      u_smooth_weight_, u_smooth_weight_);
+  pnh_.param<double>("local_planner/handoff_velocity_weight",
+                     handoff_velocity_weight_, handoff_velocity_weight_);
   pnh_.param<bool>("local_planner/enforce_acceleration_constraints",
                    enforce_acceleration_constraints_,
                    enforce_acceleration_constraints_);
@@ -307,6 +312,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
                           probe_active_topic_, probe_active_topic_);
   pnh_.param<std::string>("local_planner/replan_request_topic",
                           replan_request_topic_, replan_request_topic_);
+  pnh_.param<std::string>("local_planner/smooth_replan_request_topic",
+                          smooth_replan_request_topic_,
+                          smooth_replan_request_topic_);
   pnh_.param<std::string>("local_planner/executed_command_topic",
                           executed_command_topic_,
                           executed_command_topic_);
@@ -573,6 +581,25 @@ void LocalSparseSCPPlanner::replanRequestCallback(
     return;
   }
   requestPlanLocked("external_replan_request");
+}
+
+void LocalSparseSCPPlanner::smoothReplanRequestCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg || !msg->data) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (probe_mode_ || normal_reference_refresh_pending_) {
+    ++smooth_handoff_replan_suppressed_probe_count_;
+    return;
+  }
+  if (plan_running_ || plan_requested_) {
+    ++smooth_handoff_replan_suppressed_busy_count_;
+    return;
+  }
+
+  ++smooth_handoff_replan_count_;
+  requestPlanLocked(
+      repair_mode_ ? "smooth_handoff_repair" : "smooth_handoff_normal");
 }
 
 void LocalSparseSCPPlanner::executedCommandCallback(
@@ -1679,16 +1706,19 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  // Smoothness: ||u0-u_executed||^2 + sum ||uk-u(k-1)||^2.
+  // Certified-handoff boundary continuity. Keep this boundary-only term
+  // active even when general intra-horizon smoothness is disabled.
+  const double boundary_velocity_weight =
+      u_smooth_weight_ + handoff_velocity_weight_;
   for (int j = 0; j < dof_; ++j) {
     const int u0 = uIndex(0, j);
     p_triplets.emplace_back(
-        u0, u0, 2.0 * u_smooth_weight_);
+        u0, u0, 2.0 * boundary_velocity_weight);
     const double prev =
         previous_command.size() == dof_
             ? previous_command[j]
             : 0.0;
-    c[u0] += -2.0 * u_smooth_weight_ * prev;
+    c[u0] += -2.0 * boundary_velocity_weight * prev;
   }
   for (int k = 1; k < num_intervals_; ++k) {
     for (int j = 0; j < dof_; ++j) {
