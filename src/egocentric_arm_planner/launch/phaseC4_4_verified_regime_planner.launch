@@ -535,6 +535,8 @@
       <arg name="predicted_trajectory_topic" value="$(arg verification_trajectory_topic)" />
       <arg name="prefer_predicted_trajectory" value="true" />
       <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+      <arg name="rediscovery_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="rediscovery_trajectory_timeout" value="1.0" />
       <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
       <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
       <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
