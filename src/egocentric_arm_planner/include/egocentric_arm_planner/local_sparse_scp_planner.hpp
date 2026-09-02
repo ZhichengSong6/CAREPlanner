@@ -200,6 +200,11 @@ private:
   ros::Time current_query_stamp_;
   ros::WallTime current_query_wall_;
   ros::WallTime current_plan_start_wall_;
+  // C5.31 latency accounting for the event-driven trajectory->GCDF roundtrip.
+  double last_cdf_roundtrip_ms_ = 0.0;
+  double plan_cdf_roundtrip_sum_ms_ = 0.0;
+  double plan_cdf_roundtrip_max_ms_ = 0.0;
+  int plan_cdf_roundtrip_count_ = 0;
   std::string current_frame_id_ = "base_link";
 
   Eigen::VectorXd plan_q_current_;
