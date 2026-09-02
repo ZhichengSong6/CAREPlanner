@@ -647,6 +647,12 @@ void TrajectoryExecutionManager::publishSummary(
               : "none")
       << " tracking_error_q_ref=" << tracking_error_q_ref
       << " tracking_error_q_measured=" << tracking_error_q_measured
+      << " smooth_handoff_enabled="
+      << static_cast<int>(smooth_handoff_enabled_)
+      << " smooth_replan_request_count="
+      << smooth_replan_request_count_
+      << " smooth_replan_lead_time_s="
+      << smooth_replan_lead_time_s_
       << " source=" << source;
   msg.data = oss.str();
   summary_pub_.publish(msg);
