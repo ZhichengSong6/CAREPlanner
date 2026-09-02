@@ -16,8 +16,6 @@ GPU_DEVICE="${GPU_DEVICE:-cuda}"
 CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt}"
 GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
-LOCAL_SCP_SELF_BODY_EXCLUSION_ENABLED="${LOCAL_SCP_SELF_BODY_EXCLUSION_ENABLED:-true}"
-LOCAL_SCP_SELF_BODY_EXCLUSION_INSET_M="${LOCAL_SCP_SELF_BODY_EXCLUSION_INSET_M:-0.0}"
 
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
@@ -51,7 +49,6 @@ echo "[C5.4] run:    ${RUN_ID}"
 echo "[C5.8] architecture: Sparse SCP -> executable GCDF -> exact VBC -> single commit -> tracker"
 echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
 echo "[C5.27 PARAM] local+final GCDF proximity margin: ${LOCAL_SCP_PROXIMITY_MARGIN} m"
-echo "[C5.28] current-body exclusion: enabled=${LOCAL_SCP_SELF_BODY_EXCLUSION_ENABLED} inset=${LOCAL_SCP_SELF_BODY_EXCLUSION_INSET_M} m"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[ERROR] signed CDF checkpoint not found: ${CHECKPOINT}"
@@ -874,8 +871,6 @@ PROBE_SINGLE_FLIGHT_TOPIC="/care_planner/local_planner/candidate_trajectory_sing
 LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" \
 LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" \
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN}" \
-LOCAL_SCP_SELF_BODY_EXCLUSION_ENABLED="${LOCAL_SCP_SELF_BODY_EXCLUSION_ENABLED}" \
-LOCAL_SCP_SELF_BODY_EXCLUSION_INSET_M="${LOCAL_SCP_SELF_BODY_EXCLUSION_INSET_M}" \
 LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" \
 LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" \
 LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" \
