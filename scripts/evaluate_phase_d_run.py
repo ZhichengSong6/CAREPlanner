@@ -229,6 +229,17 @@ def main():
              "predicted_timer":len(timer_vbc_rows),
              "predicted_periodic_skip_count_max":predicted_periodic_skip_max,
              "predicted_periodic_refresh_count_max":predicted_periodic_refresh_max},
+         "safety_admission_counts":{
+             "raw_immediate_dispatch_count":integer(
+                 lc.get("raw_immediate_dispatch_count"),0),
+             "raw_busy_buffer_count":integer(
+                 lc.get("raw_busy_buffer_count"),0),
+             "post_cert_pending_dispatch_count":integer(
+                 lc.get("post_cert_pending_dispatch_count"),0),
+             "selector_fallback_dispatch_count":integer(
+                 lc.get("selector_fallback_dispatch_count"),0),
+             "pending_replace_count":integer(
+                 lc.get("pending_replace_count"),0)},
          "candidate_vbc_event_stage_ms":vbc_event_stage_ms,
          "candidate_vbc_all_predicted_stage_ms":vbc_all_predicted_stage_ms,
          "certified_candidate_compute_ms_estimate":certified_compute_est,
