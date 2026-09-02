@@ -47,6 +47,8 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
 
   replan_request_pub_ = nh_.advertise<std_msgs::Bool>(
       replan_request_topic_, 10);
+  smooth_replan_request_pub_ = nh_.advertise<std_msgs::Bool>(
+      smooth_replan_request_topic_, 10);
 
   execution_timer_ = nh_.createTimer(
       ros::Duration(1.0 / execution_rate_),
@@ -66,6 +68,12 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
                   << " vmax=" << max_command_velocity_
                   << " tracking_replan_threshold="
                   << replan_tracking_error_inf_);
+  ROS_INFO_STREAM(
+      "[TrajectoryExecutionManager] smooth_handoff="
+      << static_cast<int>(smooth_handoff_enabled_)
+      << " lead_time=" << smooth_replan_lead_time_s_
+      << " min_phase=" << smooth_replan_min_phase_s_
+      << " topic=" << smooth_replan_request_topic_);
 
   return true;
 }
@@ -113,6 +121,12 @@ bool TrajectoryExecutionManager::loadConfig() {
   pnh_.param<double>("execution/replan_request_min_interval",
                      replan_request_min_interval_s_,
                      replan_request_min_interval_s_);
+  pnh_.param<bool>("execution/smooth_handoff_enabled",
+                   smooth_handoff_enabled_, smooth_handoff_enabled_);
+  pnh_.param<double>("execution/smooth_replan_lead_time",
+                     smooth_replan_lead_time_s_, smooth_replan_lead_time_s_);
+  pnh_.param<double>("execution/smooth_replan_min_phase",
+                     smooth_replan_min_phase_s_, smooth_replan_min_phase_s_);
 
   pnh_.param<std::string>("execution/joint_states",
                           joint_state_topic_, joint_state_topic_);
@@ -127,6 +141,9 @@ bool TrajectoryExecutionManager::loadConfig() {
                           summary_topic_, summary_topic_);
   pnh_.param<std::string>("execution/replan_request_topic",
                           replan_request_topic_, replan_request_topic_);
+  pnh_.param<std::string>("execution/smooth_replan_request_topic",
+                          smooth_replan_request_topic_,
+                          smooth_replan_request_topic_);
 
   if (!pnh_.getParam("joint_names", joint_names_)) {
     ROS_ERROR("[TrajectoryExecutionManager] Missing param: joint_names");
@@ -151,7 +168,9 @@ bool TrajectoryExecutionManager::loadConfig() {
   }
   if (reference_timeout_ < 0.0 ||
       replan_request_min_interval_s_ < 0.0 ||
-      replan_tracking_error_inf_ < 0.0) {
+      replan_tracking_error_inf_ < 0.0 ||
+      smooth_replan_lead_time_s_ <= 0.0 ||
+      smooth_replan_min_phase_s_ < 0.0) {
     ROS_ERROR("[TrajectoryExecutionManager] invalid timeout/replan configuration.");
     return false;
   }
@@ -374,6 +393,8 @@ void TrajectoryExecutionManager::executionTimerCallback(
           : std::numeric_limits<double>::quiet_NaN();
 
   maybePublishReplanRequest(tracking_error);
+  maybePublishSmoothHandoffReplanRequest(
+      active, execution_stamp_ns, phase_s, remaining_s);
 
   if (tracking_error > max_tracking_error_) {
     ROS_WARN_THROTTLE(
@@ -654,6 +675,36 @@ void TrajectoryExecutionManager::maybePublishReplanRequest(
       0.5,
       "[TrajectoryExecutionManager] requested local replan: tracking_error_inf="
           << tracking_error_inf);
+}
+
+void TrajectoryExecutionManager::maybePublishSmoothHandoffReplanRequest(
+    bool trajectory_active,
+    uint64_t execution_stamp_ns,
+    double phase_s,
+    double remaining_s) {
+  if (!smooth_handoff_enabled_ || !trajectory_active ||
+      execution_stamp_ns == 0 ||
+      phase_s < smooth_replan_min_phase_s_ ||
+      remaining_s > smooth_replan_lead_time_s_) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (last_smooth_replan_execution_stamp_ns_ == execution_stamp_ns) return;
+    last_smooth_replan_execution_stamp_ns_ = execution_stamp_ns;
+    ++smooth_replan_request_count_;
+  }
+
+  std_msgs::Bool msg;
+  msg.data = true;
+  smooth_replan_request_pub_.publish(msg);
+  ROS_INFO_STREAM(
+      "[TrajectoryExecutionManager] smooth look-ahead replan requested"
+      << " execution_stamp_ns=" << execution_stamp_ns
+      << " phase_s=" << phase_s
+      << " remaining_s=" << remaining_s
+      << " count=" << smooth_replan_request_count_);
 }
 
 Eigen::VectorXd TrajectoryExecutionManager::makeZeroVelocityCommand() const {
