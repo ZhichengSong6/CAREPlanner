@@ -183,6 +183,7 @@ class CppForbiddenVoxelGpuShadow {
         "/tmp/care_collision_cdf_gpu.sock");
 
     pnh_.param("rate", rate_hz_, 20.0);
+    pnh_.param("process_on_input_callback", process_on_input_callback_, false);
     pnh_.param("anchor_stale_s", anchor_stale_s_, 0.25);
     pnh_.param("map_stale_s", map_stale_s_, 0.50);
     pnh_.param("confidence_threshold", confidence_threshold_, 0.50);
@@ -261,7 +262,9 @@ class CppForbiddenVoxelGpuShadow {
 
     ROS_WARN_STREAM(
         "[C5.2h C++] READY rate=" << rate_hz_
-        << " Hz grid=" << nx_ << "x" << ny_ << "x" << nz_
+        << " Hz process_on_input_callback="
+        << static_cast<int>(process_on_input_callback_)
+        << " grid=" << nx_ << "x" << ny_ << "x" << nz_
         << " (" << grid_size_ << " voxels)"
         << " conf<" << confidence_threshold_
         << " proximity_margin=" << proximity_margin_
@@ -307,16 +310,32 @@ class CppForbiddenVoxelGpuShadow {
         static_cast<float>(z_min_ + iz * resolution_)};
   }
 
+  void processPendingNow() {
+    if (!process_on_input_callback_) return;
+    // At most two channels can be pending (final + local). Preserve final
+    // priority inside timerCallback, but immediately drain both slots instead
+    // of waiting for a 50-Hz timer tick.
+    const ros::TimerEvent event;
+    timerCallback(event);
+    timerCallback(event);
+  }
+
   void anchorCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_anchor_cloud_ = msg;
-    latest_anchor_received_ = ros::Time::now();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_anchor_cloud_ = msg;
+      latest_anchor_received_ = ros::Time::now();
+    }
+    processPendingNow();
   }
 
   void finalAnchorCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_final_anchor_cloud_ = msg;
-    latest_final_anchor_received_ = ros::Time::now();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_final_anchor_cloud_ = msg;
+      latest_final_anchor_received_ = ros::Time::now();
+    }
+    processPendingNow();
   }
 
   void mapCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
@@ -378,6 +397,9 @@ class CppForbiddenVoxelGpuShadow {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_map_ = index;
     }
+    // If an anchor arrived just before the latest map snapshot, immediately
+    // retry it here. The periodic timer remains as a fallback path.
+    processPendingNow();
   }
 
   std::vector<Anchor> decodeAnchors(
@@ -1218,6 +1240,7 @@ class CppForbiddenVoxelGpuShadow {
   std::string gpu_socket_;
 
   double rate_hz_ = 20.0;
+  bool process_on_input_callback_ = false;
   double anchor_stale_s_ = 0.25;
   double map_stale_s_ = 0.50;
   double confidence_threshold_ = 0.50;
