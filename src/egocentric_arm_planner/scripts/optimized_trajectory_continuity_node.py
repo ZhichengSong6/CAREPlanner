@@ -103,6 +103,14 @@ class OptimizedTrajectoryContinuityNode:
             "~probe_commit_start_mismatch_max", 0.03))
         self.normal_commit_start_mismatch_max = float(rospy.get_param(
             "~normal_commit_start_mismatch_max", 0.03))
+        self.repair_commit_start_mismatch_max = float(rospy.get_param(
+            "~repair_commit_start_mismatch_max", 0.03))
+        self.smooth_handoff_rebase_enabled = bool(rospy.get_param(
+            "~smooth_handoff_rebase_enabled", False))
+        self.smooth_handoff_rebase_max_shift_inf = float(rospy.get_param(
+            "~smooth_handoff_rebase_max_shift_inf", 0.10))
+        self.smooth_handoff_joint_state_max_age_s = float(rospy.get_param(
+            "~smooth_handoff_joint_state_max_age_s", 0.05))
         # C5.21: slow only PROBE task motion before prefix/brake construction.
         # Time scaling preserves q-path geometry and scales dq/ddq consistently.
         self.probe_velocity_cap = float(rospy.get_param(
@@ -140,6 +148,8 @@ class OptimizedTrajectoryContinuityNode:
             "~repair_prefix_verification_enabled", False))
         self.repair_execution_prefix_s = float(rospy.get_param(
             "~repair_execution_prefix_s", 0.15))
+        self.probe_execution_prefix_s = float(rospy.get_param(
+            "~probe_execution_prefix_s", self.repair_execution_prefix_s))
         self.repair_brake_dt_s = float(rospy.get_param(
             "~repair_brake_dt_s", 0.05))
         self.repair_hold_s = float(rospy.get_param(
@@ -183,6 +193,17 @@ class OptimizedTrajectoryContinuityNode:
         if self.normal_commit_start_mismatch_max <= 0.0:
             raise ValueError(
                 "~normal_commit_start_mismatch_max must be positive")
+        if self.repair_commit_start_mismatch_max <= 0.0:
+            raise ValueError(
+                "~repair_commit_start_mismatch_max must be positive")
+        if self.smooth_handoff_rebase_max_shift_inf <= 0.0:
+            raise ValueError(
+                "~smooth_handoff_rebase_max_shift_inf must be positive")
+        if self.smooth_handoff_joint_state_max_age_s <= 0.0:
+            raise ValueError(
+                "~smooth_handoff_joint_state_max_age_s must be positive")
+        if self.probe_execution_prefix_s <= 0.0:
+            raise ValueError("~probe_execution_prefix_s must be positive")
         if self.probe_velocity_cap <= 0.0:
             raise ValueError("~probe_velocity_cap must be positive")
         if self.probe_time_scale_max < 1.0:
@@ -391,56 +412,37 @@ class OptimizedTrajectoryContinuityNode:
             measured.append(float(self._latest_measured_q_by_name[name]))
         return measured
 
-    def _probe_rebase_candidate_locked(self, raw, now):
-        """Translate PROBE q(t) so q(0) matches the latest measured q.
+    def _measured_rebase_candidate_locked(
+            self, raw, now, enabled, max_shift_inf, max_age_s):
+        """Translate q(t) by a constant offset so q(0) matches measured q.
 
-        A constant configuration translation preserves dq/ddq and the local
-        trajectory shape.  The translated candidate is constructed BEFORE
-        final GCDF/VBC, so the exact rebased executable is what gets audited.
-        Translation is clipped by both a small max shift and any configured
-        joint-position limits.  Any residual start mismatch is checked again
-        immediately before commit.
+        The translation preserves dq/ddq and trajectory shape. The returned
+        trajectory is always audited by final GCDF + exact VBC before commit.
         """
         out = copy.deepcopy(raw)
-        if (not self.probe_start_rebase_enabled or raw is None or
+        base_diag = {
+            "enabled": int(bool(enabled)),
+            "applied": 0,
+            "clamped": 0,
+            "target_shift_inf": math.nan,
+            "applied_shift_inf": 0.0,
+            "residual_inf": math.nan,
+            "joint_state_age_ms": self._joint_state_age_ms_locked(now),
+        }
+        if (not enabled or raw is None or
                 not raw.points or not raw.joint_names):
-            return out, {
-                "enabled": 0,
-                "applied": 0,
-                "clamped": 0,
-                "target_shift_inf": math.nan,
-                "applied_shift_inf": math.nan,
-                "residual_inf": math.nan,
-                "joint_state_age_ms":
-                    self._joint_state_age_ms_locked(now),
-            }
+            return out, base_diag
 
         measured = self._measured_positions_locked(raw.joint_names)
         joint_state_age_ms = self._joint_state_age_ms_locked(now)
         if (measured is None or not math.isfinite(joint_state_age_ms) or
-                joint_state_age_ms >
-                1000.0 * self.probe_start_joint_state_max_age_s):
-            return out, {
-                "enabled": 1,
-                "applied": 0,
-                "clamped": 0,
-                "target_shift_inf": math.nan,
-                "applied_shift_inf": 0.0,
-                "residual_inf": self._measured_mismatch_inf_locked(
-                    raw.joint_names, raw.points[0].positions),
-                "joint_state_age_ms": joint_state_age_ms,
-            }
+                joint_state_age_ms > 1000.0 * max_age_s):
+            base_diag["residual_inf"] = self._measured_mismatch_inf_locked(
+                raw.joint_names, raw.points[0].positions)
+            return out, base_diag
 
         if len(raw.points[0].positions) != len(raw.joint_names):
-            return out, {
-                "enabled": 1,
-                "applied": 0,
-                "clamped": 0,
-                "target_shift_inf": math.nan,
-                "applied_shift_inf": 0.0,
-                "residual_inf": math.nan,
-                "joint_state_age_ms": joint_state_age_ms,
-            }
+            return out, base_diag
 
         target_delta = [
             measured[j] - float(raw.points[0].positions[j])
@@ -450,8 +452,8 @@ class OptimizedTrajectoryContinuityNode:
         clamped = False
         for j, name in enumerate(raw.joint_names):
             delta = max(
-                -self.probe_rebase_max_shift_inf,
-                min(self.probe_rebase_max_shift_inf, target_delta[j]))
+                -max_shift_inf,
+                min(max_shift_inf, target_delta[j]))
             if abs(delta - target_delta[j]) > 1e-12:
                 clamped = True
 
@@ -488,13 +490,6 @@ class OptimizedTrajectoryContinuityNode:
         residual_inf = self._measured_mismatch_inf_locked(
             out.joint_names, out.points[0].positions)
 
-        self._probe_rebase_count += 1
-        if clamped:
-            self._probe_rebase_clamp_count += 1
-        self._last_probe_rebase_shift_inf = applied_inf
-        self._last_probe_rebase_target_shift_inf = target_inf
-        self._last_probe_rebase_residual_inf = residual_inf
-
         return out, {
             "enabled": 1,
             "applied": 1,
@@ -504,6 +499,31 @@ class OptimizedTrajectoryContinuityNode:
             "residual_inf": residual_inf,
             "joint_state_age_ms": joint_state_age_ms,
         }
+
+    def _probe_rebase_candidate_locked(self, raw, now):
+        out, diag = self._measured_rebase_candidate_locked(
+            raw, now,
+            self.probe_start_rebase_enabled,
+            self.probe_rebase_max_shift_inf,
+            self.probe_start_joint_state_max_age_s)
+        if diag.get("applied", 0):
+            self._probe_rebase_count += 1
+            if diag.get("clamped", 0):
+                self._probe_rebase_clamp_count += 1
+            self._last_probe_rebase_shift_inf = diag.get(
+                "applied_shift_inf", math.nan)
+            self._last_probe_rebase_target_shift_inf = diag.get(
+                "target_shift_inf", math.nan)
+            self._last_probe_rebase_residual_inf = diag.get(
+                "residual_inf", math.nan)
+        return out, diag
+
+    def _smooth_handoff_rebase_candidate_locked(self, raw, now):
+        return self._measured_rebase_candidate_locked(
+            raw, now,
+            self.smooth_handoff_rebase_enabled,
+            self.smooth_handoff_rebase_max_shift_inf,
+            self.smooth_handoff_joint_state_max_age_s)
 
     def _repair_active_cb(self, msg):
         if msg is None:
@@ -893,6 +913,15 @@ class OptimizedTrajectoryContinuityNode:
             "time_scale": 1.0,
             "time_scale_clamped": 0,
         }
+        handoff_rebase_diag = {
+            "enabled": int(self.smooth_handoff_rebase_enabled),
+            "applied": 0,
+            "clamped": 0,
+            "target_shift_inf": math.nan,
+            "applied_shift_inf": 0.0,
+            "residual_inf": math.nan,
+            "joint_state_age_ms": self._joint_state_age_ms_locked(now),
+        }
         if pending_probe:
             # A candidate is NOT being executed while it waits for admission.
             # Do not advance it by wall-clock age. Rebase its q-origin to the
@@ -903,15 +932,18 @@ class OptimizedTrajectoryContinuityNode:
             candidate, speed_diag = self._slow_probe_candidate(candidate)
             dispatch_suffix_phase_s = 0.0
         elif pending_repair:
-            # Keep existing REPAIR semantics unchanged in C5.23.
             candidate = self._suffix_from_phase(raw, age)
             dispatch_suffix_phase_s = float(age)
+            candidate, handoff_rebase_diag = (
+                self._smooth_handoff_rebase_candidate_locked(candidate, now))
         else:
-            # C5.23 NORMAL: verification latency is not execution time.
-            # Audit the exact raw full-horizon candidate produced from the
-            # latest measured state instead of advancing it by wall-clock age.
+            # Verification latency is not execution time. Preserve the full
+            # horizon, then align only its q-origin to the latest measured state
+            # BEFORE safety certification.
             candidate = copy.deepcopy(raw)
             dispatch_suffix_phase_s = 0.0
+            candidate, handoff_rebase_diag = (
+                self._smooth_handoff_rebase_candidate_locked(candidate, now))
         if candidate is None or not candidate.points:
             self._last_source = "discarded_expired_raw_candidate"
             return None, "none"
@@ -938,6 +970,20 @@ class OptimizedTrajectoryContinuityNode:
                 "residual_inf", math.nan),
             "probe_rebase_joint_state_age_ms": rebase_diag.get(
                 "joint_state_age_ms", math.nan),
+            "handoff_rebase_enabled": int(
+                handoff_rebase_diag.get("enabled", 0)),
+            "handoff_rebase_applied": int(
+                handoff_rebase_diag.get("applied", 0)),
+            "handoff_rebase_clamped": int(
+                handoff_rebase_diag.get("clamped", 0)),
+            "handoff_rebase_target_shift_inf": handoff_rebase_diag.get(
+                "target_shift_inf", math.nan),
+            "handoff_rebase_shift_inf": handoff_rebase_diag.get(
+                "applied_shift_inf", math.nan),
+            "handoff_rebase_residual_inf": handoff_rebase_diag.get(
+                "residual_inf", math.nan),
+            "handoff_rebase_joint_state_age_ms": handoff_rebase_diag.get(
+                "joint_state_age_ms", math.nan),
             "probe_speed_max_before": speed_diag.get(
                 "speed_max_before", math.nan),
             "probe_speed_max_after": speed_diag.get(
@@ -946,7 +992,7 @@ class OptimizedTrajectoryContinuityNode:
             "probe_time_scale_clamped": int(
                 speed_diag.get("time_scale_clamped", 0)),
             "probe_effective_prefix_s": (
-                self.repair_execution_prefix_s *
+                self.probe_execution_prefix_s *
                 float(speed_diag.get("time_scale", 1.0))
                 if pending_probe else self.repair_execution_prefix_s),
             "raw_start_measured_mismatch_inf_at_dispatch":
@@ -975,7 +1021,7 @@ class OptimizedTrajectoryContinuityNode:
         prefix_mode = bool(pending_repair or pending_probe)
         if self.repair_prefix_verification_enabled and prefix_mode:
             effective_prefix_s = (
-                self.repair_execution_prefix_s *
+                self.probe_execution_prefix_s *
                 float(speed_diag.get("time_scale", 1.0))
                 if pending_probe else self.repair_execution_prefix_s)
             self._last_probe_effective_prefix_s = (
@@ -1495,6 +1541,11 @@ class OptimizedTrajectoryContinuityNode:
                                     self.probe_commit_start_mismatch_max)
                                 start_gate_source = (
                                     "probe_start_continuity_rejected_replan")
+                            elif was_repair:
+                                start_gate_limit = (
+                                    self.repair_commit_start_mismatch_max)
+                                start_gate_source = (
+                                    "repair_start_continuity_rejected_replan")
                             elif was_normal:
                                 start_gate_limit = (
                                     self.normal_commit_start_mismatch_max)
