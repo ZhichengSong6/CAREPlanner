@@ -32,6 +32,29 @@ double clampValue(double x, double lo, double hi) {
   return std::max(lo, std::min(hi, x));
 }
 
+bool parseUnsignedToken(
+    const std::string& text,
+    const std::string& key,
+    unsigned long long* value) {
+  if (value == nullptr) return false;
+  const std::string needle = key + "=";
+  const std::size_t pos = text.find(needle);
+  if (pos == std::string::npos) return false;
+  const std::size_t begin = pos + needle.size();
+  std::size_t end = begin;
+  while (end < text.size() &&
+         text[end] >= '0' && text[end] <= '9') {
+    ++end;
+  }
+  if (end == begin) return false;
+  try {
+    *value = std::stoull(text.substr(begin, end - begin));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 }  // namespace
 
 LocalSparseSCPPlanner::~LocalSparseSCPPlanner() {
@@ -474,6 +497,14 @@ void LocalSparseSCPPlanner::recoveryCallback(
     std::lock_guard<std::mutex> lock(mutex_);
     if (repair_mode_ != msg->data) {
       repair_mode_ = msg->data;
+      if (repair_mode_) {
+        // C5.32: the execution that was already active/completed before REPAIR
+        // is not a REPAIR completion event. Baseline the stamp here so a
+        // repeated latched complete=1 from the previous mode cannot trigger a
+        // spurious REPAIR replan.
+        last_repair_completed_execution_stamp_ns_ =
+            latest_execution_stamp_ns_;
+      }
       requestPlanLocked(
           repair_mode_ ? "enter_repair" : "leave_repair");
       clear_bootstrap = !repair_mode_;
@@ -524,16 +555,69 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       msg->data.find(" complete=1") != std::string::npos ||
       msg->data.rfind("complete=1", 0) == 0;
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  const bool rising = complete && !latest_execution_complete_;
-  latest_execution_complete_ = complete;
+  unsigned long long execution_stamp_ns = 0;
+  const bool has_execution_stamp =
+      parseUnsignedToken(
+          msg->data, "execution_stamp_ns", &execution_stamp_ns) &&
+      execution_stamp_ns > 0;
 
-  if (rising && repair_mode_) {
-    requestPlanLocked("repair_trajectory_complete");
+  bool request_repair_replan = false;
+  bool duplicate_completion = false;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    if (has_execution_stamp) {
+      latest_execution_stamp_ns_ = execution_stamp_ns;
+    }
+
+    const bool rising = complete && !latest_execution_complete_;
+    latest_execution_complete_ = complete;
+
+    if (complete && repair_mode_) {
+      if (has_execution_stamp) {
+        // C5.32: completion identity is the immutable committed execution
+        // stamp, not a lossy Boolean edge. Faster C5.31 planning can replace
+        // trajectories quickly enough that an intermediate complete=0 tracker
+        // sample is dropped. The old rising-edge logic then permanently loses
+        // the next REPAIR replan. Exactly-once stamp handling is insensitive to
+        // that dropped sample while still rejecting repeated complete=1 rows.
+        if (execution_stamp_ns !=
+            last_repair_completed_execution_stamp_ns_) {
+          last_repair_completed_execution_stamp_ns_ =
+              execution_stamp_ns;
+          ++repair_completion_replan_count_;
+          request_repair_replan = true;
+        } else {
+          ++repair_completion_duplicate_count_;
+          duplicate_completion = true;
+        }
+      } else if (rising) {
+        // Backward-compatible fallback for an old tracker summary producer.
+        ++repair_completion_replan_count_;
+        request_repair_replan = true;
+      }
+    }
+
+    if (request_repair_replan) {
+      requestPlanLocked("repair_trajectory_complete");
+    }
   }
+
+  if (request_repair_replan) {
+    ROS_INFO_STREAM(
+        "[LocalSparseSCPPlanner] REPAIR execution completion -> replan"
+        << " stamp_ns="
+        << (has_execution_stamp ? execution_stamp_ns : 0ULL)
+        << " count=" << repair_completion_replan_count_);
+  } else if (duplicate_completion) {
+    ROS_DEBUG_STREAM_THROTTLE(
+        1.0,
+        "[LocalSparseSCPPlanner] duplicate REPAIR completion ignored stamp_ns="
+            << execution_stamp_ns);
+  }
+
   // PROBE_NORMAL replanning is owned by the regime manager and is released
   // only after tracker complete=1 for the exact committed trajectory seq.
-  // Do not use a bare complete edge here: it can belong to the previous mode.
 }
 
 void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
@@ -1839,6 +1923,10 @@ void LocalSparseSCPPlanner::publishSummary(
   unsigned long long probe_restore_total = 0;
   unsigned long long probe_restore_hard_success_total = 0;
   double active_slack_weight = 0.0;
+  unsigned long long latest_execution_stamp_ns = 0;
+  unsigned long long last_repair_completion_stamp_ns = 0;
+  unsigned long long repair_completion_replan_count = 0;
+  unsigned long long repair_completion_duplicate_count = 0;
   double last_cdf_roundtrip_ms = 0.0;
   double plan_cdf_roundtrip_sum_ms = 0.0;
   double plan_cdf_roundtrip_max_ms = 0.0;
@@ -1864,6 +1952,12 @@ void LocalSparseSCPPlanner::publishSummary(
     probe_restore_hard_success_total =
         probe_feasibility_restore_success_count_;
     active_slack_weight = plan_cdf_slack_linear_weight_;
+    latest_execution_stamp_ns = latest_execution_stamp_ns_;
+    last_repair_completion_stamp_ns =
+        last_repair_completed_execution_stamp_ns_;
+    repair_completion_replan_count = repair_completion_replan_count_;
+    repair_completion_duplicate_count =
+        repair_completion_duplicate_count_;
     last_cdf_roundtrip_ms = last_cdf_roundtrip_ms_;
     plan_cdf_roundtrip_sum_ms = plan_cdf_roundtrip_sum_ms_;
     plan_cdf_roundtrip_max_ms = plan_cdf_roundtrip_max_ms_;
@@ -1896,6 +1990,13 @@ void LocalSparseSCPPlanner::publishSummary(
       << " scp_iter=" << scp_iter
       << " trust_q_inf=" << trust
       << " slack_mu=" << active_slack_weight
+      << " latest_execution_stamp_ns=" << latest_execution_stamp_ns
+      << " last_repair_completion_stamp_ns="
+      << last_repair_completion_stamp_ns
+      << " repair_completion_replan_count="
+      << repair_completion_replan_count
+      << " repair_completion_duplicate_count="
+      << repair_completion_duplicate_count
       << " batches=" << batches
       << " cdf_roundtrip_ms=" << last_cdf_roundtrip_ms
       << " cdf_roundtrip_count=" << plan_cdf_roundtrip_count
