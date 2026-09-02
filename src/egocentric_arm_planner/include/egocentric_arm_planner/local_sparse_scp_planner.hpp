@@ -180,6 +180,13 @@ private:
   ros::Time latest_reference_received_;
   ros::Time latest_executed_command_received_;
   bool latest_execution_complete_ = false;
+  // C5.32 REPAIR liveness: identify tracker completions by immutable committed
+  // execution stamp rather than relying on a potentially dropped complete=0
+  // sample between two fast executions.
+  unsigned long long latest_execution_stamp_ns_ = 0;
+  unsigned long long last_repair_completed_execution_stamp_ns_ = 0;
+  unsigned long long repair_completion_replan_count_ = 0;
+  unsigned long long repair_completion_duplicate_count_ = 0;
 
   bool has_joint_state_ = false;
   bool has_reference_ = false;
