@@ -155,6 +155,10 @@ def main():
     candidate_plans=[r for r in loc if r.get("event")=="candidate_published"]
     timing_commit=unique_commit_timing_rows(com)
     local_plan_ms=stats(r.get("total_plan_ms") for r in candidate_plans)
+    local_cdf_roundtrip_mean_ms=stats(
+        r.get("cdf_roundtrip_mean_ms") for r in candidate_plans)
+    local_cdf_roundtrip_max_ms=stats(
+        r.get("cdf_roundtrip_max_ms") for r in candidate_plans)
     piqp_final_ms=stats(r.get("solve_ms") for r in candidate_plans)
     raw_to_safety_ms=stats(r.get("raw_to_safety_dispatch_ms") for r in timing_commit)
     final_gcdf_ms=stats(r.get("final_gcdf_roundtrip_ms") for r in timing_commit)
@@ -187,6 +191,8 @@ def main():
          "timing_sample_counts":{"candidate_plans":len(candidate_plans),"completed_verifications":len(timing_commit)},
          "local_plan_ms":local_plan_ms,
          "local_plan_equivalent_hz":hz_from_ms(local_plan_ms),
+         "local_cdf_roundtrip_mean_ms":local_cdf_roundtrip_mean_ms,
+         "local_cdf_roundtrip_max_ms":local_cdf_roundtrip_max_ms,
          "sparse_piqp_final_solve_ms":piqp_final_ms,
          "sparse_piqp_final_solve_equivalent_hz":hz_from_ms(piqp_final_ms),
          "raw_to_safety_dispatch_ms":raw_to_safety_ms,
