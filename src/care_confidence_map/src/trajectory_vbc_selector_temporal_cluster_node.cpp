@@ -66,6 +66,7 @@ public:
     if (candidate_resolution_ <= 0.0 || fallback_dt_ <= 0.0 ||
         predicted_trajectory_timeout_ <= 0.0 ||
         rediscovery_trajectory_timeout_ <= 0.0 ||
+        predicted_periodic_refresh_rate_ <= 0.0 ||
         temporal_layer_mpc_steps_ < 0 || region_max_diameter_m_ <= 0.0 ||
         tof_min_range_ < 0.0 || tof_max_range_ <= tof_min_range_ ||
         horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0 ||
@@ -196,6 +197,43 @@ private:
     std::vector<SpatialRegion> regions;
   };
 
+  struct EvalTiming
+  {
+    double trajectory_convert_ms = 0.0;
+    double body_fk_ms = 0.0;
+    double swept_voxel_build_ms = 0.0;
+    double confidence_query_ms = 0.0;
+    double candidate_filter_ms = 0.0;
+    double sensor_fk_ms = 0.0;
+    double visibility_scan_ms = 0.0;
+    double cluster_ms = 0.0;
+    double total_eval_ms = 0.0;
+  };
+
+  static double wallMs(
+      const ros::WallTime& begin,
+      const ros::WallTime& end = ros::WallTime::now())
+  {
+    return (end - begin).toSec() * 1000.0;
+  }
+
+  std::string timingFields() const
+  {
+    std::ostringstream oss;
+    oss << " trajectory_convert_ms=" << current_eval_timing_.trajectory_convert_ms
+        << " body_fk_ms=" << current_eval_timing_.body_fk_ms
+        << " swept_voxel_build_ms=" << current_eval_timing_.swept_voxel_build_ms
+        << " confidence_query_ms=" << current_eval_timing_.confidence_query_ms
+        << " candidate_filter_ms=" << current_eval_timing_.candidate_filter_ms
+        << " sensor_fk_ms=" << current_eval_timing_.sensor_fk_ms
+        << " visibility_scan_ms=" << current_eval_timing_.visibility_scan_ms
+        << " cluster_ms=" << current_eval_timing_.cluster_ms
+        << " total_eval_ms=" << current_eval_timing_.total_eval_ms
+        << " predicted_periodic_skip_count=" << predicted_periodic_skip_count_
+        << " predicted_periodic_refresh_count=" << predicted_periodic_refresh_count_;
+    return oss.str();
+  }
+
   void loadParams()
   {
     pnh_.param<std::string>(
@@ -244,6 +282,9 @@ private:
     pnh_.param(
         "trajectory_vbc/event_driven_eval",
         event_driven_eval_, false);
+    pnh_.param(
+        "trajectory_vbc/predicted_periodic_refresh_rate",
+        predicted_periodic_refresh_rate_, 5.0);
     pnh_.param("trajectory_vbc/max_eval_timesteps", max_eval_timesteps_, 50);
     pnh_.param("trajectory_vbc/query_timeout", query_timeout_, 0.10);
     pnh_.param("trajectory_vbc/fallback_dt", fallback_dt_, 0.05);
@@ -923,7 +964,8 @@ private:
         << " active_layer_point_count=0 active_layer_region_count=0"
         << " active_layer_cross_link_region_count=0 active_set_point_count=0"
         << " layer_point_counts=none active_region_sizes=none"
-        << " min_required_margin_s=" << min_margin_s_;
+        << " min_required_margin_s=" << min_margin_s_
+        << timingFields();
     std_msgs::String msg;
     msg.data = oss.str();
     summary_pub_.publish(msg);
@@ -1059,6 +1101,7 @@ private:
           << " margin_s=" << representative.margin_s;
     else
       oss << " see_time_s=inf margin_s=-inf";
+    oss << timingFields();
 
     std_msgs::String summary_msg;
     summary_msg.data = oss.str();
@@ -1087,13 +1130,21 @@ private:
       const std::string& trajectory_source,
       const std::string& evaluation_trigger = "timer")
   {
+    const ros::WallTime eval_begin = ros::WallTime::now();
+    current_eval_timing_ = EvalTiming();
+
     ros::Time identity_stamp = traj.header.stamp;
     if (identity_stamp.isZero()) identity_stamp = ros::Time::now();
     current_eval_stamp_ns_ = stampToNs(identity_stamp);
     current_eval_trigger_ = evaluation_trigger;
 
+    auto finalize_total = [this, &eval_begin]() {
+      current_eval_timing_.total_eval_ms = wallMs(eval_begin);
+    };
+
     if (!enabled_)
     {
+      finalize_total();
       publishNoTargetSummary("disabled", trajectory_source, 0);
       return;
     }
@@ -1102,15 +1153,21 @@ private:
     std::vector<int> original_indices;
     std::vector<double> eval_times_s;
     std::string error_msg;
+    const ros::WallTime convert_begin = ros::WallTime::now();
     if (!convertTrajectory(
             traj, &q_traj, &original_indices, &eval_times_s, &error_msg))
     {
+      current_eval_timing_.trajectory_convert_ms = wallMs(convert_begin);
+      finalize_total();
       ROS_WARN_STREAM_THROTTLE(2.0, "[trajectory_vbc_temporal] " << error_msg);
       return;
     }
+    current_eval_timing_.trajectory_convert_ms = wallMs(convert_begin);
 
+    const ros::WallTime body_fk_begin = ros::WallTime::now();
     const care_confidence_map::TrajectorySampleResult sample_result =
         evaluator_.computeTrajectorySamples(q_traj);
+    current_eval_timing_.body_fk_ms = wallMs(body_fk_begin);
     if (!sample_result.success)
     {
       ROS_WARN_STREAM_THROTTLE(
@@ -1119,25 +1176,33 @@ private:
       return;
     }
 
+    const ros::WallTime swept_begin = ros::WallTime::now();
     const std::vector<SweepVoxel> swept_voxels =
         buildSweptVolumeVoxels(sample_result, original_indices, eval_times_s);
+    current_eval_timing_.swept_voxel_build_ms = wallMs(swept_begin);
     last_swept_voxel_query_count_ = swept_voxels.size();
     if (swept_voxels.empty())
     {
+      finalize_total();
       publishNoTargetSummary("empty_swept_volume", trajectory_source, 0);
       return;
     }
 
     care_confidence_map::QueryConfidence confidence_srv;
+    const ros::WallTime confidence_begin = ros::WallTime::now();
     if (!queryConfidencePoints(swept_voxels, &confidence_srv))
     {
+      current_eval_timing_.confidence_query_ms = wallMs(confidence_begin);
+      finalize_total();
       ROS_WARN_THROTTLE(
           2.0,
           "[trajectory_vbc_temporal] swept-volume confidence query failed "
           "or returned invalid sizes");
       return;
     }
+    current_eval_timing_.confidence_query_ms = wallMs(confidence_begin);
 
+    const ros::WallTime candidate_filter_begin = ros::WallTime::now();
     std::map<CandidateKey, Candidate> candidate_map;
     for (std::size_t i = 0; i < swept_voxels.size(); ++i)
     {
@@ -1181,13 +1246,16 @@ private:
       }
     }
 
+    current_eval_timing_.candidate_filter_ms = wallMs(candidate_filter_begin);
     if (candidate_map.empty())
     {
+      finalize_total();
       publishNoTargetSummary(
           "no_low_confidence_sweep_candidates", trajectory_source, 0);
       return;
     }
 
+    const ros::WallTime sensor_fk_begin = ros::WallTime::now();
     std::vector<std::vector<care_confidence_map::FramePoseInBase>> sensor_poses(
         q_traj.size());
     for (std::size_t k = 0; k < q_traj.size(); ++k)
@@ -1197,10 +1265,14 @@ private:
       {
         ROS_WARN_STREAM_THROTTLE(
             2.0, "[trajectory_vbc_temporal] sensor FK failed: " << error_msg);
+        current_eval_timing_.sensor_fk_ms = wallMs(sensor_fk_begin);
+        finalize_total();
         return;
       }
     }
+    current_eval_timing_.sensor_fk_ms = wallMs(sensor_fk_begin);
 
+    const ros::WallTime visibility_begin = ros::WallTime::now();
     std::vector<Candidate> candidates;
     candidates.reserve(candidate_map.size());
     for (const auto& kv : candidate_map)
@@ -1220,10 +1292,14 @@ private:
       }
       candidates.push_back(c);
     }
+    current_eval_timing_.visibility_scan_ms = wallMs(visibility_begin);
 
+    const ros::WallTime cluster_begin = ros::WallTime::now();
     const std::vector<TemporalLayer> layers = buildTemporalLayers(candidates);
+    current_eval_timing_.cluster_ms = wallMs(cluster_begin);
     if (layers.empty())
     {
+      finalize_total();
       publishNoTargetSummary(
           "all_low_confidence_points_seen_before_deadline",
           trajectory_source,
@@ -1237,6 +1313,7 @@ private:
         chooseDiagnosticRepresentative(active_layer, candidates, &selection_reason);
     if (!representative)
     {
+      finalize_total();
       publishNoTargetSummary(
           "active_layer_has_no_representative",
           trajectory_source,
@@ -1249,6 +1326,7 @@ private:
 
     ros::Time epoch = traj.header.stamp;
     if (epoch.isZero()) epoch = ros::Time::now();
+    finalize_total();
     publishSelected(
         *representative,
         active_layer,
@@ -1290,7 +1368,14 @@ private:
           prefer_predicted_trajectory_;
     }
     if (evaluate_now)
+    {
       evaluate(*msg, "predicted", "predicted_callback");
+      std::lock_guard<std::mutex> lock(mutex_);
+      ros::Time stamp = msg->header.stamp;
+      if (stamp.isZero()) stamp = ros::Time::now();
+      last_event_evaluated_predicted_stamp_ns_ = stampToNs(stamp);
+      last_predicted_full_eval_wall_ = ros::WallTime::now();
+    }
   }
 
   void rediscoveryTrajectoryCallback(
@@ -1358,7 +1443,9 @@ private:
   {
     trajectory_msgs::JointTrajectory traj;
     std::string source = "bootstrap";
+    bool count_predicted_refresh = false;
     const ros::Time now = ros::Time::now();
+    const ros::WallTime wall_now = ros::WallTime::now();
     {
       std::lock_guard<std::mutex> lock(mutex_);
 
@@ -1403,6 +1490,29 @@ private:
         {
           traj = latest_predicted_traj_;
           source = "predicted";
+
+          if (event_driven_eval_)
+          {
+            ros::Time stamp = traj.header.stamp;
+            const unsigned long long stamp_ns =
+                stamp.isZero() ? 0ULL : stampToNs(stamp);
+            const double refresh_period_s =
+                1.0 / std::max(0.1, predicted_periodic_refresh_rate_);
+            const double since_full_eval_s =
+                last_predicted_full_eval_wall_.toSec() > 0.0
+                    ? (wall_now - last_predicted_full_eval_wall_).toSec()
+                    : std::numeric_limits<double>::infinity();
+
+            if (stamp_ns != 0ULL &&
+                stamp_ns == last_event_evaluated_predicted_stamp_ns_ &&
+                since_full_eval_s >= 0.0 &&
+                since_full_eval_s < refresh_period_s)
+            {
+              ++predicted_periodic_skip_count_;
+              return;
+            }
+            count_predicted_refresh = true;
+          }
         }
         else if (has_traj_)
         {
@@ -1420,6 +1530,12 @@ private:
       }
     }
     evaluate(traj, source, "timer");
+    if (count_predicted_refresh)
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      ++predicted_periodic_refresh_count_;
+      last_predicted_full_eval_wall_ = ros::WallTime::now();
+    }
   }
 
   void printSummary() const
@@ -1431,6 +1547,10 @@ private:
     ROS_INFO_STREAM("event-driven evaluation: "
                     << static_cast<int>(event_driven_eval_)
                     << " (periodic timer retained as fallback)");
+    ROS_INFO_STREAM(
+        "predicted periodic full-refresh rate: "
+        << predicted_periodic_refresh_rate_
+        << " Hz when event-driven evaluation is enabled");
     ROS_INFO_STREAM("bootstrap trajectory: " << input_trajectory_topic_);
     ROS_INFO_STREAM("predicted trajectory: " << predicted_trajectory_topic_);
     ROS_INFO_STREAM("rediscovery trajectory: "
@@ -1498,6 +1618,7 @@ private:
   bool prefer_predicted_trajectory_ = false;
   bool event_driven_eval_ = false;
   double eval_rate_ = 20.0;
+  double predicted_periodic_refresh_rate_ = 5.0;
   int max_eval_timesteps_ = 50;
   double query_timeout_ = 0.10;
   double fallback_dt_ = 0.05;
@@ -1516,6 +1637,11 @@ private:
   std::size_t last_swept_voxel_query_count_ = 0;
   unsigned long long current_eval_stamp_ns_ = 0;
   std::string current_eval_trigger_ = "startup";
+  EvalTiming current_eval_timing_;
+  unsigned long long last_event_evaluated_predicted_stamp_ns_ = 0;
+  ros::WallTime last_predicted_full_eval_wall_;
+  unsigned long long predicted_periodic_skip_count_ = 0;
+  unsigned long long predicted_periodic_refresh_count_ = 0;
   double min_margin_s_ = 0.30;
   int temporal_layer_mpc_steps_ = 2;
   double region_max_diameter_m_ = 0.12;
