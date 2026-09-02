@@ -435,7 +435,7 @@ class C44VerifiedRegimeManager:
             self, origin, force_bootstrap=True):
         """Fail closed in PROBE until a real visibility obligation exists.
 
-        Numerical task-QP failures need task-bootstrap VBC rediscovery.
+        Numerical task-QP failures need same-SCP-trajectory VBC rediscovery.
         Exact-VBC rejection already carries a VBC active set, while final-GCDF
         rejection now exports the exact low-confidence voxels from the rejected
         executable trajectory.  Those latter two paths must not replace their
@@ -484,7 +484,10 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
-        if f.get("trajectory_source") != "bootstrap":
+        # C5.30: solver-failure rediscovery is valid only on the latest
+        # Sparse-SCP query trajectory: the same trajectory that generated the
+        # local-GCDF batch. Task-bootstrap verdicts are not comparable here.
+        if f.get("trajectory_source") != "scp_rediscovery":
             return
         has_violation = _as_bool(f.get("has_violation"))
         if has_violation is None:
@@ -504,9 +507,9 @@ class C44VerifiedRegimeManager:
                     "probe_blocker_confirmed_wait_visibility_waypoint")
                 return
 
-            # A fresh bootstrap VBC SAFE verdict means the task solver failure
-            # was not evidence for active sensing. Stay in PROBE, stop forcing
-            # bootstrap, and request a numerical replanning attempt.
+            # A fresh SAME-SCP-trajectory VBC SAFE verdict means this solver
+            # failure is not attributable to a low-confidence swept volume on
+            # the exact GCDF linearization. Stay in PROBE and replan.
             self.blocker_rediscovery_vbc_safe_count += 1
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
