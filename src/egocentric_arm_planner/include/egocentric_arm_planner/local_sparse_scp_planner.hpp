@@ -187,6 +187,15 @@ private:
   unsigned long long last_repair_completed_execution_stamp_ns_ = 0;
   unsigned long long repair_completion_replan_count_ = 0;
   unsigned long long repair_completion_duplicate_count_ = 0;
+  // C5.33 NORMAL liveness/reference refresh. The first NORMAL plan after
+  // PROBE waits for a fresh measured-state /task_trajectory; subsequent
+  // certified executions replan exactly once per execution stamp.
+  unsigned long long last_normal_completed_execution_stamp_ns_ = 0;
+  unsigned long long normal_completion_replan_count_ = 0;
+  unsigned long long normal_completion_duplicate_count_ = 0;
+  unsigned long long normal_reference_refresh_count_ = 0;
+  unsigned long long normal_refresh_blocked_replan_count_ = 0;
+  bool normal_reference_refresh_pending_ = false;
 
   bool has_joint_state_ = false;
   bool has_reference_ = false;
