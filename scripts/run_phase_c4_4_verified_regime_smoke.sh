@@ -64,6 +64,8 @@ PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC:-/care_pl
 # C5.4 leaves this disabled and verifies the complete optimized trajectory.
 REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-${C4_REPAIR_PREFIX_VERIFY:-0}}"
 REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-${C4_REPAIR_PREFIX_S:-0.15}}"
+PROBE_PREFIX_S="${PROBE_PREFIX_S:-0.15}"
+SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-false}"
 REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-${C4_REPAIR_BRAKE_DT_S:-0.05}}"
 REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
@@ -235,6 +237,8 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   local_scp_proximity_margin:="${LOCAL_SCP_PROXIMITY_MARGIN}" \
   repair_prefix_verification_enabled:="${REPAIR_PREFIX_VERIFY}" \
   repair_execution_prefix_s:="${REPAIR_PREFIX_S}" \
+  probe_execution_prefix_s:="${PROBE_PREFIX_S}" \
+  smooth_handoff_enabled:="${SMOOTH_HANDOFF_ENABLED}" \
   repair_brake_dt_s:="${REPAIR_BRAKE_DT_S}" \
   repair_hold_s:="${REPAIR_HOLD_S}" \
   candidate_unsafe_required:="${CANDIDATE_UNSAFE_REQUIRED}" \
