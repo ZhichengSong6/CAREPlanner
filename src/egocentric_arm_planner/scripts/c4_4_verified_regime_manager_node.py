@@ -136,6 +136,9 @@ class C44VerifiedRegimeManager:
         self.force_vbc_bootstrap_topic = str(rospy.get_param(
             "~force_vbc_bootstrap_topic",
             "/care_planner/trajectory_risk/force_bootstrap"))
+        self.normal_task_replan_topic = str(rospy.get_param(
+            "~normal_task_replan_topic",
+            "/care_planner/local_planner/normal_task_replan_request"))
 
         self.state = self.NORMAL
         self.execution_ready = False
@@ -198,6 +201,7 @@ class C44VerifiedRegimeManager:
         self.repair_entry_count = 0
         self.probe_entry_count = 0
         self.normal_entry_count = 0
+        self.normal_task_replan_count = 0
         self.probe_failure_count = 0
         self.candidate_repair_entry_count = 0
         self.gcdf_repair_entry_count = 0
@@ -247,6 +251,8 @@ class C44VerifiedRegimeManager:
             self.replan_request_topic, Bool, queue_size=10, latch=False)
         self.force_vbc_bootstrap_pub = rospy.Publisher(
             self.force_vbc_bootstrap_topic, Bool, queue_size=1, latch=True)
+        self.normal_task_replan_pub = rospy.Publisher(
+            self.normal_task_replan_topic, Bool, queue_size=10, latch=False)
 
         rospy.Subscriber(
             self.candidate_outcome_topic, String, self._candidate_outcome_cb,
@@ -364,6 +370,15 @@ class C44VerifiedRegimeManager:
             self.pending_probe_execution_stamp_ns = 0
             self.clear_until = None
             self.probe_ignore_until = None
+
+            # C5.33: after active-sensing detours, the original one-shot
+            # /task_trajectory time axis is stale. Regenerate the same EE task
+            # from the current measured state before NORMAL planning resumes.
+            # This refreshes only the task reference; it does not restore the
+            # legacy RECOVERY_HOLD / replan-ready controller handshake.
+            if old == self.PROBE_NORMAL and self.execution_ready:
+                self.normal_task_replan_count += 1
+                self.normal_task_replan_pub.publish(Bool(data=True))
 
         rospy.logwarn(
             "[c4_regime] %s -> %s reason=%s repair_entries=%d probe_entries=%d",
@@ -1072,6 +1087,8 @@ class C44VerifiedRegimeManager:
                 "last_tracker_complete_stamp_ns={}".format(
                     self.last_tracker_complete_stamp_ns),
                 "normal_entry_count={}".format(self.normal_entry_count),
+                "normal_task_replan_count={}".format(
+                    self.normal_task_replan_count),
                 "commit_count={}".format(self.last_commit_count),
                 "repair_safe_commit_count={}".format(self.repair_safe_commit_count),
                 "repair_completion_gate_enabled={}".format(
