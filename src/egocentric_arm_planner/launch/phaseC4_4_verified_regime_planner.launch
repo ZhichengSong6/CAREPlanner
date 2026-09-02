@@ -543,6 +543,7 @@
       <arg name="prefer_predicted_trajectory" value="true" />
       <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
       <arg name="event_driven_eval" value="true" />
+      <arg name="predicted_periodic_refresh_rate" value="5.0" />
       <arg name="rediscovery_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
       <arg name="rediscovery_trajectory_timeout" value="1.0" />
       <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
