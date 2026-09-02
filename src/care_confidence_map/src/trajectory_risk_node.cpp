@@ -180,11 +180,14 @@ public:
               forbidden_space_pair_topic_, 1, false);
     }
 
-    eval_timer_ =
-        nh_.createTimer(
-            ros::Duration(1.0 / std::max(0.1, eval_rate_)),
-            &TrajectoryRiskNode::evalTimerCallback,
-            this);
+    if (!event_driven_eval_)
+    {
+      eval_timer_ =
+          nh_.createTimer(
+              ros::Duration(1.0 / std::max(0.1, eval_rate_)),
+              &TrajectoryRiskNode::evalTimerCallback,
+              this);
+    }
 
     printSummary();
     return true;
@@ -414,6 +417,11 @@ private:
         "trajectory_risk/eval_rate",
         eval_rate_,
         20.0);
+
+    pnh_.param(
+        "trajectory_risk/event_driven_eval",
+        event_driven_eval_,
+        false);
 
     pnh_.param(
         "trajectory_risk/max_eval_timesteps",
@@ -2982,11 +2990,26 @@ private:
   void trajectoryCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg)
   {
-    std::lock_guard<std::mutex> lock(latest_traj_mutex_);
+    if (!msg || msg->points.empty())
+    {
+      return;
+    }
 
-    latest_traj_ = *msg;
-    latest_traj_receive_time_ = ros::Time::now();
-    has_latest_traj_ = true;
+    {
+      std::lock_guard<std::mutex> lock(latest_traj_mutex_);
+      latest_traj_ = *msg;
+      latest_traj_receive_time_ = ros::Time::now();
+      has_latest_traj_ = true;
+    }
+
+    // C5.31: local/final GCDF geometry exports are latency-sensitive. When
+    // enabled, evaluate immediately on a fresh trajectory instead of waiting
+    // for the next periodic timer tick. The periodic path remains the default
+    // for legacy/main risk diagnostics.
+    if (event_driven_eval_)
+    {
+      evalTimerCallback(ros::TimerEvent());
+    }
   }
 
   void evalTimerCallback(const ros::TimerEvent&)
@@ -3168,6 +3191,7 @@ private:
     ROS_INFO_STREAM("refresh_body_prior_timeout: "
                     << refresh_body_prior_timeout_);
     ROS_INFO_STREAM("eval_rate: " << eval_rate_);
+    ROS_INFO_STREAM("event_driven_eval: " << event_driven_eval_);
     ROS_INFO_STREAM("max_eval_timesteps: " << max_eval_timesteps_);
     ROS_INFO_STREAM("query_timeout: " << query_timeout_);
     ROS_INFO_STREAM("marker_publish_rate: " << marker_publish_rate_);
@@ -3313,6 +3337,7 @@ private:
   std::vector<std::string> ignored_risk_links_;
 
   bool refresh_body_prior_before_query_ = true;
+  bool event_driven_eval_ = false;
   bool forbidden_space_pair_publish_enabled_ = false;
   bool show_full_trajectory_markers_ = false;
   bool show_worst_timestep_markers_ = true;
