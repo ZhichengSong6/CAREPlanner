@@ -1126,6 +1126,11 @@ class OptimizedTrajectoryContinuityNode:
             "probe_rebase_target_shift_inf={} probe_rebase_shift_inf={} "
             "probe_rebase_residual_inf={} "
             "probe_rebase_joint_state_age_ms={} "
+            "handoff_rebase_enabled={} handoff_rebase_applied={} "
+            "handoff_rebase_clamped={} "
+            "handoff_rebase_target_shift_inf={} handoff_rebase_shift_inf={} "
+            "handoff_rebase_residual_inf={} "
+            "handoff_rebase_joint_state_age_ms={} "
             "probe_speed_max_before={} probe_speed_max_after={} "
             "probe_time_scale={} probe_time_scale_clamped={} "
             "probe_effective_prefix_s={} "
@@ -1156,6 +1161,13 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "probe_rebase_shift_inf"),
             self._diag_value(diag, "probe_rebase_residual_inf"),
             self._diag_value(diag, "probe_rebase_joint_state_age_ms"),
+            self._diag_value(diag, "handoff_rebase_enabled"),
+            self._diag_value(diag, "handoff_rebase_applied"),
+            self._diag_value(diag, "handoff_rebase_clamped"),
+            self._diag_value(diag, "handoff_rebase_target_shift_inf"),
+            self._diag_value(diag, "handoff_rebase_shift_inf"),
+            self._diag_value(diag, "handoff_rebase_residual_inf"),
+            self._diag_value(diag, "handoff_rebase_joint_state_age_ms"),
             self._diag_value(diag, "probe_speed_max_before"),
             self._diag_value(diag, "probe_speed_max_after"),
             self._diag_value(diag, "probe_time_scale"),
