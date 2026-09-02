@@ -2069,6 +2069,10 @@ void LocalSparseSCPPlanner::publishSummary(
   unsigned long long normal_reference_refresh_count = 0;
   unsigned long long normal_refresh_blocked_replan_count = 0;
   bool normal_reference_refresh_pending = false;
+  unsigned long long smooth_handoff_replan_count = 0;
+  unsigned long long smooth_handoff_replan_suppressed_probe_count = 0;
+  unsigned long long smooth_handoff_replan_suppressed_busy_count = 0;
+  unsigned long long stale_mode_candidate_discard_count = 0;
   double last_cdf_roundtrip_ms = 0.0;
   double plan_cdf_roundtrip_sum_ms = 0.0;
   double plan_cdf_roundtrip_max_ms = 0.0;
@@ -2112,6 +2116,13 @@ void LocalSparseSCPPlanner::publishSummary(
         normal_refresh_blocked_replan_count_;
     normal_reference_refresh_pending =
         normal_reference_refresh_pending_;
+    smooth_handoff_replan_count = smooth_handoff_replan_count_;
+    smooth_handoff_replan_suppressed_probe_count =
+        smooth_handoff_replan_suppressed_probe_count_;
+    smooth_handoff_replan_suppressed_busy_count =
+        smooth_handoff_replan_suppressed_busy_count_;
+    stale_mode_candidate_discard_count =
+        stale_mode_candidate_discard_count_;
     last_cdf_roundtrip_ms = last_cdf_roundtrip_ms_;
     plan_cdf_roundtrip_sum_ms = plan_cdf_roundtrip_sum_ms_;
     plan_cdf_roundtrip_max_ms = plan_cdf_roundtrip_max_ms_;
@@ -2163,6 +2174,15 @@ void LocalSparseSCPPlanner::publishSummary(
       << normal_reference_refresh_count
       << " normal_refresh_blocked_replan_count="
       << normal_refresh_blocked_replan_count
+      << " smooth_handoff_replan_count="
+      << smooth_handoff_replan_count
+      << " smooth_handoff_replan_suppressed_probe_count="
+      << smooth_handoff_replan_suppressed_probe_count
+      << " smooth_handoff_replan_suppressed_busy_count="
+      << smooth_handoff_replan_suppressed_busy_count
+      << " stale_mode_candidate_discard_count="
+      << stale_mode_candidate_discard_count
+      << " handoff_velocity_weight=" << handoff_velocity_weight_
       << " batches=" << batches
       << " cdf_roundtrip_ms=" << last_cdf_roundtrip_ms
       << " cdf_roundtrip_count=" << plan_cdf_roundtrip_count
