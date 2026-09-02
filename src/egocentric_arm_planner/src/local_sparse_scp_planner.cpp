@@ -554,6 +554,16 @@ void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
       return;
     }
 
+    const double roundtrip_ms =
+        current_query_wall_.toSec() > 0.0
+            ? (ros::WallTime::now() - current_query_wall_).toSec() * 1000.0
+            : 0.0;
+    last_cdf_roundtrip_ms_ = roundtrip_ms;
+    plan_cdf_roundtrip_sum_ms_ += roundtrip_ms;
+    plan_cdf_roundtrip_max_ms_ =
+        std::max(plan_cdf_roundtrip_max_ms_, roundtrip_ms);
+    ++plan_cdf_roundtrip_count_;
+
     pending_batch_ = msg;
     waiting_for_cdf_ = false;
     accepted = true;
@@ -897,17 +907,13 @@ bool LocalSparseSCPPlanner::startPlan() {
             ? "base_link"
             : reference.header.frame_id;
     current_plan_start_wall_ = ros::WallTime::now();
+    last_cdf_roundtrip_ms_ = 0.0;
+    plan_cdf_roundtrip_sum_ms_ = 0.0;
+    plan_cdf_roundtrip_max_ms_ = 0.0;
+    plan_cdf_roundtrip_count_ = 0;
   }
 
-  const ros::Time stamp =
-      publishQueryTrajectory(q_init, u_init, current_frame_id_);
-
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    current_query_stamp_ = stamp;
-    current_query_wall_ = ros::WallTime::now();
-    waiting_for_cdf_ = true;
-  }
+  publishQueryTrajectory(q_init, u_init, current_frame_id_);
 
   ROS_INFO_STREAM(
       "[LocalSparseSCPPlanner] plan " << plan_sequence_
@@ -1197,14 +1203,7 @@ void LocalSparseSCPPlanner::workerLoop() {
             "applied; soft iterate is internal only, fresh GCDF + hard solve "
             "required before candidate publication");
 
-        const ros::Time stamp =
-            publishQueryTrajectory(q_next, u_next, frame);
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (plan_running_) {
-          current_query_stamp_ = stamp;
-          current_query_wall_ = ros::WallTime::now();
-          waiting_for_cdf_ = true;
-        }
+        publishQueryTrajectory(q_next, u_next, frame);
         continue;
       }
 
@@ -1242,14 +1241,7 @@ void LocalSparseSCPPlanner::workerLoop() {
     }
 
     if (publish_next_query) {
-      const ros::Time stamp =
-          publishQueryTrajectory(q_next, u_next, frame);
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (plan_running_) {
-        current_query_stamp_ = stamp;
-        current_query_wall_ = ros::WallTime::now();
-        waiting_for_cdf_ = true;
-      }
+      publishQueryTrajectory(q_next, u_next, frame);
     }
 
     (void)iteration;
@@ -1799,8 +1791,23 @@ ros::Time LocalSparseSCPPlanner::publishQueryTrajectory(
     const Eigen::MatrixXd& u,
     const std::string& frame_id) {
   const ros::Time stamp = ros::Time::now();
-  query_trajectory_pub_.publish(
-      makeTrajectoryMessage(q, u, frame_id, stamp));
+  bool armed = false;
+  {
+    // C5.31: arm the expected stamp BEFORE publishing. In the event-driven
+    // GCDF path a batch can return within a few milliseconds; publishing first
+    // creates a race where the callback sees waiting_for_cdf_=false.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (plan_running_) {
+      current_query_stamp_ = stamp;
+      current_query_wall_ = ros::WallTime::now();
+      waiting_for_cdf_ = true;
+      armed = true;
+    }
+  }
+  if (armed) {
+    query_trajectory_pub_.publish(
+        makeTrajectoryMessage(q, u, frame_id, stamp));
+  }
   return stamp;
 }
 
@@ -1832,6 +1839,10 @@ void LocalSparseSCPPlanner::publishSummary(
   unsigned long long probe_restore_total = 0;
   unsigned long long probe_restore_hard_success_total = 0;
   double active_slack_weight = 0.0;
+  double last_cdf_roundtrip_ms = 0.0;
+  double plan_cdf_roundtrip_sum_ms = 0.0;
+  double plan_cdf_roundtrip_max_ms = 0.0;
+  int plan_cdf_roundtrip_count = 0;
   std::string init_mode = "unknown";
 
   {
@@ -1853,6 +1864,10 @@ void LocalSparseSCPPlanner::publishSummary(
     probe_restore_hard_success_total =
         probe_feasibility_restore_success_count_;
     active_slack_weight = plan_cdf_slack_linear_weight_;
+    last_cdf_roundtrip_ms = last_cdf_roundtrip_ms_;
+    plan_cdf_roundtrip_sum_ms = plan_cdf_roundtrip_sum_ms_;
+    plan_cdf_roundtrip_max_ms = plan_cdf_roundtrip_max_ms_;
+    plan_cdf_roundtrip_count = plan_cdf_roundtrip_count_;
     init_mode = plan_initialization_mode_;
   }
 
@@ -1882,6 +1897,14 @@ void LocalSparseSCPPlanner::publishSummary(
       << " trust_q_inf=" << trust
       << " slack_mu=" << active_slack_weight
       << " batches=" << batches
+      << " cdf_roundtrip_ms=" << last_cdf_roundtrip_ms
+      << " cdf_roundtrip_count=" << plan_cdf_roundtrip_count
+      << " cdf_roundtrip_mean_ms="
+      << (plan_cdf_roundtrip_count > 0
+              ? plan_cdf_roundtrip_sum_ms /
+                    static_cast<double>(plan_cdf_roundtrip_count)
+              : 0.0)
+      << " cdf_roundtrip_max_ms=" << plan_cdf_roundtrip_max_ms
       << " stamp_miss=" << misses
       << " solves=" << solves
       << " solve_failures=" << failures;
