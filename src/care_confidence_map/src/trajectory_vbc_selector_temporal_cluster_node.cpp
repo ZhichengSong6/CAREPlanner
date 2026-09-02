@@ -241,6 +241,9 @@ private:
 
     pnh_.param("trajectory_vbc/enabled", enabled_, true);
     pnh_.param("trajectory_vbc/eval_rate", eval_rate_, 20.0);
+    pnh_.param(
+        "trajectory_vbc/event_driven_eval",
+        event_driven_eval_, false);
     pnh_.param("trajectory_vbc/max_eval_timesteps", max_eval_timesteps_, 50);
     pnh_.param("trajectory_vbc/query_timeout", query_timeout_, 0.10);
     pnh_.param("trajectory_vbc/fallback_dt", fallback_dt_, 0.05);
@@ -905,6 +908,8 @@ private:
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=" << reason
         << " trajectory_source=" << trajectory_source
+        << " trajectory_stamp_ns=" << current_eval_stamp_ns_
+        << " evaluation_trigger=" << current_eval_trigger_
         << " candidate_count=" << candidate_count
         << " primary_count=0 secondary_count=" << candidate_count
         << " primary_violation_count=0 secondary_violation_count=0"
@@ -1005,6 +1010,8 @@ private:
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=selected_temporal_cluster"
         << " trajectory_source=" << trajectory_source
+        << " trajectory_stamp_ns=" << current_eval_stamp_ns_
+        << " evaluation_trigger=" << current_eval_trigger_
         << " candidate_count=" << candidates.size()
         << " primary_count=" << active_count
         << " secondary_count="
@@ -1069,10 +1076,22 @@ private:
             << " source=" << trajectory_source);
   }
 
+  static unsigned long long stampToNs(const ros::Time& stamp)
+  {
+    return static_cast<unsigned long long>(stamp.sec) * 1000000000ULL +
+           static_cast<unsigned long long>(stamp.nsec);
+  }
+
   void evaluate(
       const trajectory_msgs::JointTrajectory& traj,
-      const std::string& trajectory_source)
+      const std::string& trajectory_source,
+      const std::string& evaluation_trigger = "timer")
   {
+    ros::Time identity_stamp = traj.header.stamp;
+    if (identity_stamp.isZero()) identity_stamp = ros::Time::now();
+    current_eval_stamp_ns_ = stampToNs(identity_stamp);
+    current_eval_trigger_ = evaluation_trigger;
+
     if (!enabled_)
     {
       publishNoTargetSummary("disabled", trajectory_source, 0);
@@ -1243,43 +1262,96 @@ private:
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg)
   {
     if (!msg || msg->points.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_traj_ = *msg;
-    has_traj_ = true;
+    bool evaluate_now = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_traj_ = *msg;
+      has_traj_ = true;
+      evaluate_now =
+          event_driven_eval_ && !force_bootstrap_ &&
+          !prefer_predicted_trajectory_;
+    }
+    if (evaluate_now)
+      evaluate(*msg, "bootstrap", "bootstrap_callback");
   }
 
   void predictedTrajectoryCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg)
   {
     if (!msg || msg->points.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_predicted_traj_ = *msg;
-    predicted_traj_received_ = ros::Time::now();
-    has_predicted_traj_ = true;
+    bool evaluate_now = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_predicted_traj_ = *msg;
+      predicted_traj_received_ = ros::Time::now();
+      has_predicted_traj_ = true;
+      evaluate_now =
+          event_driven_eval_ && !force_bootstrap_ &&
+          prefer_predicted_trajectory_;
+    }
+    if (evaluate_now)
+      evaluate(*msg, "predicted", "predicted_callback");
   }
 
   void rediscoveryTrajectoryCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg)
   {
     if (!msg || msg->points.empty()) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    latest_rediscovery_traj_ = *msg;
-    rediscovery_traj_received_ = ros::Time::now();
-    has_rediscovery_traj_ = true;
+    bool evaluate_now = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_rediscovery_traj_ = *msg;
+      rediscovery_traj_received_ = ros::Time::now();
+      has_rediscovery_traj_ = true;
+      evaluate_now =
+          event_driven_eval_ && force_bootstrap_ &&
+          !rediscovery_trajectory_topic_.empty();
+    }
+    if (evaluate_now)
+      evaluate(*msg, "scp_rediscovery", "rediscovery_callback");
   }
 
   void forceBootstrapCallback(const std_msgs::BoolConstPtr& msg)
   {
     if (!msg) return;
-    std::lock_guard<std::mutex> lock(mutex_);
-    const bool changed = force_bootstrap_ != msg->data;
-    force_bootstrap_ = msg->data;
+
+    bool changed = false;
+    bool evaluate_rediscovery_now = false;
+    trajectory_msgs::JointTrajectory rediscovery_traj;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      changed = force_bootstrap_ != msg->data;
+      force_bootstrap_ = msg->data;
+
+      if (event_driven_eval_ && force_bootstrap_ &&
+          !rediscovery_trajectory_topic_.empty() &&
+          has_rediscovery_traj_)
+      {
+        const double age_s =
+            (ros::Time::now() - rediscovery_traj_received_).toSec();
+        if (age_s >= 0.0 &&
+            age_s <= rediscovery_trajectory_timeout_)
+        {
+          rediscovery_traj = latest_rediscovery_traj_;
+          evaluate_rediscovery_now = true;
+        }
+      }
+    }
+
     if (changed)
     {
       ROS_INFO_STREAM(
           "[trajectory_vbc_temporal] force_bootstrap="
-          << static_cast<int>(force_bootstrap_));
+          << static_cast<int>(msg->data));
     }
+
+    // C5.34: a solver failure usually toggles force_bootstrap after the SCP
+    // query trajectory was already cached. Evaluate that fresh same-SCP
+    // trajectory immediately instead of waiting one 20-Hz timer period.
+    if (evaluate_rediscovery_now)
+      evaluate(
+          rediscovery_traj, "scp_rediscovery",
+          "force_bootstrap_callback");
   }
 
   void timerCallback(const ros::TimerEvent&)
@@ -1347,7 +1419,7 @@ private:
         }
       }
     }
-    evaluate(traj, source);
+    evaluate(traj, source, "timer");
   }
 
   void printSummary() const
@@ -1356,6 +1428,9 @@ private:
     ROS_INFO_STREAM(
         "========== trajectory_vbc_selector: bounded temporal clusters ==========");
     ROS_INFO_STREAM("enabled: " << enabled_);
+    ROS_INFO_STREAM("event-driven evaluation: "
+                    << static_cast<int>(event_driven_eval_)
+                    << " (periodic timer retained as fallback)");
     ROS_INFO_STREAM("bootstrap trajectory: " << input_trajectory_topic_);
     ROS_INFO_STREAM("predicted trajectory: " << predicted_trajectory_topic_);
     ROS_INFO_STREAM("rediscovery trajectory: "
@@ -1421,6 +1496,7 @@ private:
 
   bool enabled_ = true;
   bool prefer_predicted_trajectory_ = false;
+  bool event_driven_eval_ = false;
   double eval_rate_ = 20.0;
   int max_eval_timesteps_ = 50;
   double query_timeout_ = 0.10;
@@ -1438,6 +1514,8 @@ private:
   double map_z_min_ = 0.0;
   double map_z_max_ = 1.15;
   std::size_t last_swept_voxel_query_count_ = 0;
+  unsigned long long current_eval_stamp_ns_ = 0;
+  std::string current_eval_trigger_ = "startup";
   double min_margin_s_ = 0.30;
   int temporal_layer_mpc_steps_ = 2;
   double region_max_diameter_m_ = 0.12;
