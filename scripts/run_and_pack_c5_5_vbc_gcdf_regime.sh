@@ -31,7 +31,12 @@ export INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-0.20}"
 # PROBE is single-flight: another task candidate cannot replace the currently
 # verified/executing probe prefix. NORMAL remains full-horizon GCDF/VBC.
 export REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-1}"
-export REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.15}"
+# Smooth certified handoff: REPAIR gets enough useful-motion horizon for the
+# next plan+GCDF+VBC to finish before its fallback brake tail. PROBE retains
+# the frozen shorter single-flight semantics.
+export REPAIR_PREFIX_S="${REPAIR_PREFIX_S:-0.25}"
+export PROBE_PREFIX_S="${PROBE_PREFIX_S:-0.15}"
+export SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-true}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 
@@ -54,6 +59,8 @@ echo "[C5.9] EXECUTION VBC: elapsed suffixes use a separate audit-only topic; tr
 echo "[C5.9] PROBE success: tracker complete=1 with matching committed header.stamp token"
 echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
+echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
+echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
 echo "[C5.5] NORMAL exact-VBC view: full horizon"
 echo "[C5.5] config: ${CONFIG_FILE}"
 echo "[C5.5] startup gate wait is fail-fast (~25 s worst case)"
