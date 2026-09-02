@@ -71,6 +71,7 @@ private:
   void recoveryCallback(const std_msgs::BoolConstPtr& msg);
   void probeActiveCallback(const std_msgs::BoolConstPtr& msg);
   void replanRequestCallback(const std_msgs::BoolConstPtr& msg);
+  void smoothReplanRequestCallback(const std_msgs::BoolConstPtr& msg);
   void executedCommandCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void executionSummaryCallback(const std_msgs::StringConstPtr& msg);
@@ -155,6 +156,7 @@ private:
   ros::Subscriber recovery_sub_;
   ros::Subscriber probe_active_sub_;
   ros::Subscriber replan_request_sub_;
+  ros::Subscriber smooth_replan_request_sub_;
   ros::Subscriber executed_command_sub_;
   ros::Subscriber execution_summary_sub_;
   ros::Subscriber cdf_batch_sub_;
@@ -196,6 +198,15 @@ private:
   unsigned long long normal_reference_refresh_count_ = 0;
   unsigned long long normal_refresh_blocked_replan_count_ = 0;
   bool normal_reference_refresh_pending_ = false;
+
+  // Smooth handoff requests are advisory and mode-aware. PROBE remains owned
+  // by the verified single-flight state machine.
+  unsigned long long smooth_handoff_replan_count_ = 0;
+  unsigned long long smooth_handoff_replan_suppressed_probe_count_ = 0;
+  unsigned long long smooth_handoff_replan_suppressed_busy_count_ = 0;
+  unsigned long long mode_epoch_ = 0;
+  unsigned long long plan_mode_epoch_ = 0;
+  unsigned long long stale_mode_candidate_discard_count_ = 0;
 
   bool has_joint_state_ = false;
   bool has_reference_ = false;
@@ -272,6 +283,10 @@ private:
   // ||u-u_ref||^2 objective; false gives the GCDF-style ||u||^2 control cost.
   bool u_reference_tracking_enabled_ = true;
   double u_smooth_weight_ = 1.0;
+  // Separate boundary-only penalty for certified trajectory replacement:
+  // ||u0-u_executed||^2. This remains active even when intra-horizon
+  // u_smooth_weight is zero.
+  double handoff_velocity_weight_ = 0.0;
   // CARE execution normally enforces hard acceleration and terminal-braking
   // rows. G0 disables them to match the GCDF formulation more closely.
   bool enforce_acceleration_constraints_ = true;
@@ -344,6 +359,8 @@ private:
       "/care_planner/c4_4/probe_active";
   std::string replan_request_topic_ =
       "/care_planner/local_planner/replan_request";
+  std::string smooth_replan_request_topic_ =
+      "/care_planner/local_planner/smooth_handoff_replan_request";
   std::string executed_command_topic_ =
       "/care_arm/arm_group_velocity_controller/command";
   std::string execution_summary_topic_ =
