@@ -73,6 +73,8 @@
        default="/care_planner/local_planner/summary" />
   <arg name="local_scp_replan_request_topic"
        default="/care_planner/local_planner/replan_request" />
+  <arg name="normal_task_replan_topic"
+       default="/care_planner/local_planner/normal_task_replan_request" />
   <arg name="local_scp_body_anchor_topic"
        default="/care_planner/local_planner/body_sweep_anchors" />
   <arg name="local_scp_cdf_batch_topic"
@@ -273,6 +275,8 @@
            value="$(arg probe_single_flight_summary_topic)" />
     <param name="replan_request_topic"
            value="$(arg local_scp_replan_request_topic)" />
+    <param name="normal_task_replan_topic"
+           value="$(arg normal_task_replan_topic)" />
     <param name="committed_trajectory_topic" value="$(arg committed_trajectory_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
     <param name="physical_deadline_topic" value="$(arg rolling_deadline_topic)" />
@@ -619,6 +623,8 @@
          but C4.4 planner-mode MPC never emits the complete/replan handshake. -->
     <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
     <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="normal_task_replan_topic"
+           value="$(arg normal_task_replan_topic)" />
     <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
     <param name="execution_start_topic" value="$(arg execution_start_topic)" />
     <param name="require_initial_prior_ready" value="true" />
