@@ -539,6 +539,7 @@
       <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
       <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
       <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+      <arg name="swept_volume_margin_m" value="$(arg local_scp_proximity_margin)" />
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/trajectory_risk/vbc_active_set_points" />
@@ -570,6 +571,7 @@
       <arg name="candidate_active_topic" value="/care_planner/execution_vbc/audit_active_unused" />
       <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
       <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+      <arg name="swept_volume_margin_m" value="$(arg local_scp_proximity_margin)" />
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/execution_vbc/audit_active_set_unused" />
