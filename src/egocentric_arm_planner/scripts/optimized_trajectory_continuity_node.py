@@ -248,6 +248,11 @@ class OptimizedTrajectoryContinuityNode:
         self._continuation_count = 0
         self._execution_audit_publish_count = 0
         self._pending_replace_count = 0
+        # C5.36 safety admission diagnostics.
+        self._raw_immediate_dispatch_count = 0
+        self._raw_busy_buffer_count = 0
+        self._post_cert_pending_dispatch_count = 0
+        self._selector_fallback_dispatch_count = 0
         self._repair_prefix_build_count = 0
         self._repair_prefix_safe_count = 0
         self._repair_prefix_unsafe_count = 0
@@ -256,7 +261,7 @@ class OptimizedTrajectoryContinuityNode:
         self._probe_prefix_unsafe_count = 0
         self._last_repair_prefix_duration_s = math.nan
         self._last_repair_brake_duration_s = math.nan
-        self._last_source = "waiting_selector_cycle"
+        self._last_source = "waiting_raw_candidate"
         self._last_committed_age_s = math.nan
         self._last_verification_age_s = math.nan
         self._last_verification_seq = 0
@@ -803,23 +808,54 @@ class OptimizedTrajectoryContinuityNode:
     def _raw_cb(self, msg):
         if msg is None or not msg.points:
             return
+
         now = rospy.Time.now()
+        gcdf_to_publish = None
+        verification_to_publish = None
+
         with self._lock:
             if self._last_raw_received is not None:
                 gap = (now - self._last_raw_received).to_sec()
                 if gap >= 0.0:
                     self._last_input_gap_s = gap
                     self._max_input_gap_s = max(self._max_input_gap_s, gap)
+
             if self._pending_raw is not None:
                 self._pending_replace_count += 1
+
             self._pending_raw = copy.deepcopy(msg)
             self._pending_raw_received = now
             self._pending_repair = bool(self._repair_active)
             self._pending_probe = bool(self._probe_active)
             self._last_raw_received = now
             self._raw_input_count += 1
-            self._last_source = "raw_candidate_buffered_waiting_selector_cycle"
+
+            # C5.36: safety admission is event-driven. A new raw candidate does
+            # not need a background VBC selector cycle before it may enter the
+            # single-flight final-GCDF -> exact-VBC certification pipeline.
+            # If certification is busy, preserve the existing latest-only
+            # pending buffer; the newest candidate is dispatched immediately
+            # when the current certification terminates.
+            dispatched, route = self._dispatch_pending_locked(now)
+            if dispatched is not None:
+                self._raw_immediate_dispatch_count += 1
+                self._last_source = "raw_candidate_immediate_safety_dispatch"
+                if route == "gcdf":
+                    gcdf_to_publish = dispatched
+                elif route == "vbc":
+                    verification_to_publish = dispatched
+            else:
+                self._raw_busy_buffer_count += 1
+                self._last_source = "raw_candidate_buffered_safety_busy"
+
             self._publish_summary_locked()
+
+        # Never publish while holding the commit-gate mutex: final GCDF and
+        # event-driven exact VBC can answer quickly.
+        if gcdf_to_publish is not None:
+            self.final_gcdf_query_pub.publish(gcdf_to_publish)
+        if verification_to_publish is not None:
+            self.verification_pub.publish(verification_to_publish)
 
     def _dispatch_pending_locked(self, now):
         if (self._gcdf_outstanding is not None or
@@ -1281,6 +1317,8 @@ class OptimizedTrajectoryContinuityNode:
                     seq, "unsafe", False, age, view, safety_gate="gcdf",
                     diag=diag)
                 dispatched, route = self._dispatch_pending_locked(now)
+                if dispatched is not None:
+                    self._post_cert_pending_dispatch_count += 1
                 if route == "gcdf":
                     next_gcdf_to_publish = dispatched
                 elif route == "vbc":
@@ -1326,7 +1364,12 @@ class OptimizedTrajectoryContinuityNode:
             self._last_selector_cycle_time = now
 
             if self._outstanding is None or self._outstanding_sent is None:
+                # C5.36: this is now fallback-only. Normal admission happens
+                # directly in _raw_cb(), and completion paths dispatch pending
+                # latest-only work immediately.
                 dispatched, route = self._dispatch_pending_locked(now)
+                if dispatched is not None:
+                    self._selector_fallback_dispatch_count += 1
                 if route == "gcdf":
                     gcdf_to_publish = dispatched
                 elif route == "vbc":
@@ -1508,6 +1551,8 @@ class OptimizedTrajectoryContinuityNode:
                                 diag=diag)
 
                     dispatched, route = self._dispatch_pending_locked(now)
+                    if dispatched is not None:
+                        self._post_cert_pending_dispatch_count += 1
                     if route == "gcdf":
                         gcdf_to_publish = dispatched
                     elif route == "vbc":
@@ -1566,6 +1611,8 @@ class OptimizedTrajectoryContinuityNode:
                         seq, "timeout", False, gcdf_age, view,
                         safety_gate="gcdf")
                     dispatched, route = self._dispatch_pending_locked(now)
+                    if dispatched is not None:
+                        self._post_cert_pending_dispatch_count += 1
                     if route == "gcdf":
                         next_gcdf_to_publish = dispatched
                     elif route == "vbc":
@@ -1598,6 +1645,13 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_verification_view = view
                     timeout_event = self._make_verification_event(
                         seq, "timeout", False, age, view)
+                    dispatched, route = self._dispatch_pending_locked(now)
+                    if dispatched is not None:
+                        self._post_cert_pending_dispatch_count += 1
+                    if route == "gcdf":
+                        next_gcdf_to_publish = dispatched
+                    elif route == "vbc":
+                        next_verification_to_publish = dispatched
 
             if (self.execution_audit_enabled and
                     self._committed_master is not None and
@@ -1648,6 +1702,14 @@ class OptimizedTrajectoryContinuityNode:
             "raw_input_count={}".format(self._raw_input_count),
             "pending_candidate={}".format(int(self._pending_raw is not None)),
             "pending_replace_count={}".format(self._pending_replace_count),
+            "raw_immediate_dispatch_count={}".format(
+                self._raw_immediate_dispatch_count),
+            "raw_busy_buffer_count={}".format(
+                self._raw_busy_buffer_count),
+            "post_cert_pending_dispatch_count={}".format(
+                self._post_cert_pending_dispatch_count),
+            "selector_fallback_dispatch_count={}".format(
+                self._selector_fallback_dispatch_count),
             "selector_cycle_count={}".format(self._selector_cycle_count),
             "repair_active={}".format(int(self._repair_active)),
             "probe_active={}".format(int(self._probe_active)),
