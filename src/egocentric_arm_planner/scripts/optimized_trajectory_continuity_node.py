@@ -1853,6 +1853,12 @@ class OptimizedTrajectoryContinuityNode:
                 else "{:.6f}".format(self._last_final_gcdf_recovery_sweep_s)),
             "last_final_gcdf_recovery_point_count={}".format(
                 self._last_final_gcdf_recovery_point_count),
+            "final_gcdf_blocker_class={}".format(
+                self._last_final_gcdf_blocker_class),
+            "final_gcdf_unsafe_unknown_count={}".format(
+                self._last_final_gcdf_unsafe_unknown_count),
+            "final_gcdf_unsafe_occupied_count={}".format(
+                self._last_final_gcdf_unsafe_occupied_count),
             "final_gcdf_min_d={}".format(
                 "nan" if not math.isfinite(self._last_final_gcdf_min_d)
                 else "{:.6f}".format(self._last_final_gcdf_min_d)),
