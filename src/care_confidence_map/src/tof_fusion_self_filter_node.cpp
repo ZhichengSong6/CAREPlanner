@@ -33,6 +33,8 @@
 namespace
 {
 
+constexpr double kPi = 3.14159265358979323846;
+
 struct Sphere
 {
   tf2::Vector3 center;
@@ -468,9 +470,9 @@ private:
         raw->points.size() >= width * height)
     {
       const double h_half =
-          0.5 * ray_horizontal_fov_deg_ * M_PI / 180.0;
+          0.5 * ray_horizontal_fov_deg_ * kPi / 180.0;
       const double v_half =
-          0.5 * ray_vertical_fov_deg_ * M_PI / 180.0;
+          0.5 * ray_vertical_fov_deg_ * kPi / 180.0;
       const double fx =
           (static_cast<double>(width) - 1.0) /
           (2.0 * std::tan(h_half));
