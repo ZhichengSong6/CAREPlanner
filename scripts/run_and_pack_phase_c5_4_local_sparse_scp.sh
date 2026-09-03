@@ -235,6 +235,10 @@ names = [
     "execution_vbc_summary.csv",
     "local_planner_summary.csv",
     "local_cdf_selector_summary.csv",
+    "task_obstacle_blocked.csv",
+    "e3_summary.csv",
+    "tof_fusion_summary.csv",
+    "final_gcdf_recovery_event.csv",
     "blocker_stack_summary.csv",
     "waypoint_schedule_summary.csv",
 ]
@@ -305,6 +309,35 @@ probe = R["probe_single_flight_summary.csv"]
 digest["probe_single_flight"] = {
     "phase_transitions": transition_sequence(probe, "phase"),
     "last": probe[-1] if probe else None,
+}
+
+e3 = R["e3_summary.csv"]
+local_rows = R["local_planner_summary.csv"]
+recovery_events = R["final_gcdf_recovery_event.csv"]
+obstacle_signals = R["task_obstacle_blocked.csv"]
+commit_rows_e4 = R["commit_summary.csv"]
+
+digest["phase_e4_semantics"] = {
+    "e3_last": e3[-1] if e3 else None,
+    "max_local_unknown_cdf_rows": max(
+        [as_int(r.get("unknown_cdf_rows"), 0) for r in local_rows] or [0]),
+    "max_local_occupied_cdf_rows": max(
+        [as_int(r.get("occupied_cdf_rows"), 0) for r in local_rows] or [0]),
+    "task_obstacle_blocked_signal_count": len(obstacle_signals),
+    "gcdf_occupied_replan_count": max(
+        [as_int(r.get("gcdf_occupied_replan_count"), 0) for r in reg] or [0]),
+    "final_gcdf_blocker_classes": sorted(set(
+        r.get("final_gcdf_blocker_class")
+        for r in commit_rows_e4
+        if r.get("final_gcdf_blocker_class") not in (None, "none"))),
+    "max_final_gcdf_unsafe_unknown_count": max(
+        [as_int(r.get("final_gcdf_unsafe_unknown_count"), 0)
+         for r in commit_rows_e4] or [0]),
+    "max_final_gcdf_unsafe_occupied_count": max(
+        [as_int(r.get("final_gcdf_unsafe_occupied_count"), 0)
+         for r in commit_rows_e4] or [0]),
+    "final_gcdf_recovery_event_records": len(recovery_events),
+    "last_regime": reg[-1] if reg else None,
 }
 
 reg_last = reg[-1] if reg else {}
