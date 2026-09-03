@@ -1,0 +1,16 @@
+<launch>
+  <arg name="world_file"
+       default="$(find arm_description)/worlds/maixsense_obstacles.world" />
+  <arg name="gazebo_gui" default="true" />
+  <arg name="use_rviz" default="false" />
+  <arg name="paused" default="false" />
+
+  <include file="$(find arm_description)/launch/gazebo_velocity_control.launch">
+    <arg name="world_file" value="$(arg world_file)" />
+    <arg name="gazebo_gui" value="$(arg gazebo_gui)" />
+    <arg name="use_rviz" value="$(arg use_rviz)" />
+    <arg name="paused" value="$(arg paused)" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/tof_fusion_self_filter.launch" />
+</launch>
