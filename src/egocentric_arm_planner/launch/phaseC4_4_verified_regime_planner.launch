@@ -303,6 +303,8 @@
     <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
     <param name="task_infeasible_topic"
            value="/care_planner/local_planner/task_infeasible" />
+    <param name="task_obstacle_blocked_topic"
+           value="/care_planner/local_planner/task_obstacle_blocked" />
     <param name="task_uncertified_topic"
            value="/care_planner/local_planner/task_uncertified" />
     <param name="visibility_waypoint_active_topic"
@@ -386,6 +388,8 @@
            value="$(arg local_scp_summary_topic)" />
     <param name="local_planner/task_infeasible_topic"
            value="/care_planner/local_planner/task_infeasible" />
+    <param name="local_planner/task_obstacle_blocked_topic"
+           value="/care_planner/local_planner/task_obstacle_blocked" />
     <param name="local_planner/task_uncertified_topic"
            value="/care_planner/local_planner/task_uncertified" />
     <param name="local_planner/force_vbc_bootstrap_topic"
