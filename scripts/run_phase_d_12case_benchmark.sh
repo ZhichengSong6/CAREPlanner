@@ -2,11 +2,11 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-# RUN_SECONDS is a maximum timeout, not a required fixed duration. Phase-D
-# stops early once the measured EE pose satisfies the same success definition
-# used by evaluate_phase_d_run.py.
-RUN_SECONDS="${RUN_SECONDS:-60.0}"
-EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-true}"
+# Canonical Phase-D benchmark duration is fixed ROS/Gazebo simulation time,
+# independent of host load / Gazebo real-time factor. Goal-conditioned early
+# termination remains available as an explicit opt-in diagnostic.
+RUN_SECONDS="${RUN_SECONDS:-30.0}"
+EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
 GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M:-0.02}"
 GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD:-0.20}"
 GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
@@ -51,7 +51,8 @@ cat > "${BATCH_ROOT}/benchmark_metadata.txt" <<EOF
 phase=D.2
 method=${METHOD}
 trial_id=${TRIAL_ID}
-max_run_seconds=${RUN_SECONDS}
+run_seconds=${RUN_SECONDS}
+run_time_basis=ros_gazebo_sim_time
 early_stop_on_goal=${EARLY_STOP_ON_GOAL}
 goal_position_tolerance_m=${GOAL_POSITION_TOLERANCE_M}
 goal_orientation_tolerance_rad=${GOAL_ORIENTATION_TOLERANCE_RAD}
