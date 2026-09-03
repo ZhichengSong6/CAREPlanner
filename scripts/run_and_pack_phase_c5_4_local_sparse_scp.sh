@@ -70,6 +70,8 @@ python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
   src/egocentric_arm_planner/scripts/optimized_trajectory_continuity_node.py \
   src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py \
+  src/egocentric_arm_planner/scripts/execution_gcdf_measured_state_trajectory_node.py \
+  src/egocentric_arm_planner/scripts/execution_gcdf_safety_monitor_node.py \
   scripts/wait_for_phase_d_goal.py \
   scripts/analyze_tracker_execution_breakdown.py \
   src/care_visibility_cdf/scripts/vbc_visibility_acquisition_impl.py \
@@ -251,6 +253,9 @@ names = [
     "e3_summary.csv",
     "tof_fusion_summary.csv",
     "final_gcdf_recovery_event.csv",
+    "execution_gcdf_selector_summary.csv",
+    "execution_gcdf_safety_summary.csv",
+    "execution_gcdf_hard_hold.csv",
     "blocker_stack_summary.csv",
     "waypoint_schedule_summary.csv",
 ]
@@ -352,6 +357,46 @@ digest["phase_e4_semantics"] = {
     "final_gcdf_recovery_event_records":
         csv_data_row_count("final_gcdf_recovery_event.csv"),
     "last_regime": reg[-1] if reg else None,
+}
+
+e5_safety = R["execution_gcdf_safety_summary.csv"]
+e5_selector = R["execution_gcdf_selector_summary.csv"]
+tracker_e5 = R["tracker_summary.csv"]
+
+e5_d = [
+    as_float(r.get("d_min"))
+    for r in e5_safety
+    if as_float(r.get("d_min")) is not None
+]
+e5_age = [
+    as_float(r.get("batch_age_s"))
+    for r in e5_safety
+    if as_float(r.get("batch_age_s")) is not None
+]
+digest["phase_e5_execution_gcdf"] = {
+    "safety_records": len(e5_safety),
+    "selector_records": len(e5_selector),
+    "state_transitions": transition_sequence(e5_safety, "state"),
+    "min_measured_gcdf_distance": min(e5_d) if e5_d else None,
+    "max_batch_age_s": max(e5_age) if e5_age else None,
+    "warning_event_count": max(
+        [as_int(r.get("warning_event_count"), 0) for r in e5_safety] or [0]),
+    "hard_event_count": max(
+        [as_int(r.get("hard_event_count"), 0) for r in e5_safety] or [0]),
+    "stale_event_count": max(
+        [as_int(r.get("stale_event_count"), 0) for r in e5_safety] or [0]),
+    "replan_count": max(
+        [as_int(r.get("replan_count"), 0) for r in e5_safety] or [0]),
+    "max_unknown_pairs": max(
+        [as_int(r.get("unknown_pairs"), 0) for r in e5_safety] or [0]),
+    "max_occupied_pairs": max(
+        [as_int(r.get("occupied_pairs"), 0) for r in e5_safety] or [0]),
+    "tracker_hard_hold_samples": sum(
+        1 for r in tracker_e5
+        if r.get("source") == "external_gcdf_hard_hold"),
+    "hard_hold_topic_records":
+        csv_data_row_count("execution_gcdf_hard_hold.csv"),
+    "last": e5_safety[-1] if e5_safety else None,
 }
 
 reg_last = reg[-1] if reg else {}
