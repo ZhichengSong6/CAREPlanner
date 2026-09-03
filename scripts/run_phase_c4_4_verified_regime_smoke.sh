@@ -11,6 +11,8 @@ RUN_SECONDS="${RUN_SECONDS:-8.0}"
 GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.world}"
+CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
+TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
@@ -213,7 +215,10 @@ fi
 echo "[MODE] region_schedule_mode=${REGION_SCHEDULE_MODE}"
 
 setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch \
-  config_file:="${CONFIG_FILE}" waypoint_weight:="${CARE_WEIGHT}" \
+  config_file:="${CONFIG_FILE}" \
+  confidence_map_config_file:="${CONFIDENCE_MAP_CONFIG_FILE}" \
+  tof_fusion_enabled:="${TOF_FUSION_ENABLED}" \
+  waypoint_weight:="${CARE_WEIGHT}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
   selector_predicted_trajectory_timeout:="${PREDICTION_TIMEOUT}" \
   trajectory_risk_input_topic:="${TRAJECTORY_RISK_INPUT_TOPIC}" \
@@ -317,7 +322,612 @@ for _ in $(seq 1 400); do
   fi
 
   if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/probe_single_flight_gate$'; then
+    if ! echo "${NODES}" | grep -q '^/probe_single_flight_gate
+     [ "${BACKEND_READY}" = "1" ] &&
+     [ "${CDF_READY}" = "1" ]; then
+    READY=1
+    break
+  fi
+  sleep 0.1
+done
+
+if [ "${READY}" != "1" ]; then
+  echo "[ERROR] required planner/controller nodes did not all start"
+  echo "[DEBUG] USE_LOCAL_SPARSE_SCP=${USE_LOCAL_SPARSE_SCP}"
+  echo "[DEBUG] CDF_SELECTOR_ENABLED=${CDF_SELECTOR_ENABLED}"
+  echo "[DEBUG] CDF_SHADOW_VBC_AUDIT_ENABLED=${CDF_SHADOW_VBC_AUDIT_ENABLED}"
+  rosnode list 2>/dev/null || true
+  tail -n 320 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+expect_rosparam_bool() {
+  local name="$1"
+  local expected="$2"
+  local actual
+  actual="$(rosparam get "${name}" 2>/dev/null || true)"
+  actual="$(echo "${actual}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  if [ "${actual}" != "${expected}" ]; then
+    echo "[ERROR] runtime semantic mismatch: ${name}=${actual:-missing}, expected=${expected}"
+    tail -n 220 "${LOG}/controlled.log" || true
+    exit 1
+  fi
+}
+
+expect_rosparam_bool /optimized_trajectory_continuity/final_gcdf_enabled "${FINAL_EXECUTABLE_GCDF_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/continuation_enabled "${COMMITTED_CONTINUATION_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/execution_audit_enabled "${EXECUTION_AUDIT_STREAM_ENABLED}"
+
+if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  if ! rosnode list | grep -q '^/probe_single_flight_gate$'; then
+    echo "[ERROR] C5.9 probe_single_flight requested but node is missing"
+    exit 1
+  fi
+fi
+
+echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
+
+RUNTIME_BRANCH="$(git branch --show-current)"
+RUNTIME_HEAD="$(git rev-parse HEAD)"
+RUNTIME_FINAL_GCDF="$(rosparam get /optimized_trajectory_continuity/final_gcdf_enabled)"
+RUNTIME_CONTINUATION="$(rosparam get /optimized_trajectory_continuity/continuation_enabled)"
+RUNTIME_EXEC_AUDIT="$(rosparam get /optimized_trajectory_continuity/execution_audit_enabled)"
+RUNTIME_PROBE_NODE_COUNT="$(rosnode list | grep -c '^/probe_single_flight_gate$' || true)"
+
+cat > "${OUT}/runtime_semantics.txt" <<EOF
+branch=${RUNTIME_BRANCH}
+head=${RUNTIME_HEAD}
+case_id=${CASE_ID}
+run_id=${RUN_ID:-${CASE_ID}}
+gazebo_gui=${GAZEBO_GUI}
+use_rviz=${USE_RVIZ}
+world_file=${WORLD_FILE}
+confidence_map_config_file=${CONFIDENCE_MAP_CONFIG_FILE}
+tof_fusion_enabled=${TOF_FUSION_ENABLED}
+use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
+local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
+raw_planner_topic=${RAW_PLANNER_TOPIC}
+commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
+continuation_enabled=${RUNTIME_CONTINUATION}
+execution_audit_enabled=${RUNTIME_EXEC_AUDIT}
+execution_vbc_trajectory_topic=${EXECUTION_VBC_TRAJECTORY_TOPIC}
+probe_single_flight_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
+probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
+probe_single_flight_input_topic=${RAW_PLANNER_TOPIC}
+probe_single_flight_output_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+continuity_input_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPELINE_CANDIDATE_TOPIC}" ] && echo 1 || echo 0)
+probe_repair_requires_visibility_obligation=true
+probe_solver_failure_uses_blocker_rediscovery=true
+probe_vbc_unsafe_uses_blocker_rediscovery=true
+probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
+phase_e4_occupied_gcdf_never_creates_visibility_obligation=true
+final_gcdf_recovery_trajectory_topic=/care_planner/final_gcdf/recovery_trajectory
+final_gcdf_recovery_event_topic=/care_planner/final_gcdf/recovery_visibility_event
+EOF
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
+record_topic /care_planner/local_planner/task_infeasible "${OUT}/task_infeasible.csv"
+record_topic /care_planner/local_planner/task_obstacle_blocked "${OUT}/task_obstacle_blocked.csv"
+record_topic /care_planner/local_planner/task_uncertified "${OUT}/task_uncertified.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
+if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
+  record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
+  record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
+fi
+record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
+record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
+record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
+record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
+record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+  record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
+  # Keep the historical filename for downstream summary scripts; fields that
+  # are specific to legacy MPC will simply be absent.
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
+else
+  record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+fi
+record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+# Visualization artifacts: preserve the upstream nominal task reference and the
+# exact safety-certified trajectory that the tracker receives.
+record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
+record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, msg_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
+if ! python3 - "${INITIAL_GATE_MAX_TRIES}" "${INITIAL_GATE_ECHO_TIMEOUT}" <<'PY'
+import sys
+import time
+
+import rospy
+from std_msgs.msg import String
+
+tries = int(sys.argv[1])
+msg_timeout = float(sys.argv[2])
+topic = "/care_planner/execution/gate_summary"
+
+# Keep one ROS subscriber alive for the whole wait. Repeated shell-level
+# 'timeout rostopic echo' calls can expire during process startup / subscriber
+# handshake even when the gate has already published released=1.
+rospy.init_node(
+    "careplanner_initial_gate_wait",
+    anonymous=True,
+    disable_signals=True,
+)
+
+last = ""
+for i in range(1, tries + 1):
+    try:
+        msg = rospy.wait_for_message(topic, String, timeout=msg_timeout)
+        last = str(msg.data)
+    except rospy.ROSException:
+        pass
+
+    if "released=1" in last:
+        print(f"[READY] initial execution gate released after {i} checks")
+        raise SystemExit(0)
+
+    if i % 20 == 0:
+        print(f"[WAIT] gate still closed after {i} checks")
+        if last:
+            interesting = []
+            for token in last.split():
+                if token.startswith((
+                    "released=", "decision=", "waypoint_ready=",
+                    "release_reason="
+                )):
+                    interesting.append(token)
+            if interesting:
+                print(" ".join(interesting))
+    time.sleep(0.05)
+
+print("[ERROR] initial gate release timeout")
+if last:
+    print("[LAST GATE SUMMARY] " + last)
+raise SystemExit(1)
+PY
+then
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
+  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+else
+  echo "[ARCH] candidate verifier != committed execution auditor"
+fi
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} up to ${RUN_SECONDS}s; early stop on stable EE goal"
+  python3 scripts/wait_for_phase_d_goal.py \
+    --repo "${REPO}" \
+    --timeout-s "${RUN_SECONDS}" \
+    --position-tolerance-m "${GOAL_POSITION_TOLERANCE_M}" \
+    --orientation-tolerance-rad "${GOAL_ORIENTATION_TOLERANCE_RAD}" \
+    --hold-s "${GOAL_SUCCESS_HOLD_S}" \
+    --settle-velocity-inf-rad-s "${GOAL_SETTLE_VELOCITY_INF_RAD_S}" \
+    --settle-timeout-s "${GOAL_SETTLE_TIMEOUT_S}" \
+    --post-success-record-s "${GOAL_POST_SUCCESS_RECORD_S}" \
+    --goal-position "${GX}" "${GY}" "${GZ}" \
+    --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
+    --status-json "${OUT}/goal_stop_status.json"
+else
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s ROS/Gazebo simulation time"
+  python3 scripts/wait_for_ros_duration.py --duration-s "${RUN_SECONDS}"
+fi
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+# Teardown should not leave the velocity controller holding the last nonzero
+# command after the tracker process exits.
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  timeout 1 rostopic pub -1 "${ACTUATOR_TOPIC}" std_msgs/Float64MultiArray \
+    "data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]" \
+    >/dev/null 2>&1 || true
+fi
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+; then
+      CDF_READY=0
+    fi
+  fi
+
+  if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
+    if ! echo "${NODES}" | grep -q '^/tof_fusion_self_filter
+     [ "${BACKEND_READY}" = "1" ] &&
+     [ "${CDF_READY}" = "1" ]; then
+    READY=1
+    break
+  fi
+  sleep 0.1
+done
+
+if [ "${READY}" != "1" ]; then
+  echo "[ERROR] required planner/controller nodes did not all start"
+  echo "[DEBUG] USE_LOCAL_SPARSE_SCP=${USE_LOCAL_SPARSE_SCP}"
+  echo "[DEBUG] CDF_SELECTOR_ENABLED=${CDF_SELECTOR_ENABLED}"
+  echo "[DEBUG] CDF_SHADOW_VBC_AUDIT_ENABLED=${CDF_SHADOW_VBC_AUDIT_ENABLED}"
+  rosnode list 2>/dev/null || true
+  tail -n 320 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
+  echo "[ERROR] legacy predicted_vbc_recovery_guard unexpectedly running"
+  exit 1
+fi
+
+expect_rosparam_bool() {
+  local name="$1"
+  local expected="$2"
+  local actual
+  actual="$(rosparam get "${name}" 2>/dev/null || true)"
+  actual="$(echo "${actual}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  if [ "${actual}" != "${expected}" ]; then
+    echo "[ERROR] runtime semantic mismatch: ${name}=${actual:-missing}, expected=${expected}"
+    tail -n 220 "${LOG}/controlled.log" || true
+    exit 1
+  fi
+}
+
+expect_rosparam_bool /optimized_trajectory_continuity/final_gcdf_enabled "${FINAL_EXECUTABLE_GCDF_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/continuation_enabled "${COMMITTED_CONTINUATION_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/execution_audit_enabled "${EXECUTION_AUDIT_STREAM_ENABLED}"
+
+if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  if ! rosnode list | grep -q '^/probe_single_flight_gate$'; then
+    echo "[ERROR] C5.9 probe_single_flight requested but node is missing"
+    exit 1
+  fi
+fi
+
+echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+
+RUNTIME_BRANCH="$(git branch --show-current)"
+RUNTIME_HEAD="$(git rev-parse HEAD)"
+RUNTIME_FINAL_GCDF="$(rosparam get /optimized_trajectory_continuity/final_gcdf_enabled)"
+RUNTIME_CONTINUATION="$(rosparam get /optimized_trajectory_continuity/continuation_enabled)"
+RUNTIME_EXEC_AUDIT="$(rosparam get /optimized_trajectory_continuity/execution_audit_enabled)"
+RUNTIME_PROBE_NODE_COUNT="$(rosnode list | grep -c '^/probe_single_flight_gate$' || true)"
+
+cat > "${OUT}/runtime_semantics.txt" <<EOF
+branch=${RUNTIME_BRANCH}
+head=${RUNTIME_HEAD}
+case_id=${CASE_ID}
+run_id=${RUN_ID:-${CASE_ID}}
+gazebo_gui=${GAZEBO_GUI}
+use_rviz=${USE_RVIZ}
+world_file=${WORLD_FILE}
+use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
+local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
+raw_planner_topic=${RAW_PLANNER_TOPIC}
+commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
+continuation_enabled=${RUNTIME_CONTINUATION}
+execution_audit_enabled=${RUNTIME_EXEC_AUDIT}
+execution_vbc_trajectory_topic=${EXECUTION_VBC_TRAJECTORY_TOPIC}
+probe_single_flight_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
+probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
+probe_single_flight_input_topic=${RAW_PLANNER_TOPIC}
+probe_single_flight_output_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+continuity_input_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPELINE_CANDIDATE_TOPIC}" ] && echo 1 || echo 0)
+probe_repair_requires_visibility_obligation=true
+probe_solver_failure_uses_blocker_rediscovery=true
+probe_vbc_unsafe_uses_blocker_rediscovery=true
+probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
+final_gcdf_recovery_trajectory_topic=/care_planner/final_gcdf/recovery_trajectory
+final_gcdf_recovery_event_topic=/care_planner/final_gcdf/recovery_visibility_event
+EOF
+
+record_topic() {
+  local topic="$1"; local path="$2"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  REC_PIDS+=("$!")
+}
+record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
+record_topic /care_planner/local_planner/task_infeasible "${OUT}/task_infeasible.csv"
+record_topic /care_planner/local_planner/task_uncertified "${OUT}/task_uncertified.csv"
+record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
+record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
+record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
+record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
+record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
+record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
+record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+  record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
+  # Keep the historical filename for downstream summary scripts; fields that
+  # are specific to legacy MPC will simply be absent.
+  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
+else
+  record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+fi
+record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
+record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+# Visualization artifacts: preserve the upstream nominal task reference and the
+# exact safety-certified trajectory that the tracker receives.
+record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
+record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
+record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+
+echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, msg_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
+if ! python3 - "${INITIAL_GATE_MAX_TRIES}" "${INITIAL_GATE_ECHO_TIMEOUT}" <<'PY'
+import sys
+import time
+
+import rospy
+from std_msgs.msg import String
+
+tries = int(sys.argv[1])
+msg_timeout = float(sys.argv[2])
+topic = "/care_planner/execution/gate_summary"
+
+# Keep one ROS subscriber alive for the whole wait. Repeated shell-level
+# 'timeout rostopic echo' calls can expire during process startup / subscriber
+# handshake even when the gate has already published released=1.
+rospy.init_node(
+    "careplanner_initial_gate_wait",
+    anonymous=True,
+    disable_signals=True,
+)
+
+last = ""
+for i in range(1, tries + 1):
+    try:
+        msg = rospy.wait_for_message(topic, String, timeout=msg_timeout)
+        last = str(msg.data)
+    except rospy.ROSException:
+        pass
+
+    if "released=1" in last:
+        print(f"[READY] initial execution gate released after {i} checks")
+        raise SystemExit(0)
+
+    if i % 20 == 0:
+        print(f"[WAIT] gate still closed after {i} checks")
+        if last:
+            interesting = []
+            for token in last.split():
+                if token.startswith((
+                    "released=", "decision=", "waypoint_ready=",
+                    "release_reason="
+                )):
+                    interesting.append(token)
+            if interesting:
+                print(" ".join(interesting))
+    time.sleep(0.05)
+
+print("[ERROR] initial gate release timeout")
+if last:
+    print("[LAST GATE SUMMARY] " + last)
+raise SystemExit(1)
+PY
+then
+  tail -n 260 "${LOG}/controlled.log" || true
+  exit 1
+fi
+
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
+  echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
+else
+  echo "[ARCH] candidate verifier != committed execution auditor"
+fi
+echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} up to ${RUN_SECONDS}s; early stop on stable EE goal"
+  python3 scripts/wait_for_phase_d_goal.py \
+    --repo "${REPO}" \
+    --timeout-s "${RUN_SECONDS}" \
+    --position-tolerance-m "${GOAL_POSITION_TOLERANCE_M}" \
+    --orientation-tolerance-rad "${GOAL_ORIENTATION_TOLERANCE_RAD}" \
+    --hold-s "${GOAL_SUCCESS_HOLD_S}" \
+    --settle-velocity-inf-rad-s "${GOAL_SETTLE_VELOCITY_INF_RAD_S}" \
+    --settle-timeout-s "${GOAL_SETTLE_TIMEOUT_S}" \
+    --post-success-record-s "${GOAL_POST_SUCCESS_RECORD_S}" \
+    --goal-position "${GX}" "${GY}" "${GZ}" \
+    --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
+    --status-json "${OUT}/goal_stop_status.json"
+else
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s ROS/Gazebo simulation time"
+  python3 scripts/wait_for_ros_duration.py --duration-s "${RUN_SECONDS}"
+fi
+
+kill_group "${CONTROL_PID}"; CONTROL_PID=""
+kill_group "${GEN_PID}"; GEN_PID=""
+kill_group "${TRACKER_PID}"; TRACKER_PID=""
+# Teardown should not leave the velocity controller holding the last nonzero
+# command after the tracker process exits.
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  timeout 1 rostopic pub -1 "${ACTUATOR_TOPIC}" std_msgs/Float64MultiArray \
+    "data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]" \
+    >/dev/null 2>&1 || true
+fi
+sleep 0.2
+for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
+REC_PIDS=()
+
+python3 - "${CASE_ID}" "${OUT}" "${REGION_SCHEDULE_MODE}" <<'PY'
+import csv,json,math,os,re,statistics,sys
+cid,out,mode=sys.argv[1:]
+TOK=re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+def recs(name):
+ p=os.path.join(out,name); a=[]
+ if not os.path.isfile(p): return a
+ with open(p,newline='',errors='replace') as f:
+  rd=csv.reader(f); h=next(rd,[])
+  if not h:return a
+  ti=h.index('%time') if '%time' in h else 0
+  di=h.index('field.data') if 'field.data' in h else 1
+  for r in rd:
+   if len(r)<=di:continue
+   d=dict(TOK.findall(','.join(r[di:])))
+   try:d['_t']=float(r[ti])/1e9
+   except:d['_t']=math.nan
+   if d:a.append(d)
+ return a
+def f(x):
+ try:return float(str(x).replace('ms',''))
+ except:return math.nan
+reg=recs('regime_summary.csv'); cand=recs('candidate_vbc_summary.csv'); exe=recs('execution_vbc_summary.csv'); commit=recs('commit_summary.csv'); prog=recs('nominal_progress_summary.csv'); mpc=recs('mpc_summary.csv'); sched=recs('waypoint_schedule_summary.csv')
+lastr=reg[-1] if reg else {}; lastc=commit[-1] if commit else {}; lastp=prog[-1] if prog else {}; lasts=sched[-1] if sched else {}
+sol=[f(r.get('solve','nan')) for r in mpc]; sol=[x for x in sol if math.isfinite(x)]
+repair_multi=[r for r in mpc if r.get('vbc_wp')=='multi_deadline_repair']
+payload={
+ 'case_id':cid,
+ 'region_schedule_mode':mode,
+ 'architecture':'candidate VBC verifier != committed execution auditor; NORMAL->REPAIR->PROBE_NORMAL->NORMAL',
+ 'candidate_vbc_records':len(cand),
+ 'candidate_unsafe_records':sum(r.get('has_violation')=='1' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'candidate_safe_records':sum(r.get('has_violation')=='0' for r in cand if r.get('trajectory_source')=='predicted'),
+ 'execution_vbc_records':len(exe),
+ 'execution_unsafe_records':sum(r.get('has_violation')=='1' for r in exe),
+ 'execution_safe_records':sum(r.get('has_violation')=='0' for r in exe),
+ 'final_regime_state':lastr.get('state') if lastr else None,
+ 'repair_entry_count':int(lastr.get('repair_entry_count','0')) if lastr else 0,
+ 'candidate_repair_entry_count':int(lastr.get('candidate_repair_entry_count','0')) if lastr else 0,
+ 'execution_repair_entry_count':int(lastr.get('execution_repair_entry_count','0')) if lastr else 0,
+ 'execution_safety_event_count':int(lastr.get('execution_safety_event_count','0')) if lastr else 0,
+ 'probe_entry_count':int(lastr.get('probe_entry_count','0')) if lastr else 0,
+ 'probe_failure_count':int(lastr.get('probe_failure_count','0')) if lastr else 0,
+ 'normal_entry_count':int(lastr.get('normal_entry_count','0')) if lastr else 0,
+ 'verification_safe_count':int(lastc.get('verification_safe_count','0')) if lastc else 0,
+ 'verification_unsafe_count':int(lastc.get('verification_unsafe_count','0')) if lastc else 0,
+ 'commit_count':int(lastc.get('commit_count','0')) if lastc else 0,
+ 'final_progress_phase_s':f(lastp.get('phase_s','nan')) if lastp else None,
+ 'final_wall_elapsed_s':f(lastp.get('wall_elapsed_s','nan')) if lastp else None,
+ 'mpc_solve_ms_median':statistics.median(sol) if sol else None,
+ 'mpc_solve_ms_max':max(sol) if sol else None,
+ 'multi_deadline_repair_cycles':len(repair_multi),
+ 'max_repair_obligation_count':max([int(r.get('repair_obligation_count','0')) for r in repair_multi] or [0]),
+ 'last_schedule_obligation_count':int(lasts.get('obligation_count','0')) if lasts else 0,
+ 'last_schedule_unreachable_at_discovery_count':int(lasts.get('unreachable_at_discovery_count','0')) if lasts else 0,
+}
+json.dump(payload,open(os.path.join(out,'c4_4_verified_regime_summary.json'),'w'),indent=2)
+print(json.dumps(payload,indent=2))
+PY
+
+echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
+echo "[REGIME]    ${OUT}/regime_summary.csv"
+echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
+echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"
+; then
       CDF_READY=0
     fi
   fi
