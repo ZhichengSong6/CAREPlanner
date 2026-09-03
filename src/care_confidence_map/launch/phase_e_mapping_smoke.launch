@@ -1,0 +1,22 @@
+<launch>
+  <arg name="world_file"
+       default="$(find arm_description)/worlds/maixsense_obstacles.world" />
+  <arg name="gazebo_gui" default="true" />
+  <arg name="use_rviz" default="false" />
+  <arg name="paused" default="false" />
+
+  <!-- Phase E1/E2: obstacle Gazebo + eight ToF sensors + fusion/self-filter. -->
+  <include file="$(find care_confidence_map)/launch/phase_e_sensor_smoke.launch">
+    <arg name="world_file" value="$(arg world_file)" />
+    <arg name="gazebo_gui" value="$(arg gazebo_gui)" />
+    <arg name="use_rviz" value="$(arg use_rviz)" />
+    <arg name="paused" value="$(arg paused)" />
+  </include>
+
+  <!-- Phase E3: same dense grid, but observation source is real ToF rays
+       rather than the frozen ideal-FOV visibility fill. -->
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="config_file"
+         value="$(find care_confidence_map)/config/confidence_map_phase_e_ray.yaml" />
+  </include>
+</launch>
