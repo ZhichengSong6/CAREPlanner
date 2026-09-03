@@ -213,6 +213,10 @@ class CppForbiddenVoxelGpuShadow {
     pnh_.param("map_stale_s", map_stale_s_, 0.50);
     pnh_.param("confidence_threshold", confidence_threshold_, 0.50);
     pnh_.param("proximity_margin", proximity_margin_, 0.075);
+    pnh_.param(
+        "execution_proximity_margin",
+        execution_proximity_margin_,
+        0.075);
     pnh_.param("max_pairs_per_step", max_pairs_per_step_, 250);
     pnh_.param("max_pairs", max_pairs_, 8000);
     pnh_.param("signed_zero_band", zero_band_, 0.05);
@@ -302,6 +306,7 @@ class CppForbiddenVoxelGpuShadow {
         << " forbidden=(conf<" << confidence_threshold_
         << " OR occupancy>0.5)"
         << " proximity_margin=" << proximity_margin_
+        << " execution_proximity_margin=" << execution_proximity_margin_
         << " max_pairs_per_step=" << max_pairs_per_step_
         << " socket=" << gpu_socket_
         << " local_batch_topic=" << constraint_batch_topic_
@@ -540,6 +545,7 @@ class CppForbiddenVoxelGpuShadow {
   std::vector<PairMeta> buildPairs(
       const std::vector<Anchor>& anchors,
       const MapIndex& map,
+      double proximity_margin,
       std::size_t* raw_pair_count,
       int* active_step_count) {
     std::unordered_map<int, std::vector<const Anchor*>> by_step;
@@ -577,7 +583,7 @@ class CppForbiddenVoxelGpuShadow {
       for (const Anchor* anchor_ptr : it->second) {
         const Anchor& anchor = *anchor_ptr;
         const double search_radius =
-            static_cast<double>(anchor.radius) + proximity_margin_;
+            static_cast<double>(anchor.radius) + proximity_margin;
         const int n = static_cast<int>(
             std::ceil(search_radius / resolution_));
 
@@ -614,7 +620,7 @@ class CppForbiddenVoxelGpuShadow {
               const float clearance = static_cast<float>(
                   std::sqrt(dx * dx + dy * dy + dz * dz) -
                   static_cast<double>(anchor.radius));
-              if (static_cast<double>(clearance) > proximity_margin_) {
+              if (static_cast<double>(clearance) > proximity_margin) {
                 continue;
               }
 
@@ -1196,8 +1202,12 @@ class CppForbiddenVoxelGpuShadow {
     std::size_t raw_pair_count = 0;
     int active_step_count = 0;
     const auto selection_t0 = Clock::now();
+    const double pair_margin =
+        (channel == Channel::EXECUTION)
+            ? execution_proximity_margin_
+            : proximity_margin_;
     std::vector<PairMeta> pairs = buildPairs(
-        anchors, *map, &raw_pair_count, &active_step_count);
+        anchors, *map, pair_margin, &raw_pair_count, &active_step_count);
     const auto selection_t1 = Clock::now();
 
     // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
@@ -1361,6 +1371,7 @@ class CppForbiddenVoxelGpuShadow {
   double map_stale_s_ = 0.50;
   double confidence_threshold_ = 0.50;
   double proximity_margin_ = 0.075;
+  double execution_proximity_margin_ = 0.075;
   int max_pairs_per_step_ = 250;
   int max_pairs_ = 8000;
   double zero_band_ = 0.05;
