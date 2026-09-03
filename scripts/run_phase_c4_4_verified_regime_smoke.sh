@@ -22,10 +22,6 @@ EXECUTION_UNSAFE_REQUIRED="${EXECUTION_UNSAFE_REQUIRED:-2}"
 PROBE_SAFE_COMMITS="${PROBE_SAFE_COMMITS:-3}"
 # Preserve C4.4 behavior by default. C4.5/C4.6 wrappers override this explicitly.
 REGION_SCHEDULE_MODE="${REGION_SCHEDULE_MODE:-shared_persistent}"
-# C5.42 steering-only adjacent temporal-layer look-ahead. These parameters are
-# inert outside blocker_aware_acquisition mode.
-ONE_LAYER_LOOKAHEAD_ENABLED="${ONE_LAYER_LOOKAHEAD_ENABLED:-true}"
-PROGRESSIVE_SHARED_MAX_REGIONS="${PROGRESSIVE_SHARED_MAX_REGIONS:-4}"
 TRAJECTORY_RISK_INPUT_TOPIC="${TRAJECTORY_RISK_INPUT_TOPIC:-/care_planner/task_trajectory}"
 FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED:-false}"
 FORBIDDEN_SPACE_PAIR_TOPIC="${FORBIDDEN_SPACE_PAIR_TOPIC:-/care_planner/trajectory_risk/body_sweep_anchors}"
@@ -196,7 +192,7 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=false _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _one_layer_lookahead_enabled:=${ONE_LAYER_LOOKAHEAD_ENABLED} _progressive_shared_max_regions:=${PROGRESSIVE_SHARED_MAX_REGIONS} _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=false _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -213,7 +209,6 @@ if [ "${READY}" != "1" ]; then
 fi
 
 echo "[MODE] region_schedule_mode=${REGION_SCHEDULE_MODE}"
-echo "[C5.42] one_layer_lookahead=${ONE_LAYER_LOOKAHEAD_ENABLED} progressive_shared_max_regions=${PROGRESSIVE_SHARED_MAX_REGIONS}"
 
 setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch \
   config_file:="${CONFIG_FILE}" waypoint_weight:="${CARE_WEIGHT}" \
