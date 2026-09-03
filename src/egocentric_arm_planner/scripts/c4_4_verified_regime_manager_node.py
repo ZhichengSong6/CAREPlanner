@@ -218,6 +218,7 @@ class C44VerifiedRegimeManager:
         self.probe_failure_count = 0
         self.candidate_repair_entry_count = 0
         self.gcdf_repair_entry_count = 0
+        self.gcdf_occupied_replan_count = 0
         self.execution_repair_entry_count = 0
         self.task_infeasible_repair_entry_count = 0
         self.task_infeasible_pending = False
@@ -763,10 +764,20 @@ class C44VerifiedRegimeManager:
         Final-GCDF unsafe remains fail-closed and transitions immediately.
         """
         source = "after_gate_release" if replay else "live"
-        if result == "unsafe" and safety_gate == "gcdf":
+        if result == "unsafe" and safety_gate == "gcdf_occupied":
+            # Known physical geometry cannot be repaired by sensing.
+            self.gcdf_occupied_replan_count += 1
+            self.last_transition_reason = (
+                "final_gcdf_occupied_normal_replan_{}".format(source))
+            self.replan_request_pub.publish(Bool(data=True))
+            return
+
+        if (result == "unsafe" and
+                safety_gate in ("gcdf", "gcdf_unknown", "gcdf_mixed")):
+            self.gcdf_repair_entry_count += 1
             self._transition_locked(
                 self.REPAIR,
-                "final_gcdf_normal_unsafe_{}".format(source),
+                "final_{}_normal_unsafe_{}".format(safety_gate, source),
                 now)
             return
 
@@ -922,9 +933,20 @@ class C44VerifiedRegimeManager:
                     self.pending_probe_execution_stamp_ns = 0
                     self.pending_probe_effective_prefix_s = math.nan
 
+                    if safety_gate == "gcdf_occupied":
+                        # The probe candidate hit a known physical obstacle.
+                        # Stay in PROBE and ask for another collision-free task
+                        # probe; never manufacture a visibility obligation.
+                        self.gcdf_occupied_replan_count += 1
+                        self.last_transition_reason = (
+                            "final_gcdf_occupied_probe_replan")
+                        self.replan_request_pub.publish(Bool(data=True))
+                        return
+
                     origin = (
                         "final_gcdf_probe_unsafe"
-                        if safety_gate == "gcdf"
+                        if safety_gate in
+                        ("gcdf", "gcdf_unknown", "gcdf_mixed")
                         else "candidate_probe_unique_unsafe")
 
                     # C5.12 invariant:
@@ -1145,6 +1167,8 @@ class C44VerifiedRegimeManager:
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
                 "gcdf_repair_entry_count={}".format(self.gcdf_repair_entry_count),
+                "gcdf_occupied_replan_count={}".format(
+                    self.gcdf_occupied_replan_count),
                 "execution_repair_entry_count={}".format(self.execution_repair_entry_count),
                 "task_infeasible_repair_entry_count={}".format(
                     self.task_infeasible_repair_entry_count),
