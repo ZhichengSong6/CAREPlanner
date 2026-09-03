@@ -15,9 +15,11 @@ C4.7 optional visibility-acquisition gate:
 
 Candidate certification and committed-execution safety remain separate. A C5.8
 candidate may be rejected by the final executable GCDF gate or by exact VBC.
-PROBE success is NOT counted at commit time: it is counted only when the
-full-trajectory tracker reports trajectory_complete_hold for the exact committed
-header.stamp execution token. ROS Header.seq is diagnostic only.
+PROBE success is NOT counted at commit time. It is counted only after the
+tracker confirms that the certified task-prefix duration for the exact committed
+header.stamp execution token has actually elapsed. The certified brake+hold tail
+remains the fail-safe while the next probe is planned/certified. ROS Header.seq
+is diagnostic only.
 """
 
 import math
@@ -46,6 +48,13 @@ def _as_bool(v):
 def _as_int(v, default=0):
     try:
         return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(v, default=math.nan):
+    try:
+        return float(v)
     except (TypeError, ValueError):
         return default
 
@@ -194,6 +203,7 @@ class C44VerifiedRegimeManager:
         self.probe_completed_execution_count = 0
         self.pending_probe_candidate_seq = 0
         self.pending_probe_execution_stamp_ns = 0
+        self.pending_probe_effective_prefix_s = math.nan
         self.last_tracker_complete_seq = 0
         self.last_tracker_complete_stamp_ns = 0
         self.repair_safe_commit_count = 0
@@ -406,6 +416,7 @@ class C44VerifiedRegimeManager:
                     self.probe_completed_prefix_streak = 0
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
+                    self.pending_probe_effective_prefix_s = math.nan
                     self.repair_completion = False
                     self.repair_completion_armed = False
                     self.blocker_rediscovery_pending = False
@@ -741,6 +752,8 @@ class C44VerifiedRegimeManager:
         verification_view = f.get("verification_view", "none")
         safety_gate = f.get("safety_gate", "vbc")
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
+        probe_effective_prefix_s = _as_float(
+            f.get("probe_effective_prefix_s"), math.nan)
         if seq <= 0 or result not in ("safe", "unsafe", "timeout"):
             return
 
@@ -819,6 +832,7 @@ class C44VerifiedRegimeManager:
                     if execution_stamp_ns <= 0:
                         self.pending_probe_candidate_seq = 0
                         self.pending_probe_execution_stamp_ns = 0
+                        self.pending_probe_effective_prefix_s = math.nan
                         self.last_transition_reason = (
                             "probe_commit_missing_execution_token_replan")
                         self.replan_request_pub.publish(Bool(data=True))
@@ -827,8 +841,13 @@ class C44VerifiedRegimeManager:
                     self.last_commit_event_time = now
                     self.pending_probe_candidate_seq = seq
                     self.pending_probe_execution_stamp_ns = execution_stamp_ns
+                    self.pending_probe_effective_prefix_s = (
+                        probe_effective_prefix_s
+                        if (math.isfinite(probe_effective_prefix_s) and
+                            probe_effective_prefix_s > 0.0)
+                        else math.nan)
                     self.last_transition_reason = (
-                        "safe_probe_commit_wait_execution_stamp_{}".format(
+                        "safe_probe_commit_wait_prefix_stamp_{}".format(
                             execution_stamp_ns))
                     return
 
@@ -843,6 +862,7 @@ class C44VerifiedRegimeManager:
                     self.probe_failure_count += 1
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
+                    self.pending_probe_effective_prefix_s = math.nan
 
                     origin = (
                         "final_gcdf_probe_unsafe"
@@ -868,6 +888,7 @@ class C44VerifiedRegimeManager:
                     # stay in PROBE, fail closed, and request a fresh candidate.
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
+                    self.pending_probe_effective_prefix_s = math.nan
                     self.last_transition_reason = "probe_candidate_timeout_replan"
                     self.replan_request_pub.publish(Bool(data=True))
                     return
@@ -881,6 +902,7 @@ class C44VerifiedRegimeManager:
         seq = _as_int(f.get("seq"), 0)
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         source = f.get("source", "")
+        phase_s = _as_float(f.get("phase_s"), math.nan)
 
         now = rospy.Time.now()
         request_next_probe = False
@@ -894,28 +916,44 @@ class C44VerifiedRegimeManager:
             self.tracker_execution_stamp_ns = execution_stamp_ns
             self.tracker_source = source
 
-            if (complete is not True or execution_stamp_ns <= 0 or
-                    source != "trajectory_complete_hold"):
-                return
-
-            # ROS Header.seq is publisher-owned and diagnostic only.
-            self.last_tracker_complete_seq = seq
-            if execution_stamp_ns == self.last_tracker_complete_stamp_ns:
-                return
-            self.last_tracker_complete_stamp_ns = execution_stamp_ns
+            # Preserve full-completion diagnostics independently of PROBE
+            # progress counting.
+            full_complete = (
+                complete is True and execution_stamp_ns > 0 and
+                source == "trajectory_complete_hold")
+            if full_complete:
+                self.last_tracker_complete_seq = seq
+                if execution_stamp_ns != self.last_tracker_complete_stamp_ns:
+                    self.last_tracker_complete_stamp_ns = execution_stamp_ns
 
             if self.state != self.PROBE_NORMAL:
                 return
             if self.pending_probe_execution_stamp_ns <= 0:
                 return
             if execution_stamp_ns != self.pending_probe_execution_stamp_ns:
-                # Stable timestamp matching rejects stale completion edges from
-                # a previous REPAIR episode or any older committed trajectory.
+                # Stable timestamp matching rejects stale status from an older
+                # committed trajectory.
                 return
 
+            prefix_complete = (
+                math.isfinite(self.pending_probe_effective_prefix_s) and
+                self.pending_probe_effective_prefix_s > 0.0 and
+                math.isfinite(phase_s) and
+                phase_s + 1e-6 >= self.pending_probe_effective_prefix_s)
+
+            # Metadata-missing fallback preserves the old fail-closed behavior:
+            # only a full certified trajectory completion can count.
+            if not prefix_complete and not full_complete:
+                return
+
+            completed_stamp = self.pending_probe_execution_stamp_ns
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
+            self.pending_probe_effective_prefix_s = math.nan
             self.probe_completed_prefix_streak += 1
+            # Compatibility counter: this now means an actually executed,
+            # certified PROBE prefix (full completion remains separately logged
+            # through last_tracker_complete_*).
             self.probe_completed_execution_count += 1
 
             if self.probe_completed_prefix_streak >= self.probe_completed_prefixes_required:
@@ -923,8 +961,11 @@ class C44VerifiedRegimeManager:
                     self.NORMAL, "probe_normal_completed_prefixes", now)
             else:
                 self.last_transition_reason = (
-                    "probe_prefix_execution_complete_stamp_{}".format(
-                        execution_stamp_ns))
+                    "probe_certified_prefix_complete_stamp_{}".format(
+                        completed_stamp))
+                # Start the next measured-state PROBE now. The old committed
+                # trajectory remains safe through its certified brake+hold tail
+                # until the replacement itself passes final GCDF + exact VBC.
                 request_next_probe = True
 
         if request_next_probe:
@@ -1082,6 +1123,11 @@ class C44VerifiedRegimeManager:
                     self.pending_probe_candidate_seq),
                 "pending_probe_execution_stamp_ns={}".format(
                     self.pending_probe_execution_stamp_ns),
+                "pending_probe_effective_prefix_s={}".format(
+                    "nan" if not math.isfinite(
+                        self.pending_probe_effective_prefix_s)
+                    else "{:.6f}".format(
+                        self.pending_probe_effective_prefix_s)),
                 "last_tracker_complete_seq={}".format(
                     self.last_tracker_complete_seq),
                 "last_tracker_complete_stamp_ns={}".format(
