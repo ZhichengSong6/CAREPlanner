@@ -337,10 +337,19 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._spatiotemporal_last_reason = "malformed_{}".format(str(exc))
             return
 
+        def geometry_signature(layer_list):
+            return tuple(
+                (int(layer.get("layer_index", -1)),
+                 tuple(layer.get("keys", ())))
+                for layer in layer_list)
+
         with self._spatiotemporal_lock:
             if seq < self._spatiotemporal_seq:
                 self._spatiotemporal_last_reason = "stale"
                 return
+            changed_geometry = (
+                geometry_signature(self._spatiotemporal_layers) !=
+                geometry_signature(layers))
             self._spatiotemporal_seq = seq
             self._spatiotemporal_layers = layers
             self._spatiotemporal_received_count += 1
@@ -348,11 +357,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "l0_l1_ready" if len(layers) > 1 else
                 ("l0_only" if layers else "empty"))
 
-        # New L1 geometry may change the progressive shared steering target even
-        # when the persistent L0 obligation set is unchanged.
-        with self._progressive_shared_lock:
-            self._progressive_shared_cache_key = None
-            self._progressive_shared_cache = None
+        # Preserve C5.41 target hysteresis across periodic VBC refreshes that
+        # carry the same L0/L1 geometry. Re-solve only when the actual spatial
+        # look-ahead set changes, not merely because generation seq increments.
+        if changed_geometry:
+            with self._progressive_shared_lock:
+                self._progressive_shared_cache_key = None
+                self._progressive_shared_cache = None
 
     @staticmethod
     def _stamp_key(stamp):
