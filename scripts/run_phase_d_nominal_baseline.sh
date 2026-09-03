@@ -64,6 +64,8 @@ config_file=${CONFIG_FILE}
 task_trajectory_topic=${TASK_TOPIC}
 tracker_input_topic=${TASK_TOPIC}
 careplanner_modules_enabled=0
+run_seconds=${RUN_SECONDS}
+run_time_basis=ros_gazebo_sim_time
 EOF
 
 GAZEBO_PID=""
@@ -243,8 +245,8 @@ then
   exit 1
 fi
 
-echo "[RUN] task-only baseline for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
+echo "[RUN] task-only baseline for ${RUN_SECONDS}s ROS/Gazebo simulation time"
+python3 scripts/wait_for_ros_duration.py --duration-s "${RUN_SECONDS}"
 
 # Stop producers first; recorders then flush.
 kill_group "${TRACKER_PID}"; TRACKER_PID=""
