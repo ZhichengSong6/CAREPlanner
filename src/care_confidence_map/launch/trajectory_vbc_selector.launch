@@ -29,6 +29,8 @@
        default="/care_planner/active_sensing/target_candidate" />
   <arg name="candidate_active_topic"
        default="/care_planner/active_sensing/target_candidate_active" />
+  <arg name="spatiotemporal_bundle_topic"
+       default="/care_planner/trajectory_risk/vbc_spatiotemporal_bundle" />
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
   <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
@@ -106,6 +108,7 @@
     <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
     <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />
     <param name="trajectory_vbc/active_set_bundle_topic" value="$(arg active_set_bundle_topic)" />
+    <param name="trajectory_vbc/spatiotemporal_bundle_topic" value="$(arg spatiotemporal_bundle_topic)" />
     <param name="trajectory_vbc/force_bootstrap_topic" value="$(arg force_bootstrap_topic)" />
   </node>
 </launch>
