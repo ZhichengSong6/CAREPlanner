@@ -75,7 +75,9 @@ EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
 GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M:-0.02}"
 GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD:-0.20}"
 GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
-GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.20}"
+GOAL_SETTLE_VELOCITY_INF_RAD_S="${GOAL_SETTLE_VELOCITY_INF_RAD_S:-0.05}"
+GOAL_SETTLE_TIMEOUT_S="${GOAL_SETTLE_TIMEOUT_S:-1.0}"
+GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.0}"
 
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
@@ -515,6 +517,8 @@ if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; th
     --position-tolerance-m "${GOAL_POSITION_TOLERANCE_M}" \
     --orientation-tolerance-rad "${GOAL_ORIENTATION_TOLERANCE_RAD}" \
     --hold-s "${GOAL_SUCCESS_HOLD_S}" \
+    --settle-velocity-inf-rad-s "${GOAL_SETTLE_VELOCITY_INF_RAD_S}" \
+    --settle-timeout-s "${GOAL_SETTLE_TIMEOUT_S}" \
     --post-success-record-s "${GOAL_POST_SUCCESS_RECORD_S}" \
     --goal-position "${GX}" "${GY}" "${GZ}" \
     --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
