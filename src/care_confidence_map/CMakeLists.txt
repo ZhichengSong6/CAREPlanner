@@ -106,6 +106,21 @@ target_link_libraries(confidence_map_node
   yaml-cpp
 )
 
+add_executable(tof_fusion_self_filter_node
+  src/tof_fusion_self_filter_node.cpp
+)
+
+add_dependencies(tof_fusion_self_filter_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${catkin_EXPORTED_TARGETS}
+)
+
+target_link_libraries(tof_fusion_self_filter_node
+  body_sample_model
+  ${catkin_LIBRARIES}
+  yaml-cpp
+)
+
 add_executable(body_sample_model_node
   src/body_sample_model_node.cpp
 )
