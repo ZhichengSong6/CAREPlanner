@@ -229,8 +229,10 @@ class CppForbiddenVoxelGpuShadow {
     pnh_.param("z_max", z_max_, 1.15);
     pnh_.param("map_resolution", resolution_, 0.05);
 
-    if (rate_hz_ <= 0.0 || resolution_ <= 0.0) {
-      throw std::runtime_error("rate and resolution must be positive");
+    if (rate_hz_ <= 0.0 || resolution_ <= 0.0 ||
+        proximity_margin_ < 0.0 || execution_proximity_margin_ < 0.0) {
+      throw std::runtime_error(
+          "rate/resolution must be positive and proximity margins nonnegative");
     }
     if (confidence_threshold_ < 0.0 || confidence_threshold_ > 1.0) {
       throw std::runtime_error("confidence threshold must be in [0,1]");
