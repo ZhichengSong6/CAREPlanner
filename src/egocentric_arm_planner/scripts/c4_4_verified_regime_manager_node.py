@@ -347,6 +347,7 @@ class C44VerifiedRegimeManager:
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
+            self.pending_probe_effective_prefix_s = math.nan
             self.clear_until = None
             self.probe_ignore_until = None
             self.repair_completion = False
@@ -371,6 +372,7 @@ class C44VerifiedRegimeManager:
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
+            self.pending_probe_effective_prefix_s = math.nan
             self.clear_until = now + rospy.Duration(self.clear_pulse_s)
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
@@ -378,6 +380,7 @@ class C44VerifiedRegimeManager:
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
+            self.pending_probe_effective_prefix_s = math.nan
             self.clear_until = None
             self.probe_ignore_until = None
 
@@ -473,6 +476,7 @@ class C44VerifiedRegimeManager:
         self.blocker_rediscovery_count += 1
         self.pending_probe_candidate_seq = 0
         self.pending_probe_execution_stamp_ns = 0
+        self.pending_probe_effective_prefix_s = math.nan
         self.last_transition_reason = (
             "{}_wait_visibility_obligation".format(origin))
         self.force_vbc_bootstrap_pub.publish(
