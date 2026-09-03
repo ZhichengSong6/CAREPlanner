@@ -257,6 +257,7 @@ install(TARGETS
   body_sample_model
   trajectory_risk_evaluator
   confidence_map_node
+  tof_fusion_self_filter_node
   body_sample_model_node
   body_observability_node
   trajectory_risk_node
