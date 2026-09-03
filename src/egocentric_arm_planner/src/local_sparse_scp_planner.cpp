@@ -120,6 +120,8 @@ bool LocalSparseSCPPlanner::initialize(
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
   task_infeasible_pub_ =
       nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
+  task_obstacle_blocked_pub_ =
+      nh_.advertise<std_msgs::Bool>(task_obstacle_blocked_topic_, 10, false);
   task_uncertified_pub_ =
       nh_.advertise<std_msgs::Bool>(task_uncertified_topic_, 10, false);
   force_vbc_bootstrap_pub_ =
@@ -334,6 +336,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/task_infeasible_topic",
                           task_infeasible_topic_,
                           task_infeasible_topic_);
+  pnh_.param<std::string>("local_planner/task_obstacle_blocked_topic",
+                          task_obstacle_blocked_topic_,
+                          task_obstacle_blocked_topic_);
   pnh_.param<std::string>("local_planner/task_uncertified_topic",
                           task_uncertified_topic_,
                           task_uncertified_topic_);
@@ -1407,13 +1412,30 @@ void LocalSparseSCPPlanner::workerLoop() {
 
       if (!repair) {
         if (result.status.find("primal infeasible") != std::string::npos) {
-          std_msgs::Bool infeasible_msg;
-          infeasible_msg.data = true;
-          task_infeasible_pub_.publish(infeasible_msg);
-          ROS_WARN_STREAM(
-              "[LocalSparseSCPPlanner] task QP infeasible in "
-              << (probe ? "PROBE_NORMAL" : "NORMAL")
-              << " -> publish task infeasible signal");
+          std_msgs::Bool blocked_msg;
+          blocked_msg.data = true;
+
+          // Phase E4: a known physical obstacle must never be converted into
+          // an active-sensing request. If the hard QP contains any OCCUPIED
+          // GCDF row, give physical obstacle avoidance priority and ask for a
+          // non-sensing replan. UNKNOWN-only infeasibility retains the frozen
+          // C5.41 visibility-repair behavior.
+          if (result.selected_occupied_cdf_rows > 0) {
+            task_obstacle_blocked_pub_.publish(blocked_msg);
+            ROS_WARN_STREAM(
+                "[LocalSparseSCPPlanner] task QP obstacle-blocked in "
+                << (probe ? "PROBE_NORMAL" : "NORMAL")
+                << " unknown_rows=" << result.selected_unknown_cdf_rows
+                << " occupied_rows=" << result.selected_occupied_cdf_rows
+                << " -> publish non-sensing obstacle replan signal");
+          } else {
+            task_infeasible_pub_.publish(blocked_msg);
+            ROS_WARN_STREAM(
+                "[LocalSparseSCPPlanner] task QP unknown-space infeasible in "
+                << (probe ? "PROBE_NORMAL" : "NORMAL")
+                << " unknown_rows=" << result.selected_unknown_cdf_rows
+                << " -> publish task infeasible / visibility signal");
+          }
         } else if (
             result.status.find("max iterations") != std::string::npos ||
             result.status.find("maximum iterations") != std::string::npos) {
@@ -1514,6 +1536,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       batch.dof != dof_ ||
       batch.original_timestep.size() !=
           static_cast<std::size_t>(n_pairs) ||
+      (!batch.source_type.empty() &&
+       batch.source_type.size() != static_cast<std::size_t>(n_pairs)) ||
       batch.distance.size() !=
           static_cast<std::size_t>(n_pairs) ||
       batch.q_linearization_flat.size() !=
@@ -1582,6 +1606,17 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         ++out.screened_safe_rows;
         continue;
       }
+    }
+
+    const uint8_t source_type =
+        batch.source_type.empty()
+            ? care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN
+            : batch.source_type[static_cast<std::size_t>(i)];
+    if (source_type ==
+        care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED) {
+      ++out.selected_occupied_cdf_rows;
+    } else {
+      ++out.selected_unknown_cdf_rows;
     }
 
     SelectedRow row;
@@ -1888,6 +1923,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " eq=" << n_eq
       << " ineq=" << n_ineq
       << " selected_cdf_rows=" << n_cdf_rows
+      << " unknown_rows=" << out.selected_unknown_cdf_rows
+      << " occupied_rows=" << out.selected_occupied_cdf_rows
       << " nnz(P)=" << P.nonZeros()
       << " nnz(A)=" << A.nonZeros()
       << " nnz(G)=" << G.nonZeros());
