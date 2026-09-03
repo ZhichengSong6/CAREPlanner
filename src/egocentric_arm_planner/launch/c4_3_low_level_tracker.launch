@@ -10,6 +10,8 @@
   <arg name="use_acceleration_limiter" default="false" />
   <arg name="rate_limiter_output_velocity_command"
        default="/care_arm/arm_group_velocity_controller/command" />
+  <arg name="external_safety_hold_topic"
+       default="/care_planner/execution_gcdf/hard_hold" />
 
   <!--
     C4.3 planner/controller split.
@@ -29,6 +31,8 @@
     <param name="ee_frame" value="$(arg ee_frame)" />
     <param name="execution/input_trajectory" value="$(arg input_trajectory)" />
     <param name="execution/output_velocity_command" value="$(arg output_velocity_command)" />
+    <param name="execution/external_safety_hold_topic"
+           value="$(arg external_safety_hold_topic)" />
   </node>
 
   <node if="$(arg use_acceleration_limiter)"
