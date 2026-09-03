@@ -198,6 +198,18 @@ def records(name):
         return [{"_parse_error": repr(exc)}]
     return out
 
+def csv_data_row_count(name):
+    path = os.path.join(run, name)
+    if not os.path.isfile(path):
+        return 0
+    try:
+        with open(path, newline="", errors="replace") as f:
+            rd = csv.reader(f)
+            next(rd, None)
+            return sum(1 for row in rd if row)
+    except Exception:
+        return 0
+
 def as_int(v, default=0):
     try:
         return int(float(v))
@@ -323,7 +335,8 @@ digest["phase_e4_semantics"] = {
         [as_int(r.get("unknown_cdf_rows"), 0) for r in local_rows] or [0]),
     "max_local_occupied_cdf_rows": max(
         [as_int(r.get("occupied_cdf_rows"), 0) for r in local_rows] or [0]),
-    "task_obstacle_blocked_signal_count": len(obstacle_signals),
+    "task_obstacle_blocked_signal_count":
+        csv_data_row_count("task_obstacle_blocked.csv"),
     "gcdf_occupied_replan_count": max(
         [as_int(r.get("gcdf_occupied_replan_count"), 0) for r in reg] or [0]),
     "final_gcdf_blocker_classes": sorted(set(
@@ -336,7 +349,8 @@ digest["phase_e4_semantics"] = {
     "max_final_gcdf_unsafe_occupied_count": max(
         [as_int(r.get("final_gcdf_unsafe_occupied_count"), 0)
          for r in commit_rows_e4] or [0]),
-    "final_gcdf_recovery_event_records": len(recovery_events),
+    "final_gcdf_recovery_event_records":
+        csv_data_row_count("final_gcdf_recovery_event.csv"),
     "last_regime": reg[-1] if reg else None,
 }
 
