@@ -102,12 +102,16 @@ local_planner:
   u_tracking_weight: 0.01
   u_reference_tracking_enabled: false
 
-  # Keep the GCDF-style control magnitude objective for this integration test.
-  u_smooth_weight: 0.0
+  # C5.38 smooth certified execution: softly penalize inter-stage velocity
+  # changes across the full local horizon. This preserves feasibility because
+  # it is an objective term only; hard acceleration rows remain disabled.
+  # Combined with the boundary handoff term below, this prevents each short
+  # certified segment from rebuilding an independent accel/decel profile.
+  u_smooth_weight: 1.0
 
-  # Smooth certified handoff: only the replacement boundary is regularized
-  # against the actually rate-limited actuator command. This does not restore
-  # the old whole-horizon smoothness objective or hard acceleration rows.
+  # Replacement-boundary continuity against the actually rate-limited actuator
+  # command. With u_smooth_weight active, the first command and the following
+  # local velocity profile are both regularized continuously.
   handoff_velocity_weight: 1.0
 
   # Leave CARE acceleration/terminal-braking rows off for now; the previous G0
