@@ -3,20 +3,23 @@
 
 C5.9 execution ownership rule
 -----------------------------
-PROBE_NORMAL is a receding executable-prefix mode.  At most one PROBE prefix may
+PROBE_NORMAL is a receding executable-prefix mode. At most one PROBE prefix may
 be in verification/execution at a time:
 
-    raw PROBE candidate -> VERIFYING -> committed -> EXECUTING -> tracker complete
+    raw PROBE candidate -> VERIFYING -> committed -> EXECUTING
+        -> certified task prefix complete -> next flight admitted
 
-Any additional PROBE candidates that arrive while VERIFYING or EXECUTING are
-intentionally dropped.  Once the exact committed execution token completes, the
-regime manager requests the next fresh plan from measured state.
+The committed brake+hold tail is still part of the exact GCDF/VBC-certified
+trajectory. It remains the fail-safe execution while the next fresh probe is
+planned/certified. No new probe is admitted before the current certified task
+prefix has actually executed.
 
 Outside PROBE_NORMAL this node is transparent.  Therefore an emergency
 PROBE->REPAIR transition can immediately preempt the probe stream with a fresh
 REPAIR candidate instead of waiting for the old task prefix to complete.
 """
 
+import math
 import re
 import threading
 
@@ -47,6 +50,13 @@ def _as_int(v, default=0):
         return default
 
 
+def _as_float(v, default=float("nan")):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 class ProbeSingleFlightGate:
     IDLE = "IDLE"
     VERIFYING = "VERIFYING"
@@ -72,12 +82,14 @@ class ProbeSingleFlightGate:
         self.probe_active = False
         self.phase = self.IDLE
         self.execution_stamp_ns = 0
+        self.effective_prefix_s = float("nan")
 
         self.input_count = 0
         self.forward_count = 0
         self.drop_busy_count = 0
         self.verify_release_count = 0
         self.execution_complete_count = 0
+        self.prefix_release_count = 0
         self.mode_reset_count = 0
         self.last_reason = "startup"
 
@@ -107,6 +119,7 @@ class ProbeSingleFlightGate:
             self.mode_reset_count += 1
         self.phase = self.IDLE
         self.execution_stamp_ns = 0
+        self.effective_prefix_s = float("nan")
         self.last_reason = reason
 
     def _probe_active_cb(self, msg):
@@ -162,6 +175,8 @@ class ProbeSingleFlightGate:
         result = f.get("result", "")
         committed = _as_bool(f.get("committed"))
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
+        effective_prefix_s = _as_float(
+            f.get("probe_effective_prefix_s"), float("nan"))
 
         with self._lock:
             if not self.probe_active or self.phase != self.VERIFYING:
@@ -170,7 +185,8 @@ class ProbeSingleFlightGate:
             if result == "safe" and committed is True and execution_stamp_ns > 0:
                 self.phase = self.EXECUTING
                 self.execution_stamp_ns = execution_stamp_ns
-                self.last_reason = "probe_verified_wait_tracker"
+                self.effective_prefix_s = effective_prefix_s
+                self.last_reason = "probe_verified_wait_prefix"
             elif result in ("unsafe", "timeout") or committed is False:
                 # No executable trajectory exists, so a fresh PROBE candidate
                 # may be considered immediately when the planner replans.
@@ -187,8 +203,7 @@ class ProbeSingleFlightGate:
         complete = _as_bool(f.get("complete"))
         source = f.get("source", "")
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
-        if complete is not True or source != "trajectory_complete_hold":
-            return
+        phase_s = _as_float(f.get("phase_s"), float("nan"))
 
         with self._lock:
             if (not self.probe_active or self.phase != self.EXECUTING or
@@ -197,10 +212,30 @@ class ProbeSingleFlightGate:
             if execution_stamp_ns != self.execution_stamp_ns:
                 return
 
+            prefix_complete = (
+                math.isfinite(self.effective_prefix_s) and
+                self.effective_prefix_s > 0.0 and
+                math.isfinite(phase_s) and
+                phase_s + 1e-6 >= self.effective_prefix_s)
+            full_complete = (
+                complete is True and source == "trajectory_complete_hold")
+
+            if not prefix_complete and not full_complete:
+                return
+
+            # Safety invariant: release only after the certified task prefix
+            # itself has executed. Until the next candidate passes GCDF+VBC,
+            # the current trajectory continues through its already-certified
+            # brake+hold tail.
             self.phase = self.IDLE
             self.execution_stamp_ns = 0
-            self.execution_complete_count += 1
-            self.last_reason = "probe_execution_complete"
+            self.effective_prefix_s = float("nan")
+            self.prefix_release_count += 1
+            if full_complete:
+                self.execution_complete_count += 1
+                self.last_reason = "probe_execution_complete_fallback_release"
+            else:
+                self.last_reason = "probe_prefix_complete_release"
             self._publish_summary_locked()
 
     def _publish_summary_locked(self):
@@ -214,6 +249,10 @@ class ProbeSingleFlightGate:
             "drop_busy_count={}".format(self.drop_busy_count),
             "verify_release_count={}".format(self.verify_release_count),
             "execution_complete_count={}".format(self.execution_complete_count),
+            "prefix_release_count={}".format(self.prefix_release_count),
+            "effective_prefix_s={}".format(
+                "nan" if not math.isfinite(self.effective_prefix_s)
+                else "{:.6f}".format(self.effective_prefix_s)),
             "mode_reset_count={}".format(self.mode_reset_count),
             "reason={}".format(self.last_reason),
         ])
