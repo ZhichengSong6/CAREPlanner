@@ -19,6 +19,7 @@ PROBE->REPAIR transition can immediately preempt the probe stream with a fresh
 REPAIR candidate instead of waiting for the old task prefix to complete.
 """
 
+import copy
 import math
 import re
 import threading
@@ -76,6 +77,12 @@ class ProbeSingleFlightGate:
             "~verification_outcome_topic", "/care_planner/verification_outcome"))
         self.tracker_summary_topic = str(rospy.get_param(
             "~tracker_summary_topic", "/care_planner/execution/tracker_summary"))
+        self.regime_summary_topic = str(rospy.get_param(
+            "~regime_summary_topic", "/care_planner/c4_4/regime_summary"))
+        self.replan_request_topic = str(rospy.get_param(
+            "~replan_request_topic", "/care_planner/local_planner/replan_request"))
+        self.lookahead_plan_lead_s = float(rospy.get_param(
+            "~lookahead_plan_lead_s", 0.18))
         self.summary_topic = str(rospy.get_param(
             "~summary_topic", "/care_planner/execution/probe_single_flight_summary"))
 
@@ -83,6 +90,10 @@ class ProbeSingleFlightGate:
         self.phase = self.IDLE
         self.execution_stamp_ns = 0
         self.effective_prefix_s = float("nan")
+        self.buffered_candidate = None
+        self.lookahead_requested = False
+        self.probe_completed_prefix_streak = 0
+        self.probe_completed_prefixes_required = 3
 
         self.input_count = 0
         self.forward_count = 0
@@ -90,6 +101,10 @@ class ProbeSingleFlightGate:
         self.verify_release_count = 0
         self.execution_complete_count = 0
         self.prefix_release_count = 0
+        self.lookahead_request_count = 0
+        self.buffer_count = 0
+        self.buffer_replace_count = 0
+        self.buffer_forward_count = 0
         self.mode_reset_count = 0
         self.last_reason = "startup"
 
@@ -97,6 +112,8 @@ class ProbeSingleFlightGate:
             self.output_topic, JointTrajectory, queue_size=1)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
+        self.replan_request_pub = rospy.Publisher(
+            self.replan_request_topic, Bool, queue_size=10, latch=False)
 
         rospy.Subscriber(
             self.input_topic, JointTrajectory, self._candidate_cb, queue_size=1)
@@ -108,6 +125,9 @@ class ProbeSingleFlightGate:
         rospy.Subscriber(
             self.tracker_summary_topic, String,
             self._tracker_summary_cb, queue_size=20)
+        rospy.Subscriber(
+            self.regime_summary_topic, String,
+            self._regime_summary_cb, queue_size=20)
 
         self._publish_summary()
         rospy.logwarn(
@@ -120,6 +140,8 @@ class ProbeSingleFlightGate:
         self.phase = self.IDLE
         self.execution_stamp_ns = 0
         self.effective_prefix_s = float("nan")
+        self.buffered_candidate = None
+        self.lookahead_requested = False
         self.last_reason = reason
 
     def _probe_active_cb(self, msg):
@@ -155,6 +177,16 @@ class ProbeSingleFlightGate:
                 self.forward_count += 1
                 self.last_reason = "probe_candidate_forwarded_verify"
                 publish = True
+            elif self.phase == self.EXECUTING and self.lookahead_requested:
+                # C5.40: planner work may happen before the certified prefix
+                # ends, but the raw candidate is NOT admitted to safety or
+                # execution yet. Keep only the freshest one-slot look-ahead.
+                if self.buffered_candidate is None:
+                    self.buffer_count += 1
+                else:
+                    self.buffer_replace_count += 1
+                self.buffered_candidate = copy.deepcopy(msg)
+                self.last_reason = "probe_candidate_buffered_lookahead"
             else:
                 self.drop_busy_count += 1
                 self.last_reason = "probe_candidate_dropped_{}".format(
@@ -186,6 +218,8 @@ class ProbeSingleFlightGate:
                 self.phase = self.EXECUTING
                 self.execution_stamp_ns = execution_stamp_ns
                 self.effective_prefix_s = effective_prefix_s
+                self.buffered_candidate = None
+                self.lookahead_requested = False
                 self.last_reason = "probe_verified_wait_prefix"
             elif result in ("unsafe", "timeout") or committed is False:
                 # No executable trajectory exists, so a fresh PROBE candidate
@@ -205,6 +239,9 @@ class ProbeSingleFlightGate:
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         phase_s = _as_float(f.get("phase_s"), float("nan"))
 
+        candidate_to_publish = None
+        request_lookahead = False
+
         with self._lock:
             if (not self.probe_active or self.phase != self.EXECUTING or
                     self.execution_stamp_ns <= 0):
@@ -220,23 +257,76 @@ class ProbeSingleFlightGate:
             full_complete = (
                 complete is True and source == "trajectory_complete_hold")
 
-            if not prefix_complete and not full_complete:
-                return
+            # Only preplan when another PROBE will still be required after this
+            # certified prefix. The final probe therefore cannot leak a stale
+            # fourth probe across PROBE->NORMAL.
+            another_probe_needed = (
+                self.probe_completed_prefix_streak + 1 <
+                self.probe_completed_prefixes_required)
+            lookahead_due = (
+                another_probe_needed and
+                math.isfinite(self.effective_prefix_s) and
+                math.isfinite(phase_s) and
+                phase_s + 1e-6 >= max(
+                    0.0, self.effective_prefix_s -
+                    max(0.0, self.lookahead_plan_lead_s)))
 
-            # Safety invariant: release only after the certified task prefix
-            # itself has executed. Until the next candidate passes GCDF+VBC,
-            # the current trajectory continues through its already-certified
-            # brake+hold tail.
-            self.phase = self.IDLE
-            self.execution_stamp_ns = 0
-            self.effective_prefix_s = float("nan")
-            self.prefix_release_count += 1
-            if full_complete:
-                self.execution_complete_count += 1
-                self.last_reason = "probe_execution_complete_fallback_release"
+            if lookahead_due and not self.lookahead_requested:
+                self.lookahead_requested = True
+                self.lookahead_request_count += 1
+                request_lookahead = True
+                self.last_reason = "probe_lookahead_replan_requested"
+                self._publish_summary_locked()
+
+            if not prefix_complete and not full_complete:
+                # Planning may happen now, but current certified execution
+                # ownership remains unchanged.
+                pass
             else:
-                self.last_reason = "probe_prefix_complete_release"
-            self._publish_summary_locked()
+                self.prefix_release_count += 1
+                self.execution_stamp_ns = 0
+                self.effective_prefix_s = float("nan")
+
+                if self.buffered_candidate is not None:
+                    # Admit the preplanned RAW candidate only now. Downstream
+                    # will rebase it to current measured q, rebuild the exact
+                    # prefix+brake+hold executable, then run final GCDF + exact
+                    # VBC before any commit. No safety authority is bypassed.
+                    candidate_to_publish = self.buffered_candidate
+                    self.buffered_candidate = None
+                    self.phase = self.VERIFYING
+                    self.lookahead_requested = False
+                    self.forward_count += 1
+                    self.buffer_forward_count += 1
+                    self.last_reason = (
+                        "probe_prefix_complete_forward_buffered_verify")
+                else:
+                    self.phase = self.IDLE
+                    self.lookahead_requested = False
+                    if full_complete:
+                        self.execution_complete_count += 1
+                        self.last_reason = (
+                            "probe_execution_complete_fallback_release")
+                    else:
+                        self.last_reason = "probe_prefix_complete_release"
+                self._publish_summary_locked()
+
+        if request_lookahead:
+            self.replan_request_pub.publish(Bool(data=True))
+        if candidate_to_publish is not None:
+            self.output_pub.publish(candidate_to_publish)
+
+    def _regime_summary_cb(self, msg):
+        if msg is None:
+            return
+        f = _tokens(msg.data)
+        streak = _as_int(f.get("probe_completed_prefix_streak"), -1)
+        required = _as_int(f.get("probe_completed_prefixes_required"), -1)
+        if streak < 0 or required < 1:
+            return
+        with self._lock:
+            self.probe_completed_prefix_streak = streak
+            self.probe_completed_prefixes_required = required
 
     def _publish_summary_locked(self):
         msg = String()
@@ -250,6 +340,16 @@ class ProbeSingleFlightGate:
             "verify_release_count={}".format(self.verify_release_count),
             "execution_complete_count={}".format(self.execution_complete_count),
             "prefix_release_count={}".format(self.prefix_release_count),
+            "lookahead_request_count={}".format(self.lookahead_request_count),
+            "buffered_candidate={}".format(
+                int(self.buffered_candidate is not None)),
+            "buffer_count={}".format(self.buffer_count),
+            "buffer_replace_count={}".format(self.buffer_replace_count),
+            "buffer_forward_count={}".format(self.buffer_forward_count),
+            "probe_completed_prefix_streak={}".format(
+                self.probe_completed_prefix_streak),
+            "probe_completed_prefixes_required={}".format(
+                self.probe_completed_prefixes_required),
             "effective_prefix_s={}".format(
                 "nan" if not math.isfinite(self.effective_prefix_s)
                 else "{:.6f}".format(self.effective_prefix_s)),
