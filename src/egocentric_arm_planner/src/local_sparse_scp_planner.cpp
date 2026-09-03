@@ -2240,6 +2240,8 @@ void LocalSparseSCPPlanner::publishSummary(
         << " solve_ms=" << result->setup_and_solve_ms
         << " batch_pairs=" << result->batch_pairs
         << " cdf_rows=" << result->selected_cdf_rows
+        << " unknown_cdf_rows=" << result->selected_unknown_cdf_rows
+        << " occupied_cdf_rows=" << result->selected_occupied_cdf_rows
         << " screened_safe=" << result->screened_safe_rows
         << " skipped_step0=" << result->skipped_step0_rows
         << " skipped_horizon=" << result->skipped_horizon_rows
