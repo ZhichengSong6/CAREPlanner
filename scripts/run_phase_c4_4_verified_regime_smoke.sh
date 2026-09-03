@@ -441,6 +441,7 @@ record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
+record_topic /care_planner/final_gcdf/recovery_visibility_event "${OUT}/final_gcdf_recovery_event.csv"
 record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
