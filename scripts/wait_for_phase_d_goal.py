@@ -85,7 +85,9 @@ def main():
     ap.add_argument("--position-tolerance-m", type=float, default=0.02)
     ap.add_argument("--orientation-tolerance-rad", type=float, default=0.20)
     ap.add_argument("--hold-s", type=float, default=0.10)
-    ap.add_argument("--post-success-record-s", type=float, default=0.20)
+    ap.add_argument("--settle-velocity-inf-rad-s", type=float, default=0.05)
+    ap.add_argument("--settle-timeout-s", type=float, default=1.0)
+    ap.add_argument("--post-success-record-s", type=float, default=0.0)
     ap.add_argument("--goal-position", type=float, nargs=3, required=True)
     ap.add_argument("--goal-orientation", type=float, nargs=4, required=True)
     ap.add_argument("--status-json", default="")
@@ -97,8 +99,10 @@ def main():
         raise ValueError("--position-tolerance-m must be positive")
     if args.orientation_tolerance_rad <= 0.0:
         raise ValueError("--orientation-tolerance-rad must be positive")
-    if args.hold_s < 0.0 or args.post_success_record_s < 0.0:
-        raise ValueError("hold/post-success durations must be non-negative")
+    if (args.hold_s < 0.0 or args.post_success_record_s < 0.0 or
+            args.settle_velocity_inf_rad_s < 0.0 or
+            args.settle_timeout_s < 0.0):
+        raise ValueError("hold/settle/post-success values must be non-negative")
 
     repo = os.path.abspath(args.repo)
     helper = load_fk_helper(repo)
@@ -116,10 +120,13 @@ def main():
     wall_start = time.monotonic()
     inside_since_ros = None
     success_wall_s = None
+    success_latched_wall = None
     last_pos = math.nan
     last_rot = math.nan
+    last_speed_inf = math.nan
     sample_count = 0
     goal_reached = False
+    settled_before_exit = False
     last_log_wall = -math.inf
 
     print(
@@ -156,6 +163,17 @@ def main():
         if not all(name in qmap for name in JOINTS):
             continue
 
+        dqmap = {}
+        if len(msg.velocity) == len(msg.name):
+            dqmap = {
+                str(name): float(value)
+                for name, value in zip(msg.name, msg.velocity)
+            }
+        if all(name in dqmap for name in JOINTS):
+            last_speed_inf = max(abs(dqmap[name]) for name in JOINTS)
+        else:
+            last_speed_inf = math.nan
+
         sample_count += 1
         T = fk_T(helper, chain, qmap)
         last_pos, last_rot = pose_error(T, p_goal, R_goal)
@@ -164,27 +182,48 @@ def main():
             and last_rot <= args.orientation_tolerance_rad
         )
 
-        now_ros = (
-            msg.header.stamp.to_sec()
-            if not msg.header.stamp.is_zero()
-            else rospy.Time.now().to_sec()
-        )
+        stamp_s = msg.header.stamp.to_sec()
+        now_ros = stamp_s if stamp_s > 0.0 else rospy.Time.now().to_sec()
 
-        if inside:
-            if inside_since_ros is None:
-                inside_since_ros = now_ros
-            if now_ros - inside_since_ros >= args.hold_s:
-                goal_reached = True
-                success_wall_s = time.monotonic() - wall_start
-                print(
-                    "[GOAL WATCH] reached stable goal: elapsed={:.3f}s "
-                    "position_error={:.6f}m orientation_error={:.6f}rad".format(
-                        success_wall_s, last_pos, last_rot
+        if success_wall_s is None:
+            if inside:
+                if inside_since_ros is None:
+                    inside_since_ros = now_ros
+                if now_ros - inside_since_ros >= args.hold_s:
+                    success_wall_s = time.monotonic() - wall_start
+                    success_latched_wall = time.monotonic()
+                    print(
+                        "[GOAL WATCH] benchmark success latched: elapsed={:.3f}s "
+                        "position_error={:.6f}m orientation_error={:.6f}rad "
+                        "speed_inf={:.6f}rad/s".format(
+                            success_wall_s, last_pos, last_rot,
+                            last_speed_inf
+                        )
                     )
+            else:
+                inside_since_ros = None
+        else:
+            speed_ok = (
+                math.isfinite(last_speed_inf)
+                and last_speed_inf <= args.settle_velocity_inf_rad_s
+            )
+            if inside and speed_ok:
+                goal_reached = True
+                settled_before_exit = True
+                print(
+                    "[GOAL WATCH] settled after success: speed_inf="
+                    "{:.6f}rad/s".format(last_speed_inf)
                 )
                 break
-        else:
-            inside_since_ros = None
+            if (success_latched_wall is not None and
+                    time.monotonic() - success_latched_wall >=
+                    args.settle_timeout_s):
+                goal_reached = True
+                print(
+                    "[GOAL WATCH] success settle timeout reached; "
+                    "ending without extending task metric"
+                )
+                break
 
         now_wall = time.monotonic()
         if now_wall - last_log_wall >= 2.0:
@@ -200,7 +239,8 @@ def main():
             )
 
     if goal_reached and args.post_success_record_s > 0.0:
-        time.sleep(args.post_success_record_s)
+        remaining = max(0.0, args.timeout_s - (time.monotonic() - wall_start))
+        time.sleep(min(args.post_success_record_s, remaining))
 
     elapsed = time.monotonic() - wall_start
     reason = "goal_tolerance_stable" if goal_reached else "max_timeout"
@@ -213,7 +253,12 @@ def main():
         "position_tolerance_m": args.position_tolerance_m,
         "orientation_tolerance_rad": args.orientation_tolerance_rad,
         "required_hold_s": args.hold_s,
+        "settle_velocity_inf_rad_s": args.settle_velocity_inf_rad_s,
+        "settle_timeout_s": args.settle_timeout_s,
+        "settled_before_exit": bool(settled_before_exit),
         "post_success_record_s": args.post_success_record_s,
+        "last_speed_inf_rad_s": (
+            last_speed_inf if math.isfinite(last_speed_inf) else None),
         "last_position_error_m": (
             last_pos if math.isfinite(last_pos) else None),
         "last_orientation_error_rad": (
