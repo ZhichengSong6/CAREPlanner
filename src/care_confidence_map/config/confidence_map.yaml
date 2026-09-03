@@ -20,6 +20,10 @@ confidence_map:
   # so previously observed space is effectively remembered over a normal run.
   temporal_decay_time: 100.0
 
+  # Frozen C5.41 baseline semantics. Phase E uses a separate config that
+  # switches this node to real ToF ray integration.
+  observation_mode: ideal_fov
+
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
