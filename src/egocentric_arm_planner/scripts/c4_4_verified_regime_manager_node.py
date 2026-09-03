@@ -133,6 +133,9 @@ class C44VerifiedRegimeManager:
         self.task_infeasible_topic = str(rospy.get_param(
             "~task_infeasible_topic",
             "/care_planner/local_planner/task_infeasible"))
+        self.task_obstacle_blocked_topic = str(rospy.get_param(
+            "~task_obstacle_blocked_topic",
+            "/care_planner/local_planner/task_obstacle_blocked"))
         self.task_uncertified_topic = str(rospy.get_param(
             "~task_uncertified_topic",
             "/care_planner/local_planner/task_uncertified"))
@@ -218,6 +221,9 @@ class C44VerifiedRegimeManager:
         self.execution_repair_entry_count = 0
         self.task_infeasible_repair_entry_count = 0
         self.task_infeasible_pending = False
+        self.task_obstacle_blocked_pending = False
+        self.task_obstacle_blocked_count = 0
+        self.task_obstacle_replan_count = 0
         self.task_uncertified_repair_entry_count = 0
         self.task_uncertified_pending = False
 
@@ -288,6 +294,9 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.task_infeasible_topic, Bool, self._task_infeasible_cb,
             queue_size=10)
+        rospy.Subscriber(
+            self.task_obstacle_blocked_topic, Bool,
+            self._task_obstacle_blocked_cb, queue_size=10)
         rospy.Subscriber(
             self.task_uncertified_topic, Bool, self._task_uncertified_cb,
             queue_size=10)
@@ -422,6 +431,7 @@ class C44VerifiedRegimeManager:
                     self.pending_probe_effective_prefix_s = math.nan
                     self.repair_completion = False
                     self.repair_completion_armed = False
+                    self.task_obstacle_blocked_pending = False
                     self.blocker_rediscovery_pending = False
                     self.blocker_rediscovery_origin = "none"
                     self.blocker_rediscovery_force_bootstrap = False
@@ -436,7 +446,13 @@ class C44VerifiedRegimeManager:
             if was_ready:
                 return
 
-            if self.task_infeasible_pending and self.state == self.NORMAL:
+            if self.task_obstacle_blocked_pending:
+                self.task_obstacle_blocked_pending = False
+                self.task_obstacle_replan_count += 1
+                self.last_transition_reason = (
+                    "task_obstacle_blocked_after_gate_release_replan")
+                self.replan_request_pub.publish(Bool(data=True))
+            elif self.task_infeasible_pending and self.state == self.NORMAL:
                 self.task_infeasible_pending = False
                 self.task_uncertified_pending = False
                 self.task_infeasible_repair_entry_count += 1
@@ -621,6 +637,37 @@ class C44VerifiedRegimeManager:
                 self.task_infeasible_repair_entry_count += 1
                 self._transition_locked(
                     self.REPAIR, "task_planner_infeasible", now)
+
+    def _task_obstacle_blocked_cb(self, msg):
+        """Known OCCUPIED geometry is a planning problem, never a sensing one."""
+        if msg is None or not bool(msg.data):
+            return
+        now = rospy.Time.now()
+        with self._lock:
+            self.task_obstacle_blocked_count += 1
+
+            if not self.execution_ready:
+                self.task_obstacle_blocked_pending = True
+                self.last_transition_reason = "task_obstacle_blocked_pending"
+                return
+
+            self.task_obstacle_blocked_pending = False
+
+            if self.state == self.PROBE_NORMAL and self._probe_single_flight_busy_locked():
+                self.probe_failure_suppressed_busy_count += 1
+                self.last_transition_reason = (
+                    "task_obstacle_blocked_suppressed_single_flight_{}".format(
+                        self.probe_single_flight_phase.lower()))
+                return
+
+            # Stay in the current regime. In NORMAL this asks LocalSparseSCP to
+            # find a collision-free task detour; in PROBE it retries the current
+            # task probe without manufacturing a visibility obligation.
+            self.task_obstacle_replan_count += 1
+            self.last_transition_reason = (
+                "task_obstacle_blocked_{}_replan".format(
+                    self.state.lower()))
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _task_uncertified_cb(self, msg):
         if msg is None or not bool(msg.data):
@@ -1103,6 +1150,12 @@ class C44VerifiedRegimeManager:
                     self.task_infeasible_repair_entry_count),
                 "task_infeasible_pending={}".format(
                     int(self.task_infeasible_pending)),
+                "task_obstacle_blocked_pending={}".format(
+                    int(self.task_obstacle_blocked_pending)),
+                "task_obstacle_blocked_count={}".format(
+                    self.task_obstacle_blocked_count),
+                "task_obstacle_replan_count={}".format(
+                    self.task_obstacle_replan_count),
                 "task_uncertified_repair_entry_count={}".format(
                     self.task_uncertified_repair_entry_count),
                 "task_uncertified_pending={}".format(
