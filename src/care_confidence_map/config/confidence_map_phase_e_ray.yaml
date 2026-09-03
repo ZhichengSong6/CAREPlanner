@@ -20,8 +20,8 @@ confidence_map:
   # so previously observed space is effectively remembered over a normal run.
   temporal_decay_time: 100.0
 
-  # Frozen C5.41 baseline semantics. Phase E uses a separate config that
-  # switches this node to real ToF ray integration.
+  # Phase E3 semantics: real ToF ray integration. The frozen C5.41 baseline
+  # remains in confidence_map.yaml with observation_mode: ideal_fov.
   observation_mode: tof_ray
 
   # Phase E3 real depth-ray integration. E2 publishes one coarse ray sample
