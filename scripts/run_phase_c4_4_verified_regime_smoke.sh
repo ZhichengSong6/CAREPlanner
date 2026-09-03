@@ -68,6 +68,15 @@ PROBE_PREFIX_S="${PROBE_PREFIX_S:-0.15}"
 SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-false}"
 REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-${C4_REPAIR_BRAKE_DT_S:-0.05}}"
 REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
+
+# Optional online task-success stop. Defaults off here so historical C4/C5
+# diagnostics retain their fixed-duration semantics. Phase-D enables it.
+EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
+GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M:-0.02}"
+GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD:-0.20}"
+GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
+GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.20}"
+
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
@@ -498,8 +507,22 @@ else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
 echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
-echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for ${RUN_SECONDS}s"
-sleep "${RUN_SECONDS}"
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} up to ${RUN_SECONDS}s; early stop on stable EE goal"
+  python3 scripts/wait_for_phase_d_goal.py \
+    --repo "${REPO}" \
+    --timeout-s "${RUN_SECONDS}" \
+    --position-tolerance-m "${GOAL_POSITION_TOLERANCE_M}" \
+    --orientation-tolerance-rad "${GOAL_ORIENTATION_TOLERANCE_RAD}" \
+    --hold-s "${GOAL_SUCCESS_HOLD_S}" \
+    --post-success-record-s "${GOAL_POST_SUCCESS_RECORD_S}" \
+    --goal-position "${GX}" "${GY}" "${GZ}" \
+    --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
+    --status-json "${OUT}/goal_stop_status.json"
+else
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s"
+  sleep "${RUN_SECONDS}"
+fi
 
 kill_group "${CONTROL_PID}"; CONTROL_PID=""
 kill_group "${GEN_PID}"; GEN_PID=""
