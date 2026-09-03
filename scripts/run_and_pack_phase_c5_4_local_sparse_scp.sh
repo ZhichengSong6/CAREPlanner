@@ -706,6 +706,55 @@ digest["c5_12_recovery"] = {
         if blocker_rows else 0),
 }
 
+# C5.42 adjacent temporal-layer look-ahead diagnostics.
+digest["c5_42_spatiotemporal_visibility"] = {
+    "enabled": (
+        blocker_rows[-1].get("one_layer_lookahead_enabled") == "1"
+        if blocker_rows else False),
+    "spatiotemporal_received_count": (
+        as_int(blocker_rows[-1].get("spatiotemporal_received_count"))
+        if blocker_rows else 0),
+    "spatiotemporal_drop_count": (
+        as_int(blocker_rows[-1].get("spatiotemporal_drop_count"))
+        if blocker_rows else 0),
+    "lookahead_shared_success_count": (
+        as_int(blocker_rows[-1].get("lookahead_shared_success_count"))
+        if blocker_rows else 0),
+    "lookahead_drop_count": (
+        as_int(blocker_rows[-1].get("lookahead_drop_count"))
+        if blocker_rows else 0),
+    "progressive_shared_attempt_count": (
+        as_int(blocker_rows[-1].get("progressive_shared_attempt_count"))
+        if blocker_rows else 0),
+    "progressive_shared_success_count": (
+        as_int(blocker_rows[-1].get("progressive_shared_success_count"))
+        if blocker_rows else 0),
+    "progressive_shared_fallback_count": (
+        as_int(blocker_rows[-1].get("progressive_shared_fallback_count"))
+        if blocker_rows else 0),
+    "last_mode": (
+        blocker_rows[-1].get("progressive_shared_mode")
+        if blocker_rows else None),
+    "last_considered_ids": (
+        blocker_rows[-1].get("progressive_shared_considered_ids")
+        if blocker_rows else None),
+    "last_kept_ids": (
+        blocker_rows[-1].get("progressive_shared_kept_ids")
+        if blocker_rows else None),
+    "last_dropped_ids": (
+        blocker_rows[-1].get("progressive_shared_dropped_ids")
+        if blocker_rows else None),
+    "last_slacks": (
+        blocker_rows[-1].get("progressive_shared_slacks")
+        if blocker_rows else None),
+    "last_l1_region_count": (
+        as_int(blocker_rows[-1].get("lookahead_l1_region_count"))
+        if blocker_rows else 0),
+    "last_l1_point_count": (
+        as_int(blocker_rows[-1].get("lookahead_l1_point_count"))
+        if blocker_rows else 0),
+}
+
 # The key C5.12 invariant is checked on observed regime records rather than
 # inferred from final state: a transition into REPAIR from PROBE must name a
 # visibility-obligation-ready reason (direct transition is only allowed when
