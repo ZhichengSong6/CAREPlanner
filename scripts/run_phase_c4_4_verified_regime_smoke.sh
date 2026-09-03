@@ -524,8 +524,8 @@ if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; th
     --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
     --status-json "${OUT}/goal_stop_status.json"
 else
-  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s"
-  sleep "${RUN_SECONDS}"
+  echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s ROS/Gazebo simulation time"
+  python3 scripts/wait_for_ros_duration.py --duration-s "${RUN_SECONDS}"
 fi
 
 kill_group "${CONTROL_PID}"; CONTROL_PID=""
