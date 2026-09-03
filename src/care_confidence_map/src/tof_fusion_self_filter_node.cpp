@@ -39,6 +39,12 @@ struct Sphere
   double radius = 0.0;
 };
 
+struct RaySample
+{
+  pcl::PointXYZ endpoint_base;
+  bool hit = false;
+};
+
 struct SensorState
 {
   pcl::PointCloud<pcl::PointXYZ>::Ptr filtered_base{
@@ -52,6 +58,8 @@ struct SensorState
   std::size_t tf_failures = 0;
   std::size_t latest_tf_fallbacks = 0;
   tf2::Vector3 sensor_origin_base{0.0, 0.0, 0.0};
+  std::vector<RaySample> ray_samples;
+  std::size_t ray_self_blocked = 0;
   bool valid = false;
 };
 
@@ -104,6 +112,10 @@ public:
     pnh_.param("allow_latest_tf_fallback", allow_latest_tf_fallback_, true);
     pnh_.param("publish_rate", publish_rate_, 15.0);
     pnh_.param("self_geometry_rate", self_geometry_rate_, 30.0);
+    pnh_.param("ray_pixel_stride", ray_pixel_stride_, 8);
+    pnh_.param("ray_horizontal_fov_deg", ray_horizontal_fov_deg_, 55.0);
+    pnh_.param("ray_vertical_fov_deg", ray_vertical_fov_deg_, 72.0);
+    pnh_.param("ray_max_forward_depth", ray_max_forward_depth_, 0.75);
 
     if (!pnh_.getParam("input_topics", input_topics_) ||
         input_topics_.empty())
@@ -140,7 +152,11 @@ public:
         sensor_timeout_ <= 0.0 ||
         tf_timeout_ < 0.0 ||
         publish_rate_ <= 0.0 ||
-        self_geometry_rate_ <= 0.0)
+        self_geometry_rate_ <= 0.0 ||
+        ray_pixel_stride_ < 1 ||
+        ray_horizontal_fov_deg_ <= 0.0 ||
+        ray_vertical_fov_deg_ <= 0.0 ||
+        ray_max_forward_depth_ <= 0.0)
     {
       ROS_ERROR("[tof_fusion_self_filter] invalid numeric parameter.");
       return false;
@@ -439,6 +455,108 @@ private:
     kept->height = 1;
     kept->is_dense = false;
 
+    // Phase E3 coarse organized-ray sampling. Finite pixels are obstacle
+    // endpoints (unless they are robot-self returns); non-finite pixels mean
+    // no hit before the depth-camera far plane and therefore carry a FREE ray
+    // to ray_max_forward_depth_.
+    std::vector<RaySample> ray_samples;
+    std::size_t ray_self_blocked = 0;
+
+    const std::size_t width = static_cast<std::size_t>(raw->width);
+    const std::size_t height = static_cast<std::size_t>(raw->height);
+    if (width > 0 && height > 1 &&
+        raw->points.size() >= width * height)
+    {
+      const double h_half =
+          0.5 * ray_horizontal_fov_deg_ * M_PI / 180.0;
+      const double v_half =
+          0.5 * ray_vertical_fov_deg_ * M_PI / 180.0;
+      const double fx =
+          (static_cast<double>(width) - 1.0) /
+          (2.0 * std::tan(h_half));
+      const double fy =
+          (static_cast<double>(height) - 1.0) /
+          (2.0 * std::tan(v_half));
+      const double cx = 0.5 * (static_cast<double>(width) - 1.0);
+      const double cy = 0.5 * (static_cast<double>(height) - 1.0);
+
+      const std::size_t stride =
+          static_cast<std::size_t>(ray_pixel_stride_);
+      ray_samples.reserve(
+          ((width + stride - 1) / stride) *
+          ((height + stride - 1) / stride));
+
+      for (std::size_t v = 0; v < height; v += stride)
+      {
+        for (std::size_t u = 0; u < width; u += stride)
+        {
+          const pcl::PointXYZ& p_sensor =
+              raw->points[v * width + u];
+
+          RaySample sample;
+          if (finitePoint(p_sensor))
+          {
+            const tf2::Vector3 p_base =
+                T_base_sensor * tf2::Vector3(
+                    static_cast<double>(p_sensor.x),
+                    static_cast<double>(p_sensor.y),
+                    static_cast<double>(p_sensor.z));
+            if (isSelfPoint(p_base, spheres))
+            {
+              ++ray_self_blocked;
+              continue;
+            }
+
+            sample.endpoint_base.x =
+                static_cast<float>(p_base.x());
+            sample.endpoint_base.y =
+                static_cast<float>(p_base.y());
+            sample.endpoint_base.z =
+                static_cast<float>(p_base.z());
+            sample.hit = true;
+          }
+          else
+          {
+            // Optical-frame convention: +x image-right, +y image-down,
+            // +z forward. The far plane is specified in forward depth z.
+            const double x =
+                (static_cast<double>(u) - cx) / fx *
+                ray_max_forward_depth_;
+            const double y =
+                (static_cast<double>(v) - cy) / fy *
+                ray_max_forward_depth_;
+            const tf2::Vector3 p_base =
+                T_base_sensor * tf2::Vector3(
+                    x, y, ray_max_forward_depth_);
+
+            sample.endpoint_base.x =
+                static_cast<float>(p_base.x());
+            sample.endpoint_base.y =
+                static_cast<float>(p_base.y());
+            sample.endpoint_base.z =
+                static_cast<float>(p_base.z());
+            sample.hit = false;
+          }
+
+          ray_samples.push_back(sample);
+        }
+      }
+    }
+    else
+    {
+      // Defensive fallback for an unorganized cloud: finite filtered points
+      // are still useful occupied endpoints, but no-hit FREE rays cannot be
+      // reconstructed without pixel geometry.
+      ray_samples.reserve(kept->points.size());
+      for (const auto& p : kept->points)
+      {
+        RaySample sample;
+        sample.endpoint_base = p;
+        sample.hit = true;
+        ray_samples.push_back(sample);
+      }
+    }
+
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       SensorState& state = sensor_states_[sensor_index];
@@ -450,6 +568,8 @@ private:
       state.self_removed = self_removed;
       state.kept_points = kept->points.size();
       state.sensor_origin_base = T_base_sensor.getOrigin();
+      state.ray_samples = std::move(ray_samples);
+      state.ray_self_blocked = ray_self_blocked;
       if (used_latest_fallback)
       {
         ++state.latest_tf_fallbacks;
@@ -479,6 +599,7 @@ private:
     std::size_t kept_before_merge = 0;
     std::size_t tf_failures = 0;
     std::size_t latest_tf_fallbacks = 0;
+    std::size_t ray_self_blocked = 0;
 
     ros::Time newest_cloud_stamp(0);
 
@@ -486,6 +607,7 @@ private:
     {
       tf_failures += state.tf_failures;
       latest_tf_fallbacks += state.latest_tf_fallbacks;
+      ray_self_blocked += state.ray_self_blocked;
 
       if (!state.valid)
       {
@@ -546,12 +668,11 @@ private:
         continue;
       }
       const double age = (now - state.received).toSec();
-      if (!std::isfinite(age) || age > sensor_timeout_ ||
-          !state.filtered_base)
+      if (!std::isfinite(age) || age > sensor_timeout_)
       {
         continue;
       }
-      ray_observation_count += state.filtered_base->points.size();
+      ray_observation_count += state.ray_samples.size();
     }
 
     sensor_msgs::PointCloud2 ray_msg;
@@ -560,14 +681,15 @@ private:
         newest_cloud_stamp.isZero() ? now : newest_cloud_stamp;
     sensor_msgs::PointCloud2Modifier ray_modifier(ray_msg);
     ray_modifier.setPointCloud2Fields(
-        7,
+        8,
         "x", 1, sensor_msgs::PointField::FLOAT32,
         "y", 1, sensor_msgs::PointField::FLOAT32,
         "z", 1, sensor_msgs::PointField::FLOAT32,
         "sensor_id", 1, sensor_msgs::PointField::INT32,
         "origin_x", 1, sensor_msgs::PointField::FLOAT32,
         "origin_y", 1, sensor_msgs::PointField::FLOAT32,
-        "origin_z", 1, sensor_msgs::PointField::FLOAT32);
+        "origin_z", 1, sensor_msgs::PointField::FLOAT32,
+        "hit", 1, sensor_msgs::PointField::UINT8);
     ray_modifier.resize(ray_observation_count);
 
     sensor_msgs::PointCloud2Iterator<float> ray_x(ray_msg, "x");
@@ -581,11 +703,13 @@ private:
         ray_msg, "origin_y");
     sensor_msgs::PointCloud2Iterator<float> ray_origin_z(
         ray_msg, "origin_z");
+    sensor_msgs::PointCloud2Iterator<uint8_t> ray_hit(
+        ray_msg, "hit");
 
     for (std::size_t sensor_id = 0; sensor_id < states.size(); ++sensor_id)
     {
       const auto& state = states[sensor_id];
-      if (!state.valid || !state.filtered_base)
+      if (!state.valid)
       {
         continue;
       }
@@ -595,11 +719,11 @@ private:
         continue;
       }
 
-      for (const auto& p : state.filtered_base->points)
+      for (const auto& ray : state.ray_samples)
       {
-        *ray_x = p.x;
-        *ray_y = p.y;
-        *ray_z = p.z;
+        *ray_x = ray.endpoint_base.x;
+        *ray_y = ray.endpoint_base.y;
+        *ray_z = ray.endpoint_base.z;
         *ray_sensor_id = static_cast<int32_t>(sensor_id);
         *ray_origin_x =
             static_cast<float>(state.sensor_origin_base.x());
@@ -607,6 +731,8 @@ private:
             static_cast<float>(state.sensor_origin_base.y());
         *ray_origin_z =
             static_cast<float>(state.sensor_origin_base.z());
+        *ray_hit = ray.hit ? static_cast<uint8_t>(1)
+                           : static_cast<uint8_t>(0);
 
         ++ray_x;
         ++ray_y;
@@ -615,6 +741,7 @@ private:
         ++ray_origin_x;
         ++ray_origin_y;
         ++ray_origin_z;
+        ++ray_hit;
       }
     }
     ray_observation_pub_.publish(ray_msg);
@@ -653,6 +780,7 @@ private:
         << " kept_before_merge=" << kept_before_merge
         << " fused_points=" << output->points.size()
         << " ray_observations=" << ray_observation_count
+        << " ray_self_blocked=" << ray_self_blocked
         << " self_sphere_count=" << sphere_count
         << " transformed_body_samples=" << transformed_body_samples
         << " missing_geometry_frames=" << missing_geometry_frames
@@ -693,6 +821,10 @@ private:
   bool allow_latest_tf_fallback_ = true;
   double publish_rate_ = 15.0;
   double self_geometry_rate_ = 30.0;
+  int ray_pixel_stride_ = 8;
+  double ray_horizontal_fov_deg_ = 55.0;
+  double ray_vertical_fov_deg_ = 72.0;
+  double ray_max_forward_depth_ = 0.75;
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
