@@ -35,6 +35,11 @@ confidence_map:
   ray_min_valid_range: 0.05
   ray_max_valid_range: 1.50
 
+  # Phase E5 static-obstacle safety: once an obstacle voxel is observed,
+  # later free-ray traversal cannot erase it in a single coarse-grid update.
+  # This is intentionally enabled for the current static Gazebo world.
+  ray_persistent_occupied: true
+
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
