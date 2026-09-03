@@ -219,7 +219,7 @@ private:
     nh.param(
         "confidence_map/ray_max_valid_range",
         ray_max_valid_range_,
-        0.80);
+        1.50);
 
     nh.param<std::string>(
         "confidence_map/marker_topic",
@@ -884,6 +884,8 @@ private:
     std::vector<uint8_t> occupied_mask(grid_points_.size(), 0);
 
     std::size_t valid_rays = 0;
+    std::size_t hit_rays = 0;
+    std::size_t no_hit_rays = 0;
     std::size_t invalid_range = 0;
     std::size_t out_of_map_endpoints = 0;
 
@@ -897,12 +899,15 @@ private:
       sensor_msgs::PointCloud2ConstIterator<float> oz_it(*msg, "origin_z");
       sensor_msgs::PointCloud2ConstIterator<int32_t> sensor_it(
           *msg, "sensor_id");
+      sensor_msgs::PointCloud2ConstIterator<uint8_t> hit_it(
+          *msg, "hit");
 
       for (; x_it != x_it.end();
            ++x_it, ++y_it, ++z_it,
-           ++ox_it, ++oy_it, ++oz_it, ++sensor_it)
+           ++ox_it, ++oy_it, ++oz_it, ++sensor_it, ++hit_it)
       {
         (void)(*sensor_it);
+        const bool hit = (*hit_it != 0);
 
         const tf2::Vector3 endpoint(
             static_cast<double>(*x_it),
@@ -935,14 +940,24 @@ private:
         }
 
         ++valid_rays;
+        if (hit)
+        {
+          ++hit_rays;
+        }
+        else
+        {
+          ++no_hit_rays;
+        }
         const tf2::Vector3 direction = delta / range;
 
         const double free_end =
-            std::max(
-                ray_free_start_range_,
-                range - ray_endpoint_guard_distance_);
+            hit
+                ? std::max(
+                      ray_free_start_range_,
+                      range - ray_endpoint_guard_distance_)
+                : range;
 
-        if (free_end > ray_free_start_range_)
+        if (free_end >= ray_free_start_range_)
         {
           for (double d = ray_free_start_range_;
                d < free_end;
@@ -960,7 +975,14 @@ private:
         int endpoint_index = -1;
         if (positionToGridIndex(endpoint, endpoint_index))
         {
-          occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+          if (hit)
+          {
+            occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+          }
+          else
+          {
+            free_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+          }
         }
         else
         {
@@ -1017,6 +1039,8 @@ private:
     last_ray_observation_stamp_ = stamp;
     ++ray_packet_count_;
     last_ray_count_ = valid_rays;
+    last_hit_ray_count_ = hit_rays;
+    last_no_hit_ray_count_ = no_hit_rays;
     last_ray_free_cell_count_ = free_cells;
     last_ray_occupied_cell_count_ = occupied_cells;
     last_ray_out_of_map_endpoint_count_ = out_of_map_endpoints;
@@ -1067,6 +1091,8 @@ private:
         << " ray_packet_count=" << ray_packet_count_
         << " ray_decode_failure_count=" << ray_decode_failure_count_
         << " last_ray_count=" << last_ray_count_
+        << " last_hit_ray_count=" << last_hit_ray_count_
+        << " last_no_hit_ray_count=" << last_no_hit_ray_count_
         << " last_free_cell_count=" << last_ray_free_cell_count_
         << " last_occupied_cell_count=" << last_ray_occupied_cell_count_
         << " last_out_of_map_endpoint_count="
@@ -1778,13 +1804,15 @@ private:
   double ray_endpoint_guard_distance_ = 0.025;
   double ray_step_ = 0.025;
   double ray_min_valid_range_ = 0.10;
-  double ray_max_valid_range_ = 0.80;
+  double ray_max_valid_range_ = 1.50;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
   std::size_t ray_packet_count_ = 0;
   std::size_t ray_decode_failure_count_ = 0;
   std::size_t last_ray_count_ = 0;
+  std::size_t last_hit_ray_count_ = 0;
+  std::size_t last_no_hit_ray_count_ = 0;
   std::size_t last_ray_free_cell_count_ = 0;
   std::size_t last_ray_occupied_cell_count_ = 0;
   std::size_t last_ray_out_of_map_endpoint_count_ = 0;
