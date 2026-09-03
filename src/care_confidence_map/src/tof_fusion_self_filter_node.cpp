@@ -3,6 +3,7 @@
 #include <care_confidence_map/body_sample_model.hpp>
 
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/String.h>
 
 #include <tf2/LinearMath/Transform.h>
