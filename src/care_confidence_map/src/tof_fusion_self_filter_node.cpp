@@ -495,8 +495,10 @@ private:
       voxel_points += state.voxel_points;
       self_removed += state.self_removed;
       kept_before_merge += state.kept_points;
-      newest_cloud_stamp =
-          std::max(newest_cloud_stamp, state.cloud_stamp);
+      if (state.cloud_stamp > newest_cloud_stamp)
+      {
+        newest_cloud_stamp = state.cloud_stamp;
+      }
 
       if (state.filtered_base)
       {
