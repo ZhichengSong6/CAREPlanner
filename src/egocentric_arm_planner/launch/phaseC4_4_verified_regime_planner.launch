@@ -63,6 +63,25 @@
   <arg name="committed_continuation_enabled" default="true" />
   <arg name="execution_audit_stream_enabled" default="false" />
 
+  <!-- Phase E5: measured-q execution collision safety closure. Disabled by
+       default so frozen C5.41/E4 runs remain unchanged. -->
+  <arg name="execution_gcdf_audit_enabled" default="false" />
+  <arg name="execution_gcdf_measured_trajectory_topic"
+       default="/care_planner/execution_gcdf/measured_trajectory" />
+  <arg name="execution_gcdf_body_anchor_topic"
+       default="/care_planner/execution_gcdf/body_sweep_anchors" />
+  <arg name="execution_gcdf_batch_topic"
+       default="/care_planner/execution_gcdf/constraint_batch" />
+  <arg name="execution_gcdf_selector_summary_topic"
+       default="/care_planner/execution_gcdf/selector_summary" />
+  <arg name="execution_gcdf_safety_summary_topic"
+       default="/care_planner/execution_gcdf/safety_summary" />
+  <arg name="execution_gcdf_hard_hold_topic"
+       default="/care_planner/execution_gcdf/hard_hold" />
+  <arg name="execution_gcdf_warning_margin" default="0.05" />
+  <arg name="execution_gcdf_hard_margin" default="0.0" />
+  <arg name="execution_gcdf_stale_timeout_s" default="0.35" />
+
   <!-- C5.9 commit-pipeline serialization. Legacy C4.x remains transparent.
        When enabled, raw planner candidates first pass a PROBE-only single-flight
        gate before entering the final GCDF -> exact VBC -> commit pipeline. -->
@@ -484,6 +503,12 @@
            value="/care_planner/final_gcdf/selector_summary" />
     <param name="final_constraint_batch_topic"
            value="/care_planner/final_gcdf/constraint_batch" />
+    <param name="execution_anchor_topic"
+           value="$(arg execution_gcdf_body_anchor_topic)" />
+    <param name="execution_summary_topic"
+           value="$(arg execution_gcdf_selector_summary_topic)" />
+    <param name="execution_constraint_batch_topic"
+           value="$(arg execution_gcdf_batch_topic)" />
     <param name="output_jsonl" value="$(arg local_scp_selector_jsonl)" />
     <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
     <param name="rate" value="50.0" />
@@ -496,6 +521,71 @@
     <param name="signed_zero_band" value="0.05" />
     <param name="max_pairs" value="8000" />
   </node>
+
+  <!-- Phase E5 measured-q collision audit. The current measured state is
+       wrapped as a one-point trajectory, exported through the same body-sphere
+       geometry as planning, and evaluated by the shared GCDF GPU selector.
+       Crucially, body-prior refresh is disabled so execution audit cannot clear
+       the evidence it is about to inspect. -->
+  <group if="$(arg execution_gcdf_audit_enabled)" ns="execution_gcdf_audit">
+    <node pkg="egocentric_arm_planner"
+          type="execution_gcdf_measured_state_trajectory_node.py"
+          name="measured_state_trajectory"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+      <param name="joint_states_topic" value="/care_arm/joint_states" />
+      <param name="output_topic"
+             value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <param name="frame_id" value="$(arg base_frame)" />
+      <param name="rate" value="20.0" />
+      <param name="max_age_s" value="0.15" />
+    </node>
+
+    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/execution_gcdf/unused_target" />
+      <arg name="output_namespace"
+           value="/care_planner/execution_gcdf/risk" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="$(arg execution_gcdf_body_anchor_topic)" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="20.0" />
+      <arg name="event_driven_eval" value="true" />
+      <arg name="max_eval_timesteps" value="1" />
+      <arg name="refresh_body_prior_before_query" value="false" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+
+    <node pkg="egocentric_arm_planner"
+          type="execution_gcdf_safety_monitor_node.py"
+          name="safety_monitor"
+          output="screen">
+      <param name="batch_topic" value="$(arg execution_gcdf_batch_topic)" />
+      <param name="summary_topic"
+             value="$(arg execution_gcdf_safety_summary_topic)" />
+      <param name="replan_topic" value="$(arg local_scp_replan_request_topic)" />
+      <param name="hard_hold_topic"
+             value="$(arg execution_gcdf_hard_hold_topic)" />
+      <param name="warning_margin"
+             value="$(arg execution_gcdf_warning_margin)" />
+      <param name="hard_margin"
+             value="$(arg execution_gcdf_hard_margin)" />
+      <param name="stale_timeout_s"
+             value="$(arg execution_gcdf_stale_timeout_s)" />
+      <param name="startup_grace_s" value="2.0" />
+      <param name="replan_min_interval_s" value="0.20" />
+      <param name="clear_consecutive_required" value="2" />
+      <param name="fail_closed_on_stale" value="true" />
+    </node>
+  </group>
 
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
     <arg name="base_frame" value="$(arg base_frame)" />
