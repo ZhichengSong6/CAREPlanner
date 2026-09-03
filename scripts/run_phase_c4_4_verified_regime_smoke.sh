@@ -6,6 +6,10 @@ CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_c2_vbc_c
 CONFIG_FILE="${CONFIG_FILE:-${REPO}/src/egocentric_arm_planner/config/planner_phase1_c4_3_planner.yaml}"
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-8.0}"
+# Visualization controls. Keep formal benchmarks headless by default; set these
+# to true for an otherwise identical Gazebo + RViz execution.
+GAZEBO_GUI="${GAZEBO_GUI:-false}"
+USE_RVIZ="${USE_RVIZ:-false}"
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
@@ -168,8 +172,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+echo "[VIS] gazebo_gui=${GAZEBO_GUI} use_rviz=${USE_RVIZ}"
 setsid roslaunch arm_description gazebo_velocity_control.launch \
-  gazebo_gui:=false use_rviz:=false > "${LOG}/gazebo.log" 2>&1 &
+  gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" > "${LOG}/gazebo.log" 2>&1 &
 GAZEBO_PID=$!
 
 READY=0
@@ -377,6 +382,8 @@ branch=${RUNTIME_BRANCH}
 head=${RUNTIME_HEAD}
 case_id=${CASE_ID}
 run_id=${RUN_ID:-${CASE_ID}}
+gazebo_gui=${GAZEBO_GUI}
+use_rviz=${USE_RVIZ}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
