@@ -28,8 +28,10 @@ export INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-0.20}"
 # C5.9 execution semantics: REPAIR/PROBE optimize over a 1 s local horizon but
 # build a short executable prefix with the actual braking/hold tail. That exact
 # executable view must pass final GCDF and exact VBC before a single commit.
-# PROBE is single-flight: another task candidate cannot replace the currently
-# verified/executing probe prefix. NORMAL remains full-horizon GCDF/VBC.
+# PROBE keeps single certified execution ownership. C5.40 may preplan one raw
+# look-ahead candidate while the current certified prefix executes, but that raw
+# candidate is buffered until prefix completion; only then is it rebased and
+# sent through final GCDF + exact VBC. NORMAL remains full-horizon GCDF/VBC.
 export REPAIR_PREFIX_VERIFY="${REPAIR_PREFIX_VERIFY:-1}"
 # Smooth certified handoff: REPAIR gets enough useful-motion horizon for the
 # next plan+GCDF+VBC to finish before its fallback brake tail. PROBE retains
@@ -51,12 +53,12 @@ echo "[C5.5] Existing VBC/regime architecture + hard GCDF safety"
 echo "[C5.5] REPAIR: q_vis objective + 5-step executable-horizon hard GCDF + hold initialization"
 echo "[C5.5] PROBE_NORMAL: task objective + 5-step executable-horizon hard GCDF + safe-prefix commit"
 echo "[C5.5] NORMAL: task objective + full-horizon hard GCDF"
-echo "[C5.9] PROBE SINGLE-FLIGHT: IDLE -> VERIFYING -> EXECUTING -> tracker-complete"
+echo "[C5.40] PROBE ROLLING: certified prefix executes while one raw next-probe candidate may preplan behind the gate"
 echo "[C5.9] COMMIT GATE: exact executable prefix+brake+hold -> final GCDF -> exact VBC -> single commit"
 echo "[C5.9] GCDF transport: one GPU client, independent local/final channels, final priority"
 echo "[C5.9] EXECUTION: committed trajectory published once; tracker owns execution to completion"
 echo "[C5.9] EXECUTION VBC: elapsed suffixes use a separate audit-only topic; tracker is never reset"
-echo "[C5.9] PROBE success: tracker complete=1 with matching committed header.stamp token"
+echo "[C5.40] PROBE success: matching execution token reaches certified prefix duration; brake+hold remains fallback while replacement is certified"
 echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
