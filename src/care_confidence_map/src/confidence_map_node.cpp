@@ -6,6 +6,7 @@
 #include <care_confidence_map/body_sample_model.hpp>
 
 #include <std_srvs/Trigger.h>
+#include <std_msgs/String.h>
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -23,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -42,6 +44,10 @@ struct GridPoint
 
   float confidence = 0.0f;
   float current_visibility = 0.0f;
+  // Phase E3 semantic state. 0 = not occupied / unknown-or-free,
+  // 1 = most recently observed as occupied. Confidence distinguishes
+  // UNKNOWN (low confidence) from observed FREE (high confidence).
+  float occupancy = 0.0f;
   double last_seen_time = -1.0;
 };
 
@@ -89,7 +95,14 @@ public:
     }
 
     generateGlobalGrid();
-    generateSensorLocalVisiblePoints();
+    if (observation_mode_ == "ideal_fov")
+    {
+      generateSensorLocalVisiblePoints();
+    }
+    else
+    {
+      local_visible_points_.clear();
+    }
 
     fov_marker_pub_ =
         nh_.advertise<visualization_msgs::MarkerArray>(fov_marker_topic_, 1, true);
@@ -100,6 +113,18 @@ public:
 
     pointcloud_pub_ =
         nh_.advertise<sensor_msgs::PointCloud2>(pointcloud_topic_, 1, true);
+    e3_summary_pub_ =
+        nh_.advertise<std_msgs::String>(e3_summary_topic_, 1, true);
+
+    if (observation_mode_ == "tof_ray")
+    {
+      ray_observation_sub_ =
+          nh_.subscribe(
+              ray_observation_topic_,
+              1,
+              &ConfidenceMapNode::rayObservationCallback,
+              this);
+    }
 
     query_service_ =
         nh_.advertiseService(query_service_name_,
@@ -160,6 +185,43 @@ private:
     nh.param("confidence_map/temporal_decay_time", temporal_decay_time_, 2.0);
 
     nh.param<std::string>(
+        "confidence_map/observation_mode",
+        observation_mode_,
+        "ideal_fov");
+    nh.param<std::string>(
+        "confidence_map/ray_observation_topic",
+        ray_observation_topic_,
+        "/care_planner/perception/tof_ray_observations");
+    nh.param<std::string>(
+        "confidence_map/e3_summary_topic",
+        e3_summary_topic_,
+        "/care_planner/confidence_map/e3_summary");
+    nh.param(
+        "confidence_map/ray_observation_timeout",
+        ray_observation_timeout_,
+        0.25);
+    nh.param(
+        "confidence_map/ray_free_start_range",
+        ray_free_start_range_,
+        0.15);
+    nh.param(
+        "confidence_map/ray_endpoint_guard_distance",
+        ray_endpoint_guard_distance_,
+        0.5 * resolution_);
+    nh.param(
+        "confidence_map/ray_step",
+        ray_step_,
+        0.5 * resolution_);
+    nh.param(
+        "confidence_map/ray_min_valid_range",
+        ray_min_valid_range_,
+        0.10);
+    nh.param(
+        "confidence_map/ray_max_valid_range",
+        ray_max_valid_range_,
+        0.80);
+
+    nh.param<std::string>(
         "confidence_map/marker_topic",
         marker_topic_,
         "/care_planner/confidence_map/markers");
@@ -197,6 +259,26 @@ private:
     {
       ROS_ERROR_STREAM("[confidence_map_node] Invalid temporal_decay_time: "
                        << temporal_decay_time_);
+      return false;
+    }
+
+    if (observation_mode_ != "ideal_fov" &&
+        observation_mode_ != "tof_ray")
+    {
+      ROS_ERROR_STREAM(
+          "[confidence_map_node] Invalid observation_mode='"
+          << observation_mode_ << "'. Expected ideal_fov or tof_ray.");
+      return false;
+    }
+
+    if (ray_observation_timeout_ <= 0.0 ||
+        ray_free_start_range_ < 0.0 ||
+        ray_endpoint_guard_distance_ < 0.0 ||
+        ray_step_ <= 0.0 ||
+        ray_min_valid_range_ < 0.0 ||
+        ray_max_valid_range_ <= ray_min_valid_range_)
+    {
+      ROS_ERROR("[confidence_map_node] Invalid Phase E3 ray parameters.");
       return false;
     }
 
@@ -431,6 +513,7 @@ private:
           p.z = static_cast<float>(z);
           p.confidence = 0.0f;
           p.current_visibility = 0.0f;
+          p.occupancy = 0.0f;
           p.last_seen_time = -1.0;
 
           grid_points_.push_back(p);
@@ -504,6 +587,7 @@ private:
           GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
           gp.last_seen_time = stamp_sec;
           gp.confidence = 1.0f;
+          gp.occupancy = 0.0f;
 
           // This is a robot-body known-clear prior, not a live sensor ray.
           // Do not set current_visibility=1 here.
@@ -868,12 +952,13 @@ private:
 
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     modifier.setPointCloud2Fields(
-        6,
+        7,
         "x", 1, sensor_msgs::PointField::FLOAT32,
         "y", 1, sensor_msgs::PointField::FLOAT32,
         "z", 1, sensor_msgs::PointField::FLOAT32,
         "confidence", 1, sensor_msgs::PointField::FLOAT32,
         "current_visibility", 1, sensor_msgs::PointField::FLOAT32,
+        "occupancy", 1, sensor_msgs::PointField::FLOAT32,
         "intensity", 1, sensor_msgs::PointField::FLOAT32);
 
     modifier.resize(grid_points_.size());
@@ -883,6 +968,7 @@ private:
     sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
     sensor_msgs::PointCloud2Iterator<float> iter_conf(cloud, "confidence");
     sensor_msgs::PointCloud2Iterator<float> iter_vis(cloud, "current_visibility");
+    sensor_msgs::PointCloud2Iterator<float> iter_occ(cloud, "occupancy");
     sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud, "intensity");
 
     for (const auto& p : grid_points_)
@@ -892,13 +978,18 @@ private:
       *iter_z = p.z;
       *iter_conf = p.confidence;
       *iter_vis = p.current_visibility;
-      *iter_intensity = p.confidence;
+      *iter_occ = p.occupancy;
+      // RViz-compatible intensity: occupied known cells appear stronger than
+      // free known cells while unknown remains near zero.
+      *iter_intensity =
+          p.occupancy > 0.5f ? 2.0f : p.confidence;
 
       ++iter_x;
       ++iter_y;
       ++iter_z;
       ++iter_conf;
       ++iter_vis;
+      ++iter_occ;
       ++iter_intensity;
     }
 
@@ -1333,6 +1424,9 @@ private:
     ROS_INFO_STREAM("update_rate: " << update_rate_);
     ROS_INFO_STREAM("publish_rate: " << publish_rate_);
     ROS_INFO_STREAM("temporal_decay_time: " << temporal_decay_time_);
+    ROS_INFO_STREAM("observation_mode: " << observation_mode_);
+    ROS_INFO_STREAM("ray_observation_topic: " << ray_observation_topic_);
+    ROS_INFO_STREAM("e3_summary_topic: " << e3_summary_topic_);
     ROS_INFO_STREAM("query_service: " << query_service_name_);
     ROS_INFO_STREAM("marker_topic: " << marker_topic_);
     ROS_INFO_STREAM("pointcloud_topic: " << pointcloud_topic_);
@@ -1382,6 +1476,8 @@ private:
   ros::Publisher fov_marker_pub_;
   ros::Publisher current_body_prior_marker_pub_;
   ros::Publisher pointcloud_pub_;
+  ros::Publisher e3_summary_pub_;
+  ros::Subscriber ray_observation_sub_;
   ros::ServiceServer query_service_;
   ros::ServiceServer refresh_body_prior_service_;
 
@@ -1401,6 +1497,28 @@ private:
   double update_rate_ = 30.0;
   double publish_rate_ = 10.0;
   double temporal_decay_time_ = 2.0;
+
+  std::string observation_mode_ = "ideal_fov";
+  std::string ray_observation_topic_ =
+      "/care_planner/perception/tof_ray_observations";
+  std::string e3_summary_topic_ =
+      "/care_planner/confidence_map/e3_summary";
+  double ray_observation_timeout_ = 0.25;
+  double ray_free_start_range_ = 0.15;
+  double ray_endpoint_guard_distance_ = 0.025;
+  double ray_step_ = 0.025;
+  double ray_min_valid_range_ = 0.10;
+  double ray_max_valid_range_ = 0.80;
+
+  ros::Time last_ray_observation_received_;
+  ros::Time last_ray_observation_stamp_;
+  std::size_t ray_packet_count_ = 0;
+  std::size_t ray_decode_failure_count_ = 0;
+  std::size_t last_ray_count_ = 0;
+  std::size_t last_ray_free_cell_count_ = 0;
+  std::size_t last_ray_occupied_cell_count_ = 0;
+  std::size_t last_ray_out_of_map_endpoint_count_ = 0;
+  std::size_t last_ray_invalid_range_count_ = 0;
 
   int nx_ = 0;
   int ny_ = 0;
