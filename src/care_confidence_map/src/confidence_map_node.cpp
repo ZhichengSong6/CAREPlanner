@@ -1133,6 +1133,7 @@ private:
   {
     int currently_visible_count = 0;
     int confident_count = 0;
+    int occupied_count = 0;
     int ever_seen_count = 0;
 
     double min_conf = 1.0;
@@ -1154,6 +1155,10 @@ private:
       if (c > 1e-4)
       {
         ++confident_count;
+        if (p.occupancy > 0.5f)
+        {
+          ++occupied_count;
+        }
       }
 
       if (p.last_seen_time >= 0.0)
@@ -1174,10 +1179,11 @@ private:
 
     ROS_INFO_THROTTLE(
         2.0,
-        "[confidence_map_node] confidence stats: visible_now=%d / %zu, confident=%d, ever_seen=%d, min=%.3f, max=%.3f, mean=%.3f",
+        "[confidence_map_node] confidence stats: visible_now=%d / %zu, confident=%d, occupied=%d, ever_seen=%d, min=%.3f, max=%.3f, mean=%.3f",
         currently_visible_count,
         grid_points_.size(),
         confident_count,
+        occupied_count,
         ever_seen_count,
         min_conf,
         max_conf,
@@ -1626,10 +1632,28 @@ private:
 
   void updateTimerCallback(const ros::TimerEvent&)
   {
-    std::vector<tf2::Transform> T_map_sensors;
-    getSensorTransforms(T_map_sensors, nullptr);
+    const ros::Time now = ros::Time::now();
 
-    updateConfidenceMapSensorCentric(T_map_sensors, ros::Time::now());
+    if (observation_mode_ == "ideal_fov")
+    {
+      std::vector<tf2::Transform> T_map_sensors;
+      getSensorTransforms(T_map_sensors, nullptr);
+      updateConfidenceMapSensorCentric(T_map_sensors, now);
+      return;
+    }
+
+    // In tof_ray mode the observation callback owns the current visible set.
+    // Only clear it when the entire E2 observation stream has gone stale;
+    // otherwise a 30-Hz timer would flicker visibility between 15-Hz packets.
+    if (last_ray_observation_received_.isZero() ||
+        (now - last_ray_observation_received_).toSec() >
+            ray_observation_timeout_)
+    {
+      resetCurrentVisibility();
+    }
+
+    applyTemporalDecay(now);
+    printConfidenceStatsThrottled();
   }
 
   void publishTimerCallback(const ros::TimerEvent&)
@@ -1643,6 +1667,8 @@ private:
 
     sensor_msgs::PointCloud2 cloud = makeGridPointCloudMsg();
     pointcloud_pub_.publish(cloud);
+
+    e3_summary_pub_.publish(makeE3SummaryMsg(ros::Time::now()));
   }
 
   void printSummary() const
