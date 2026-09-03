@@ -1,0 +1,41 @@
+base_frame: base_link
+
+output_topic: /care_planner/perception/tof_fused_filtered
+summary_topic: /care_planner/perception/tof_fusion_summary
+
+# Downsample each 320x240 depth cloud before TF/self filtering, then remove
+# duplicate points again after merging all eight sensors.
+input_voxel_leaf_size: 0.03
+output_voxel_leaf_size: 0.03
+
+# Existing body_samples.yaml contains the arm collision approximation.  The
+# padding absorbs TF/sample discretization error; small sensor-origin spheres
+# additionally remove returns from sensor housings that are not in that file.
+self_filter_padding: 0.015
+sensor_origin_filter_radius: 0.06
+
+sensor_timeout: 0.25
+tf_timeout: 0.03
+allow_latest_tf_fallback: true
+publish_rate: 15.0
+self_geometry_rate: 30.0
+
+input_topics:
+  - /link2_sensor1/tof/cloud
+  - /link2_sensor2/tof/cloud
+  - /link3_sensor1/tof/cloud
+  - /link3_sensor2/tof/cloud
+  - /link4_sensor1/tof/cloud
+  - /link4_sensor2/tof/cloud
+  - /EE_sensor1/tof/cloud
+  - /EE_sensor2/tof/cloud
+
+sensor_frames:
+  - link2_sensor1_tof_link
+  - link2_sensor2_tof_link
+  - link3_sensor1_tof_link
+  - link3_sensor2_tof_link
+  - link4_sensor1_tof_link
+  - link4_sensor2_tof_link
+  - EE_sensor1_tof_link
+  - EE_sensor2_tof_link
