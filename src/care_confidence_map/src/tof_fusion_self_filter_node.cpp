@@ -50,6 +50,7 @@ struct SensorState
   std::size_t kept_points = 0;
   std::size_t tf_failures = 0;
   std::size_t latest_tf_fallbacks = 0;
+  tf2::Vector3 sensor_origin_base{0.0, 0.0, 0.0};
   bool valid = false;
 };
 
@@ -84,6 +85,10 @@ public:
         "summary_topic",
         summary_topic_,
         "/care_planner/perception/tof_fusion_summary");
+    pnh_.param<std::string>(
+        "ray_observation_topic",
+        ray_observation_topic_,
+        "/care_planner/perception/tof_ray_observations");
     pnh_.param<std::string>("body_samples_file", body_samples_file_, "");
 
     pnh_.param("input_voxel_leaf_size", input_voxel_leaf_size_, 0.03);
@@ -166,6 +171,8 @@ public:
 
     output_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
         output_topic_, 1, false);
+    ray_observation_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
+        ray_observation_topic_, 1, false);
     summary_pub_ = nh_.advertise<std_msgs::String>(
         summary_topic_, 1, true);
 
@@ -441,6 +448,7 @@ private:
       state.voxel_points = voxel->points.size();
       state.self_removed = self_removed;
       state.kept_points = kept->points.size();
+      state.sensor_origin_base = T_base_sensor.getOrigin();
       if (used_latest_fallback)
       {
         ++state.latest_tf_fallbacks;
@@ -526,6 +534,90 @@ private:
       output_filter.filter(*output);
     }
 
+    // Phase E3 transport: preserve ray provenance.  The regular fused cloud
+    // remains optimized for visualization/environment geometry, while this
+    // observation cloud keeps one sensor origin per retained endpoint.
+    std::size_t ray_observation_count = 0;
+    for (const auto& state : states)
+    {
+      if (!state.valid)
+      {
+        continue;
+      }
+      const double age = (now - state.received).toSec();
+      if (!std::isfinite(age) || age > sensor_timeout_ ||
+          !state.filtered_base)
+      {
+        continue;
+      }
+      ray_observation_count += state.filtered_base->points.size();
+    }
+
+    sensor_msgs::PointCloud2 ray_msg;
+    ray_msg.header.frame_id = base_frame_;
+    ray_msg.header.stamp =
+        newest_cloud_stamp.isZero() ? now : newest_cloud_stamp;
+    sensor_msgs::PointCloud2Modifier ray_modifier(ray_msg);
+    ray_modifier.setPointCloud2Fields(
+        7,
+        "x", 1, sensor_msgs::PointField::FLOAT32,
+        "y", 1, sensor_msgs::PointField::FLOAT32,
+        "z", 1, sensor_msgs::PointField::FLOAT32,
+        "sensor_id", 1, sensor_msgs::PointField::INT32,
+        "origin_x", 1, sensor_msgs::PointField::FLOAT32,
+        "origin_y", 1, sensor_msgs::PointField::FLOAT32,
+        "origin_z", 1, sensor_msgs::PointField::FLOAT32);
+    ray_modifier.resize(ray_observation_count);
+
+    sensor_msgs::PointCloud2Iterator<float> ray_x(ray_msg, "x");
+    sensor_msgs::PointCloud2Iterator<float> ray_y(ray_msg, "y");
+    sensor_msgs::PointCloud2Iterator<float> ray_z(ray_msg, "z");
+    sensor_msgs::PointCloud2Iterator<int32_t> ray_sensor_id(
+        ray_msg, "sensor_id");
+    sensor_msgs::PointCloud2Iterator<float> ray_origin_x(
+        ray_msg, "origin_x");
+    sensor_msgs::PointCloud2Iterator<float> ray_origin_y(
+        ray_msg, "origin_y");
+    sensor_msgs::PointCloud2Iterator<float> ray_origin_z(
+        ray_msg, "origin_z");
+
+    for (std::size_t sensor_id = 0; sensor_id < states.size(); ++sensor_id)
+    {
+      const auto& state = states[sensor_id];
+      if (!state.valid || !state.filtered_base)
+      {
+        continue;
+      }
+      const double age = (now - state.received).toSec();
+      if (!std::isfinite(age) || age > sensor_timeout_)
+      {
+        continue;
+      }
+
+      for (const auto& p : state.filtered_base->points)
+      {
+        *ray_x = p.x;
+        *ray_y = p.y;
+        *ray_z = p.z;
+        *ray_sensor_id = static_cast<int32_t>(sensor_id);
+        *ray_origin_x =
+            static_cast<float>(state.sensor_origin_base.x());
+        *ray_origin_y =
+            static_cast<float>(state.sensor_origin_base.y());
+        *ray_origin_z =
+            static_cast<float>(state.sensor_origin_base.z());
+
+        ++ray_x;
+        ++ray_y;
+        ++ray_z;
+        ++ray_sensor_id;
+        ++ray_origin_x;
+        ++ray_origin_y;
+        ++ray_origin_z;
+      }
+    }
+    ray_observation_pub_.publish(ray_msg);
+
     sensor_msgs::PointCloud2 msg;
     pcl::toROSMsg(*output, msg);
     msg.header.frame_id = base_frame_;
@@ -559,6 +651,7 @@ private:
         << " self_removed=" << self_removed
         << " kept_before_merge=" << kept_before_merge
         << " fused_points=" << output->points.size()
+        << " ray_observations=" << ray_observation_count
         << " self_sphere_count=" << sphere_count
         << " transformed_body_samples=" << transformed_body_samples
         << " missing_geometry_frames=" << missing_geometry_frames
@@ -585,6 +678,7 @@ private:
   std::string base_frame_;
   std::string output_topic_;
   std::string summary_topic_;
+  std::string ray_observation_topic_;
   std::string body_samples_file_;
   std::vector<std::string> input_topics_;
   std::vector<std::string> sensor_frames_;
@@ -601,6 +695,7 @@ private:
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
+  ros::Publisher ray_observation_pub_;
   ros::Publisher summary_pub_;
   ros::Timer geometry_timer_;
   ros::Timer publish_timer_;
