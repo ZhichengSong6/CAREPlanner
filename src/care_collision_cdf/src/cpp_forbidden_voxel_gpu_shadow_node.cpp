@@ -50,13 +50,18 @@ struct Anchor {
 };
 
 struct MapIndex {
+  // low now means hard-forbidden: UNKNOWN(low confidence) OR OCCUPIED.
   std::vector<uint8_t> low;
+  std::vector<uint8_t> source_type;
   std::vector<float> confidence;
   std::vector<float> current_visibility;
+  std::vector<float> occupancy;
   ros::Time stamp;
   ros::Time received;
   std::size_t total_voxel_count = 0;
   std::size_t low_voxel_count = 0;
+  std::size_t unknown_voxel_count = 0;
+  std::size_t occupied_voxel_count = 0;
   double build_ms = 0.0;
 };
 
@@ -65,6 +70,8 @@ struct PairMeta {
   std::array<float, 7> q{};
   float confidence = 0.0f;
   float current_visibility = 0.0f;
+  uint8_t source_type =
+      care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN;
   float approx_body_clearance_m = 0.0f;
   int eval_timestep = -1;
   int original_timestep = -1;
@@ -266,7 +273,8 @@ class CppForbiddenVoxelGpuShadow {
         << static_cast<int>(process_on_input_callback_)
         << " grid=" << nx_ << "x" << ny_ << "x" << nz_
         << " (" << grid_size_ << " voxels)"
-        << " conf<" << confidence_threshold_
+        << " forbidden=(conf<" << confidence_threshold_
+        << " OR occupancy>0.5)"
         << " proximity_margin=" << proximity_margin_
         << " max_pairs_per_step=" << max_pairs_per_step_
         << " socket=" << gpu_socket_
@@ -343,8 +351,12 @@ class CppForbiddenVoxelGpuShadow {
 
     auto index = std::make_shared<MapIndex>();
     index->low.assign(grid_size_, 0);
+    index->source_type.assign(
+        grid_size_,
+        care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN);
     index->confidence.assign(grid_size_, 0.0f);
     index->current_visibility.assign(grid_size_, 0.0f);
+    index->occupancy.assign(grid_size_, 0.0f);
     index->stamp = msg->header.stamp;
     index->received = ros::Time::now();
 
@@ -355,18 +367,21 @@ class CppForbiddenVoxelGpuShadow {
       sensor_msgs::PointCloud2ConstIterator<float> conf_it(*msg, "confidence");
       sensor_msgs::PointCloud2ConstIterator<float> vis_it(
           *msg, "current_visibility");
+      sensor_msgs::PointCloud2ConstIterator<float> occ_it(
+          *msg, "occupancy");
 
       for (; ix_it != ix_it.end();
-           ++ix_it, ++iy_it, ++iz_it, ++conf_it, ++vis_it) {
+           ++ix_it, ++iy_it, ++iz_it, ++conf_it, ++vis_it, ++occ_it) {
         const float x = *ix_it;
         const float y = *iy_it;
         const float z = *iz_it;
         const float conf = *conf_it;
         const float vis = *vis_it;
+        const float occ = *occ_it;
         ++index->total_voxel_count;
 
         if (!finiteFloat(x) || !finiteFloat(y) || !finiteFloat(z) ||
-            !finiteFloat(conf) || !finiteFloat(vis)) {
+            !finiteFloat(conf) || !finiteFloat(vis) || !finiteFloat(occ)) {
           continue;
         }
 
@@ -378,11 +393,27 @@ class CppForbiddenVoxelGpuShadow {
         }
 
         const int linear = linearIndex(ix, iy, iz);
-        index->confidence[static_cast<std::size_t>(linear)] = conf;
-        index->current_visibility[static_cast<std::size_t>(linear)] = vis;
-        if (static_cast<double>(conf) < confidence_threshold_) {
-          index->low[static_cast<std::size_t>(linear)] = 1;
+        const std::size_t ulinear = static_cast<std::size_t>(linear);
+        index->confidence[ulinear] = conf;
+        index->current_visibility[ulinear] = vis;
+        index->occupancy[ulinear] = occ;
+
+        const bool occupied = static_cast<double>(occ) > 0.5;
+        const bool unknown =
+            !occupied &&
+            static_cast<double>(conf) < confidence_threshold_;
+        if (occupied || unknown) {
+          index->low[ulinear] = 1;
+          index->source_type[ulinear] =
+              occupied
+                  ? care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED
+                  : care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN;
           ++index->low_voxel_count;
+          if (occupied) {
+            ++index->occupied_voxel_count;
+          } else {
+            ++index->unknown_voxel_count;
+          }
         }
       }
     } catch (const std::runtime_error& e) {
@@ -569,6 +600,16 @@ class CppForbiddenVoxelGpuShadow {
             if (ca != cb) {
               return ca < cb;
             }
+            // At equal geometric proximity, keep known physical obstacles
+            // ahead of speculative unknown-space constraints.
+            const uint8_t sa =
+                map.source_type[static_cast<std::size_t>(a)];
+            const uint8_t sb =
+                map.source_type[static_cast<std::size_t>(b)];
+            if (sa != sb) {
+              return sa ==
+                  care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED;
+            }
             return map.confidence[static_cast<std::size_t>(a)] <
                    map.confidence[static_cast<std::size_t>(b)];
           });
@@ -587,6 +628,7 @@ class CppForbiddenVoxelGpuShadow {
         pair.confidence = map.confidence[ulinear];
         pair.current_visibility =
             map.current_visibility[ulinear];
+        pair.source_type = map.source_type[ulinear];
         pair.approx_body_clearance_m =
             best_clearance_[ulinear];
         pair.eval_timestep = representative.eval_timestep;
@@ -929,6 +971,7 @@ class CppForbiddenVoxelGpuShadow {
     msg.num_pairs = static_cast<int32_t>(pairs.size());
     msg.dof = 7;
     msg.original_timestep.resize(pairs.size());
+    msg.source_type.resize(pairs.size());
     msg.point_flat.resize(pairs.size() * 3);
     msg.q_linearization_flat.resize(pairs.size() * 7);
     msg.distance.resize(pairs.size());
@@ -937,6 +980,7 @@ class CppForbiddenVoxelGpuShadow {
     for (std::size_t i = 0; i < pairs.size(); ++i) {
       msg.original_timestep[i] =
           static_cast<int32_t>(pairs[i].original_timestep);
+      msg.source_type[i] = pairs[i].source_type;
       for (int j = 0; j < 3; ++j) {
         msg.point_flat[i * 3 + static_cast<std::size_t>(j)] =
             static_cast<double>(
@@ -1002,6 +1046,9 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
         << " map_index_ms=" << map_index_ms
+        << " map_forbidden=" << (latest_map_ ? latest_map_->low_voxel_count : 0)
+        << " map_unknown=" << (latest_map_ ? latest_map_->unknown_voxel_count : 0)
+        << " map_occupied=" << (latest_map_ ? latest_map_->occupied_voxel_count : 0)
         << " channel=" << (final_channel ? "final" : "local")
         << " batch_topic="
         << (final_channel ? final_constraint_batch_topic_ : constraint_batch_topic_)
