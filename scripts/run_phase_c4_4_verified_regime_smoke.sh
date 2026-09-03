@@ -531,6 +531,13 @@ fi
 kill_group "${CONTROL_PID}"; CONTROL_PID=""
 kill_group "${GEN_PID}"; GEN_PID=""
 kill_group "${TRACKER_PID}"; TRACKER_PID=""
+# Teardown should not leave the velocity controller holding the last nonzero
+# command after the tracker process exits.
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  timeout 1 rostopic pub -1 "${ACTUATOR_TOPIC}" std_msgs/Float64MultiArray \
+    "data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]" \
+    >/dev/null 2>&1 || true
+fi
 sleep 0.2
 for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
 REC_PIDS=()
