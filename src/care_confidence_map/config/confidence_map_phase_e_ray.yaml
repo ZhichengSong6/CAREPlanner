@@ -1,0 +1,86 @@
+confidence_map:
+  frame: base_link
+
+  x_min: -0.95
+  x_max:  0.95
+  y_min: -0.95
+  y_max:  0.95
+  z_min:  0.0
+  z_max:  1.15
+
+  resolution: 0.05
+
+  update_rate: 30.0
+  publish_rate: 10.0
+
+  # Temporal memory of observed / initially trusted-clear space.
+  # If a voxel is not currently visible, confidence decays as:
+  # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
+  # 100 s is intentionally very slow for current active-sensing debugging,
+  # so previously observed space is effectively remembered over a normal run.
+  temporal_decay_time: 100.0
+
+  # Frozen C5.41 baseline semantics. Phase E uses a separate config that
+  # switches this node to real ToF ray integration.
+  observation_mode: tof_ray
+
+  # Phase E3 real depth-ray integration. E2 publishes one coarse ray sample
+  # per organized depth-image stride, including hit/no-hit provenance.
+  ray_observation_topic: /care_planner/perception/tof_ray_observations
+  e3_summary_topic: /care_planner/confidence_map/e3_summary
+  ray_observation_timeout: 0.25
+  ray_free_start_range: 0.0
+  ray_endpoint_guard_distance: 0.025
+  ray_step: 0.025
+  ray_min_valid_range: 0.05
+  ray_max_valid_range: 1.50
+
+  marker_topic: /care_planner/confidence_map/markers
+  pointcloud_topic: /care_planner/confidence_map/points
+  fov_marker_topic: /care_planner/confidence_map/fov_markers
+  query_service: /care_planner/confidence_map/query
+
+# Legacy parameter namespace kept for compatibility. Semantically this is now
+# an INITIAL trusted-free bootstrap around the robot's starting configuration.
+# It must be written exactly once and must never follow the moving robot.
+current_body_prior:
+  enabled: true
+
+  # This file is set by confidence_map.launch so that $(find ...) works.
+  body_samples_file: ""
+
+  # Small trusted-clear envelope around the initial body geometry.
+  inflation_radius: 0.10
+
+  # IMPORTANT: disabled here. initialize_body_prior_once.py waits until all
+  # required body TFs are available, performs one complete refresh, then locks.
+  refresh_on_startup: false
+
+  # false = include all body samples, including base if present.
+  # true  = only include samples marked include_for_risk in body_samples.yaml.
+  risk_samples_only: false
+
+  tf_timeout: 0.05
+  refresh_service: /care_planner/confidence_map/refresh_body_prior
+  marker_topic: /care_planner/confidence_map/current_body_prior_markers
+
+sensor_model:
+  forward_axis: z
+
+  tof_min_range: 0.15
+  tof_max_range: 0.75
+
+  horizontal_fov_deg: 55.0
+  vertical_fov_deg: 72.0
+
+  local_resolution: 0.05
+
+  sensors:
+    - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
+    - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
+    - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
+    - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
+    - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
+    - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
+    - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
+    - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}
