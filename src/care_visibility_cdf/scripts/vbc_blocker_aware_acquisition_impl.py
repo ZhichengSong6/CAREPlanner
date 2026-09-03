@@ -48,6 +48,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._coherent_bundle_drop_count = 0
         self._coherent_bundle_last_reason = "startup"
 
+        # C5.42: separate steering-only L0+L1 transport. L0 still owns
+        # persistent obligation materialization through the coherent bundle
+        # above. L1 is never inserted into self._obligations here.
+        self._spatiotemporal_lock = threading.Lock()
+        self._spatiotemporal_seq = 0
+        self._spatiotemporal_layers: List[Dict[str, object]] = []
+        self._spatiotemporal_received_count = 0
+        self._spatiotemporal_drop_count = 0
+        self._spatiotemporal_last_reason = "startup"
+        self._lookahead_last_region_count = 0
+        self._lookahead_last_point_count = 0
+
         self._repair_stack: List[int] = []
         self._pending_blocker_id = None
         self._pending_blocker_count = 0
@@ -112,9 +124,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.progressive_shared_repair_enabled = bool(rospy.get_param(
             "~progressive_shared_repair_enabled", True))
         self.progressive_shared_max_regions = int(rospy.get_param(
-            "~progressive_shared_max_regions", 3))
+            "~progressive_shared_max_regions", 4))
         self.progressive_shared_accept_f_min = float(rospy.get_param(
             "~progressive_shared_accept_f_min", 0.0))
+        self.one_layer_lookahead_enabled = bool(rospy.get_param(
+            "~one_layer_lookahead_enabled", True))
 
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
@@ -122,6 +136,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.active_set_bundle_topic = str(rospy.get_param(
             "~active_set_bundle_topic",
             "/care_planner/trajectory_risk/vbc_active_set_bundle"))
+        self.spatiotemporal_bundle_topic = str(rospy.get_param(
+            "~spatiotemporal_bundle_topic",
+            "/care_planner/trajectory_risk/vbc_spatiotemporal_bundle"))
         self.gcdf_recovery_trajectory_topic = str(rospy.get_param(
             "~gcdf_recovery_trajectory_topic",
             "/care_planner/final_gcdf/recovery_trajectory"))
@@ -142,6 +159,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.active_set_bundle_sub = rospy.Subscriber(
             self.active_set_bundle_topic, Float64MultiArray,
             self._active_set_bundle_cb, queue_size=1)
+        self.spatiotemporal_bundle_sub = rospy.Subscriber(
+            self.spatiotemporal_bundle_topic, Float64MultiArray,
+            self._spatiotemporal_bundle_cb, queue_size=1)
         self.gcdf_recovery_trajectory_sub = rospy.Subscriber(
             self.gcdf_recovery_trajectory_topic, JointTrajectory,
             self._gcdf_recovery_trajectory_cb, queue_size=1)
@@ -153,10 +173,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._publish_schedule()
         self._publish_blocker_stack_summary()
         rospy.logwarn(
-            "[vbc_blocker_stack] C4.9/C5.26 ENABLED max_blocker_sweep=%.3fs "
-            "confirmations=%d coherent_bundle=%s",
+            "[vbc_blocker_stack] C5.42 ENABLED max_blocker_sweep=%.3fs "
+            "confirmations=%d coherent_bundle=%s one_layer_lookahead=%d "
+            "spatiotemporal_bundle=%s",
             self.blocker_push_max_sweep_s, self.blocker_confirmations,
-            self.active_set_bundle_topic)
+            self.active_set_bundle_topic, int(self.one_layer_lookahead_enabled),
+            self.spatiotemporal_bundle_topic)
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         """Ignore the legacy split active-set stream in C5.26 blocker mode.
@@ -242,6 +264,95 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._acquisition_started = True
             self._acquisition_complete = False
             self.acquisition_complete_pub.publish(Bool(data=False))
+
+    def _spatiotemporal_bundle_cb(self, msg: Float64MultiArray) -> None:
+        """Parse C5.42 L0+L1 steering look-ahead without owning obligation life."""
+        if msg is None:
+            return
+        values = np.asarray(list(msg.data), dtype=np.float64)
+        if values.size < 2:
+            self._spatiotemporal_drop_count += 1
+            self._spatiotemporal_last_reason = "malformed_short"
+            return
+        try:
+            seq = int(round(float(values[0])))
+            layer_count = int(round(float(values[1])))
+        except Exception:
+            self._spatiotemporal_drop_count += 1
+            self._spatiotemporal_last_reason = "malformed_header"
+            return
+        if (seq < 0 or layer_count < 0 or layer_count > 2 or
+                abs(float(values[0]) - seq) > 1e-6 or
+                abs(float(values[1]) - layer_count) > 1e-6):
+            self._spatiotemporal_drop_count += 1
+            self._spatiotemporal_last_reason = "invalid_header"
+            return
+
+        cursor = 2
+        layers = []
+        try:
+            for expected_index in range(layer_count):
+                if cursor + 6 > values.size:
+                    raise ValueError("short_layer_header")
+                layer_index = int(round(float(values[cursor + 0])))
+                min_sweep = float(values[cursor + 1])
+                max_sweep = float(values[cursor + 2])
+                start_k = int(round(float(values[cursor + 3])))
+                end_k = int(round(float(values[cursor + 4])))
+                point_count = int(round(float(values[cursor + 5])))
+                cursor += 6
+                if (layer_index != expected_index or point_count < 0 or
+                        not math.isfinite(min_sweep) or
+                        not math.isfinite(max_sweep) or
+                        min_sweep < 0.0 or max_sweep + 1e-12 < min_sweep):
+                    raise ValueError("invalid_layer_header")
+                need = 3 * point_count
+                if cursor + need > values.size:
+                    raise ValueError("short_layer_points")
+                points = values[cursor:cursor + need].reshape(point_count, 3)
+                cursor += need
+                if point_count and not np.all(np.isfinite(points)):
+                    raise ValueError("nonfinite_layer_points")
+
+                by_key = {}
+                for point in points:
+                    by_key[self._cell_key(point)] = point.copy()
+                ordered_keys = tuple(sorted(by_key.keys()))
+                canonical = (
+                    np.asarray([by_key[k] for k in ordered_keys], dtype=np.float64)
+                    if ordered_keys else np.zeros((0, 3), dtype=np.float64))
+                layers.append({
+                    "layer_index": int(layer_index),
+                    "min_sweep_s": float(min_sweep),
+                    "max_sweep_s": float(max_sweep),
+                    "start_original_timestep": int(start_k),
+                    "end_original_timestep": int(end_k),
+                    "points": canonical,
+                    "keys": ordered_keys,
+                })
+            if cursor != values.size:
+                raise ValueError("trailing_values")
+        except Exception as exc:
+            self._spatiotemporal_drop_count += 1
+            self._spatiotemporal_last_reason = "malformed_{}".format(str(exc))
+            return
+
+        with self._spatiotemporal_lock:
+            if seq < self._spatiotemporal_seq:
+                self._spatiotemporal_last_reason = "stale"
+                return
+            self._spatiotemporal_seq = seq
+            self._spatiotemporal_layers = layers
+            self._spatiotemporal_received_count += 1
+            self._spatiotemporal_last_reason = (
+                "l0_l1_ready" if len(layers) > 1 else
+                ("l0_only" if layers else "empty"))
+
+        # New L1 geometry may change the progressive shared steering target even
+        # when the persistent L0 obligation set is unchanged.
+        with self._progressive_shared_lock:
+            self._progressive_shared_cache_key = None
+            self._progressive_shared_cache = None
 
     @staticmethod
     def _stamp_key(stamp):
@@ -457,29 +568,97 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._repair_stack.append(root)
                 self._last_switch_reason = "initialize_oldest_obligation"
 
-    def _progressive_priority_order(self, by_id, active_id):
-        """Current blocker first; then urgent-layer regions; then the rest.
+    def _lookahead_region_items(self):
+        """Return transient L1 spatial regions for steering only.
 
-        Within the same importance tier prefer a q_vis closer to the measured
-        configuration. This is only a steering preference; it cannot make an
-        unsafe candidate executable.
+        Negative IDs are local synthetic identities. They are never appended to
+        self._obligations and therefore cannot block acquisition completion.
+        """
+        if not self.one_layer_lookahead_enabled:
+            self._lookahead_last_region_count = 0
+            self._lookahead_last_point_count = 0
+            return {}
+        with self._coherent_bundle_lock:
+            l0_seq = int(self._coherent_bundle_seq)
+        with self._spatiotemporal_lock:
+            seq = int(self._spatiotemporal_seq)
+            layers = [dict(layer) for layer in self._spatiotemporal_layers]
+        if seq != l0_seq or len(layers) < 2:
+            self._lookahead_last_region_count = 0
+            self._lookahead_last_point_count = 0
+            return {}
+
+        l1 = layers[1]
+        points = np.asarray(l1.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if points.shape[0] == 0:
+            self._lookahead_last_region_count = 0
+            self._lookahead_last_point_count = 0
+            return {}
+
+        regions = self._cluster_regions(points)
+        items = {}
+        for index, region in enumerate(regions):
+            oid = -(1001 + index)
+            items[oid] = {
+                "id": oid,
+                "points": np.asarray(region["points"], dtype=np.float64).copy(),
+                "keys": tuple(region["keys"]),
+                "centroid": np.asarray(region["centroid"], dtype=np.float64).copy(),
+                "q_vis": np.asarray([], dtype=np.float64),
+                "q_zero": np.asarray([], dtype=np.float64),
+                "final_f_min": math.nan,
+                "discovered_sweep_time_s": float(l1["min_sweep_s"]),
+                "temporal_priority": 3,
+                "steering_only_lookahead": True,
+                "lookahead_layer_index": 1,
+            }
+        self._lookahead_last_region_count = len(items)
+        self._lookahead_last_point_count = int(points.shape[0])
+        return items
+
+    def _progressive_priority_order(self, by_id, active_id):
+        """Hierarchical spatiotemporal priority for progressive dropout.
+
+        0 current blocker (mandatory)
+        1 other regions in current earliest temporal layer
+        2 other persistent visibility debt
+        3 next temporal layer L1 (opportunistic)
         """
         q0 = None if self._latest_measured_q is None else np.asarray(
             self._latest_measured_q, dtype=np.float64)
         urgent = set(int(v) for v in self._last_active_layer_ids)
+        active_centroid = np.asarray(
+            by_id[active_id].get("centroid", [math.nan] * 3),
+            dtype=np.float64).reshape(-1)
+
+        for oid, item in by_id.items():
+            if oid == active_id:
+                item["temporal_priority"] = 0
+            elif bool(item.get("steering_only_lookahead", False)):
+                item["temporal_priority"] = 3
+            elif oid in urgent:
+                item["temporal_priority"] = 1
+            else:
+                item["temporal_priority"] = 2
 
         def distance(oid):
-            if q0 is None:
-                return math.inf
             qv = np.asarray(by_id[oid].get("q_vis", []), dtype=np.float64)
-            if qv.shape != (7,) or not np.all(np.isfinite(qv)):
-                return math.inf
-            return float(np.linalg.norm(qv - q0))
+            if (q0 is not None and qv.shape == (7,) and
+                    np.all(np.isfinite(qv))):
+                return float(np.linalg.norm(qv - q0))
+            centroid = np.asarray(
+                by_id[oid].get("centroid", [math.nan] * 3),
+                dtype=np.float64).reshape(-1)
+            if (active_centroid.shape == (3,) and centroid.shape == (3,) and
+                    np.all(np.isfinite(active_centroid)) and
+                    np.all(np.isfinite(centroid))):
+                return float(np.linalg.norm(centroid - active_centroid))
+            return math.inf
 
         others = [oid for oid in by_id if oid != active_id]
         others.sort(
             key=lambda oid: (
-                0 if oid in urgent else 1,
+                int(by_id[oid].get("temporal_priority", 9)),
                 distance(oid),
                 oid))
         return [active_id] + others
@@ -548,7 +727,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 return None
 
             active = list(considered)
-            urgent = set(int(v) for v in self._last_active_layer_ids)
             dropped = []
             last_slacks = {}
 
@@ -613,7 +791,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                         self._progressive_shared_cache_key = cache_key
                         self._progressive_shared_cache = cache
                         rospy.logwarn(
-                            "[vbc_blocker_stack] C5.41 shared q_vis %s "
+                            "[vbc_blocker_stack] C5.42 shared q_vis %s "
                             "considered=%s kept=%s dropped=%s min_f=%+.4f",
                             cache["mode"],
                             ":".join(str(v) for v in considered),
@@ -633,10 +811,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 if not optional:
                     break
                 lowest_importance = max(
-                    0 if oid in urgent else 1 for oid in optional)
+                    int(by_id[oid].get("temporal_priority", 9))
+                    for oid in optional)
                 pool = [
                     oid for oid in optional
-                    if (0 if oid in urgent else 1) == lowest_importance]
+                    if int(by_id[oid].get("temporal_priority", 9)) ==
+                    lowest_importance]
                 drop_id = max(
                     pool,
                     key=lambda oid: (
@@ -663,15 +843,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             stack = list(self._repair_stack)
         if not copied:
             return []
-        by_id = {int(ob["id"]): ob for ob in copied}
-        valid_stack = [oid for oid in stack if oid in by_id]
-        active_id = valid_stack[-1] if valid_stack else min(by_id)
+        persistent_by_id = {int(ob["id"]): ob for ob in copied}
+        valid_stack = [oid for oid in stack if oid in persistent_by_id]
+        active_id = (
+            valid_stack[-1] if valid_stack else min(persistent_by_id))
 
-        priority_order = self._progressive_priority_order(by_id, active_id)
+        steering_by_id = {
+            oid: dict(ob) for oid, ob in persistent_by_id.items()}
+        steering_by_id.update(self._lookahead_region_items())
+
+        priority_order = self._progressive_priority_order(
+            steering_by_id, active_id)
         shared = self._compute_progressive_shared_target(
-            by_id, active_id, priority_order)
+            steering_by_id, active_id, priority_order)
 
-        first = dict(by_id[active_id])
+        first = dict(persistent_by_id[active_id])
         if shared is not None:
             first["q_vis"] = np.asarray(
                 shared["q_vis"], dtype=np.float64).copy()
@@ -680,8 +866,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             first["final_f_min"] = float(shared["final_f_min"])
             first["shared_solution_mode"] = str(shared["mode"])
 
-        rest = [by_id[oid] for oid in priority_order if oid != active_id]
-        return [first] + rest
+        # Never publish steering-only L1 pseudo-regions as actual obligations.
+        persistent_order = [
+            oid for oid in priority_order if oid in persistent_by_id and
+            oid != active_id]
+        return [first] + [persistent_by_id[oid] for oid in persistent_order]
 
     def _select_nearest_qvis_id(self, ids: List[int]):
         with self._obligation_lock:
@@ -955,6 +1144,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" coherent_bundle_drop_count={self._coherent_bundle_drop_count}"
             f" coherent_bundle_reason={self._coherent_bundle_last_reason}"
             f" switch_reason={self._last_switch_reason}"
+            f" one_layer_lookahead_enabled={int(self.one_layer_lookahead_enabled)}"
+            f" spatiotemporal_seq={self._spatiotemporal_seq}"
+            f" spatiotemporal_layer_count={len(self._spatiotemporal_layers)}"
+            f" spatiotemporal_received_count={self._spatiotemporal_received_count}"
+            f" spatiotemporal_drop_count={self._spatiotemporal_drop_count}"
+            f" spatiotemporal_reason={self._spatiotemporal_last_reason}"
+            f" lookahead_l1_region_count={self._lookahead_last_region_count}"
+            f" lookahead_l1_point_count={self._lookahead_last_point_count}"
             f" progressive_shared_enabled={int(self.progressive_shared_repair_enabled)}"
             f" progressive_shared_max_regions={self.progressive_shared_max_regions}"
             f" progressive_shared_accept_f_min={self.progressive_shared_accept_f_min:.6f}"
