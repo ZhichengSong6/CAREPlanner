@@ -928,7 +928,6 @@ class C44VerifiedRegimeManager:
                             self.probe_ignore_until is not None and
                             now < self.probe_ignore_until):
                         return
-                    self.probe_failure_count += 1
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
                     self.pending_probe_effective_prefix_s = math.nan
@@ -942,6 +941,10 @@ class C44VerifiedRegimeManager:
                             "final_gcdf_occupied_probe_replan")
                         self.replan_request_pub.publish(Bool(data=True))
                         return
+
+                    # Only visibility/VBC failures count as active-sensing
+                    # PROBE failures. A known obstacle is tracked separately.
+                    self.probe_failure_count += 1
 
                     origin = (
                         "final_gcdf_probe_unsafe"
