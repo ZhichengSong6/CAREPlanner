@@ -531,7 +531,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             if measured is None or measured.shape != (7,) or not np.all(
                     np.isfinite(measured)):
                 self._progressive_shared_last_mode = "no_measured_q"
-                self._progressive_shared_cache_key = cache_key
+                # Transient startup state: do not cache the miss, so the same
+                # obligation set is retried as soon as measured q arrives.
+                self._progressive_shared_cache_key = None
                 self._progressive_shared_cache = None
                 return None
 
@@ -540,7 +542,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     self._preferred_trajectory_locked())
             if trajectory is None:
                 self._progressive_shared_last_mode = "no_trajectory"
-                self._progressive_shared_cache_key = cache_key
+                # Transient startup/refresh state: retry later.
+                self._progressive_shared_cache_key = None
                 self._progressive_shared_cache = None
                 return None
 
