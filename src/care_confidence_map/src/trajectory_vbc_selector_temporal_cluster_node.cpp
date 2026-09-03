@@ -132,13 +132,10 @@ public:
         active_set_points_topic_, 1, true);
     active_set_bundle_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
         active_set_bundle_topic_, 1, true);
-    spatiotemporal_bundle_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
-        spatiotemporal_bundle_topic_, 1, true);
 
     publishCandidateActive(false);
     publishActiveSet({});
     publishActiveSetBundle({}, std::numeric_limits<double>::quiet_NaN());
-    publishSpatiotemporalBundle({}, {});
 
     timer_ = nh_.createTimer(
         ros::Duration(1.0 / std::max(0.1, eval_rate_)),
@@ -269,10 +266,6 @@ private:
         "trajectory_vbc/active_set_bundle_topic",
         active_set_bundle_topic_,
         "/care_planner/trajectory_risk/vbc_active_set_bundle");
-    pnh_.param<std::string>(
-        "trajectory_vbc/spatiotemporal_bundle_topic",
-        spatiotemporal_bundle_topic_,
-        "/care_planner/trajectory_risk/vbc_spatiotemporal_bundle");
     pnh_.param<std::string>(
         "trajectory_vbc/force_bootstrap_topic",
         force_bootstrap_topic_,
@@ -928,49 +921,6 @@ private:
     active_set_bundle_pub_.publish(msg);
   }
 
-  // C5.42 one-layer look-ahead transport. The first layer remains the
-  // authoritative L0 active set and is also published on active_set_bundle.
-  // Layer 1 is steering-only/opportunistic: downstream must NOT create a
-  // persistent visibility obligation from it until it later becomes L0.
-  //
-  // data = [active_bundle_seq, layer_count,
-  //         layer_index, min_sweep, max_sweep, start_k, end_k, point_count,
-  //         x0,y0,z0,...,  ...next layer...]
-  // At most L0 + L1 are transported.
-  void publishSpatiotemporalBundle(
-      const std::vector<TemporalLayer>& layers,
-      const std::vector<Candidate>& candidates)
-  {
-    const std::size_t count = std::min<std::size_t>(2, layers.size());
-    std_msgs::Float64MultiArray msg;
-    std::size_t reserve = 2;
-    for (std::size_t li = 0; li < count; ++li)
-      reserve += 6 + 3 * layers[li].member_indices.size();
-    msg.data.reserve(reserve);
-    msg.data.push_back(static_cast<double>(active_set_bundle_seq_));
-    msg.data.push_back(static_cast<double>(count));
-
-    for (std::size_t li = 0; li < count; ++li)
-    {
-      const TemporalLayer& layer = layers[li];
-      msg.data.push_back(static_cast<double>(li));
-      msg.data.push_back(layer.min_sweep_time_s);
-      msg.data.push_back(layer.max_sweep_time_s);
-      msg.data.push_back(static_cast<double>(layer.start_original_timestep));
-      msg.data.push_back(static_cast<double>(layer.end_original_timestep));
-      msg.data.push_back(static_cast<double>(layer.member_indices.size()));
-      for (const int idx : layer.member_indices)
-      {
-        if (idx < 0 || idx >= static_cast<int>(candidates.size())) continue;
-        const Candidate& cand = candidates[static_cast<std::size_t>(idx)];
-        msg.data.push_back(cand.point_base.x());
-        msg.data.push_back(cand.point_base.y());
-        msg.data.push_back(cand.point_base.z());
-      }
-    }
-    spatiotemporal_bundle_pub_.publish(msg);
-  }
-
   static std::string joinInts(const std::vector<int>& values)
   {
     std::ostringstream oss;
@@ -990,7 +940,6 @@ private:
     publishCandidateActive(false);
     publishActiveSet({});
     publishActiveSetBundle({}, std::numeric_limits<double>::quiet_NaN());
-    publishSpatiotemporalBundle({}, {});
     has_selected_key_ = false;
 
     std::ostringstream oss;
@@ -1052,7 +1001,6 @@ private:
       active_points.push_back(&candidates[static_cast<std::size_t>(idx)]);
     publishActiveSet(active_points);
     publishActiveSetBundle(active_points, active_layer.min_sweep_time_s);
-    publishSpatiotemporalBundle(layers, candidates);
 
     // Legacy split-topic metadata remains for diagnostics/backward-compatible
     // consumers. C5.26 blocker acquisition consumes the coherent bundle above.
@@ -1131,14 +1079,6 @@ private:
         << " active_layer_region_count=" << active_layer.regions.size()
         << " active_layer_cross_link_region_count=" << active_cross_link_regions
         << " active_set_point_count=" << active_count
-        << " lookahead_layer_count=" << std::min<std::size_t>(2, layers.size())
-        << " next_layer_point_count="
-        << ((layers.size() > 1) ? layers[1].member_indices.size() : 0)
-        << " next_layer_region_count="
-        << ((layers.size() > 1) ? layers[1].regions.size() : 0)
-        << " next_layer_sweep_time_min_s="
-        << ((layers.size() > 1) ? layers[1].min_sweep_time_s
-                                : std::numeric_limits<double>::quiet_NaN())
         << " layer_point_counts=" << joinInts(layer_sizes)
         << " active_region_sizes=" << joinInts(active_region_sizes)
         << " min_required_margin_s=" << min_margin_s_
@@ -1629,16 +1569,13 @@ private:
     ROS_INFO_STREAM("spatial region maximum diameter: "
                     << region_max_diameter_m_ << " m");
     ROS_INFO_STREAM("active set topic: " << active_set_points_topic_);
-    ROS_INFO_STREAM("spatiotemporal look-ahead topic: "
-                    << spatiotemporal_bundle_topic_);
     ROS_INFO_STREAM("force bootstrap topic: " << force_bootstrap_topic_);
     ROS_INFO_STREAM("required VBC margin: " << min_margin_s_ << " s");
     ROS_INFO_STREAM(
         "Rule: audit every candidate; sort violations by t_sweep; greedily form "
         "ordered temporal layers with bounded MPC-step span; spatially cluster "
         "inside each layer; ALL regions and ALL points in the earliest unsafe "
-        "layer form the authoritative steering active set. C5.42 additionally "
-        "transports the next temporal layer as opportunistic look-ahead only.");
+        "layer form the steering active set.");
     ROS_INFO_STREAM(
         "=========================================================================");
   }
@@ -1659,7 +1596,6 @@ private:
   ros::Publisher selected_see_time_pub_;
   ros::Publisher active_set_points_pub_;
   ros::Publisher active_set_bundle_pub_;
-  ros::Publisher spatiotemporal_bundle_pub_;
   ros::Timer timer_;
 
   care_confidence_map::TrajectoryRiskEvaluator evaluator_;
@@ -1727,8 +1663,6 @@ private:
       "/care_planner/trajectory_risk/vbc_active_set_points";
   std::string active_set_bundle_topic_ =
       "/care_planner/trajectory_risk/vbc_active_set_bundle";
-  std::string spatiotemporal_bundle_topic_ =
-      "/care_planner/trajectory_risk/vbc_spatiotemporal_bundle";
   std::string force_bootstrap_topic_ =
       "/care_planner/trajectory_risk/force_bootstrap";
 
