@@ -3,8 +3,14 @@ std_msgs/Header header
 int32 num_pairs
 int32 dof
 
+# Phase E4 forbidden-source semantics. UNKNOWN and OCCUPIED are both hard
+# GCDF constraints, but only UNKNOWN may generate visibility repair.
+uint8 SOURCE_UNKNOWN=0
+uint8 SOURCE_OCCUPIED=1
+
 # One entry per paired constraint.
 int32[] original_timestep
+uint8[] source_type
 
 # Flat arrays:
 # point_flat              : num_pairs * 3
