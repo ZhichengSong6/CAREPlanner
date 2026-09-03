@@ -2,7 +2,16 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+# RUN_SECONDS is a maximum timeout, not a required fixed duration. Phase-D
+# stops early once the measured EE pose satisfies the same success definition
+# used by evaluate_phase_d_run.py.
 RUN_SECONDS="${RUN_SECONDS:-60.0}"
+EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-true}"
+GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M:-0.02}"
+GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD:-0.20}"
+GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
+GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.20}"
+
 TRIAL_ID="${TRIAL_ID:-trial_00}"
 METHOD="${METHOD:-careplanner_full}"
 KEEP_CASE_ZIPS="${KEEP_CASE_ZIPS:-0}"
@@ -40,7 +49,12 @@ cat > "${BATCH_ROOT}/benchmark_metadata.txt" <<EOF
 phase=D.2
 method=${METHOD}
 trial_id=${TRIAL_ID}
-run_seconds=${RUN_SECONDS}
+max_run_seconds=${RUN_SECONDS}
+early_stop_on_goal=${EARLY_STOP_ON_GOAL}
+goal_position_tolerance_m=${GOAL_POSITION_TOLERANCE_M}
+goal_orientation_tolerance_rad=${GOAL_ORIENTATION_TOLERANCE_RAD}
+goal_success_hold_s=${GOAL_SUCCESS_HOLD_S}
+goal_post_success_record_s=${GOAL_POST_SUCCESS_RECORD_S}
 git_head=$(git rev-parse HEAD)
 git_branch=$(git branch --show-current)
 cases=${CASES[*]}
@@ -67,6 +81,11 @@ for CASE_ID in "${CASES[@]}"; do
 
   set +e
   CASE_ID="${CASE_ID}" RUN_ID="${RUN_ID}" RUN_SECONDS="${RUN_SECONDS}" \
+    EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL}" \
+    GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M}" \
+    GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD}" \
+    GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S}" \
+    GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S}" \
     bash scripts/run_and_pack_c5_5_vbc_gcdf_regime.sh \
     > >(tee "${BATCH_LOG_DIR}/${CASE_ID}.log") 2>&1
   RUN_RC=$?
@@ -97,7 +116,8 @@ for CASE_ID in "${CASES[@]}"; do
       tracker_summary.csv \
       local_planner_summary.csv \
       nominal_progress_summary.csv \
-      tracker_execution_breakdown.json; do
+      tracker_execution_breakdown.json \
+      goal_stop_status.json; do
       copy_if_exists "${ROOT_OUT}/run/${name}" "${CASE_DIR}/${name}"
     done
     copy_if_exists "${ROOT_OUT}/c5_4_local_sparse_scp_summary.json" "${CASE_DIR}/c5_4_local_sparse_scp_summary.json"
