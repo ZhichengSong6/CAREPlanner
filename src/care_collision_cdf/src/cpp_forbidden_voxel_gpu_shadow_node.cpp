@@ -424,6 +424,14 @@ class CppForbiddenVoxelGpuShadow {
 
     index->build_ms = msBetween(t0, Clock::now());
 
+    ROS_INFO_STREAM_THROTTLE(
+        2.0,
+        "[Phase E4 GCDF] map voxels=" << index->total_voxel_count
+        << " forbidden=" << index->low_voxel_count
+        << " unknown=" << index->unknown_voxel_count
+        << " occupied=" << index->occupied_voxel_count
+        << " build_ms=" << index->build_ms);
+
     {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_map_ = index;
@@ -1046,9 +1054,6 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
         << " map_index_ms=" << map_index_ms
-        << " map_forbidden=" << (latest_map_ ? latest_map_->low_voxel_count : 0)
-        << " map_unknown=" << (latest_map_ ? latest_map_->unknown_voxel_count : 0)
-        << " map_occupied=" << (latest_map_ ? latest_map_->occupied_voxel_count : 0)
         << " channel=" << (final_channel ? "final" : "local")
         << " batch_topic="
         << (final_channel ? final_constraint_batch_topic_ : constraint_batch_topic_)
