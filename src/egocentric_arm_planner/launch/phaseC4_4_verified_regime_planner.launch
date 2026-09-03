@@ -3,6 +3,13 @@
   <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
   <arg name="base_frame" default="base_link" />
   <arg name="ee_frame" default="EE_link" />
+
+  <!-- Phase E perception is opt-in. Defaults preserve frozen C5.41
+       ideal-FOV behavior. -->
+  <arg name="confidence_map_config_file"
+       default="$(find care_confidence_map)/config/confidence_map.yaml" />
+  <arg name="tof_fusion_enabled" default="false" />
+
   <arg name="waypoint_weight" default="3000.0" />
   <arg name="waypoint_timeout" default="0.20" />
   <arg name="waypoint_horizon_slack" default="0.025" />
@@ -420,7 +427,11 @@
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
        RECOVERY_HOLD in planner-mode semantics, so there is nothing to ack. -->
 
+  <include if="$(arg tof_fusion_enabled)"
+           file="$(find care_confidence_map)/launch/tof_fusion_self_filter.launch" />
+
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="config_file" value="$(arg confidence_map_config_file)" />
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
 
