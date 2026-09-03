@@ -2231,8 +2231,8 @@
       <camera name="link2_sensor1_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2300,8 +2300,8 @@
       <camera name="link2_sensor2_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2369,8 +2369,8 @@
       <camera name="link3_sensor1_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2438,8 +2438,8 @@
       <camera name="link3_sensor2_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2507,8 +2507,8 @@
       <camera name="link4_sensor1_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2576,8 +2576,8 @@
       <camera name="link4_sensor2_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2612,8 +2612,8 @@
       <camera name="EE_sensor1_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
@@ -2646,8 +2646,8 @@
       <camera name="EE_sensor2_tof_camera">
         <horizontal_fov>0.9599310885968813</horizontal_fov>
         <image>
-          <width>320</width>
-          <height>240</height>
+          <width>240</width>
+          <height>335</height>
           <format>R8G8B8</format>
         </image>
         <clip>
