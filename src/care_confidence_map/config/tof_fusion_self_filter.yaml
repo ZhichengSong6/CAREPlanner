@@ -2,6 +2,7 @@ base_frame: base_link
 
 output_topic: /care_planner/perception/tof_fused_filtered
 summary_topic: /care_planner/perception/tof_fusion_summary
+ray_observation_topic: /care_planner/perception/tof_ray_observations
 
 # Downsample each 320x240 depth cloud before TF/self filtering, then remove
 # duplicate points again after merging all eight sensors.
