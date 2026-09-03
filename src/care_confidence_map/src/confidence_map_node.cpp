@@ -837,6 +837,250 @@ private:
     printConfidenceStatsThrottled();
   }
 
+  void applyTemporalDecay(const ros::Time& now)
+  {
+    const double now_sec = now.toSec();
+    for (auto& p : grid_points_)
+    {
+      if (p.current_visibility > 0.5f)
+      {
+        continue;
+      }
+
+      if (p.last_seen_time >= 0.0)
+      {
+        const double dt = std::max(0.0, now_sec - p.last_seen_time);
+        p.confidence =
+            static_cast<float>(std::exp(-dt / temporal_decay_time_));
+      }
+      else
+      {
+        p.confidence = 0.0f;
+      }
+    }
+  }
+
+  void rayObservationCallback(
+      const sensor_msgs::PointCloud2ConstPtr& msg)
+  {
+    if (!msg || observation_mode_ != "tof_ray")
+    {
+      return;
+    }
+
+    if (!msg->header.frame_id.empty() &&
+        msg->header.frame_id != map_frame_)
+    {
+      ++ray_decode_failure_count_;
+      ROS_ERROR_STREAM_THROTTLE(
+          1.0,
+          "[confidence_map_node] Phase E3 ray frame mismatch: msg='"
+          << msg->header.frame_id << "' map='" << map_frame_
+          << "'. E2 ray observations must be expressed in the map frame.");
+      return;
+    }
+
+    std::vector<uint8_t> free_mask(grid_points_.size(), 0);
+    std::vector<uint8_t> occupied_mask(grid_points_.size(), 0);
+
+    std::size_t valid_rays = 0;
+    std::size_t invalid_range = 0;
+    std::size_t out_of_map_endpoints = 0;
+
+    try
+    {
+      sensor_msgs::PointCloud2ConstIterator<float> x_it(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> y_it(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> z_it(*msg, "z");
+      sensor_msgs::PointCloud2ConstIterator<float> ox_it(*msg, "origin_x");
+      sensor_msgs::PointCloud2ConstIterator<float> oy_it(*msg, "origin_y");
+      sensor_msgs::PointCloud2ConstIterator<float> oz_it(*msg, "origin_z");
+      sensor_msgs::PointCloud2ConstIterator<int32_t> sensor_it(
+          *msg, "sensor_id");
+
+      for (; x_it != x_it.end();
+           ++x_it, ++y_it, ++z_it,
+           ++ox_it, ++oy_it, ++oz_it, ++sensor_it)
+      {
+        (void)(*sensor_it);
+
+        const tf2::Vector3 endpoint(
+            static_cast<double>(*x_it),
+            static_cast<double>(*y_it),
+            static_cast<double>(*z_it));
+        const tf2::Vector3 origin(
+            static_cast<double>(*ox_it),
+            static_cast<double>(*oy_it),
+            static_cast<double>(*oz_it));
+
+        if (!std::isfinite(endpoint.x()) ||
+            !std::isfinite(endpoint.y()) ||
+            !std::isfinite(endpoint.z()) ||
+            !std::isfinite(origin.x()) ||
+            !std::isfinite(origin.y()) ||
+            !std::isfinite(origin.z()))
+        {
+          ++invalid_range;
+          continue;
+        }
+
+        const tf2::Vector3 delta = endpoint - origin;
+        const double range = delta.length();
+        if (!std::isfinite(range) ||
+            range < ray_min_valid_range_ ||
+            range > ray_max_valid_range_)
+        {
+          ++invalid_range;
+          continue;
+        }
+
+        ++valid_rays;
+        const tf2::Vector3 direction = delta / range;
+
+        const double free_end =
+            std::max(
+                ray_free_start_range_,
+                range - ray_endpoint_guard_distance_);
+
+        if (free_end > ray_free_start_range_)
+        {
+          for (double d = ray_free_start_range_;
+               d < free_end;
+               d += ray_step_)
+          {
+            const tf2::Vector3 p = origin + direction * d;
+            int index = -1;
+            if (positionToGridIndex(p, index))
+            {
+              free_mask[static_cast<std::size_t>(index)] = 1;
+            }
+          }
+        }
+
+        int endpoint_index = -1;
+        if (positionToGridIndex(endpoint, endpoint_index))
+        {
+          occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+        }
+        else
+        {
+          ++out_of_map_endpoints;
+        }
+      }
+    }
+    catch (const std::runtime_error& ex)
+    {
+      ++ray_decode_failure_count_;
+      ROS_ERROR_STREAM_THROTTLE(
+          1.0,
+          "[confidence_map_node] Phase E3 ray observation decode failed: "
+          << ex.what());
+      return;
+    }
+
+    resetCurrentVisibility();
+
+    const ros::Time stamp =
+        msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+    const double stamp_sec = stamp.toSec();
+
+    std::size_t free_cells = 0;
+    std::size_t occupied_cells = 0;
+
+    for (std::size_t i = 0; i < grid_points_.size(); ++i)
+    {
+      GridPoint& gp = grid_points_[i];
+
+      // Occupied endpoint wins over free traversal if multiple sensors touch
+      // the same coarse voxel during one fused observation packet.
+      if (occupied_mask[i] != 0)
+      {
+        gp.occupancy = 1.0f;
+        gp.current_visibility = 1.0f;
+        gp.confidence = 1.0f;
+        gp.last_seen_time = stamp_sec;
+        ++occupied_cells;
+      }
+      else if (free_mask[i] != 0)
+      {
+        gp.occupancy = 0.0f;
+        gp.current_visibility = 1.0f;
+        gp.confidence = 1.0f;
+        gp.last_seen_time = stamp_sec;
+        ++free_cells;
+      }
+    }
+
+    applyTemporalDecay(stamp);
+
+    last_ray_observation_received_ = ros::Time::now();
+    last_ray_observation_stamp_ = stamp;
+    ++ray_packet_count_;
+    last_ray_count_ = valid_rays;
+    last_ray_free_cell_count_ = free_cells;
+    last_ray_occupied_cell_count_ = occupied_cells;
+    last_ray_out_of_map_endpoint_count_ = out_of_map_endpoints;
+    last_ray_invalid_range_count_ = invalid_range;
+
+    printConfidenceStatsThrottled();
+  }
+
+  std_msgs::String makeE3SummaryMsg(const ros::Time& now) const
+  {
+    std::size_t visible_now = 0;
+    std::size_t known_free = 0;
+    std::size_t known_occupied = 0;
+    std::size_t unknown = 0;
+
+    for (const auto& gp : grid_points_)
+    {
+      if (gp.current_visibility > 0.5f)
+      {
+        ++visible_now;
+      }
+
+      if (gp.confidence <= 1e-4f)
+      {
+        ++unknown;
+      }
+      else if (gp.occupancy > 0.5f)
+      {
+        ++known_occupied;
+      }
+      else
+      {
+        ++known_free;
+      }
+    }
+
+    const double observation_age =
+        last_ray_observation_received_.isZero()
+            ? std::numeric_limits<double>::quiet_NaN()
+            : std::max(
+                  0.0,
+                  (now - last_ray_observation_received_).toSec());
+
+    std_msgs::String msg;
+    std::ostringstream oss;
+    oss << "phase=E3"
+        << " observation_mode=" << observation_mode_
+        << " ray_packet_count=" << ray_packet_count_
+        << " ray_decode_failure_count=" << ray_decode_failure_count_
+        << " last_ray_count=" << last_ray_count_
+        << " last_free_cell_count=" << last_ray_free_cell_count_
+        << " last_occupied_cell_count=" << last_ray_occupied_cell_count_
+        << " last_out_of_map_endpoint_count="
+        << last_ray_out_of_map_endpoint_count_
+        << " last_invalid_range_count=" << last_ray_invalid_range_count_
+        << " visible_now=" << visible_now
+        << " known_free=" << known_free
+        << " known_occupied=" << known_occupied
+        << " unknown=" << unknown
+        << " observation_age_s=" << observation_age;
+    msg.data = oss.str();
+    return msg;
+  }
+
   bool handleQueryConfidence(
       care_confidence_map::QueryConfidence::Request& req,
       care_confidence_map::QueryConfidence::Response& res)
