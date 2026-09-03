@@ -258,6 +258,9 @@ class OptimizedTrajectoryContinuityNode:
         self._last_final_gcdf_recovery_timestep = -1
         self._last_final_gcdf_recovery_sweep_s = math.nan
         self._last_final_gcdf_recovery_point_count = 0
+        self._last_final_gcdf_blocker_class = "none"
+        self._last_final_gcdf_unsafe_unknown_count = 0
+        self._last_final_gcdf_unsafe_occupied_count = 0
         self._verification_publish_count = 0
         self._verification_safe_count = 0
         self._verification_unsafe_count = 0
@@ -1192,20 +1195,59 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "brake_displacement_inf"))
         return msg
 
+    def _classify_final_gcdf_unsafe(self, batch, distances):
+        """Return semantic blocker class for violated final-GCDF rows."""
+        source_types = list(getattr(batch, "source_type", []))
+        source_unknown = int(getattr(batch, "SOURCE_UNKNOWN", 0))
+        source_occupied = int(getattr(batch, "SOURCE_OCCUPIED", 1))
+        unknown = 0
+        occupied = 0
+        for i, d in enumerate(distances):
+            if (not math.isfinite(d) or
+                    d >= self.final_gcdf_safety_margin):
+                continue
+            source_type = (
+                int(source_types[i])
+                if i < len(source_types)
+                else source_unknown)
+            if source_type == source_occupied:
+                occupied += 1
+            else:
+                unknown += 1
+
+        if unknown > 0 and occupied > 0:
+            blocker_class = "mixed"
+        elif occupied > 0:
+            blocker_class = "occupied"
+        elif unknown > 0:
+            blocker_class = "unknown"
+        else:
+            blocker_class = "none"
+        return blocker_class, unknown, occupied
+
     def _build_final_gcdf_recovery_evidence(
             self, candidate, seq, batch, distances):
-        """Extract the earliest real low-confidence blocker from final GCDF.
+        """Extract earliest UNKNOWN blocker evidence from final GCDF.
 
-        The final-GCDF batch already contains the low-confidence voxel point
-        paired with each executable body anchor.  When the exact executable
+        Phase E4 batches may contain both UNKNOWN and OCCUPIED hard constraints.
+        Only UNKNOWN rows are valid active-sensing evidence.  OCCUPIED rows are
+        physical obstacles and must never become q_vis obligations.  When the exact executable
         prefix+brake+hold is rejected, use the earliest violated timestep as
         active-sensing evidence instead of guessing from the nominal task VBC.
         """
         unsafe = []
+        source_types = list(getattr(batch, "source_type", []))
+        source_unknown = int(getattr(batch, "SOURCE_UNKNOWN", 0))
         for i, d in enumerate(distances):
             if (not math.isfinite(d) or
                     d >= self.final_gcdf_safety_margin or
                     i >= len(batch.original_timestep)):
+                continue
+            source_type = (
+                int(source_types[i])
+                if i < len(source_types)
+                else source_unknown)
+            if source_type != source_unknown:
                 continue
             k = int(batch.original_timestep[i])
             unsafe.append((k, i))
@@ -1357,6 +1399,15 @@ class OptimizedTrajectoryContinuityNode:
                 self._last_source = "candidate_rejected_final_gcdf_unsafe"
 
                 (
+                    gcdf_blocker_class,
+                    gcdf_unknown_count,
+                    gcdf_occupied_count,
+                ) = self._classify_final_gcdf_unsafe(msg, distances)
+                self._last_final_gcdf_blocker_class = gcdf_blocker_class
+                self._last_final_gcdf_unsafe_unknown_count = gcdf_unknown_count
+                self._last_final_gcdf_unsafe_occupied_count = gcdf_occupied_count
+
+                (
                     gcdf_recovery_trajectory_to_publish,
                     gcdf_recovery_event_to_publish,
                 ) = self._build_final_gcdf_recovery_evidence(
@@ -1371,9 +1422,13 @@ class OptimizedTrajectoryContinuityNode:
                 else:
                     self._final_gcdf_recovery_event_drop_count += 1
 
+                gcdf_safety_gate = (
+                    "gcdf_{}".format(gcdf_blocker_class)
+                    if gcdf_blocker_class in ("unknown", "occupied", "mixed")
+                    else "gcdf")
                 event_to_publish = self._make_verification_event(
-                    seq, "unsafe", False, age, view, safety_gate="gcdf",
-                    diag=diag)
+                    seq, "unsafe", False, age, view,
+                    safety_gate=gcdf_safety_gate, diag=diag)
                 dispatched, route = self._dispatch_pending_locked(now)
                 if dispatched is not None:
                     self._post_cert_pending_dispatch_count += 1
