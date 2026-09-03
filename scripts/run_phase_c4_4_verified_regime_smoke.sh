@@ -13,6 +13,10 @@ USE_RVIZ="${USE_RVIZ:-false}"
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
 TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
+EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
+EXECUTION_GCDF_WARNING_MARGIN="${EXECUTION_GCDF_WARNING_MARGIN:-0.05}"
+EXECUTION_GCDF_HARD_MARGIN="${EXECUTION_GCDF_HARD_MARGIN:-0.0}"
+EXECUTION_GCDF_STALE_TIMEOUT_S="${EXECUTION_GCDF_STALE_TIMEOUT_S:-0.35}"
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
@@ -249,6 +253,10 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   committed_continuation_enabled:="${COMMITTED_CONTINUATION_ENABLED}" \
   execution_audit_stream_enabled:="${EXECUTION_AUDIT_STREAM_ENABLED}" \
   execution_vbc_trajectory_topic:="${EXECUTION_VBC_TRAJECTORY_TOPIC}" \
+  execution_gcdf_audit_enabled:="${EXECUTION_GCDF_AUDIT_ENABLED}" \
+  execution_gcdf_warning_margin:="${EXECUTION_GCDF_WARNING_MARGIN}" \
+  execution_gcdf_hard_margin:="${EXECUTION_GCDF_HARD_MARGIN}" \
+  execution_gcdf_stale_timeout_s:="${EXECUTION_GCDF_STALE_TIMEOUT_S}" \
   probe_single_flight_enabled:="${PROBE_SINGLE_FLIGHT_ENABLED}" \
   commit_pipeline_candidate_topic:="${COMMIT_PIPELINE_CANDIDATE_TOPIC}" \
   probe_single_flight_summary_topic:="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" \
@@ -333,6 +341,14 @@ for _ in $(seq 1 400); do
     fi
   fi
 
+  if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
+    if ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/measured_state_trajectory$' || \
+       ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/trajectory_risk_node$' || \
+       ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/safety_monitor$'; then
+      CDF_READY=0
+    fi
+  fi
+
   if [ "${COMMON_READY}" = "1" ] &&
      [ "${BACKEND_READY}" = "1" ] &&
      [ "${CDF_READY}" = "1" ]; then
@@ -383,6 +399,7 @@ fi
 
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
+echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S}"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
 RUNTIME_HEAD="$(git rev-parse HEAD)"
@@ -401,6 +418,10 @@ use_rviz=${USE_RVIZ}
 world_file=${WORLD_FILE}
 confidence_map_config_file=${CONFIDENCE_MAP_CONFIG_FILE}
 tof_fusion_enabled=${TOF_FUSION_ENABLED}
+execution_gcdf_audit_enabled=${EXECUTION_GCDF_AUDIT_ENABLED}
+execution_gcdf_warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}
+execution_gcdf_hard_margin=${EXECUTION_GCDF_HARD_MARGIN}
+execution_gcdf_stale_timeout_s=${EXECUTION_GCDF_STALE_TIMEOUT_S}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
@@ -447,6 +468,11 @@ record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT
 if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
   record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
   record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
+fi
+if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
+  record_topic /care_planner/execution_gcdf/selector_summary "${OUT}/execution_gcdf_selector_summary.csv"
+  record_topic /care_planner/execution_gcdf/safety_summary "${OUT}/execution_gcdf_safety_summary.csv"
+  record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
 fi
 record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
