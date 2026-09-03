@@ -36,6 +36,10 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
       input_trajectory_topic_, 1,
       &TrajectoryExecutionManager::trajectoryCallback, this);
 
+  safety_hold_sub_ = nh_.subscribe(
+      external_safety_hold_topic_, 1,
+      &TrajectoryExecutionManager::safetyHoldCallback, this);
+
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       output_velocity_command_topic_, 1);
 
@@ -74,6 +78,9 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
       << " lead_time=" << smooth_replan_lead_time_s_
       << " min_phase=" << smooth_replan_min_phase_s_
       << " topic=" << smooth_replan_request_topic_);
+  ROS_INFO_STREAM(
+      "[TrajectoryExecutionManager] Phase E5 external safety hold topic="
+      << external_safety_hold_topic_);
 
   return true;
 }
@@ -144,6 +151,9 @@ bool TrajectoryExecutionManager::loadConfig() {
   pnh_.param<std::string>("execution/smooth_replan_request_topic",
                           smooth_replan_request_topic_,
                           smooth_replan_request_topic_);
+  pnh_.param<std::string>("execution/external_safety_hold_topic",
+                          external_safety_hold_topic_,
+                          external_safety_hold_topic_);
 
   if (!pnh_.getParam("joint_names", joint_names_)) {
     ROS_ERROR("[TrajectoryExecutionManager] Missing param: joint_names");
@@ -196,6 +206,38 @@ void TrajectoryExecutionManager::jointStateCallback(
   q_measured_ = q;
   dq_measured_ = dq;
   has_joint_state_ = true;
+}
+
+void TrajectoryExecutionManager::safetyHoldCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+
+  const ros::Time now = ros::Time::now();
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  const bool requested = msg->data;
+  if (requested == external_safety_hold_) return;
+
+  if (requested) {
+    external_safety_hold_ = true;
+    external_safety_hold_start_time_ = now;
+    ++external_safety_hold_event_count_;
+    ROS_ERROR_STREAM(
+        "[TrajectoryExecutionManager] Phase E5 external GCDF HARD HOLD engaged"
+        << " count=" << external_safety_hold_event_count_);
+  } else {
+    if (external_safety_hold_ &&
+        !external_safety_hold_start_time_.isZero() &&
+        has_active_trajectory_) {
+      // Freeze trajectory phase while externally held so release never jumps
+      // forward along an unexecuted reference segment.
+      active_trajectory_start_time_ +=
+          (now - external_safety_hold_start_time_);
+    }
+    external_safety_hold_ = false;
+    external_safety_hold_start_time_ = ros::Time(0);
+    ROS_WARN(
+        "[TrajectoryExecutionManager] Phase E5 external GCDF hold released");
+  }
 }
 
 void TrajectoryExecutionManager::trajectoryCallback(
@@ -286,6 +328,9 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
   bool has_joint_state = false;
   bool has_received_trajectory = false;
+  bool external_safety_hold = false;
+  ros::Time external_safety_hold_start;
+  unsigned long long external_safety_hold_event_count = 0;
   bool active = false;
   bool complete = false;
   uint32_t trajectory_seq = 0;
@@ -300,13 +345,20 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
     has_joint_state = has_joint_state_;
     has_received_trajectory = has_received_trajectory_;
+    external_safety_hold = external_safety_hold_;
+    external_safety_hold_start = external_safety_hold_start_time_;
+    external_safety_hold_event_count = external_safety_hold_event_count_;
     if (has_joint_state) q_measured = q_measured_;
 
     if (has_active_trajectory_) {
       trajectory_seq = active_trajectory_seq_;
       execution_stamp_ns = active_execution_stamp_ns_;
+      const ros::Time phase_now =
+          (external_safety_hold && !external_safety_hold_start.isZero())
+              ? external_safety_hold_start
+              : now;
       phase_s = std::max(
-          0.0, (now - active_trajectory_start_time_).toSec());
+          0.0, (phase_now - active_trajectory_start_time_).toSec());
       const double sample_t =
           std::min(phase_s, active_trajectory_duration_s_);
 
@@ -354,6 +406,23 @@ void TrajectoryExecutionManager::executionTimerCallback(
   if (!has_joint_state) {
     ROS_WARN_THROTTLE(
         1.0, "[TrajectoryExecutionManager] Waiting for joint state.");
+    return;
+  }
+
+  if (external_safety_hold) {
+    const Eigen::VectorXd dq_zero = makeZeroVelocityCommand();
+    publishVelocityCommand(dq_zero);
+    publishReferenceState(q_measured, dq_zero);
+    publishSummary(
+        active, complete, trajectory_seq, execution_stamp_ns,
+        phase_s, remaining_s, 0.0,
+        -1, std::numeric_limits<double>::quiet_NaN(),
+        std::numeric_limits<double>::quiet_NaN(),
+        "external_gcdf_hard_hold");
+    ROS_ERROR_STREAM_THROTTLE(
+        0.5,
+        "[TrajectoryExecutionManager] Phase E5 HARD HOLD active"
+        << " events=" << external_safety_hold_event_count);
     return;
   }
 
