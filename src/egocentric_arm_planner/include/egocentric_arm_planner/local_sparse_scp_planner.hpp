@@ -46,6 +46,8 @@ private:
     double setup_and_solve_ms = 0.0;
     int batch_pairs = 0;
     int selected_cdf_rows = 0;
+    int selected_unknown_cdf_rows = 0;
+    int selected_occupied_cdf_rows = 0;
     int screened_safe_rows = 0;
     int skipped_step0_rows = 0;
     int skipped_horizon_rows = 0;
@@ -165,6 +167,7 @@ private:
   ros::Publisher candidate_trajectory_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher task_infeasible_pub_;
+  ros::Publisher task_obstacle_blocked_pub_;
   ros::Publisher task_uncertified_pub_;
   ros::Publisher force_vbc_bootstrap_pub_;
 
@@ -375,6 +378,8 @@ private:
       "/care_planner/local_planner/summary";
   std::string task_infeasible_topic_ =
       "/care_planner/local_planner/task_infeasible";
+  std::string task_obstacle_blocked_topic_ =
+      "/care_planner/local_planner/task_obstacle_blocked";
   std::string task_uncertified_topic_ =
       "/care_planner/local_planner/task_uncertified";
   std::string force_vbc_bootstrap_topic_ =
