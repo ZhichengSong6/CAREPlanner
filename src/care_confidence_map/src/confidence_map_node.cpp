@@ -222,6 +222,15 @@ private:
         ray_max_valid_range_,
         1.50);
 
+    // Phase E5 safety semantics for the current static-obstacle world.
+    // Once a voxel is positively observed occupied, a later free traversal
+    // must not erase it in one packet. Coarse 5-cm ray rounding and multiple
+    // sensors otherwise create false-free holes directly through obstacles.
+    nh.param(
+        "confidence_map/ray_persistent_occupied",
+        ray_persistent_occupied_,
+        false);
+
     nh.param<std::string>(
         "confidence_map/marker_topic",
         marker_topic_,
@@ -1009,6 +1018,7 @@ private:
 
     std::size_t free_cells = 0;
     std::size_t occupied_cells = 0;
+    std::size_t occupied_free_clear_suppressed = 0;
 
     for (std::size_t i = 0; i < grid_points_.size(); ++i)
     {
@@ -1026,7 +1036,17 @@ private:
       }
       else if (free_mask[i] != 0)
       {
-        gp.occupancy = 0.0f;
+        // Static-world safety mode: free-space traversal may refresh
+        // visibility/confidence, but it cannot erase a previously observed
+        // occupied voxel. This prevents last-observation-wins false frees.
+        if (ray_persistent_occupied_ && gp.occupancy > 0.5f)
+        {
+          ++occupied_free_clear_suppressed;
+        }
+        else
+        {
+          gp.occupancy = 0.0f;
+        }
         gp.current_visibility = 1.0f;
         gp.confidence = 1.0f;
         gp.last_seen_time = stamp_sec;
@@ -1044,6 +1064,10 @@ private:
     last_no_hit_ray_count_ = no_hit_rays;
     last_ray_free_cell_count_ = free_cells;
     last_ray_occupied_cell_count_ = occupied_cells;
+    last_ray_occupied_free_clear_suppressed_count_ =
+        occupied_free_clear_suppressed;
+    total_ray_occupied_free_clear_suppressed_count_ +=
+        occupied_free_clear_suppressed;
     last_ray_out_of_map_endpoint_count_ = out_of_map_endpoints;
     last_ray_invalid_range_count_ = invalid_range;
 
@@ -1096,6 +1120,11 @@ private:
         << " last_no_hit_ray_count=" << last_no_hit_ray_count_
         << " last_free_cell_count=" << last_ray_free_cell_count_
         << " last_occupied_cell_count=" << last_ray_occupied_cell_count_
+        << " persistent_occupied=" << static_cast<int>(ray_persistent_occupied_)
+        << " last_occupied_free_clear_suppressed_count="
+        << last_ray_occupied_free_clear_suppressed_count_
+        << " total_occupied_free_clear_suppressed_count="
+        << total_ray_occupied_free_clear_suppressed_count_
         << " last_out_of_map_endpoint_count="
         << last_ray_out_of_map_endpoint_count_
         << " last_invalid_range_count=" << last_ray_invalid_range_count_
@@ -1806,6 +1835,7 @@ private:
   double ray_step_ = 0.025;
   double ray_min_valid_range_ = 0.10;
   double ray_max_valid_range_ = 1.50;
+  bool ray_persistent_occupied_ = false;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
@@ -1816,6 +1846,8 @@ private:
   std::size_t last_no_hit_ray_count_ = 0;
   std::size_t last_ray_free_cell_count_ = 0;
   std::size_t last_ray_occupied_cell_count_ = 0;
+  std::size_t last_ray_occupied_free_clear_suppressed_count_ = 0;
+  std::size_t total_ray_occupied_free_clear_suppressed_count_ = 0;
   std::size_t last_ray_out_of_map_endpoint_count_ = 0;
   std::size_t last_ray_invalid_range_count_ = 0;
 
