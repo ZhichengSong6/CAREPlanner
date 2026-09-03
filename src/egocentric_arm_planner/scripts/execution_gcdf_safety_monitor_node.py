@@ -43,6 +43,7 @@ class ExecutionGCDFSafetyMonitor:
 
         self.hard_hold = False
         self.stale_hold = False
+        self.warning_active = False
         self.clear_consecutive = 0
         self.batch_count = 0
         self.warning_event_count = 0
@@ -162,6 +163,7 @@ class ExecutionGCDFSafetyMonitor:
             warning_now = math.isfinite(d_min) and d_min < self.warning_margin
 
             if hard_now:
+                self.warning_active = False
                 self.clear_consecutive = 0
                 if not self.hard_hold:
                     self.hard_event_count += 1
@@ -178,8 +180,12 @@ class ExecutionGCDFSafetyMonitor:
                     self.clear_consecutive = 0
 
                 if warning_now:
-                    self.warning_event_count += 1
+                    if not self.warning_active:
+                        self.warning_event_count += 1
+                    self.warning_active = True
                     self._maybe_replan_locked(now, "warning")
+                else:
+                    self.warning_active = False
 
             self._publish_hold_locked()
             self._publish_summary_locked(now)
