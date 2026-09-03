@@ -446,10 +446,12 @@ class C44VerifiedRegimeManager:
             elif self.task_uncertified_pending and self.state == self.NORMAL:
                 self.task_uncertified_pending = False
                 self.task_infeasible_pending = False
-                self.task_uncertified_repair_entry_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_planner_uncertified_after_gate_release",
-                    self.execution_ready_time)
+                # Numerical non-certification is not evidence of a visibility
+                # blocker. Stay NORMAL and request a fresh measured-state solve.
+                # Only an actual GCDF/VBC/visibility fact may enter REPAIR.
+                self.last_transition_reason = (
+                    "task_planner_uncertified_after_gate_release_replan")
+                self.replan_request_pub.publish(Bool(data=True))
             elif (self.candidate_outcome_pending_gate_replay and
                   self.state == self.NORMAL):
                 self.candidate_outcome_pending_gate_replay = False
@@ -662,9 +664,14 @@ class C44VerifiedRegimeManager:
                     self._transition_locked(
                         self.REPAIR, "task_probe_uncertified", now)
             else:
-                self.task_uncertified_repair_entry_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_planner_uncertified", now)
+                # NORMAL numerical non-certification is not itself an
+                # active-sensing request. Keep executing the previously
+                # certified trajectory/fail-safe hold and retry from the latest
+                # measured state. A genuine final-GCDF/VBC unsafe result or
+                # task infeasibility still enters REPAIR through its own path.
+                self.last_transition_reason = (
+                    "task_planner_uncertified_replan")
+                self.replan_request_pub.publish(Bool(data=True))
 
     def _deadline_cb(self, msg):
         if msg is None:
