@@ -212,6 +212,8 @@ catkin_install_python(PROGRAMS
   scripts/optimized_trajectory_continuity_node.py
   scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
+  scripts/execution_gcdf_measured_state_trajectory_node.py
+  scripts/execution_gcdf_safety_monitor_node.py
   scripts/phase_b2_visibility_acquisition_adapter_node.py
   scripts/phase_b2_ab_logger_node.py
   scripts/phase_b2_steering_logger_node.py
