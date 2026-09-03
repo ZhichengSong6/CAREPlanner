@@ -2090,6 +2090,48 @@
     <axis xyz="0 0 0" />
   </joint>
 
+  <!-- EE ToF rendering frames added in Phase E so Gazebo matches the
+       eight-sensor visibility model used by confidence/VBC/VisCDF. -->
+  <link name="EE_sensor1_tof_gz_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.000001" />
+      <inertia
+        ixx="0.000000001"
+        ixy="0"
+        ixz="0"
+        iyy="0.000000001"
+        iyz="0"
+        izz="0.000000001" />
+    </inertial>
+  </link>
+  <joint name="EE_sensor1_tof_gz_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="1.5707963267949 -1.5707963267949 0" />
+    <parent link="EE_sensor1_tof_link" />
+    <child link="EE_sensor1_tof_gz_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+
+  <link name="EE_sensor2_tof_gz_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <mass value="0.000001" />
+      <inertia
+        ixx="0.000000001"
+        ixy="0"
+        ixz="0"
+        iyy="0.000000001"
+        iyz="0"
+        izz="0.000000001" />
+    </inertial>
+  </link>
+  <joint name="EE_sensor2_tof_gz_joint" type="fixed">
+    <origin xyz="0 0 0" rpy="1.5707963267949 -1.5707963267949 0" />
+    <parent link="EE_sensor2_tof_link" />
+    <child link="EE_sensor2_tof_gz_link" />
+    <axis xyz="0 0 0" />
+  </joint>
+
   <!-- Preserve the explicit Gazebo rendering-frame joints for link2/link3 sensors. -->
   <gazebo reference="link2_sensor1_camera_gz_joint">
     <preserveFixedJoint>true</preserveFixedJoint>
@@ -2130,10 +2172,23 @@
     <preserveFixedJoint>true</preserveFixedJoint>
   </gazebo>
 
+  <gazebo reference="EE_sensor1_tof_gz_joint">
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+  <gazebo reference="EE_sensor2_tof_gz_joint">
+    <preserveFixedJoint>true</preserveFixedJoint>
+  </gazebo>
+
   <!-- link2/link3 RGB and ToF Gazebo plugins.
        Parameters intentionally match link4_sensor1/link4_sensor2. -->
 
   <!-- link2_sensor1 RGB: ideal RGB observation only -->
+  <gazebo reference="EE_sensor1_tof_gz_link">
+    <gravity>false</gravity>
+  </gazebo>
+  <gazebo reference="EE_sensor2_tof_gz_link">
+    <gravity>false</gravity>
+  </gazebo>
   <gazebo reference="link2_sensor1_camera_gz_link">
     <sensor type="camera" name="link2_sensor1_rgb_sensor">
       <always_on>true</always_on>
@@ -2547,6 +2602,75 @@
     </sensor>
   </gazebo>
 
+
+  <!-- Phase E EE ToF sensors: same simulated MaixSense depth model as link2-4. -->
+  <gazebo reference="EE_sensor1_tof_gz_link">
+    <sensor type="depth" name="EE_sensor1_tof_sensor">
+      <always_on>true</always_on>
+      <update_rate>30.0</update_rate>
+      <visualize>false</visualize>
+      <camera name="EE_sensor1_tof_camera">
+        <horizontal_fov>0.9599310885968813</horizontal_fov>
+        <image>
+          <width>320</width>
+          <height>240</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.15</near>
+          <far>0.75</far>
+        </clip>
+      </camera>
+      <plugin name="EE_sensor1_tof_ros_plugin" filename="libgazebo_ros_openni_kinect.so">
+        <baseline>0.0</baseline>
+        <alwaysOn>true</alwaysOn>
+        <updateRate>0.0</updateRate>
+        <cameraName>EE_sensor1_tof</cameraName>
+        <imageTopicName>/EE_sensor1/tof/internal_rgb_unused/image_raw</imageTopicName>
+        <cameraInfoTopicName>/EE_sensor1/tof/internal_rgb_unused/camera_info</cameraInfoTopicName>
+        <depthImageTopicName>/EE_sensor1/tof/depth_raw</depthImageTopicName>
+        <depthImageCameraInfoTopicName>/EE_sensor1/tof/camera_info</depthImageCameraInfoTopicName>
+        <pointCloudTopicName>/EE_sensor1/tof/cloud</pointCloudTopicName>
+        <frameName>EE_sensor1_tof_link</frameName>
+        <pointCloudCutoff>0.15</pointCloudCutoff>
+        <pointCloudCutoffMax>0.75</pointCloudCutoffMax>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="EE_sensor2_tof_gz_link">
+    <sensor type="depth" name="EE_sensor2_tof_sensor">
+      <always_on>true</always_on>
+      <update_rate>30.0</update_rate>
+      <visualize>false</visualize>
+      <camera name="EE_sensor2_tof_camera">
+        <horizontal_fov>0.9599310885968813</horizontal_fov>
+        <image>
+          <width>320</width>
+          <height>240</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.15</near>
+          <far>0.75</far>
+        </clip>
+      </camera>
+      <plugin name="EE_sensor2_tof_ros_plugin" filename="libgazebo_ros_openni_kinect.so">
+        <baseline>0.0</baseline>
+        <alwaysOn>true</alwaysOn>
+        <updateRate>0.0</updateRate>
+        <cameraName>EE_sensor2_tof</cameraName>
+        <imageTopicName>/EE_sensor2/tof/internal_rgb_unused/image_raw</imageTopicName>
+        <cameraInfoTopicName>/EE_sensor2/tof/internal_rgb_unused/camera_info</cameraInfoTopicName>
+        <depthImageTopicName>/EE_sensor2/tof/depth_raw</depthImageTopicName>
+        <depthImageCameraInfoTopicName>/EE_sensor2/tof/camera_info</depthImageCameraInfoTopicName>
+        <pointCloudTopicName>/EE_sensor2/tof/cloud</pointCloudTopicName>
+        <frameName>EE_sensor2_tof_link</frameName>
+        <pointCloudCutoff>0.15</pointCloudCutoff>
+        <pointCloudCutoffMax>0.75</pointCloudCutoffMax>
+      </plugin>
+    </sensor>
+  </gazebo>
 
   <!-- ================================================================ -->
   <!-- Gazebo ros_control plugin                                       -->
