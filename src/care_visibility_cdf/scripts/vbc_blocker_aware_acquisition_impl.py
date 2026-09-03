@@ -59,6 +59,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._spatiotemporal_last_reason = "startup"
         self._lookahead_last_region_count = 0
         self._lookahead_last_point_count = 0
+        self._lookahead_shared_success_count = 0
+        self._lookahead_drop_count = 0
 
         self._repair_stack: List[int] = []
         self._pending_blocker_id = None
@@ -795,6 +797,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                                 else "progressive_shared_reduced"),
                         }
                         self._progressive_shared_success_count += 1
+                        if any(int(oid) < 0 for oid in active):
+                            self._lookahead_shared_success_count += 1
+                        self._lookahead_drop_count += sum(
+                            1 for oid in dropped if int(oid) < 0)
                         self._progressive_shared_last_mode = cache["mode"]
                         self._progressive_shared_last_kept_ids = list(active)
                         self._progressive_shared_last_dropped_ids = list(dropped)
@@ -840,6 +846,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             # individual current-blocker q_vis rather than publishing a poor
             # shared best-effort pose.
             self._progressive_shared_fallback_count += 1
+            self._lookahead_drop_count += sum(
+                1 for oid in dropped if int(oid) < 0)
             self._progressive_shared_last_mode = "individual_current_fallback"
             self._progressive_shared_last_kept_ids = [active_id]
             self._progressive_shared_last_dropped_ids = list(dropped)
@@ -1163,6 +1171,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" spatiotemporal_reason={self._spatiotemporal_last_reason}"
             f" lookahead_l1_region_count={self._lookahead_last_region_count}"
             f" lookahead_l1_point_count={self._lookahead_last_point_count}"
+            f" lookahead_shared_success_count={self._lookahead_shared_success_count}"
+            f" lookahead_drop_count={self._lookahead_drop_count}"
             f" progressive_shared_enabled={int(self.progressive_shared_repair_enabled)}"
             f" progressive_shared_max_regions={self.progressive_shared_max_regions}"
             f" progressive_shared_accept_f_min={self.progressive_shared_accept_f_min:.6f}"
