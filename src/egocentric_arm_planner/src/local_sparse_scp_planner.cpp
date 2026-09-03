@@ -1415,26 +1415,42 @@ void LocalSparseSCPPlanner::workerLoop() {
           std_msgs::Bool blocked_msg;
           blocked_msg.data = true;
 
-          // Phase E4: a known physical obstacle must never be converted into
-          // an active-sensing request. If the hard QP contains any OCCUPIED
-          // GCDF row, give physical obstacle avoidance priority and ask for a
-          // non-sensing replan. UNKNOWN-only infeasibility retains the frozen
-          // C5.41 visibility-repair behavior.
-          if (result.selected_occupied_cdf_rows > 0) {
-            task_obstacle_blocked_pub_.publish(blocked_msg);
+          // Phase E4 semantics:
+          //   UNKNOWN-only  -> visibility repair
+          //   MIXED         -> visibility repair for UNKNOWN while OCCUPIED
+          //                    remains a hard GCDF constraint
+          //   OCCUPIED-only -> non-sensing collision-free replan
+          //
+          // Presence of any occupied row is NOT sufficient to classify the
+          // failure as obstacle-only. In a mixed batch the UNKNOWN rows may be
+          // the actual cause of infeasibility (and are active constraints).
+          if (result.selected_unknown_cdf_rows > 0) {
+            task_infeasible_pub_.publish(blocked_msg);
             ROS_WARN_STREAM(
-                "[LocalSparseSCPPlanner] task QP obstacle-blocked in "
+                "[LocalSparseSCPPlanner] task QP "
+                << (result.selected_occupied_cdf_rows > 0
+                        ? "mixed UNKNOWN+OCCUPIED"
+                        : "UNKNOWN-only")
+                << " infeasible in "
                 << (probe ? "PROBE_NORMAL" : "NORMAL")
                 << " unknown_rows=" << result.selected_unknown_cdf_rows
                 << " occupied_rows=" << result.selected_occupied_cdf_rows
+                << " -> publish visibility-repair signal");
+          } else if (result.selected_occupied_cdf_rows > 0) {
+            task_obstacle_blocked_pub_.publish(blocked_msg);
+            ROS_WARN_STREAM(
+                "[LocalSparseSCPPlanner] task QP OCCUPIED-only blocked in "
+                << (probe ? "PROBE_NORMAL" : "NORMAL")
+                << " occupied_rows=" << result.selected_occupied_cdf_rows
                 << " -> publish non-sensing obstacle replan signal");
           } else {
+            // Defensive fallback for a hard infeasibility with no semantic
+            // GCDF rows. Preserve the old task-infeasible path rather than
+            // silently stalling.
             task_infeasible_pub_.publish(blocked_msg);
             ROS_WARN_STREAM(
-                "[LocalSparseSCPPlanner] task QP unknown-space infeasible in "
-                << (probe ? "PROBE_NORMAL" : "NORMAL")
-                << " unknown_rows=" << result.selected_unknown_cdf_rows
-                << " -> publish task infeasible / visibility signal");
+                "[LocalSparseSCPPlanner] task QP infeasible with no semantic "
+                "GCDF rows -> publish task infeasible signal");
           }
         } else if (
             result.status.find("max iterations") != std::string::npos ||
