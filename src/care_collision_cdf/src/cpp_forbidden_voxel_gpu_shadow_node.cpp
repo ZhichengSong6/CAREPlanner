@@ -150,6 +150,12 @@ Stats simpleStats(const std::vector<float>& values) {
 
 class CppForbiddenVoxelGpuShadow {
  public:
+  enum class Channel {
+    LOCAL = 0,
+    FINAL = 1,
+    EXECUTION = 2,
+  };
+
   CppForbiddenVoxelGpuShadow()
       : nh_(), pnh_("~") {
     pnh_.param<std::string>(
@@ -160,6 +166,10 @@ class CppForbiddenVoxelGpuShadow {
         "final_anchor_topic",
         final_anchor_topic_,
         "/care_planner/final_gcdf/body_sweep_anchors");
+    pnh_.param<std::string>(
+        "execution_anchor_topic",
+        execution_anchor_topic_,
+        "/care_planner/execution_gcdf/body_sweep_anchors");
     pnh_.param<std::string>(
         "map_topic",
         map_topic_,
@@ -180,6 +190,14 @@ class CppForbiddenVoxelGpuShadow {
         "final_constraint_batch_topic",
         final_constraint_batch_topic_,
         "/care_planner/final_gcdf/constraint_batch");
+    pnh_.param<std::string>(
+        "execution_summary_topic",
+        execution_summary_topic_,
+        "/care_planner/execution_gcdf/selector_summary");
+    pnh_.param<std::string>(
+        "execution_constraint_batch_topic",
+        execution_constraint_batch_topic_,
+        "/care_planner/execution_gcdf/constraint_batch");
     pnh_.param<std::string>(
         "output_jsonl",
         output_jsonl_,
@@ -248,18 +266,26 @@ class CppForbiddenVoxelGpuShadow {
         summary_topic_, 10);
     final_summary_pub_ = nh_.advertise<std_msgs::String>(
         final_summary_topic_, 10);
+    execution_summary_pub_ = nh_.advertise<std_msgs::String>(
+        execution_summary_topic_, 10);
     constraint_batch_pub_ =
         nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
             constraint_batch_topic_, 2);
     final_constraint_batch_pub_ =
         nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
             final_constraint_batch_topic_, 2);
+    execution_constraint_batch_pub_ =
+        nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
+            execution_constraint_batch_topic_, 2);
     anchor_sub_ = nh_.subscribe(
         anchor_topic_, 1,
         &CppForbiddenVoxelGpuShadow::anchorCallback, this);
     final_anchor_sub_ = nh_.subscribe(
         final_anchor_topic_, 1,
         &CppForbiddenVoxelGpuShadow::finalAnchorCallback, this);
+    execution_anchor_sub_ = nh_.subscribe(
+        execution_anchor_topic_, 1,
+        &CppForbiddenVoxelGpuShadow::executionAnchorCallback, this);
     map_sub_ = nh_.subscribe(
         map_topic_, 1,
         &CppForbiddenVoxelGpuShadow::mapCallback, this);
@@ -280,7 +306,9 @@ class CppForbiddenVoxelGpuShadow {
         << " socket=" << gpu_socket_
         << " local_batch_topic=" << constraint_batch_topic_
         << " final_anchor_topic=" << final_anchor_topic_
-        << " final_batch_topic=" << final_constraint_batch_topic_);
+        << " final_batch_topic=" << final_constraint_batch_topic_
+        << " execution_anchor_topic=" << execution_anchor_topic_
+        << " execution_batch_topic=" << execution_constraint_batch_topic_);
   }
 
   ~CppForbiddenVoxelGpuShadow() {
@@ -320,10 +348,11 @@ class CppForbiddenVoxelGpuShadow {
 
   void processPendingNow() {
     if (!process_on_input_callback_) return;
-    // At most two channels can be pending (final + local). Preserve final
-    // priority inside timerCallback, but immediately drain both slots instead
-    // of waiting for a 50-Hz timer tick.
+    // At most three channels can be pending. Preserve safety priority
+    // FINAL > EXECUTION > LOCAL, but drain all slots immediately instead of
+    // waiting for timer ticks.
     const ros::TimerEvent event;
+    timerCallback(event);
     timerCallback(event);
     timerCallback(event);
   }
@@ -342,6 +371,15 @@ class CppForbiddenVoxelGpuShadow {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_final_anchor_cloud_ = msg;
       latest_final_anchor_received_ = ros::Time::now();
+    }
+    processPendingNow();
+  }
+
+  void executionAnchorCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      latest_execution_anchor_cloud_ = msg;
+      latest_execution_anchor_received_ = ros::Time::now();
     }
     processPendingNow();
   }
@@ -793,8 +831,40 @@ class CppForbiddenVoxelGpuShadow {
     return rows;
   }
 
+  const char* channelName(Channel channel) const {
+    switch (channel) {
+      case Channel::FINAL: return "final";
+      case Channel::EXECUTION: return "execution";
+      default: return "local";
+    }
+  }
+
+  ros::Publisher& batchPublisher(Channel channel) {
+    if (channel == Channel::FINAL) return final_constraint_batch_pub_;
+    if (channel == Channel::EXECUTION) return execution_constraint_batch_pub_;
+    return constraint_batch_pub_;
+  }
+
+  ros::Publisher& summaryPublisher(Channel channel) {
+    if (channel == Channel::FINAL) return final_summary_pub_;
+    if (channel == Channel::EXECUTION) return execution_summary_pub_;
+    return summary_pub_;
+  }
+
+  const std::string& batchTopic(Channel channel) const {
+    if (channel == Channel::FINAL) return final_constraint_batch_topic_;
+    if (channel == Channel::EXECUTION) return execution_constraint_batch_topic_;
+    return constraint_batch_topic_;
+  }
+
+  std::size_t& batchPublishCount(Channel channel) {
+    if (channel == Channel::FINAL) return final_constraint_batch_publish_count_;
+    if (channel == Channel::EXECUTION) return execution_constraint_batch_publish_count_;
+    return constraint_batch_publish_count_;
+  }
+
   void appendJsonRecord(
-      bool final_channel,
+      Channel channel,
       const ros::Time& anchor_stamp,
       const MapIndex& map,
       std::size_t anchor_count,
@@ -868,7 +938,7 @@ class CppForbiddenVoxelGpuShadow {
     out << "{";
     out << "\"record_index\":" << record_index_ << ",";
     out << "\"channel\":\""
-        << (final_channel ? "final" : "local") << "\",";
+        << channelName(channel) << "\",";
     out << "\"wall_time\":" << ros::WallTime::now().toSec() << ",";
     out << "\"anchor_cloud_stamp\":" << anchor_stamp.toSec() << ",";
     out << "\"map_cloud_stamp\":" << map.stamp.toSec() << ",";
@@ -957,7 +1027,7 @@ class CppForbiddenVoxelGpuShadow {
   }
 
   void publishConstraintBatch(
-      bool final_channel,
+      Channel channel,
       const std_msgs::Header& source_header,
       const std::vector<PairMeta>& pairs,
       const std::vector<float>& distance,
@@ -1016,17 +1086,12 @@ class CppForbiddenVoxelGpuShadow {
     msg.gpu_worker_total_ms = gpu.worker_total_ms;
     msg.online_pipeline_ms = pipeline_ms;
 
-    if (final_channel) {
-      final_constraint_batch_pub_.publish(msg);
-      ++final_constraint_batch_publish_count_;
-    } else {
-      constraint_batch_pub_.publish(msg);
-      ++constraint_batch_publish_count_;
-    }
+    batchPublisher(channel).publish(msg);
+    ++batchPublishCount(channel);
   }
 
   void publishSummary(
-      bool final_channel,
+      Channel channel,
       std::size_t pair_count,
       int active_step_count,
       double d_min,
@@ -1054,25 +1119,14 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
         << " map_index_ms=" << map_index_ms
-        << " channel=" << (final_channel ? "final" : "local")
-        << " batch_topic="
-        << (final_channel ? final_constraint_batch_topic_ : constraint_batch_topic_)
-        << " batch_subscribers="
-        << (final_channel
-                ? final_constraint_batch_pub_.getNumSubscribers()
-                : constraint_batch_pub_.getNumSubscribers())
-        << " batch_publish_count="
-        << (final_channel
-                ? final_constraint_batch_publish_count_
-                : constraint_batch_publish_count_);
+        << " channel=" << channelName(channel)
+        << " batch_topic=" << batchTopic(channel)
+        << " batch_subscribers=" << batchPublisher(channel).getNumSubscribers()
+        << " batch_publish_count=" << batchPublishCount(channel);
 
     std_msgs::String msg;
     msg.data = oss.str();
-    if (final_channel) {
-      final_summary_pub_.publish(msg);
-    } else {
-      summary_pub_.publish(msg);
-    }
+    summaryPublisher(channel).publish(msg);
   }
 
   void timerCallback(const ros::TimerEvent&) {
@@ -1082,7 +1136,7 @@ class CppForbiddenVoxelGpuShadow {
     sensor_msgs::PointCloud2ConstPtr anchor_cloud;
     ros::Time anchor_received;
     std::shared_ptr<MapIndex> map;
-    bool final_channel = false;
+    Channel channel = Channel::LOCAL;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -1091,23 +1145,30 @@ class CppForbiddenVoxelGpuShadow {
         return;
       }
 
-      // Final executable audits are safety-critical and therefore have
-      // priority over local-SCP geometry queries. The two channels keep
-      // independent latest/processed slots, so neither can overwrite the
-      // other's request while still sharing the same GPU connection.
+      // Safety priority: final candidate certification first, then measured
+      // execution audit, then local-SCP optimization.
       if (latest_final_anchor_cloud_ &&
           latest_final_anchor_cloud_->header.stamp !=
               last_processed_final_anchor_stamp_ &&
           (now - latest_final_anchor_received_).toSec() <= anchor_stale_s_) {
-        final_channel = true;
+        channel = Channel::FINAL;
         anchor_cloud = latest_final_anchor_cloud_;
         anchor_received = latest_final_anchor_received_;
         last_processed_final_anchor_stamp_ = anchor_cloud->header.stamp;
       } else if (
+          latest_execution_anchor_cloud_ &&
+          latest_execution_anchor_cloud_->header.stamp !=
+              last_processed_execution_anchor_stamp_ &&
+          (now - latest_execution_anchor_received_).toSec() <= anchor_stale_s_) {
+        channel = Channel::EXECUTION;
+        anchor_cloud = latest_execution_anchor_cloud_;
+        anchor_received = latest_execution_anchor_received_;
+        last_processed_execution_anchor_stamp_ = anchor_cloud->header.stamp;
+      } else if (
           latest_anchor_cloud_ &&
           latest_anchor_cloud_->header.stamp != last_processed_anchor_stamp_ &&
           (now - latest_anchor_received_).toSec() <= anchor_stale_s_) {
-        final_channel = false;
+        channel = Channel::LOCAL;
         anchor_cloud = latest_anchor_cloud_;
         anchor_received = latest_anchor_received_;
         last_processed_anchor_stamp_ = anchor_cloud->header.stamp;
@@ -1128,7 +1189,7 @@ class CppForbiddenVoxelGpuShadow {
       ROS_WARN_STREAM_THROTTLE(
           1.0,
           "[C5.8 C++] empty anchor decode channel="
-              << (final_channel ? "final" : "local"));
+              << channelName(channel));
       return;
     }
 
@@ -1148,7 +1209,7 @@ class CppForbiddenVoxelGpuShadow {
       const double selection_ms =
           msBetween(selection_t0, selection_t1);
       publishConstraintBatch(
-          final_channel,
+          channel,
           anchor_cloud->header,
           pairs,
           std::vector<float>{},
@@ -1159,7 +1220,7 @@ class CppForbiddenVoxelGpuShadow {
           empty_gpu,
           pipeline_ms);
       publishSummary(
-          final_channel,
+          channel,
           0,
           0,
           std::numeric_limits<double>::quiet_NaN(),
@@ -1174,7 +1235,7 @@ class CppForbiddenVoxelGpuShadow {
       ROS_INFO_STREAM_THROTTLE(
           1.0,
           "[C5.8 C++] zero nearby forbidden pairs channel="
-              << (final_channel ? "final" : "local")
+              << channelName(channel)
               << " -> explicit empty batch");
       return;
     }
@@ -1197,7 +1258,7 @@ class CppForbiddenVoxelGpuShadow {
       ROS_WARN_STREAM_THROTTLE(
           1.0,
           "[C5.8 C++] GPU query failed channel="
-              << (final_channel ? "final" : "local"));
+              << channelName(channel));
       return;
     }
 
@@ -1222,7 +1283,7 @@ class CppForbiddenVoxelGpuShadow {
         static_cast<double>(distance.size());
 
     publishConstraintBatch(
-        final_channel,
+        channel,
         anchor_cloud->header,
         pairs,
         distance,
@@ -1234,7 +1295,7 @@ class CppForbiddenVoxelGpuShadow {
         pipeline_ms);
 
     appendJsonRecord(
-        final_channel,
+        channel,
         anchor_cloud->header.stamp,
         *map,
         anchors.size(),
@@ -1251,7 +1312,7 @@ class CppForbiddenVoxelGpuShadow {
         pipeline_ms);
 
     publishSummary(
-        final_channel,
+        channel,
         pairs.size(),
         active_step_count,
         d_stats.min,
@@ -1266,7 +1327,7 @@ class CppForbiddenVoxelGpuShadow {
 
     ROS_INFO_STREAM_THROTTLE(
         1.0,
-        "[C5.8 C++] channel=" << (final_channel ? "final" : "local")
+        "[C5.8 C++] channel=" << channelName(channel)
         << " pairs=" << pairs.size()
         << " pipeline=" << pipeline_ms << " ms"
         << " selection=" << selection_ms << " ms"
@@ -1283,11 +1344,14 @@ class CppForbiddenVoxelGpuShadow {
 
   std::string anchor_topic_;
   std::string final_anchor_topic_;
+  std::string execution_anchor_topic_;
   std::string map_topic_;
   std::string summary_topic_;
   std::string final_summary_topic_;
   std::string constraint_batch_topic_;
   std::string final_constraint_batch_topic_;
+  std::string execution_summary_topic_;
+  std::string execution_constraint_batch_topic_;
   std::string output_jsonl_;
   std::string gpu_socket_;
 
@@ -1315,11 +1379,14 @@ class CppForbiddenVoxelGpuShadow {
 
   ros::Subscriber anchor_sub_;
   ros::Subscriber final_anchor_sub_;
+  ros::Subscriber execution_anchor_sub_;
   ros::Subscriber map_sub_;
   ros::Publisher summary_pub_;
   ros::Publisher final_summary_pub_;
+  ros::Publisher execution_summary_pub_;
   ros::Publisher constraint_batch_pub_;
   ros::Publisher final_constraint_batch_pub_;
+  ros::Publisher execution_constraint_batch_pub_;
   ros::Timer timer_;
 
   mutable std::mutex mutex_;
@@ -1327,9 +1394,12 @@ class CppForbiddenVoxelGpuShadow {
   ros::Time latest_anchor_received_;
   sensor_msgs::PointCloud2ConstPtr latest_final_anchor_cloud_;
   ros::Time latest_final_anchor_received_;
+  sensor_msgs::PointCloud2ConstPtr latest_execution_anchor_cloud_;
+  ros::Time latest_execution_anchor_received_;
   std::shared_ptr<MapIndex> latest_map_;
   ros::Time last_processed_anchor_stamp_;
   ros::Time last_processed_final_anchor_stamp_;
+  ros::Time last_processed_execution_anchor_stamp_;
 
   std::vector<float> best_clearance_;
 
@@ -1337,6 +1407,7 @@ class CppForbiddenVoxelGpuShadow {
   std::size_t record_index_ = 0;
   std::size_t constraint_batch_publish_count_ = 0;
   std::size_t final_constraint_batch_publish_count_ = 0;
+  std::size_t execution_constraint_batch_publish_count_ = 0;
 };
 
 }  // namespace care_collision_cdf
