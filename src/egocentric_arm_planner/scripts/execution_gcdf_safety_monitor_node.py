@@ -85,7 +85,7 @@ class ExecutionGCDFSafetyMonitor:
         return min(vals) if vals else math.nan
 
     def _maybe_replan_locked(self, now, reason):
-        if (not self.last_replan.is_zero() and
+        if (self.last_replan != rospy.Time(0) and
                 (now - self.last_replan).to_sec() < self.replan_min_interval_s):
             return
         self.last_replan = now
@@ -198,7 +198,7 @@ class ExecutionGCDFSafetyMonitor:
                 self._publish_summary_locked(now)
                 return
 
-            stale = (self.last_batch_received.is_zero() or
+            stale = (self.last_batch_received == rospy.Time(0) or
                      (now - self.last_batch_received).to_sec() >
                      self.stale_timeout_s)
             if stale and self.fail_closed_on_stale:
@@ -210,7 +210,7 @@ class ExecutionGCDFSafetyMonitor:
             self._publish_summary_locked(now)
 
     def _publish_summary_locked(self, now):
-        age = (math.nan if self.last_batch_received.is_zero()
+        age = (math.nan if self.last_batch_received == rospy.Time(0)
                else max(0.0, (now - self.last_batch_received).to_sec()))
         state = ("HARD_HOLD" if self.hard_hold else
                  "STALE_HOLD" if self.stale_hold else
