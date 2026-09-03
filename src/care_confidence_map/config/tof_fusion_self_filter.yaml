@@ -21,6 +21,13 @@ allow_latest_tf_fallback: true
 publish_rate: 15.0
 self_geometry_rate: 30.0
 
+# Phase E3 ray transport. We sample the organized 240x335 depth image rather
+# than publishing every pixel into the dense 5-cm map.
+ray_pixel_stride: 8
+ray_horizontal_fov_deg: 55.0
+ray_vertical_fov_deg: 72.0
+ray_max_forward_depth: 0.75
+
 input_topics:
   - /link2_sensor1/tof/cloud
   - /link2_sensor2/tof/cloud
