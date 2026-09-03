@@ -37,6 +37,7 @@ public:
 private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void safetyHoldCallback(const std_msgs::BoolConstPtr& msg);
   void executionTimerCallback(const ros::TimerEvent& event);
 
   bool loadConfig();
@@ -106,6 +107,7 @@ private:
 
   ros::Subscriber joint_state_sub_;
   ros::Subscriber trajectory_sub_;
+  ros::Subscriber safety_hold_sub_;
 
   ros::Publisher velocity_command_pub_;
   ros::Publisher reference_state_pub_;
@@ -118,6 +120,9 @@ private:
   mutable std::mutex data_mutex_;
 
   bool has_joint_state_ = false;
+  bool external_safety_hold_ = false;
+  ros::Time external_safety_hold_start_time_;
+  unsigned long long external_safety_hold_event_count_ = 0;
   sensor_msgs::JointState latest_joint_state_;
   Eigen::VectorXd q_measured_;
   Eigen::VectorXd dq_measured_;
@@ -190,6 +195,8 @@ private:
       "/care_planner/local_planner/replan_request";
   std::string smooth_replan_request_topic_ =
       "/care_planner/local_planner/smooth_handoff_replan_request";
+  std::string external_safety_hold_topic_ =
+      "/care_planner/execution_gcdf/hard_hold";
 };
 
 }  // namespace egocentric_arm_planner
