@@ -1805,7 +1805,7 @@
        y image-down, z viewing-forward. Gazebo rendering cameras view
        along positive x, so dedicated gz links supply the fixed rotation. -->
 
-  <!-- link2/link3 rendering frames added for six-ToF simulation.
+  <!-- link2/link3 rendering frames retained as part of eight-ToF simulation.
        Parameters match the existing link4 sensor Gazebo plugins. -->
 
   <!-- link2_sensor1 rendering frames -->
