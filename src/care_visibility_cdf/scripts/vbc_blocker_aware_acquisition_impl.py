@@ -23,6 +23,7 @@ from typing import Dict, List
 
 import numpy as np
 import rospy
+import torch
 from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 
@@ -60,6 +61,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._process_success_count = 0
         self._last_process_reason = "startup"
 
+        # C5.41 motion-efficient progressive shared visibility steering.
+        # This cache affects only the learned REPAIR steering target. Exact
+        # final GCDF + VBC remain downstream commit authorities.
+        self._progressive_shared_lock = threading.RLock()
+        self._progressive_shared_cache_key = None
+        self._progressive_shared_cache = None
+        self._progressive_shared_attempt_count = 0
+        self._progressive_shared_success_count = 0
+        self._progressive_shared_fallback_count = 0
+        self._progressive_shared_last_mode = "startup"
+        self._progressive_shared_last_considered_ids: List[int] = []
+        self._progressive_shared_last_kept_ids: List[int] = []
+        self._progressive_shared_last_dropped_ids: List[int] = []
+        self._progressive_shared_last_slacks: Dict[int, float] = {}
+
         # C5.12 direct final-GCDF recovery evidence.  A rejected executable
         # trajectory can expose low-confidence voxels that the task-bootstrap
         # VBC does not report (notably braking-tail sweep).  Keep this evidence
@@ -87,6 +103,19 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "~blocker_push_max_sweep_s", 0.30))
         self.blocker_confirmations = int(rospy.get_param(
             "~blocker_confirmations", 2))
+
+        # C5.41: first try to satisfy several important spatial visibility
+        # regions with one shared learned q_vis. If the shared max-min solve
+        # cannot make the set jointly visible, progressively remove the
+        # lowest-priority region with the largest learned visibility deficit.
+        # The current blocker is mandatory and is never dropped.
+        self.progressive_shared_repair_enabled = bool(rospy.get_param(
+            "~progressive_shared_repair_enabled", True))
+        self.progressive_shared_max_regions = int(rospy.get_param(
+            "~progressive_shared_max_regions", 3))
+        self.progressive_shared_accept_f_min = float(rospy.get_param(
+            "~progressive_shared_accept_f_min", 0.0))
+
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
             "/care_planner/active_sensing/blocker_stack_summary"))
@@ -103,6 +132,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             raise ValueError("~blocker_push_max_sweep_s must be positive")
         if self.blocker_confirmations < 1:
             raise ValueError("~blocker_confirmations must be >= 1")
+        if self.progressive_shared_max_regions < 1:
+            raise ValueError("~progressive_shared_max_regions must be >= 1")
+        if not math.isfinite(self.progressive_shared_accept_f_min):
+            raise ValueError("~progressive_shared_accept_f_min must be finite")
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
@@ -424,6 +457,203 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._repair_stack.append(root)
                 self._last_switch_reason = "initialize_oldest_obligation"
 
+    def _progressive_priority_order(self, by_id, active_id):
+        """Current blocker first; then urgent-layer regions; then the rest.
+
+        Within the same importance tier prefer a q_vis closer to the measured
+        configuration. This is only a steering preference; it cannot make an
+        unsafe candidate executable.
+        """
+        q0 = None if self._latest_measured_q is None else np.asarray(
+            self._latest_measured_q, dtype=np.float64)
+        urgent = set(int(v) for v in self._last_active_layer_ids)
+
+        def distance(oid):
+            if q0 is None:
+                return math.inf
+            qv = np.asarray(by_id[oid].get("q_vis", []), dtype=np.float64)
+            if qv.shape != (7,) or not np.all(np.isfinite(qv)):
+                return math.inf
+            return float(np.linalg.norm(qv - q0))
+
+        others = [oid for oid in by_id if oid != active_id]
+        others.sort(
+            key=lambda oid: (
+                0 if oid in urgent else 1,
+                distance(oid),
+                oid))
+        return [active_id] + others
+
+    def _region_learned_slack(self, ob, q_vis):
+        points = np.asarray(ob.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if points.shape[0] == 0 or not np.all(np.isfinite(points)):
+            return math.inf, -math.inf
+        x = torch.tensor(points, device=self.device, dtype=torch.float32)
+        q = torch.tensor(
+            np.asarray(q_vis, dtype=np.float64).reshape(1, 7),
+            device=self.device, dtype=torch.float32)
+        values = self._per_point_values(x, q)
+        f_min = float(np.min(values)) if values.size else -math.inf
+        slack = max(0.0, self.progressive_shared_accept_f_min - f_min)
+        return float(slack), f_min
+
+    def _compute_progressive_shared_target(
+            self, by_id, active_id, priority_order):
+        if (not self.progressive_shared_repair_enabled or
+                self.progressive_shared_max_regions <= 1 or
+                len(priority_order) <= 1):
+            return None
+
+        considered = priority_order[:self.progressive_shared_max_regions]
+        # Cache by target identity + exact spatial cells. Do not continuously
+        # re-solve as q moves; target persistence is intentional hysteresis.
+        geometry_key = tuple(
+            (oid, tuple(by_id[oid].get("keys", ())))
+            for oid in considered)
+        cache_key = (
+            int(active_id),
+            tuple(considered),
+            geometry_key,
+            tuple(sorted(int(v) for v in self._last_active_layer_ids)))
+        with self._progressive_shared_lock:
+            if self._progressive_shared_cache_key == cache_key:
+                return self._progressive_shared_cache
+
+            self._progressive_shared_attempt_count += 1
+            self._progressive_shared_last_considered_ids = list(considered)
+            self._progressive_shared_last_kept_ids = [active_id]
+            self._progressive_shared_last_dropped_ids = []
+            self._progressive_shared_last_slacks = {}
+
+            measured = (
+                None if self._latest_measured_q is None
+                else np.asarray(self._latest_measured_q, dtype=np.float64).copy())
+            if measured is None or measured.shape != (7,) or not np.all(
+                    np.isfinite(measured)):
+                self._progressive_shared_last_mode = "no_measured_q"
+                self._progressive_shared_cache_key = cache_key
+                self._progressive_shared_cache = None
+                return None
+
+            with self._lock:
+                trajectory, trajectory_received, _ = (
+                    self._preferred_trajectory_locked())
+            if trajectory is None:
+                self._progressive_shared_last_mode = "no_trajectory"
+                self._progressive_shared_cache_key = cache_key
+                self._progressive_shared_cache = None
+                return None
+
+            active = list(considered)
+            urgent = set(int(v) for v in self._last_active_layer_ids)
+            dropped = []
+            last_slacks = {}
+
+            while active:
+                points = np.vstack([
+                    np.asarray(by_id[oid]["points"], dtype=np.float64).reshape(-1, 3)
+                    for oid in active])
+                sweep_candidates = [
+                    float(by_id[oid].get("discovered_sweep_time_s", math.nan))
+                    for oid in active]
+                sweep_candidates = [
+                    v for v in sweep_candidates if math.isfinite(v) and v >= 0.0]
+                sweep_s = (
+                    min(sweep_candidates)
+                    if sweep_candidates
+                    else max(self.safety_margin_s, 0.30))
+
+                self._seed_override = measured.copy()
+                try:
+                    result = self._generate_active_set_waypoint(
+                        points, trajectory, sweep_s, trajectory_received)
+                except Exception as exc:
+                    rospy.logwarn(
+                        "[vbc_blocker_stack] progressive shared q_vis solve "
+                        "failed ids=%s: %s",
+                        ":".join(str(v) for v in active), exc)
+                    result = None
+                finally:
+                    self._seed_override = None
+
+                if result is None:
+                    slacks = {oid: math.inf for oid in active}
+                else:
+                    qv = np.asarray(result["q_vis"], dtype=np.float64).reshape(7)
+                    slacks = {}
+                    for oid in active:
+                        slack, _ = self._region_learned_slack(by_id[oid], qv)
+                        slacks[oid] = slack
+
+                    if all(
+                            math.isfinite(slacks[oid]) and
+                            slacks[oid] <= 1e-9
+                            for oid in active):
+                        cache = {
+                            "q_vis": qv.copy(),
+                            "q_zero": np.asarray(
+                                result["q_zero"], dtype=np.float64).reshape(7).copy(),
+                            "final_f_min": float(result["final_f_min"]),
+                            "kept_ids": list(active),
+                            "dropped_ids": list(dropped),
+                            "slacks": dict(slacks),
+                            "mode": (
+                                "progressive_shared_all"
+                                if len(active) == len(considered)
+                                else "progressive_shared_reduced"),
+                        }
+                        self._progressive_shared_success_count += 1
+                        self._progressive_shared_last_mode = cache["mode"]
+                        self._progressive_shared_last_kept_ids = list(active)
+                        self._progressive_shared_last_dropped_ids = list(dropped)
+                        self._progressive_shared_last_slacks = dict(slacks)
+                        self._progressive_shared_cache_key = cache_key
+                        self._progressive_shared_cache = cache
+                        rospy.logwarn(
+                            "[vbc_blocker_stack] C5.41 shared q_vis %s "
+                            "considered=%s kept=%s dropped=%s min_f=%+.4f",
+                            cache["mode"],
+                            ":".join(str(v) for v in considered),
+                            ":".join(str(v) for v in active),
+                            ":".join(str(v) for v in dropped) or "none",
+                            cache["final_f_min"])
+                        return cache
+
+                last_slacks = dict(slacks)
+                if len(active) <= 1:
+                    break
+
+                # Current blocker is mandatory. Among all optional regions,
+                # discard a lower-importance tier first; within that tier,
+                # discard the one demanding the largest learned slack.
+                optional = [oid for oid in active if oid != active_id]
+                if not optional:
+                    break
+                lowest_importance = max(
+                    0 if oid in urgent else 1 for oid in optional)
+                pool = [
+                    oid for oid in optional
+                    if (0 if oid in urgent else 1) == lowest_importance]
+                drop_id = max(
+                    pool,
+                    key=lambda oid: (
+                        slacks.get(oid, math.inf),
+                        priority_order.index(oid)))
+                active.remove(drop_id)
+                dropped.append(drop_id)
+
+            # Fail closed on steering quality: retain the already-generated
+            # individual current-blocker q_vis rather than publishing a poor
+            # shared best-effort pose.
+            self._progressive_shared_fallback_count += 1
+            self._progressive_shared_last_mode = "individual_current_fallback"
+            self._progressive_shared_last_kept_ids = [active_id]
+            self._progressive_shared_last_dropped_ids = list(dropped)
+            self._progressive_shared_last_slacks = dict(last_slacks)
+            self._progressive_shared_cache_key = cache_key
+            self._progressive_shared_cache = None
+            return None
+
     def _ordered_obligations(self):
         with self._obligation_lock:
             copied = [dict(ob) for ob in self._obligations]
@@ -433,8 +663,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         by_id = {int(ob["id"]): ob for ob in copied}
         valid_stack = [oid for oid in stack if oid in by_id]
         active_id = valid_stack[-1] if valid_stack else min(by_id)
-        first = by_id[active_id]
-        rest = [ob for oid, ob in sorted(by_id.items()) if oid != active_id]
+
+        priority_order = self._progressive_priority_order(by_id, active_id)
+        shared = self._compute_progressive_shared_target(
+            by_id, active_id, priority_order)
+
+        first = dict(by_id[active_id])
+        if shared is not None:
+            first["q_vis"] = np.asarray(
+                shared["q_vis"], dtype=np.float64).copy()
+            first["q_zero"] = np.asarray(
+                shared["q_zero"], dtype=np.float64).copy()
+            first["final_f_min"] = float(shared["final_f_min"])
+            first["shared_solution_mode"] = str(shared["mode"])
+
+        rest = [by_id[oid] for oid in priority_order if oid != active_id]
         return [first] + rest
 
     def _select_nearest_qvis_id(self, ids: List[int]):
@@ -709,5 +952,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" coherent_bundle_drop_count={self._coherent_bundle_drop_count}"
             f" coherent_bundle_reason={self._coherent_bundle_last_reason}"
             f" switch_reason={self._last_switch_reason}"
+            f" progressive_shared_enabled={int(self.progressive_shared_repair_enabled)}"
+            f" progressive_shared_max_regions={self.progressive_shared_max_regions}"
+            f" progressive_shared_accept_f_min={self.progressive_shared_accept_f_min:.6f}"
+            f" progressive_shared_attempt_count={self._progressive_shared_attempt_count}"
+            f" progressive_shared_success_count={self._progressive_shared_success_count}"
+            f" progressive_shared_fallback_count={self._progressive_shared_fallback_count}"
+            f" progressive_shared_mode={self._progressive_shared_last_mode}"
+            f" progressive_shared_considered_ids="
+            f"{':'.join(str(v) for v in self._progressive_shared_last_considered_ids) or 'none'}"
+            f" progressive_shared_kept_ids="
+            f"{':'.join(str(v) for v in self._progressive_shared_last_kept_ids) or 'none'}"
+            f" progressive_shared_dropped_ids="
+            f"{':'.join(str(v) for v in self._progressive_shared_last_dropped_ids) or 'none'}"
+            f" progressive_shared_slacks="
+            f"{';'.join(str(k)+':' + ('inf' if not math.isfinite(v) else f'{v:.4f}') for k,v in sorted(self._progressive_shared_last_slacks.items())) or 'none'}"
         )
         self.blocker_stack_summary_pub.publish(msg)
