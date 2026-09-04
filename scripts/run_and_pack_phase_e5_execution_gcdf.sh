@@ -2,7 +2,8 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-CASE_ID="${CASE_ID:-case_014}"
+export CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json}"
+CASE_ID="${CASE_ID:-phase_e_case_000}"
 RUN_SECONDS="${RUN_SECONDS:-16}"
 
 export WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_obstacles.world}"
@@ -24,6 +25,7 @@ if [[ -z "${RUN_ID:-}" ]]; then
   export RUN_ID="${CASE_ID}_phase_e5_execution_gcdf_${STAMP}_${SHORT}"
 fi
 
+echo "[PHASE E5] case_file=${CASE_FILE}"
 echo "[PHASE E5] case=${CASE_ID}"
 echo "[PHASE E5] measured-q execution GCDF audit enabled=${EXECUTION_GCDF_AUDIT_ENABLED}"
 echo "[PHASE E5] warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}"
