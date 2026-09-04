@@ -291,11 +291,40 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         now_s = rospy.Time.now().to_sec()
         min_hit = self._rest_min_hit_time(measured, q_vis)
         deadline_remaining = deadline_abs - now_s
+        source_points = np.asarray(
+            region["points"], dtype=np.float64).copy()
+        source_centroid = np.asarray(
+            region["centroid"], dtype=np.float64).copy()
+        source_keys = tuple(region["keys"])
+        source_xyz_min = (
+            np.min(source_points, axis=0)
+            if source_points.shape[0]
+            else np.asarray([math.nan, math.nan, math.nan], dtype=np.float64))
+        source_xyz_max = (
+            np.max(source_points, axis=0)
+            if source_points.shape[0]
+            else np.asarray([math.nan, math.nan, math.nan], dtype=np.float64))
+
         ob = {
             "id": int(self._next_obligation_id),
-            "points": np.asarray(region["points"], dtype=np.float64).copy(),
-            "keys": tuple(region["keys"]),
-            "centroid": np.asarray(region["centroid"], dtype=np.float64).copy(),
+            "points": source_points.copy(),
+            "keys": source_keys,
+            "centroid": source_centroid.copy(),
+            # Diagnostic-only immutable snapshot of the spatial region used to
+            # generate q_vis. Later blocker matching is allowed to refresh the
+            # live region geometry, but this snapshot lets us detect whether
+            # q_vis has become stale relative to that refreshed geometry.
+            "q_vis_source_points": source_points.copy(),
+            "q_vis_source_keys": source_keys,
+            "q_vis_source_centroid": source_centroid.copy(),
+            "q_vis_source_xyz_min": source_xyz_min.copy(),
+            "q_vis_source_xyz_max": source_xyz_max.copy(),
+            "geometry_match_update_count": 0,
+            "geometry_match_change_count": 0,
+            "geometry_changed_since_qvis": False,
+            "last_match_centroid_shift_m": 0.0,
+            "max_centroid_shift_from_qvis_m": 0.0,
+            "last_geometry_match_source": "discovery",
             "q_vis": q_vis,
             "q_zero": np.asarray(result["q_zero"], dtype=np.float64),
             "deadline_abs_s": deadline_abs,
@@ -324,6 +353,10 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_reachable_before_discovered_deadline_lower_bound": ob[
                 "reachable_before_discovered_deadline_lower_bound"],
             "c4_6_q_vis_generation_ms": float(q_vis_generation_ms),
+            "c4_6_q_vis_source_centroid": source_centroid.tolist(),
+            "c4_6_q_vis_source_xyz_min": source_xyz_min.tolist(),
+            "c4_6_q_vis_source_xyz_max": source_xyz_max.tolist(),
+            "c4_6_q_vis_source_point_count": int(source_points.shape[0]),
         })
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = Path(self.output_root) / (
