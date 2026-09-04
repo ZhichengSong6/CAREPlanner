@@ -1062,6 +1062,7 @@ class CppForbiddenVoxelGpuShadow {
     msg.q_linearization_flat.resize(pairs.size() * 7);
     msg.distance.resize(pairs.size());
     msg.gradient_flat.resize(pairs.size() * 7);
+    msg.approx_body_clearance_m.resize(pairs.size());
 
     for (std::size_t i = 0; i < pairs.size(); ++i) {
       msg.original_timestep[i] =
@@ -1083,6 +1084,8 @@ class CppForbiddenVoxelGpuShadow {
                 gradient[i * 7 + static_cast<std::size_t>(j)]);
       }
       msg.distance[i] = static_cast<double>(distance[i]);
+      msg.approx_body_clearance_m[i] =
+          static_cast<double>(pairs[i].approx_body_clearance_m);
     }
 
     msg.pair_selection_ms = selection_ms;
