@@ -17,6 +17,7 @@ EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
 EXECUTION_GCDF_WARNING_MARGIN="${EXECUTION_GCDF_WARNING_MARGIN:-0.05}"
 EXECUTION_GCDF_HARD_MARGIN="${EXECUTION_GCDF_HARD_MARGIN:-0.0}"
 EXECUTION_GCDF_STALE_TIMEOUT_S="${EXECUTION_GCDF_STALE_TIMEOUT_S:-0.35}"
+GCDF_BODY_INFLATION_M="${GCDF_BODY_INFLATION_M:-0.0}"
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
@@ -257,6 +258,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   execution_gcdf_warning_margin:="${EXECUTION_GCDF_WARNING_MARGIN}" \
   execution_gcdf_hard_margin:="${EXECUTION_GCDF_HARD_MARGIN}" \
   execution_gcdf_stale_timeout_s:="${EXECUTION_GCDF_STALE_TIMEOUT_S}" \
+  gcdf_body_inflation_m:="${GCDF_BODY_INFLATION_M}" \
   probe_single_flight_enabled:="${PROBE_SINGLE_FLIGHT_ENABLED}" \
   commit_pipeline_candidate_topic:="${COMMIT_PIPELINE_CANDIDATE_TOPIC}" \
   probe_single_flight_summary_topic:="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" \
@@ -399,7 +401,7 @@ fi
 
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
-echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S}"
+echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
 RUNTIME_HEAD="$(git rev-parse HEAD)"
@@ -422,6 +424,7 @@ execution_gcdf_audit_enabled=${EXECUTION_GCDF_AUDIT_ENABLED}
 execution_gcdf_warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}
 execution_gcdf_hard_margin=${EXECUTION_GCDF_HARD_MARGIN}
 execution_gcdf_stale_timeout_s=${EXECUTION_GCDF_STALE_TIMEOUT_S}
+gcdf_body_inflation_m=${GCDF_BODY_INFLATION_M}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
