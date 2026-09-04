@@ -74,6 +74,7 @@
   <arg name="forbidden_space_pair_topic"
        default="/care_planner/trajectory_risk/body_sweep_anchors" />
   <arg name="forbidden_space_confidence_threshold" default="0.50" />
+  <arg name="forbidden_space_body_inflation_m" default="0.0" />
 
   <!-- ========================= -->
   <!-- Trajectory risk node       -->
@@ -179,5 +180,7 @@
 
     <param name="trajectory_risk/forbidden_space_confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
+    <param name="trajectory_risk/forbidden_space_body_inflation_m"
+           value="$(arg forbidden_space_body_inflation_m)" />
   </node>
 </launch>
