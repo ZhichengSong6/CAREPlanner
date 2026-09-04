@@ -188,10 +188,23 @@ GAZEBO_PID=$!
 
 READY=0
 for _ in $(seq 1 120); do
-  if timeout 2 rostopic echo -n 1 /care_arm/joint_states >/dev/null 2>&1; then READY=1; break; fi
+  if ! kill -0 "${GAZEBO_PID}" 2>/dev/null; then
+    echo "[ERROR] Gazebo roslaunch exited before joint states became ready"
+    break
+  fi
+  if timeout 0.5 rostopic echo -n 1 /care_arm/joint_states >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
   sleep 0.25
 done
-[ "${READY}" = "1" ] || { echo "[ERROR] Gazebo joint state timeout"; exit 1; }
+if [ "${READY}" != "1" ]; then
+  echo "[ERROR] Gazebo robot/controller readiness failed: /care_arm/joint_states unavailable"
+  echo "[DEBUG] gazebo log: ${LOG}/gazebo.log"
+  tail -n 220 "${LOG}/gazebo.log" 2>/dev/null || true
+  exit 1
+fi
+echo "[READY] Gazebo robot spawned and /care_arm/joint_states is live"
 
 setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   config_file:="${CONFIG_FILE}" input_trajectory:="${COMMITTED_TOPIC}" \
