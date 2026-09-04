@@ -186,25 +186,43 @@ setsid roslaunch arm_description gazebo_velocity_control.launch \
   gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" > "${LOG}/gazebo.log" 2>&1 &
 GAZEBO_PID=$!
 
-READY=0
-for _ in $(seq 1 120); do
-  if ! kill -0 "${GAZEBO_PID}" 2>/dev/null; then
-    echo "[ERROR] Gazebo roslaunch exited before joint states became ready"
-    break
-  fi
-  if timeout 0.5 rostopic echo -n 1 /care_arm/joint_states >/dev/null 2>&1; then
-    READY=1
-    break
-  fi
-  sleep 0.25
-done
-if [ "${READY}" != "1" ]; then
-  echo "[ERROR] Gazebo robot/controller readiness failed: /care_arm/joint_states unavailable"
+echo "[WAIT] Gazebo robot/controller readiness: waiting for one /care_arm/joint_states message"
+if ! python3 - <<'PY'
+import sys
+import rospy
+from sensor_msgs.msg import JointState
+
+topic = "/care_arm/joint_states"
+rospy.init_node(
+    "careplanner_gazebo_joint_state_ready",
+    anonymous=True,
+    disable_signals=True,
+)
+try:
+    msg = rospy.wait_for_message(topic, JointState, timeout=20.0)
+except rospy.ROSException as exc:
+    print(f"[ERROR] timed out waiting for {topic}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(
+    "[READY] Gazebo robot spawned and joint state is live: "
+    f"names={len(msg.name)} positions={len(msg.position)}"
+)
+PY
+then
+  echo "[ERROR] Gazebo robot/controller readiness failed"
+  echo "[DEBUG] joint-state-like topics:"
+  rostopic list 2>/dev/null | grep -E 'joint|state' || true
+  echo "[DEBUG] expected topic info:"
+  rostopic info /care_arm/joint_states 2>/dev/null || true
+  echo "[DEBUG] controller states:"
+  rosservice call /care_arm/controller_manager/list_controllers 2>/dev/null || true
+  echo "[DEBUG] ROS nodes:"
+  rosnode list 2>/dev/null || true
   echo "[DEBUG] gazebo log: ${LOG}/gazebo.log"
-  tail -n 220 "${LOG}/gazebo.log" 2>/dev/null || true
+  tail -n 260 "${LOG}/gazebo.log" 2>/dev/null || true
   exit 1
 fi
-echo "[READY] Gazebo robot spawned and /care_arm/joint_states is live"
 
 setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   config_file:="${CONFIG_FILE}" input_trajectory:="${COMMITTED_TOPIC}" \
