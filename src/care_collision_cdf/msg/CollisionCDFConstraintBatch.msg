@@ -22,6 +22,15 @@ float64[] q_linearization_flat
 float64[] distance
 float64[] gradient_flat
 
+# Phase E5 execution-safety metric. For each pair this is the Euclidean
+# workspace clearance from the robot body sphere surface to the forbidden
+# voxel CENTER, in meters:
+#   ||p_voxel_center - p_body_sphere_center|| - sphere_radius
+# The execution monitor additionally subtracts the confidence-map voxel
+# half-diagonal to conservatively convert center clearance to voxel-volume
+# clearance.
+float64[] approx_body_clearance_m
+
 # Profiling copied from the C++ selector / GPU worker.
 float64 pair_selection_ms
 float64 pair_buffer_build_ms
