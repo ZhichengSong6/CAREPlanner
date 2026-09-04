@@ -174,6 +174,18 @@ class OnlineBlockerAwareAcquisitionWaypointNode(
 
 
 def _configure_runtime_mode(mode: str) -> None:
+    # Diagnostic-only runtime override. Default behavior is unchanged unless the
+    # caller explicitly exports PROGRESSIVE_SHARED_REPAIR_ENABLED. This lets us
+    # compare C5.41 shared-O steering against strict one-obligation steering
+    # without editing launch/config semantics.
+    if "PROGRESSIVE_SHARED_REPAIR_ENABLED" in os.environ:
+        rospy.set_param(
+            "~progressive_shared_repair_enabled",
+            _env_bool("PROGRESSIVE_SHARED_REPAIR_ENABLED", True))
+        rospy.logwarn(
+            "[vbc_waypoint_online] override progressive_shared_repair_enabled=%d",
+            int(_env_bool("PROGRESSIVE_SHARED_REPAIR_ENABLED", True)))
+
     mpc_prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
     multi = mode == "accumulated_multi_deadline"
     rospy.set_param(mpc_prefix + "/multi_deadline_enabled", bool(multi))
