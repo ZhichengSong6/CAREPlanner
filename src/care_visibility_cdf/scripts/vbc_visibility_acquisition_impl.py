@@ -159,7 +159,8 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         query_diag = {
             "status": "empty_points" if n == 0 else "not_queried",
             "inside_count": 0,
-            "outside_count": n,
+            "outside_count": 0,
+            "unclassified_count": n,
             "finite_confidence_count": 0,
             "nonfinite_confidence_count": 0,
             "finite_current_visibility_count": 0,
@@ -168,6 +169,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             "response_confidence_count": -1,
             "response_inside_count": -1,
             "response_visibility_count": -1,
+            "exception": "none",
         }
         if n == 0:
             return (
@@ -181,6 +183,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             res = self.confidence_client(req)
         except Exception as exc:
             query_diag["status"] = "service_exception"
+            error_text = "_".join(str(exc).strip().split()) or type(exc).__name__
+            error_text = (
+                error_text.replace(",", ";").replace("|", "/")
+                .replace("=", ":"))[:180]
+            query_diag["exception"] = error_text
             rospy.logwarn_throttle(
                 1.0, "[vbc_acquisition] confidence query failed: %s", exc)
             return (
@@ -213,6 +220,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         query_diag["status"] = "ok"
         query_diag["inside_count"] = int(np.count_nonzero(inside))
         query_diag["outside_count"] = int(n - np.count_nonzero(inside))
+        query_diag["unclassified_count"] = 0
         query_diag["finite_confidence_count"] = int(
             np.count_nonzero(finite_inside))
         query_diag["nonfinite_confidence_count"] = int(
@@ -408,6 +416,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 "status": "none",
                 "inside_count": 0,
                 "outside_count": 0,
+                "unclassified_count": 0,
                 "finite_confidence_count": 0,
                 "nonfinite_confidence_count": 0,
                 "finite_current_visibility_count": 0,
@@ -464,8 +473,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f"{float(active_worst_point[1]):.4f},"
             f"{float(active_worst_point[2]):.4f}"
             f" active_query_status={active_query_diag.get('status','unknown')}"
+            f" active_query_error={active_query_diag.get('exception','none')}"
             f" active_inside_map_count={int(active_query_diag.get('inside_count',0))}"
             f" active_outside_map_count={int(active_query_diag.get('outside_count',0))}"
+            f" active_query_unclassified_count="
+            f"{int(active_query_diag.get('unclassified_count',0))}"
             f" active_finite_confidence_count="
             f"{int(active_query_diag.get('finite_confidence_count',0))}"
             f" active_nonfinite_confidence_count="
