@@ -2,6 +2,24 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+
+# Gazebo/ROS Noetic must run in the system ROS environment. An inherited
+# research conda env (e.g. viscdf) can override libstdc++/Qt/Python paths and
+# let gzclient start while spawn_model / gazebo_ros_control never becomes
+# healthy. GPU/NCDF subprocesses activate their own conda envs later.
+if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
+  if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  fi
+  _care_conda_before="${CONDA_DEFAULT_ENV:-unknown}"
+  while [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); do
+    conda deactivate || break
+  done
+  echo "[PHASE E5] sanitized inherited conda env (was ${_care_conda_before}); ROS/Gazebo use system environment"
+fi
+
 export CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json}"
 CASE_ID="${CASE_ID:-phase_e_case_000}"
 RUN_SECONDS="${RUN_SECONDS:-16}"
