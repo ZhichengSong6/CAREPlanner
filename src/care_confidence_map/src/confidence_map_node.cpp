@@ -324,6 +324,10 @@ private:
              current_body_prior_refresh_on_startup_,
              true);
 
+    nh.param("current_body_prior/lock_after_complete_refresh",
+             current_body_prior_lock_after_complete_refresh_,
+             false);
+
     nh.param("current_body_prior/risk_samples_only",
              current_body_prior_risk_samples_only_,
              false);
@@ -614,6 +618,19 @@ private:
       const std::string& reason,
       std::string* message)
   {
+    if (current_body_prior_locked_)
+    {
+      if (message)
+      {
+        *message = "current_body_prior locked after complete initial refresh";
+      }
+      ROS_WARN_STREAM_THROTTLE(
+          2.0,
+          "[confidence_map_node] rejecting body-prior refresh after lock; reason="
+              << reason);
+      return true;
+    }
+
     last_body_prior_spheres_.clear();
     last_body_prior_refresh_time_ = now;
     last_body_prior_updated_cells_ = 0;
@@ -711,6 +728,16 @@ private:
             << oss.str());
 
     publishCurrentBodyPriorMarkers();
+
+    if (current_body_prior_lock_after_complete_refresh_ &&
+        last_body_prior_transformed_samples_ > 0 &&
+        last_body_prior_skipped_samples_ == 0)
+    {
+      current_body_prior_locked_ = true;
+      ROS_WARN(
+          "[confidence_map_node] initial trusted-free body prior LOCKED; "
+          "future refresh requests cannot move/clear the map.");
+    }
 
     return true;
   }
@@ -1862,6 +1889,8 @@ private:
 
   bool current_body_prior_enabled_ = true;
   bool current_body_prior_refresh_on_startup_ = true;
+  bool current_body_prior_lock_after_complete_refresh_ = false;
+  bool current_body_prior_locked_ = false;
   bool current_body_prior_risk_samples_only_ = false;
   double current_body_prior_inflation_radius_ = 0.10;
   double current_body_prior_tf_timeout_ = 0.05;
