@@ -381,12 +381,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             with self._obligation_lock:
                 matched = self._match_existing(region)
                 if matched is not None:
-                    matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
-                    matched["points"] = np.asarray(
-                        region["points"], dtype=np.float64).copy()
-                    matched["keys"] = tuple(region["keys"])
-                    matched["centroid"] = np.asarray(
-                        region["centroid"], dtype=np.float64).copy()
+                    self._update_matched_geometry_diagnostics(
+                        matched, region, "final_gcdf_recovery")
                     active_ids.append(int(matched["id"]))
                     self._schedule_matched_obligations += 1
                     self._gcdf_recovery_match_count += 1
@@ -445,6 +441,73 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._consider_active_layer(active_ids, new_ids, sweep_s)
         self._publish_schedule()
         self._publish_blocker_stack_summary()
+
+    def _update_matched_geometry_diagnostics(
+            self, matched, region, source: str) -> None:
+        """Refresh live matched-region geometry while preserving q_vis provenance.
+
+        This intentionally keeps the existing planner semantics: matched
+        obligations still inherit the newest region points/keys/centroid and
+        q_vis is NOT regenerated. The additional state only measures whether
+        the live geometry has drifted away from the geometry that originally
+        generated q_vis.
+        """
+        old_centroid = np.asarray(
+            matched.get("centroid", [math.nan, math.nan, math.nan]),
+            dtype=np.float64).reshape(3)
+        new_centroid = np.asarray(
+            region["centroid"], dtype=np.float64).reshape(3)
+        old_keys = tuple(matched.get("keys", ()))
+        new_keys = tuple(region["keys"])
+        qvis_source_centroid = np.asarray(
+            matched.get("q_vis_source_centroid", old_centroid),
+            dtype=np.float64).reshape(3)
+
+        last_shift = (
+            float(np.linalg.norm(new_centroid - old_centroid))
+            if np.all(np.isfinite(old_centroid)) and
+               np.all(np.isfinite(new_centroid))
+            else math.nan)
+        source_shift = (
+            float(np.linalg.norm(new_centroid - qvis_source_centroid))
+            if np.all(np.isfinite(qvis_source_centroid)) and
+               np.all(np.isfinite(new_centroid))
+            else math.nan)
+
+        matched["geometry_match_update_count"] = int(
+            matched.get("geometry_match_update_count", 0)) + 1
+        changed = bool(old_keys != new_keys or (
+            math.isfinite(last_shift) and last_shift > 1e-12))
+        if changed:
+            matched["geometry_match_change_count"] = int(
+                matched.get("geometry_match_change_count", 0)) + 1
+        matched["geometry_changed_since_qvis"] = bool(
+            matched.get("geometry_changed_since_qvis", False) or
+            old_keys != new_keys or
+            (math.isfinite(source_shift) and source_shift > 1e-12))
+        matched["last_match_centroid_shift_m"] = float(last_shift)
+        if math.isfinite(source_shift):
+            matched["max_centroid_shift_from_qvis_m"] = max(
+                float(matched.get("max_centroid_shift_from_qvis_m", 0.0)),
+                source_shift)
+        matched["last_geometry_match_source"] = str(source)
+
+        matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
+        matched["points"] = np.asarray(
+            region["points"], dtype=np.float64).copy()
+        matched["keys"] = new_keys
+        matched["centroid"] = new_centroid.copy()
+
+        if changed:
+            rospy.logwarn_throttle(
+                0.5,
+                "[vbc_blocker_stack] MATCH geometry drift obligation=%d "
+                "source=%s update=%d last_shift=%.4fm source_shift=%.4fm "
+                "old_points=%d new_points=%d",
+                int(matched["id"]), str(source),
+                int(matched["geometry_match_update_count"]),
+                float(last_shift), float(source_shift),
+                len(old_keys), len(new_keys))
 
     def _prune_or_initialize_stack(self) -> None:
         with self._obligation_lock:
@@ -827,10 +890,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             with self._obligation_lock:
                 matched = self._match_existing(region)
                 if matched is not None:
-                    matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
-                    matched["points"] = np.asarray(region["points"], dtype=np.float64).copy()
-                    matched["keys"] = tuple(region["keys"])
-                    matched["centroid"] = np.asarray(region["centroid"], dtype=np.float64).copy()
+                    self._update_matched_geometry_diagnostics(
+                        matched, region, "candidate_vbc_active_set")
                     oid = int(matched["id"])
                     active_ids.append(oid)
                     self._schedule_matched_obligations += 1
