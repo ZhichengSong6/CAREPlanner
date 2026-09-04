@@ -1,0 +1,499 @@
+{
+  "benchmark_name": "phase_e_obstacle_core12_v1",
+  "source_pool": "phase_e_obstacle_goal_pool_200.json",
+  "source_seed": 20260904,
+  "selection_version": 1,
+  "selection_semantics": "Fixed terminal-feasible Phase-E core set. Spatial/obstacle geometry is balanced; path feasibility and difficulty labels are intentionally not assigned yet.",
+  "selection_filters": {
+    "min_terminal_clearance_m": 0.065,
+    "min_terminal_joint_limit_margin_rad": 0.15,
+    "source_pool_accepted_count": 161,
+    "spatial_balance": "4 geometry_near + 4 geometry_mid + 4 geometry_open; covers negative-y, center-y, positive-y and multiple heights"
+  },
+  "selected_case_ids": [
+    "phase_e_case_000",
+    "phase_e_case_001",
+    "phase_e_case_002",
+    "phase_e_case_003",
+    "phase_e_case_004",
+    "phase_e_case_005",
+    "phase_e_case_006",
+    "phase_e_case_007",
+    "phase_e_case_008",
+    "phase_e_case_009",
+    "phase_e_case_010",
+    "phase_e_case_011"
+  ],
+  "source_goal_ids": [
+    "phase_e_goal_073",
+    "phase_e_goal_030",
+    "phase_e_goal_074",
+    "phase_e_goal_089",
+    "phase_e_goal_100",
+    "phase_e_goal_111",
+    "phase_e_goal_057",
+    "phase_e_goal_060",
+    "phase_e_goal_069",
+    "phase_e_goal_026",
+    "phase_e_goal_117",
+    "phase_e_goal_103"
+  ],
+  "cases": [
+    {
+      "case_id": "phase_e_case_000",
+      "source_goal_id": "phase_e_goal_073",
+      "geometry_bin": "geometry_near",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.31968715045035345,
+        -0.22788512358617766,
+        0.6528791935900378
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        1.4020752425165195,
+        -0.4037898847741637,
+        1.5855501380372898,
+        1.3761213922927236,
+        0.5851881048251947,
+        -1.2599668656935272,
+        -0.9727847741853387
+      ],
+      "terminal_clearance_m": 0.07664855468309438,
+      "terminal_joint_limit_margin_rad": 0.22721522581466125
+    },
+    {
+      "case_id": "phase_e_case_001",
+      "source_goal_id": "phase_e_goal_030",
+      "geometry_bin": "geometry_near",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.31937150426032124,
+        0.14404355570992866,
+        0.671895057125382
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.2652404252993883,
+        -0.30131832725521035,
+        1.7996067838300183,
+        -1.4410472810712804,
+        2.857216126541534,
+        -1.3425956286591365,
+        0.5712201318943495
+      ],
+      "terminal_clearance_m": 0.06993462486872198,
+      "terminal_joint_limit_margin_rad": 0.28278387345846623
+    },
+    {
+      "case_id": "phase_e_case_002",
+      "source_goal_id": "phase_e_goal_074",
+      "geometry_bin": "geometry_near",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.35216054782673056,
+        0.14714443101521701,
+        0.72973761111472
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.8297311015025923,
+        -0.22168983368301595,
+        1.1801428525455633,
+        -1.1407658115500612,
+        2.77968417122498,
+        -1.17424866986201,
+        0.542752664464049
+      ],
+      "terminal_clearance_m": 0.07686960874257345,
+      "terminal_joint_limit_margin_rad": 0.3603158287750201
+    },
+    {
+      "case_id": "phase_e_case_003",
+      "source_goal_id": "phase_e_goal_089",
+      "geometry_bin": "geometry_near",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.3113874689915873,
+        0.29705387142759143,
+        0.694915255251799
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.5715211549627848,
+        -0.44841692347366086,
+        1.3133597183651413,
+        -1.104006053180024,
+        2.6129753331376393,
+        -1.042960804652208,
+        0.9157329765857068
+      ],
+      "terminal_clearance_m": 0.07306794376796491,
+      "terminal_joint_limit_margin_rad": 0.2842670234142931
+    },
+    {
+      "case_id": "phase_e_case_004",
+      "source_goal_id": "phase_e_goal_100",
+      "geometry_bin": "geometry_mid",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.27270189278837315,
+        -0.18023474022609093,
+        0.716900745041103
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.7891068522221296,
+        0.6421311099442936,
+        1.047826553425267,
+        -1.3530174196712847,
+        2.3415293614972064,
+        -1.080593057580946,
+        0.15440023937797592
+      ],
+      "terminal_clearance_m": 0.08021268294219464,
+      "terminal_joint_limit_margin_rad": 0.7984706385027938
+    },
+    {
+      "case_id": "phase_e_case_005",
+      "source_goal_id": "phase_e_goal_111",
+      "geometry_bin": "geometry_mid",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.35821731273504676,
+        -0.26707047340631773,
+        0.7444399023138005
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.2700632866864316,
+        0.6764461556770767,
+        1.5025580653189636,
+        -0.8210847663864569,
+        2.6097960736750507,
+        -0.9475325980023593,
+        -0.2667125708717654
+      ],
+      "terminal_clearance_m": 0.07681568078896825,
+      "terminal_joint_limit_margin_rad": 0.5302039263249494
+    },
+    {
+      "case_id": "phase_e_case_006",
+      "source_goal_id": "phase_e_goal_057",
+      "geometry_bin": "geometry_mid",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.3321171665743725,
+        0.22001756258425542,
+        0.7217481614116781
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.9471902590757597,
+        -0.19952258396042816,
+        0.7810811907124896,
+        -1.1164072905268874,
+        2.2588746131009363,
+        -1.01659472834873,
+        0.9552918133929138
+      ],
+      "terminal_clearance_m": 0.0748851118748037,
+      "terminal_joint_limit_margin_rad": 0.24470818660708615
+    },
+    {
+      "case_id": "phase_e_case_007",
+      "source_goal_id": "phase_e_goal_060",
+      "geometry_bin": "geometry_mid",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.3074122132850188,
+        0.2845952546133256,
+        0.7666363989574518
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.9688384166250632,
+        -0.3223058025810623,
+        0.7044301353232371,
+        -0.8351017239423608,
+        2.393456075053268,
+        -0.8227074540088585,
+        0.831213845499311
+      ],
+      "terminal_clearance_m": 0.07417848676279445,
+      "terminal_joint_limit_margin_rad": 0.36878615450068897
+    },
+    {
+      "case_id": "phase_e_case_008",
+      "source_goal_id": "phase_e_goal_069",
+      "geometry_bin": "geometry_open",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.1942890027359965,
+        -0.3287166782559407,
+        0.833272265758014
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        1.5836842680227776,
+        -0.4416218708430218,
+        1.862749772775792,
+        0.5843024159579773,
+        0.33153210876677247,
+        -0.563990313993151,
+        -0.6209649853856253
+      ],
+      "terminal_clearance_m": 0.08199999999999999,
+      "terminal_joint_limit_margin_rad": 0.5790350146143747
+    },
+    {
+      "case_id": "phase_e_case_009",
+      "source_goal_id": "phase_e_goal_026",
+      "geometry_bin": "geometry_open",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.24903275064108987,
+        -0.11679358879023091,
+        0.8490510462203833
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.5745056689555939,
+        0.4078736689370517,
+        1.1065517703006642,
+        -0.8857673087010457,
+        2.477212020570189,
+        -0.7652174565174098,
+        0.08990735681349515
+      ],
+      "terminal_clearance_m": 0.08199999999999999,
+      "terminal_joint_limit_margin_rad": 0.6627879794298113
+    },
+    {
+      "case_id": "phase_e_case_010",
+      "source_goal_id": "phase_e_goal_117",
+      "geometry_bin": "geometry_open",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.2538274917400787,
+        0.005426771100890959,
+        0.7656137863975259
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.5248426942248838,
+        0.5167436149336069,
+        0.8103489787289448,
+        -1.3349582992461289,
+        1.764232664117205,
+        -0.7509518041282766,
+        0.7513768709623428
+      ],
+      "terminal_clearance_m": 0.08199999999999999,
+      "terminal_joint_limit_margin_rad": 0.4486231290376571
+    },
+    {
+      "case_id": "phase_e_case_011",
+      "source_goal_id": "phase_e_goal_103",
+      "geometry_bin": "geometry_open",
+      "difficulty_bin": "unassigned",
+      "path_feasibility_verified": false,
+      "goal_position": [
+        0.19113494144573953,
+        0.1796413522680309,
+        0.8415945558007603
+      ],
+      "goal_orientation": [
+        0,
+        0,
+        0.7071067811865476,
+        0.7071067811865476
+      ],
+      "initial_q": [
+        -8.562050757277007e-7,
+        -4.65925742432205e-8,
+        5.169884342848263e-8,
+        -4.5987627927956964e-8,
+        2.041868274460512e-8,
+        1.539679743700617e-7,
+        1.2901693047240315e-7
+      ],
+      "terminal_best_q": [
+        -1.9268803205753726,
+        0.0656821925026783,
+        0.4033089249955878,
+        -0.9645726609927245,
+        2.086345090575858,
+        -0.585547896263499,
+        0.7351482890326725
+      ],
+      "terminal_clearance_m": 0.07555372784203293,
+      "terminal_joint_limit_margin_rad": 0.46485171096732747
+    }
+  ]
+}
