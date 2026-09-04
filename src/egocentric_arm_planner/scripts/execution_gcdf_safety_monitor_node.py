@@ -143,13 +143,19 @@ class ExecutionGCDFSafetyMonitor:
             # the Phase-E body-model inflation.
             d = raw_clearance - self.voxel_half_diagonal_m
             raw_center_clearance_valid.append(raw_clearance)
-            all_d.append(d)
 
             source = int(sources[i]) if i < len(sources) else source_unknown
-            if source == source_occupied:
-                occupied_d.append(d)
-            else:
+
+            # Phase E5 execution safety is physical collision safety only.
+            # UNKNOWN is an epistemic/planning constraint, not collision
+            # evidence. Ignore it here even if an upstream legacy batch
+            # accidentally contains UNKNOWN rows.
+            if source != source_occupied:
                 unknown_d.append(d)
+                continue
+
+            occupied_d.append(d)
+            all_d.append(d)
             if d < self.warning_margin:
                 warning_count += 1
             if d < self.hard_margin:
