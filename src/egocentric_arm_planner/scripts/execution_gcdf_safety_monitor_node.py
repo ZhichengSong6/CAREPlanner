@@ -18,8 +18,13 @@ class ExecutionGCDFSafetyMonitor:
         self.hard_hold_topic = str(rospy.get_param(
             "~hard_hold_topic", "/care_planner/execution_gcdf/hard_hold"))
 
+        # Phase E5 margins are metric workspace clearances in meters.
         self.warning_margin = float(rospy.get_param("~warning_margin", 0.05))
         self.hard_margin = float(rospy.get_param("~hard_margin", 0.0))
+        self.voxel_resolution_m = float(
+            rospy.get_param("~voxel_resolution_m", 0.05))
+        self.voxel_half_diagonal_m = (
+            0.5 * math.sqrt(3.0) * self.voxel_resolution_m)
         self.stale_timeout_s = float(rospy.get_param("~stale_timeout_s", 0.35))
         self.startup_grace_s = float(rospy.get_param("~startup_grace_s", 2.0))
         self.replan_min_interval_s = float(
@@ -31,6 +36,8 @@ class ExecutionGCDFSafetyMonitor:
 
         if self.warning_margin <= self.hard_margin:
             raise RuntimeError("warning_margin must be > hard_margin")
+        if self.voxel_resolution_m <= 0.0:
+            raise RuntimeError("voxel_resolution_m must be positive")
         if self.stale_timeout_s <= 0.0 or self.startup_grace_s < 0.0:
             raise RuntimeError("invalid E5 timeout")
         if self.clear_consecutive_required < 1:
@@ -54,6 +61,8 @@ class ExecutionGCDFSafetyMonitor:
         self.last_d_min = math.nan
         self.last_unknown_min = math.nan
         self.last_occupied_min = math.nan
+        self.last_learned_d_min = math.nan
+        self.last_raw_center_clearance_min = math.nan
         self.last_pair_count = 0
         self.last_unknown_count = 0
         self.last_occupied_count = 0
@@ -75,9 +84,10 @@ class ExecutionGCDFSafetyMonitor:
         self.timer = rospy.Timer(rospy.Duration(0.05), self._timer_cb)
 
         rospy.logwarn(
-            "[Phase E5 execution GCDF] warning=%.3f hard=%.3f stale=%.3fs fail_closed_stale=%d",
-            self.warning_margin, self.hard_margin, self.stale_timeout_s,
-            int(self.fail_closed_on_stale))
+            "[Phase E5 execution GCDF] workspace warning=%.3fm hard=%.3fm voxel=%.3fm halfdiag=%.4fm stale=%.3fs fail_closed_stale=%d",
+            self.warning_margin, self.hard_margin,
+            self.voxel_resolution_m, self.voxel_half_diagonal_m,
+            self.stale_timeout_s, int(self.fail_closed_on_stale))
 
     @staticmethod
     def _finite_min(values):
@@ -102,8 +112,12 @@ class ExecutionGCDFSafetyMonitor:
         if msg is None:
             return
         now = rospy.Time.now()
-        distances = list(msg.distance)
-        n = min(int(msg.num_pairs), len(distances))
+        learned_distances = list(msg.distance)
+        raw_clearances = list(msg.approx_body_clearance_m)
+        n = min(
+            int(msg.num_pairs),
+            len(learned_distances),
+            len(raw_clearances))
         sources = list(msg.source_type)
         source_unknown = int(getattr(msg, "SOURCE_UNKNOWN", 0))
         source_occupied = int(getattr(msg, "SOURCE_OCCUPIED", 1))
@@ -113,12 +127,24 @@ class ExecutionGCDFSafetyMonitor:
         warning_count = 0
         hard_count = 0
         all_d = []
+        learned_valid = []
+        raw_center_clearance_valid = []
 
         for i in range(n):
-            d = float(distances[i])
-            if not math.isfinite(d):
+            learned_d = float(learned_distances[i])
+            raw_clearance = float(raw_clearances[i])
+            if math.isfinite(learned_d):
+                learned_valid.append(learned_d)
+            if not math.isfinite(raw_clearance):
                 continue
+
+            # Convert sphere-to-voxel-CENTER clearance into a conservative
+            # sphere-to-voxel-VOLUME clearance. Anchor radius already includes
+            # the Phase-E body-model inflation.
+            d = raw_clearance - self.voxel_half_diagonal_m
+            raw_center_clearance_valid.append(raw_clearance)
             all_d.append(d)
+
             source = int(sources[i]) if i < len(sources) else source_unknown
             if source == source_occupied:
                 occupied_d.append(d)
@@ -132,6 +158,8 @@ class ExecutionGCDFSafetyMonitor:
         d_min = self._finite_min(all_d)
         unknown_min = self._finite_min(unknown_d)
         occupied_min = self._finite_min(occupied_d)
+        learned_d_min = self._finite_min(learned_valid)
+        raw_center_clearance_min = self._finite_min(raw_center_clearance_valid)
 
         if math.isfinite(d_min):
             if math.isfinite(unknown_min) and abs(d_min - unknown_min) < 1e-12:
@@ -149,6 +177,8 @@ class ExecutionGCDFSafetyMonitor:
             self.last_d_min = d_min
             self.last_unknown_min = unknown_min
             self.last_occupied_min = occupied_min
+            self.last_learned_d_min = learned_d_min
+            self.last_raw_center_clearance_min = raw_center_clearance_min
             self.last_pair_count = n
             self.last_unknown_count = len(unknown_d)
             self.last_occupied_count = len(occupied_d)
@@ -171,10 +201,17 @@ class ExecutionGCDFSafetyMonitor:
                 self._maybe_replan_locked(now, "hard")
             else:
                 if self.hard_hold:
-                    # Require repeated fresh non-violating batches before release.
-                    self.clear_consecutive += 1
-                    if self.clear_consecutive >= self.clear_consecutive_required:
-                        self.hard_hold = False
+                    # Fail closed: an empty/no-pair batch cannot prove that a
+                    # robot already in hard hold is safe (it could be inside a
+                    # surface-only obstacle shell). Release only after repeated
+                    # finite clearances beyond the warning margin.
+                    if (math.isfinite(d_min) and
+                            d_min >= self.warning_margin):
+                        self.clear_consecutive += 1
+                        if self.clear_consecutive >= self.clear_consecutive_required:
+                            self.hard_hold = False
+                            self.clear_consecutive = 0
+                    else:
                         self.clear_consecutive = 0
                 else:
                     self.clear_consecutive = 0
@@ -219,13 +256,16 @@ class ExecutionGCDFSafetyMonitor:
                  "SAFE")
         data = (
             "phase=E5 state={} batch_count={} d_min={} unknown_min={} "
-            "occupied_min={} pair_count={} unknown_pairs={} occupied_pairs={} "
+            "occupied_min={} learned_d_min={} raw_center_clearance_min={} "
+            "voxel_half_diagonal_m={} pair_count={} unknown_pairs={} occupied_pairs={} "
             "warning_pairs={} hard_pairs={} min_source={} "
             "warning_event_count={} hard_event_count={} stale_event_count={} "
             "replan_count={} hard_hold={} stale_hold={} batch_age_s={}"
         ).format(
             state, self.batch_count, self.last_d_min,
             self.last_unknown_min, self.last_occupied_min,
+            self.last_learned_d_min, self.last_raw_center_clearance_min,
+            self.voxel_half_diagonal_m,
             self.last_pair_count, self.last_unknown_count,
             self.last_occupied_count, self.last_warning_count,
             self.last_hard_count, self.last_source,
