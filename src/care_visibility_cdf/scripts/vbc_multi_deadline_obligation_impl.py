@@ -228,6 +228,17 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             return 0.0
         return float(len(sa & sb)) / float(len(sa | sb))
 
+    def _match_candidate_compatible(
+            self, ob: Dict[str, object], region: Dict[str, object]) -> bool:
+        """Semantic hook layered on top of spatial obligation matching.
+
+        The accumulated C4.6 mode keeps the historical spatial-only behavior.
+        Blocker-aware acquisition overrides this hook so a live region may reuse
+        an existing obligation only when that obligation's stored q_vis is still
+        a valid learned visibility solution for the new geometry.
+        """
+        return True
+
     def _match_existing(self, region: Dict[str, object]):
         best = None
         best_score = None
@@ -239,6 +250,8 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             elif d <= self.region_match_distance_m:
                 score = (1, -d, 0.0)
             else:
+                continue
+            if not self._match_candidate_compatible(ob, region):
                 continue
             if best_score is None or score > best_score:
                 best_score = score
