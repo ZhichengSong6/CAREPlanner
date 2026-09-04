@@ -37,6 +37,21 @@ CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confi
 
 cd "${REPO}"
 
+# Keep the whole batch, including the offline evaluator, on the system ROS
+# Python. Phase-E GPU/NCDF workers explicitly activate their own conda envs.
+if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
+  if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  fi
+  _qualification_conda_before="${CONDA_DEFAULT_ENV:-unknown}"
+  while [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); do
+    conda deactivate || break
+  done
+  echo "[QUALIFICATION ENV] sanitized inherited conda env (was ${_qualification_conda_before}); batch uses system ROS/Python"
+fi
+
 if [[ ! -f "${CASE_FILE}" ]]; then
   echo "[ERROR] Phase-E qualification case file not found:"
   echo "        ${CASE_FILE}"
