@@ -368,6 +368,11 @@ e5_d = [
     for r in e5_safety
     if as_float(r.get("d_min")) is not None
 ]
+e5_learned_d = [
+    as_float(r.get("learned_d_min"))
+    for r in e5_safety
+    if as_float(r.get("learned_d_min")) is not None
+]
 e5_age = [
     as_float(r.get("batch_age_s"))
     for r in e5_safety
@@ -377,7 +382,9 @@ digest["phase_e5_execution_gcdf"] = {
     "safety_records": len(e5_safety),
     "selector_records": len(e5_selector),
     "state_transitions": transition_sequence(e5_safety, "state"),
-    "min_measured_gcdf_distance": min(e5_d) if e5_d else None,
+    "min_workspace_clearance_m": min(e5_d) if e5_d else None,
+    "min_learned_gcdf_distance": (
+        min(e5_learned_d) if e5_learned_d else None),
     "max_batch_age_s": max(e5_age) if e5_age else None,
     "warning_event_count": max(
         [as_int(r.get("warning_event_count"), 0) for r in e5_safety] or [0]),
