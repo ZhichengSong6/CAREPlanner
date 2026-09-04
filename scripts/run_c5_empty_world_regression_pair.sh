@@ -79,6 +79,13 @@ echo "================================================================"
 
 git worktree add --detach "${BASE_WT}" "${BASELINE_FULL}"
 
+# Historical revisions depend on the PIQP git submodule. A detached worktree
+# does not populate submodule contents automatically, so initialize the exact
+# gitlink recorded by the baseline revision before building.
+echo "[BASELINE] initializing submodules for ${BASELINE_SHORT}..."
+git -C "${BASE_WT}" submodule sync --recursive
+git -C "${BASE_WT}" submodule update --init --recursive
+
 # Some learned-model checkpoints may intentionally be kept outside historical
 # git revisions. Reuse the exact current checkpoint file if the old worktree
 # does not contain it; code/config still comes from the historical revision.
