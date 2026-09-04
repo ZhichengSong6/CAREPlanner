@@ -547,6 +547,7 @@ class CppForbiddenVoxelGpuShadow {
   std::vector<PairMeta> buildPairs(
       const std::vector<Anchor>& anchors,
       const MapIndex& map,
+      Channel channel,
       double proximity_margin,
       std::size_t* raw_pair_count,
       int* active_step_count) {
@@ -614,6 +615,16 @@ class CppForbiddenVoxelGpuShadow {
               const std::size_t ulinear =
                   static_cast<std::size_t>(linear);
               if (map.low[ulinear] == 0) {
+                continue;
+              }
+
+              // Phase E5 semantic reset:
+              // execution emergency safety is PHYSICAL collision safety.
+              // UNKNOWN is epistemic risk and is handled by planning/VBC/
+              // active sensing; it must never hard-stop the measured robot.
+              if (channel == Channel::EXECUTION &&
+                  map.source_type[ulinear] !=
+                      care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED) {
                 continue;
               }
 
@@ -1212,7 +1223,8 @@ class CppForbiddenVoxelGpuShadow {
             ? execution_proximity_margin_
             : proximity_margin_;
     std::vector<PairMeta> pairs = buildPairs(
-        anchors, *map, pair_margin, &raw_pair_count, &active_step_count);
+        anchors, *map, channel, pair_margin,
+        &raw_pair_count, &active_step_count);
     const auto selection_t1 = Clock::now();
 
     // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
