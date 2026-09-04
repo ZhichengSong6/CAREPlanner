@@ -167,15 +167,10 @@ class ExecutionGCDFSafetyMonitor:
         learned_d_min = self._finite_min(learned_valid)
         raw_center_clearance_min = self._finite_min(raw_center_clearance_valid)
 
-        if math.isfinite(d_min):
-            if math.isfinite(unknown_min) and abs(d_min - unknown_min) < 1e-12:
-                source_name = "unknown"
-            elif math.isfinite(occupied_min) and abs(d_min - occupied_min) < 1e-12:
-                source_name = "occupied"
-            else:
-                source_name = "mixed"
-        else:
-            source_name = "none"
+        # d_min is intentionally computed from OCCUPIED rows only.
+        # unknown_min is diagnostic and never participates in the execution
+        # collision gate.
+        source_name = "occupied" if math.isfinite(d_min) else "none"
 
         with self._lock:
             self.last_batch_received = now
