@@ -76,6 +76,19 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._progressive_shared_last_dropped_ids: List[int] = []
         self._progressive_shared_last_slacks: Dict[int, float] = {}
 
+        # Obligation identity coherence. Spatial proximity alone is insufficient:
+        # a matched obligation may keep its old q_vis only while that q_vis still
+        # makes the newly observed region learned-visible. These fields exist
+        # before parent initialization because ROS callbacks may start early.
+        self._obligation_match_qvis_min_f = 0.0
+        self._qvis_match_check_count = 0
+        self._qvis_match_accept_count = 0
+        self._qvis_match_reject_count = 0
+        self._qvis_match_error_count = 0
+        self._qvis_match_last_obligation_id = -1
+        self._qvis_match_last_f_min = math.nan
+        self._qvis_match_last_reason = "startup"
+
         # C5.12 direct final-GCDF recovery evidence.  A rejected executable
         # trajectory can expose low-confidence voxels that the task-bootstrap
         # VBC does not report (notably braking-tail sweep).  Keep this evidence
@@ -115,6 +128,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "~progressive_shared_max_regions", 3))
         self.progressive_shared_accept_f_min = float(rospy.get_param(
             "~progressive_shared_accept_f_min", 0.0))
+        self._obligation_match_qvis_min_f = float(rospy.get_param(
+            "~obligation_match_qvis_min_f", 0.0))
 
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
@@ -136,6 +151,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             raise ValueError("~progressive_shared_max_regions must be >= 1")
         if not math.isfinite(self.progressive_shared_accept_f_min):
             raise ValueError("~progressive_shared_accept_f_min must be finite")
+        if not math.isfinite(self._obligation_match_qvis_min_f):
+            raise ValueError("~obligation_match_qvis_min_f must be finite")
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
@@ -441,6 +458,67 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._consider_active_layer(active_ids, new_ids, sweep_s)
         self._publish_schedule()
         self._publish_blocker_stack_summary()
+
+    def _match_candidate_compatible(
+            self, ob: Dict[str, object], region: Dict[str, object]) -> bool:
+        """Require the stored q_vis to remain valid for refreshed geometry.
+
+        A spatial match is accepted only when the old q_vis still satisfies the
+        learned visibility field for every point in the new region. If it does
+        not, _match_existing returns no match and the normal obligation creation
+        path generates a new q_vis tied to the new geometry instead of silently
+        overwriting points/centroid under a stale q_vis.
+        """
+        self._qvis_match_check_count += 1
+        oid = int(ob.get("id", -1))
+        self._qvis_match_last_obligation_id = oid
+
+        q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
+        points = np.asarray(
+            region.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if (q_vis.shape != (7,) or not np.all(np.isfinite(q_vis)) or
+                points.shape[0] == 0 or not np.all(np.isfinite(points))):
+            self._qvis_match_reject_count += 1
+            self._qvis_match_last_f_min = math.nan
+            self._qvis_match_last_reason = "invalid_qvis_or_region"
+            return False
+
+        try:
+            x = torch.tensor(points, device=self.device, dtype=torch.float32)
+            q = torch.tensor(
+                q_vis.reshape(1, 7), device=self.device, dtype=torch.float32)
+            values = self._per_point_values(x, q)
+            f_min = float(np.min(values)) if values.size else -math.inf
+        except Exception as exc:
+            self._qvis_match_error_count += 1
+            self._qvis_match_reject_count += 1
+            self._qvis_match_last_f_min = math.nan
+            self._qvis_match_last_reason = "learned_visibility_eval_error"
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_blocker_stack] q_vis compatibility evaluation failed "
+                "obligation=%d; refusing stale-identity reuse: %s",
+                oid, exc)
+            return False
+
+        self._qvis_match_last_f_min = f_min
+        compatible = bool(
+            math.isfinite(f_min) and
+            f_min + 1e-9 >= self._obligation_match_qvis_min_f)
+        if compatible:
+            self._qvis_match_accept_count += 1
+            self._qvis_match_last_reason = "qvis_compatible"
+            return True
+
+        self._qvis_match_reject_count += 1
+        self._qvis_match_last_reason = "qvis_incompatible_new_obligation"
+        rospy.logwarn_throttle(
+            0.5,
+            "[vbc_blocker_stack] REJECT stale obligation identity id=%d "
+            "old_q_vis new_region_f_min=%+.5f required=%+.5f; "
+            "new geometry will receive its own q_vis",
+            oid, f_min, self._obligation_match_qvis_min_f)
+        return False
 
     def _update_matched_geometry_diagnostics(
             self, matched, region, source: str) -> None:
@@ -1023,6 +1101,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" coherent_bundle_drop_count={self._coherent_bundle_drop_count}"
             f" coherent_bundle_reason={self._coherent_bundle_last_reason}"
             f" switch_reason={self._last_switch_reason}"
+            f" obligation_match_qvis_min_f={self._obligation_match_qvis_min_f:.6f}"
+            f" qvis_match_check_count={self._qvis_match_check_count}"
+            f" qvis_match_accept_count={self._qvis_match_accept_count}"
+            f" qvis_match_reject_count={self._qvis_match_reject_count}"
+            f" qvis_match_error_count={self._qvis_match_error_count}"
+            f" qvis_match_last_obligation_id={self._qvis_match_last_obligation_id}"
+            f" qvis_match_last_f_min={self._qvis_match_last_f_min:.6f}"
+            f" qvis_match_last_reason={self._qvis_match_last_reason}"
             f" progressive_shared_enabled={int(self.progressive_shared_repair_enabled)}"
             f" progressive_shared_max_regions={self.progressive_shared_max_regions}"
             f" progressive_shared_accept_f_min={self.progressive_shared_accept_f_min:.6f}"
