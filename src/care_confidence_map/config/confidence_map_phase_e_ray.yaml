@@ -61,6 +61,11 @@ current_body_prior:
   # required body TFs are available, performs one complete refresh, then locks.
   refresh_on_startup: false
 
+  # Safety invariant: the trusted-clear body prior belongs only to q_start.
+  # Once the initializer gets a complete-TF refresh, reject every later
+  # request that would move this free-space bubble with the robot.
+  lock_after_complete_refresh: true
+
   # false = include all body samples, including base if present.
   # true  = only include samples marked include_for_risk in body_samples.yaml.
   risk_samples_only: false
