@@ -713,7 +713,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
             return
-        if not math.isfinite(sweep_s) or sweep_s > self.blocker_push_max_sweep_s:
+        # ROS trajectory times are floating-point values. A nominal 0.30 s
+        # layer may arrive as 0.30000000000000004; treating that as strictly
+        # beyond a 0.30 s blocker horizon silently prevents the second
+        # confirmation and defeats recursive blocker preemption. Admit the
+        # configured boundary with a tiny numerical tolerance.
+        sweep_tol_s = 1e-9
+        if (not math.isfinite(sweep_s) or
+                sweep_s > self.blocker_push_max_sweep_s + sweep_tol_s):
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
             return
