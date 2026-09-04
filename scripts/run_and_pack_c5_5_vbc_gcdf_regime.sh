@@ -2,6 +2,27 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+
+# ROS Noetic/Gazebo scripts use /usr/bin/env python3. If CAREPlanner is
+# launched from a research conda env (e.g. viscdf), spawn_model and controller
+# spawner inherit that interpreter and can import rospy via ROS_PYTHONPATH while
+# still missing system packages such as rospkg. Normalize the parent shell here
+# so every C5 caller (Phase D, Phase E, direct single-case runs) starts the ROS/
+# Gazebo stack from the system environment. GPU/NCDF subprocesses explicitly
+# activate their own conda env later.
+if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
+  if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  fi
+  _care_c5_conda_before="${CONDA_DEFAULT_ENV:-unknown}"
+  while [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); do
+    conda deactivate || break
+  done
+  echo "[C5 ENV] sanitized inherited conda env (was ${_care_c5_conda_before}); ROS/Gazebo use system Python"
+fi
+
 CASE_ID="${CASE_ID:-case_003}"
 RUN_SECONDS="${RUN_SECONDS:-30.0}"
 
