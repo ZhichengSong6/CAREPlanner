@@ -145,7 +145,7 @@ pack_debug_bundle() {
   # streams, etc.) are already included via RUN_OUT above.
   local f src
   for f in waypoint_generator.log controlled.log common_runner.log \
-           low_level_tracker.log gpu_worker.log; do
+           low_level_tracker.log gazebo.log gpu_worker.log; do
     src=""
     if [[ -f "${ROOT_LOG}/${f}" ]]; then
       src="${ROOT_LOG}/${f}"
