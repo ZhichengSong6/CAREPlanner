@@ -147,35 +147,79 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
     # ------------------------------------------------------------------
     def _query_region_seen(self, ob: Dict[str, object]):
         points = np.asarray(ob["points"], dtype=np.float64).reshape(-1, 3)
-        if points.shape[0] == 0:
+        n = int(points.shape[0])
+        nan3 = np.asarray(
+            [math.nan, math.nan, math.nan], dtype=np.float64)
+        xyz_min = (
+            np.min(points, axis=0).astype(np.float64)
+            if n else nan3.copy())
+        xyz_max = (
+            np.max(points, axis=0).astype(np.float64)
+            if n else nan3.copy())
+        query_diag = {
+            "status": "empty_points" if n == 0 else "not_queried",
+            "inside_count": 0,
+            "outside_count": n,
+            "finite_confidence_count": 0,
+            "nonfinite_confidence_count": 0,
+            "finite_current_visibility_count": 0,
+            "xyz_min": xyz_min,
+            "xyz_max": xyz_max,
+            "response_confidence_count": -1,
+            "response_inside_count": -1,
+            "response_visibility_count": -1,
+        }
+        if n == 0:
             return (
                 False, 0.0, math.nan, math.nan, math.nan, 0,
-                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
-                math.nan)
+                nan3.copy(), math.nan, query_diag)
+
         req = QueryConfidenceRequest()
         req.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
                       for p in points]
         try:
             res = self.confidence_client(req)
         except Exception as exc:
+            query_diag["status"] = "service_exception"
             rospy.logwarn_throttle(
                 1.0, "[vbc_acquisition] confidence query failed: %s", exc)
             return (
-                False, 0.0, math.nan, math.nan, math.nan, int(points.shape[0]),
-                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
-                math.nan)
-        n = points.shape[0]
+                False, 0.0, math.nan, math.nan, math.nan, n,
+                nan3.copy(), math.nan, query_diag)
+
+        query_diag["response_confidence_count"] = len(res.confidence)
+        query_diag["response_inside_count"] = len(res.inside_map)
+        query_diag["response_visibility_count"] = len(res.current_visibility)
         if (len(res.confidence) != n or len(res.inside_map) != n or
                 len(res.current_visibility) != n):
+            query_diag["status"] = "length_mismatch"
+            rospy.logwarn_throttle(
+                1.0,
+                "[vbc_acquisition] confidence query length mismatch "
+                "points=%d confidence=%d inside=%d visibility=%d",
+                n, len(res.confidence), len(res.inside_map),
+                len(res.current_visibility))
             return (
-                False, 0.0, math.nan, math.nan, math.nan, int(n),
-                np.asarray([math.nan, math.nan, math.nan], dtype=np.float64),
-                math.nan)
+                False, 0.0, math.nan, math.nan, math.nan, n,
+                nan3.copy(), math.nan, query_diag)
 
         conf = np.asarray(res.confidence, dtype=np.float64)
         inside = np.asarray(res.inside_map, dtype=bool)
         current_vis = np.asarray(res.current_visibility, dtype=np.float64)
-        finite_inside = inside & np.isfinite(conf)
+        finite_conf = np.isfinite(conf)
+        finite_inside = inside & finite_conf
+        finite_vis = np.isfinite(current_vis)
+
+        query_diag["status"] = "ok"
+        query_diag["inside_count"] = int(np.count_nonzero(inside))
+        query_diag["outside_count"] = int(n - np.count_nonzero(inside))
+        query_diag["finite_confidence_count"] = int(
+            np.count_nonzero(finite_inside))
+        query_diag["nonfinite_confidence_count"] = int(
+            np.count_nonzero(inside & ~finite_conf))
+        query_diag["finite_current_visibility_count"] = int(
+            np.count_nonzero(finite_vis))
+
         good = finite_inside & (conf >= self.seen_threshold)
         fraction = float(np.mean(good)) if n else 0.0
         seen = fraction + 1e-12 >= self.required_seen_fraction
@@ -187,11 +231,10 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             float(np.mean(conf[finite_inside]))
             if np.any(finite_inside) else math.nan)
         max_vis = (
-            float(np.nanmax(current_vis))
-            if current_vis.size else math.nan)
+            float(np.max(current_vis[finite_vis]))
+            if np.any(finite_vis) else math.nan)
 
-        worst_point = np.asarray(
-            [math.nan, math.nan, math.nan], dtype=np.float64)
+        worst_point = nan3.copy()
         if np.any(finite_inside):
             valid_indices = np.where(finite_inside)[0]
             worst_idx = int(valid_indices[np.argmin(conf[valid_indices])])
@@ -205,8 +248,40 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             q_dist_inf = float(np.max(np.abs(measured - q_vis)))
 
         return (
-            bool(seen), fraction, min_conf, mean_conf, max_vis, int(n),
-            worst_point, q_dist_inf)
+            bool(seen), fraction, min_conf, mean_conf, max_vis, n,
+            worst_point, q_dist_inf, query_diag)
+
+    @staticmethod
+    def _obligation_geometry_diagnostics(ob: Dict[str, object]):
+        nan3 = np.asarray(
+            [math.nan, math.nan, math.nan], dtype=np.float64)
+        current_centroid = np.asarray(
+            ob.get("centroid", nan3), dtype=np.float64).reshape(3)
+        source_centroid = np.asarray(
+            ob.get("q_vis_source_centroid", current_centroid),
+            dtype=np.float64).reshape(3)
+        source_shift = (
+            float(np.linalg.norm(current_centroid - source_centroid))
+            if np.all(np.isfinite(current_centroid)) and
+               np.all(np.isfinite(source_centroid))
+            else math.nan)
+        return {
+            "match_update_count": int(
+                ob.get("geometry_match_update_count", 0)),
+            "match_change_count": int(
+                ob.get("geometry_match_change_count", 0)),
+            "changed_since_qvis": bool(
+                ob.get("geometry_changed_since_qvis", False)),
+            "last_match_centroid_shift_m": float(
+                ob.get("last_match_centroid_shift_m", math.nan)),
+            "centroid_shift_from_qvis_m": source_shift,
+            "max_centroid_shift_from_qvis_m": float(
+                ob.get("max_centroid_shift_from_qvis_m", source_shift)),
+            "current_centroid": current_centroid,
+            "q_vis_source_centroid": source_centroid,
+            "last_match_source": str(
+                ob.get("last_geometry_match_source", "unknown")),
+        }
 
     def _update_actual_visibility_completion(self) -> None:
         if not self._c47_ready:
@@ -233,11 +308,13 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         diagnostics = []
         for ob in snapshot:
             (seen, frac, min_conf, mean_conf, max_vis, point_count,
-             worst_point, q_dist_inf) = self._query_region_seen(ob)
+             worst_point, q_dist_inf, query_diag) = self._query_region_seen(ob)
             oid = int(ob["id"])
+            geometry_diag = self._obligation_geometry_diagnostics(ob)
             diagnostics.append((
                 oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
-                q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy()))
+                q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy(),
+                query_diag, geometry_diag))
             if seen:
                 seen_ids.append(oid)
 
@@ -262,6 +339,13 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self.acquisition_complete_pub.publish(Bool(data=complete))
         self._publish_acquisition_summary(diagnostics)
 
+    @staticmethod
+    def _fmt_xyz_diag(values) -> str:
+        arr = np.asarray(values, dtype=np.float64).reshape(3)
+        return ",".join(
+            "nan" if not math.isfinite(float(v)) else f"{float(v):.3f}"
+            for v in arr)
+
     def _publish_acquisition_summary(self, diagnostics) -> None:
         remaining = self._ordered_obligations()
         msg = String()
@@ -275,12 +359,40 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 f"{float(worst_point[2]):.3f}"
             )
             for (oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
-                 q_dist_inf, worst_point) in diagnostics)
+                 q_dist_inf, worst_point, _query_diag, _geometry_diag)
+            in diagnostics)
 
-        if diagnostics:
+        geometry_text = ";".join(
+            (
+                f"{oid}|{query_diag.get('status','unknown')}|"
+                f"{int(query_diag.get('inside_count',0))}|"
+                f"{int(query_diag.get('outside_count',0))}|"
+                f"{int(query_diag.get('finite_confidence_count',0))}|"
+                f"{int(query_diag.get('nonfinite_confidence_count',0))}|"
+                f"{int(geometry_diag.get('match_update_count',0))}|"
+                f"{int(geometry_diag.get('match_change_count',0))}|"
+                f"{int(bool(geometry_diag.get('changed_since_qvis',False)))}|"
+                f"{float(geometry_diag.get('centroid_shift_from_qvis_m',math.nan)):.4f}|"
+                f"{float(geometry_diag.get('last_match_centroid_shift_m',math.nan)):.4f}|"
+                f"{self._fmt_xyz_diag(geometry_diag.get('current_centroid'))}|"
+                f"{self._fmt_xyz_diag(geometry_diag.get('q_vis_source_centroid'))}|"
+                f"{self._fmt_xyz_diag(query_diag.get('xyz_min'))}|"
+                f"{self._fmt_xyz_diag(query_diag.get('xyz_max'))}"
+            )
+            for (oid, _seen, _point_count, _frac, _min_conf, _mean_conf,
+                 _max_vis, _q_dist_inf, _worst_point, query_diag,
+                 geometry_diag) in diagnostics)
+
+        remaining_ids = [int(ob["id"]) for ob in remaining]
+        by_id = {int(row[0]): row for row in diagnostics}
+        active_row = (
+            by_id.get(remaining_ids[0])
+            if remaining_ids else None)
+        if active_row is not None:
             (active_oid, active_seen, active_point_count, active_frac,
              active_min_conf, active_mean_conf, active_max_vis,
-             active_q_dist_inf, active_worst_point) = diagnostics[0]
+             active_q_dist_inf, active_worst_point, active_query_diag,
+             active_geometry_diag) = active_row
         else:
             active_oid = -1
             active_seen = False
@@ -292,6 +404,27 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             active_q_dist_inf = math.nan
             active_worst_point = np.asarray(
                 [math.nan, math.nan, math.nan], dtype=np.float64)
+            active_query_diag = {
+                "status": "none",
+                "inside_count": 0,
+                "outside_count": 0,
+                "finite_confidence_count": 0,
+                "nonfinite_confidence_count": 0,
+                "finite_current_visibility_count": 0,
+                "xyz_min": active_worst_point,
+                "xyz_max": active_worst_point,
+            }
+            active_geometry_diag = {
+                "match_update_count": 0,
+                "match_change_count": 0,
+                "changed_since_qvis": False,
+                "last_match_centroid_shift_m": math.nan,
+                "centroid_shift_from_qvis_m": math.nan,
+                "max_centroid_shift_from_qvis_m": math.nan,
+                "current_centroid": active_worst_point,
+                "q_vis_source_centroid": active_worst_point,
+                "last_match_source": "none",
+            }
 
         measured = self._latest_measured_q
         measured_text = (
@@ -330,9 +463,39 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f"{float(active_worst_point[0]):.4f},"
             f"{float(active_worst_point[1]):.4f},"
             f"{float(active_worst_point[2]):.4f}"
+            f" active_query_status={active_query_diag.get('status','unknown')}"
+            f" active_inside_map_count={int(active_query_diag.get('inside_count',0))}"
+            f" active_outside_map_count={int(active_query_diag.get('outside_count',0))}"
+            f" active_finite_confidence_count="
+            f"{int(active_query_diag.get('finite_confidence_count',0))}"
+            f" active_nonfinite_confidence_count="
+            f"{int(active_query_diag.get('nonfinite_confidence_count',0))}"
+            f" active_finite_current_visibility_count="
+            f"{int(active_query_diag.get('finite_current_visibility_count',0))}"
+            f" active_xyz_min={self._fmt_xyz_diag(active_query_diag.get('xyz_min'))}"
+            f" active_xyz_max={self._fmt_xyz_diag(active_query_diag.get('xyz_max'))}"
+            f" active_geometry_match_update_count="
+            f"{int(active_geometry_diag.get('match_update_count',0))}"
+            f" active_geometry_match_change_count="
+            f"{int(active_geometry_diag.get('match_change_count',0))}"
+            f" active_geometry_changed_since_qvis="
+            f"{int(bool(active_geometry_diag.get('changed_since_qvis',False)))}"
+            f" active_centroid_shift_from_qvis_m="
+            f"{float(active_geometry_diag.get('centroid_shift_from_qvis_m',math.nan)):.6f}"
+            f" active_max_centroid_shift_from_qvis_m="
+            f"{float(active_geometry_diag.get('max_centroid_shift_from_qvis_m',math.nan)):.6f}"
+            f" active_last_match_centroid_shift_m="
+            f"{float(active_geometry_diag.get('last_match_centroid_shift_m',math.nan)):.6f}"
+            f" active_current_centroid="
+            f"{self._fmt_xyz_diag(active_geometry_diag.get('current_centroid'))}"
+            f" active_q_vis_source_centroid="
+            f"{self._fmt_xyz_diag(active_geometry_diag.get('q_vis_source_centroid'))}"
+            f" active_last_geometry_match_source="
+            f"{active_geometry_diag.get('last_match_source','unknown')}"
             f" measured_q={measured_text}"
             f" active_q_vis={active_q_vis_text}"
             f" region_checks={diag_text or 'none'}"
+            f" geometry_checks={geometry_text or 'none'}"
         )
         self.acquisition_summary_pub.publish(msg)
 
