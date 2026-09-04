@@ -2,6 +2,24 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+
+# Phase-D launches ROS/Gazebo and also runs ROS-package-backed offline
+# evaluators (e.g. urdf_parser_py). Do not inherit an arbitrary research conda
+# interpreter from the caller. The C5 child runner has the same guard so direct
+# C5 invocation is independently safe.
+if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
+  if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  fi
+  _phase_d_conda_before="${CONDA_DEFAULT_ENV:-unknown}"
+  while [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); do
+    conda deactivate || break
+  done
+  echo "[PHASE D ENV] sanitized inherited conda env (was ${_phase_d_conda_before}); benchmark uses system ROS/Python"
+fi
+
 # Canonical Phase-D benchmark duration is fixed ROS/Gazebo simulation time,
 # independent of host load / Gazebo real-time factor. Goal-conditioned early
 # termination remains available as an explicit opt-in diagnostic.
