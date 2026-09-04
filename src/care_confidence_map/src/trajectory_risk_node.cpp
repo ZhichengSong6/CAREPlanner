@@ -3353,7 +3353,7 @@ private:
   double forbidden_space_body_inflation_m_ = 0.0;
   std::vector<std::string> ignored_risk_links_;
 
-  bool refresh_body_prior_before_query_ = true;
+  bool refresh_body_prior_before_query_ = false;
   bool event_driven_eval_ = false;
   bool forbidden_space_pair_publish_enabled_ = false;
   bool show_full_trajectory_markers_ = false;
