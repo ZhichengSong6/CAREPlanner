@@ -15,7 +15,9 @@ joint configuration q such that:
 This is intentionally OFFLINE. It does not start ROS, Gazebo, the planner,
 confidence map, or any controller.
 
-The collision test matches the current CAREPlanner GCDF body proxy:
+Kinematics/IK use the full Arm.urdf because the benchmark goal is defined at
+EE_link. Collision checking remains independent and matches the current
+CAREPlanner GCDF body proxy:
   body_samples.yaml sphere radius + --body-inflation (default 0.015 m).
 
 Outputs one JSON report plus a concise terminal summary with one of:
@@ -368,7 +370,11 @@ def main() -> int:
         "--urdf",
         type=Path,
         default=None,
-        help="Default: Arm_with_self_filter_collision.urdf",
+        help=(
+            "Default: full Arm.urdf. The full model is required because the "
+            "benchmark goal is defined at EE_link; collision geometry is still "
+            "taken from body_samples.yaml."
+        ),
     )
     ap.add_argument(
         "--body-samples",
@@ -419,7 +425,7 @@ def main() -> int:
     cases_json = (args.cases_json or (
         repo / "src/egocentric_arm_planner/config/phase_c2_vbc_cases.json")).resolve()
     urdf = (args.urdf or (
-        repo / "src/arm_description/urdf/Arm_with_self_filter_collision.urdf")).resolve()
+        repo / "src/arm_description/urdf/Arm.urdf")).resolve()
     body_samples_path = (args.body_samples or (
         repo / "src/care_confidence_map/config/body_samples.yaml")).resolve()
     world = (args.world or (
