@@ -3,10 +3,11 @@ set -euo pipefail
 
 # Phase-E obligation geometry / confidence-query diagnostic.
 #
-# Diagnostic only: planner semantics remain unchanged. The run uses the current
-# blocker-aware C5.41 policy and records whether persistent obligations:
-#   1) leave the confidence-map bounds / lose finite confidence samples, or
-#   2) drift spatially after q_vis was generated while keeping the old q_vis.
+# Focused Phase-E validation for obligation identity coherence. The run uses
+# blocker-aware C5.41 plus q_vis-compatible obligation matching and records:
+#   1) confidence-query transport / response validity,
+#   2) accepted geometry refreshes relative to q_vis provenance, and
+#   3) stale-identity rejections that force a new geometry-specific q_vis.
 #
 # Default representative case: phase_e_goal_014, empty world, 15 s.
 
@@ -84,8 +85,8 @@ echo "PHASE-E OBLIGATION GEOMETRY DIAGNOSTIC"
 echo "case       : ${CASE_ID}"
 echo "world      : ${WORLD_FILE}"
 echo "runtime    : ${RUN_SECONDS}s"
-echo "planner    : current blocker-aware C5.41 (unchanged)"
-echo "diagnostic : confidence validity + q_vis geometry provenance"
+echo "planner    : C5.41 + q_vis-compatible obligation identity"
+echo "diagnostic : confidence validity + geometry/q_vis coherence"
 echo "================================================================"
 
 cleanup_ros
@@ -157,18 +158,21 @@ def token_rows(name):
         header = next(rd, [])
         if not header:
             return out
-        data_i = header.index("field.data") if "field.data" in header else None
+        time_i = header.index("%time") if "%time" in header else 0
+        data_i = header.index("field.data") if "field.data" in header else 1
         for row in rd:
-            if data_i is not None and len(row) > data_i:
-                text = row[data_i]
-            else:
-                text = ",".join(row[1:])
+            if len(row) <= data_i:
+                continue
+            # rostopic CSV may split field.data at commas embedded in token
+            # values (xyz, q vectors). The normal C5 digest deliberately joins
+            # every column from field.data onward; keep this parser identical.
+            text = ",".join(row[data_i:])
             d = dict(TOKEN.findall(text))
             if d:
                 try:
-                    d["_t"] = float(row[0])
+                    d["_t"] = float(row[time_i]) / 1e9
                 except Exception:
-                    pass
+                    d["_t"] = math.nan
                 out.append(d)
     return out
 
@@ -196,7 +200,8 @@ valid_rows = [
 ]
 outside_rows = [
     r for r in valid_rows
-    if integer(r.get("active_point_count"), 0) > 0 and
+    if r.get("active_query_status") == "ok" and
+       integer(r.get("active_point_count"), 0) > 0 and
        integer(r.get("active_inside_map_count"), 0) == 0
 ]
 length_mismatch_rows = [
@@ -207,6 +212,10 @@ service_exception_rows = [
     r for r in valid_rows
     if r.get("active_query_status") == "service_exception"
 ]
+service_exception_errors = sorted({
+    r.get("active_query_error", "unknown")
+    for r in service_exception_rows
+})
 nonfinite_rows = [
     r for r in valid_rows
     if integer(r.get("active_nonfinite_confidence_count"), 0) > 0
@@ -240,10 +249,10 @@ unsafe_pred = [
        r.get("has_violation") == "1"
 ]
 
-if outside_rows:
-    primary = "ACTIVE_OBLIGATION_ALL_POINTS_OUTSIDE_MAP"
-elif length_mismatch_rows or service_exception_rows:
+if length_mismatch_rows or service_exception_rows:
     primary = "CONFIDENCE_QUERY_TRANSPORT_OR_RESPONSE_FAILURE"
+elif outside_rows:
+    primary = "ACTIVE_OBLIGATION_ALL_POINTS_OUTSIDE_MAP"
 elif nonfinite_rows:
     primary = "INSIDE_MAP_CONFIDENCE_NONFINITE"
 elif geometry_changed_rows and max_historical_source_shift > 0.05:
@@ -278,6 +287,13 @@ report = {
     } if first_outside else None,
     "length_mismatch_record_count": len(length_mismatch_rows),
     "service_exception_record_count": len(service_exception_rows),
+    "service_exception_first_t": (
+        service_exception_rows[0].get("_t")
+        if service_exception_rows else None),
+    "service_exception_last_t": (
+        service_exception_rows[-1].get("_t")
+        if service_exception_rows else None),
+    "service_exception_errors": service_exception_errors,
     "inside_map_nonfinite_confidence_record_count": len(nonfinite_rows),
     "geometry_changed_since_qvis_record_count": len(geometry_changed_rows),
     "max_current_centroid_shift_from_qvis_m": max_source_shift,
@@ -311,6 +327,19 @@ report = {
             last_acq.get("active_geometry_changed_since_qvis"), 0),
         "cycle_block_count": integer(
             last_blk.get("cycle_block_count"), 0),
+        "qvis_match_check_count": integer(
+            last_blk.get("qvis_match_check_count"), 0),
+        "qvis_match_accept_count": integer(
+            last_blk.get("qvis_match_accept_count"), 0),
+        "qvis_match_reject_count": integer(
+            last_blk.get("qvis_match_reject_count"), 0),
+        "qvis_match_error_count": integer(
+            last_blk.get("qvis_match_error_count"), 0),
+        "qvis_match_last_obligation_id": integer(
+            last_blk.get("qvis_match_last_obligation_id"), -1),
+        "qvis_match_last_f_min": num(
+            last_blk.get("qvis_match_last_f_min")),
+        "qvis_match_last_reason": last_blk.get("qvis_match_last_reason"),
         "blocker_stack": last_blk.get("stack"),
         "blocker_switch_reason": last_blk.get("switch_reason"),
         "regime_state": last_reg.get("state"),
@@ -333,7 +362,7 @@ case_id=${CASE_ID}
 world_file=${WORLD_FILE}
 confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 run_seconds=${RUN_SECONDS}
-planner_semantics=current_blocker_aware_c5_41_unchanged
+planner_semantics=c5_41_qvis_compatible_obligation_identity
 EOF
 
 rm -f "${UPLOAD_ZIP}"
