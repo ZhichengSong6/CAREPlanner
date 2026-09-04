@@ -44,7 +44,7 @@
   <arg name="event_driven_eval" default="false" />
   <arg name="max_eval_timesteps" default="50" />
   <arg name="query_timeout" default="0.10" />
-  <arg name="refresh_body_prior_before_query" default="true" />
+  <arg name="refresh_body_prior_before_query" default="false" />
 
   <!-- Marker publish rate is throttled separately from risk eval rate. -->
   <arg name="marker_publish_rate" default="2.0" />
