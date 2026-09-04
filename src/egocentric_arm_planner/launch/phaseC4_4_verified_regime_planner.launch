@@ -522,7 +522,7 @@
            value="$(arg forbidden_space_confidence_threshold)" />
     <param name="map_resolution" value="0.05" />
     <param name="proximity_margin" value="$(arg local_scp_proximity_margin)" />
-    <param name="execution_proximity_margin" value="0.075" />
+    <param name="execution_proximity_margin" value="0.12" />
     <param name="max_pairs_per_step" value="250" />
     <param name="signed_zero_band" value="0.05" />
     <param name="max_pairs" value="8000" />
@@ -586,6 +586,7 @@
              value="$(arg execution_gcdf_warning_margin)" />
       <param name="hard_margin"
              value="$(arg execution_gcdf_hard_margin)" />
+      <param name="voxel_resolution_m" value="0.05" />
       <param name="stale_timeout_s"
              value="$(arg execution_gcdf_stale_timeout_s)" />
       <param name="startup_grace_s" value="2.0" />
