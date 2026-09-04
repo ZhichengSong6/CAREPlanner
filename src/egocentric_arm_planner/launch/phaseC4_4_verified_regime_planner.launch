@@ -80,6 +80,7 @@
        default="/care_planner/execution_gcdf/hard_hold" />
   <arg name="execution_gcdf_warning_margin" default="0.05" />
   <arg name="execution_gcdf_hard_margin" default="0.0" />
+  <arg name="gcdf_body_inflation_m" default="0.0" />
   <arg name="execution_gcdf_stale_timeout_s" default="0.35" />
 
   <!-- C5.9 commit-pipeline serialization. Legacy C4.x remains transparent.
@@ -436,6 +437,8 @@
            value="/care_planner/final_gcdf/body_sweep_anchors" />
       <arg name="forbidden_space_confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
       <arg name="show_full_trajectory_markers" value="false" />
       <arg name="show_worst_timestep_markers" value="false" />
       <arg name="show_attribution_markers" value="false" />
@@ -476,6 +479,8 @@
            value="$(arg local_scp_body_anchor_topic)" />
       <arg name="forbidden_space_confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
       <arg name="show_full_trajectory_markers" value="false" />
       <arg name="show_worst_timestep_markers" value="false" />
       <arg name="show_attribution_markers" value="false" />
@@ -555,6 +560,8 @@
            value="$(arg execution_gcdf_body_anchor_topic)" />
       <arg name="forbidden_space_confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
       <arg name="show_full_trajectory_markers" value="false" />
       <arg name="show_worst_timestep_markers" value="false" />
       <arg name="show_attribution_markers" value="false" />
@@ -598,6 +605,8 @@
          value="$(arg forbidden_space_pair_topic)" />
     <arg name="forbidden_space_confidence_threshold"
          value="$(arg forbidden_space_confidence_threshold)" />
+    <arg name="forbidden_space_body_inflation_m"
+         value="$(arg gcdf_body_inflation_m)" />
     <arg name="show_full_trajectory_markers" value="false" />
     <arg name="show_worst_timestep_markers" value="false" />
     <arg name="show_attribution_markers" value="false" />
