@@ -528,6 +528,19 @@ private:
         forbidden_space_confidence_threshold_,
         0.50);
 
+    pnh_.param(
+        "trajectory_risk/forbidden_space_body_inflation_m",
+        forbidden_space_body_inflation_m_,
+        0.0);
+
+    if (forbidden_space_body_inflation_m_ < 0.0)
+    {
+      ROS_ERROR_STREAM(
+          "[trajectory_risk_node] forbidden_space_body_inflation_m must be nonnegative, got "
+          << forbidden_space_body_inflation_m_);
+      forbidden_space_body_inflation_m_ = 0.0;
+    }
+
     ignored_risk_links_.clear();
     if (!pnh_.getParam("trajectory_risk/ignored_risk_links",
                        ignored_risk_links_))
@@ -2468,7 +2481,8 @@ private:
           *iter_q6 = static_cast<float>(frame.q(6));
           *iter_conf = confidence;
           *iter_vis = current_visibility;
-          *iter_radius = static_cast<float>(sample.radius);
+          *iter_radius = static_cast<float>(
+              sample.radius + forbidden_space_body_inflation_m_);
           *iter_eval = static_cast<int32_t>(frame.timestep_index);
           *iter_original = static_cast<int32_t>(original_timestep);
 
@@ -3228,6 +3242,8 @@ private:
                     << forbidden_space_pair_topic_);
     ROS_INFO_STREAM("forbidden_space_confidence_threshold: "
                     << forbidden_space_confidence_threshold_);
+    ROS_INFO_STREAM("forbidden_space_body_inflation_m: "
+                    << forbidden_space_body_inflation_m_);
     ROS_INFO_STREAM("Pinocchio nq: " << evaluator_.nq());
     ROS_INFO_STREAM("Pinocchio nv: " << evaluator_.nv());
     ROS_INFO_STREAM("active joints:");
@@ -3334,6 +3350,7 @@ private:
   double frontier_gap_threshold_ = 0.50;
   double frontier_radius_margin_ = 0.05;
   double forbidden_space_confidence_threshold_ = 0.50;
+  double forbidden_space_body_inflation_m_ = 0.0;
   std::vector<std::string> ignored_risk_links_;
 
   bool refresh_body_prior_before_query_ = true;
