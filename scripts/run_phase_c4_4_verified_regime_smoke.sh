@@ -80,6 +80,7 @@ PROBE_PREFIX_S="${PROBE_PREFIX_S:-0.15}"
 SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-false}"
 REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-${C4_REPAIR_BRAKE_DT_S:-0.05}}"
 REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
+CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-false}"
 
 # Optional online task-success stop. Defaults off here so historical C4/C5
 # diagnostics retain their fixed-duration semantics. Phase-D enables it.
@@ -305,6 +306,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   smooth_handoff_enabled:="${SMOOTH_HANDOFF_ENABLED}" \
   repair_brake_dt_s:="${REPAIR_BRAKE_DT_S}" \
   repair_hold_s:="${REPAIR_HOLD_S}" \
+  cycle_recovery_enabled:="${CYCLE_RECOVERY_ENABLED}" \
   candidate_unsafe_required:="${CANDIDATE_UNSAFE_REQUIRED}" \
   execution_unsafe_required:="${EXECUTION_UNSAFE_REQUIRED}" \
   probe_safe_commits_required:="${PROBE_SAFE_COMMITS}" \
