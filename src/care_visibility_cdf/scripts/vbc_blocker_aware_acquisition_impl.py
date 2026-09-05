@@ -28,6 +28,7 @@ from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
+from evaluate_direct_vs_projection_ascent import model_value_and_grad_q
 
 
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
@@ -75,6 +76,27 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._progressive_shared_last_kept_ids: List[int] = []
         self._progressive_shared_last_dropped_ids: List[int] = []
         self._progressive_shared_last_slacks: Dict[int, float] = {}
+
+        # Unified safe visibility-frontier steering. This runs in every
+        # multi-obligation REPAIR episode at low weight and is boosted when
+        # recursive VBC dependencies form a live cycle. It only proposes a
+        # local learned target; downstream final GCDF + exact VBC still decide
+        # whether any motion may execute.
+        self._frontier_lock = threading.RLock()
+        self._frontier_cache_key = None
+        self._frontier_cache = None
+        self._frontier_compute_count = 0
+        self._frontier_publish_count = 0
+        self._frontier_error_count = 0
+        self._frontier_last_mode = "startup"
+        self._frontier_last_considered_ids: List[int] = []
+        self._frontier_last_f_values: Dict[int, float] = {}
+        self._frontier_last_softmin_weights: Dict[int, float] = {}
+        self._frontier_last_direction_norm_inf = math.nan
+        self._frontier_last_target_shift_inf = math.nan
+        self._frontier_last_weight_scale = 0.0
+        self._frontier_last_qvis_weight_scale = 1.0
+        self._frontier_last_cycle_active = False
 
         # Obligation identity coherence. Spatial proximity alone is insufficient:
         # a matched obligation may keep its old q_vis only while that q_vis still
@@ -131,6 +153,33 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._obligation_match_qvis_min_f = float(rospy.get_param(
             "~obligation_match_qvis_min_f", 0.0))
 
+        self.frontier_steering_enabled = bool(rospy.get_param(
+            "~frontier_steering_enabled", True))
+        self.frontier_max_regions = int(rospy.get_param(
+            "~frontier_max_regions", 3))
+        self.frontier_softmin_temperature = float(rospy.get_param(
+            "~frontier_softmin_temperature", 0.05))
+        self.frontier_step_inf = float(rospy.get_param(
+            "~frontier_step_inf", 0.05))
+        self.frontier_recompute_q_inf = float(rospy.get_param(
+            "~frontier_recompute_q_inf", 0.01))
+        self.frontier_base_weight_scale = float(rospy.get_param(
+            "~frontier_base_weight_scale", 0.10))
+        self.frontier_cycle_weight_scale = float(rospy.get_param(
+            "~frontier_cycle_weight_scale", 1.00))
+        self.frontier_base_qvis_weight_scale = float(rospy.get_param(
+            "~frontier_base_qvis_weight_scale", 1.00))
+        self.frontier_cycle_qvis_weight_scale = float(rospy.get_param(
+            "~frontier_cycle_qvis_weight_scale", 0.10))
+        self.frontier_gradient_eps = float(rospy.get_param(
+            "~frontier_gradient_eps", 1e-6))
+        self.frontier_target_topic = str(rospy.get_param(
+            "~frontier_target_topic",
+            "/care_planner/active_sensing/visibility_frontier_target"))
+        self.frontier_summary_topic = str(rospy.get_param(
+            "~frontier_summary_topic",
+            "/care_planner/active_sensing/visibility_frontier_summary"))
+
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
             "/care_planner/active_sensing/blocker_stack_summary"))
@@ -153,9 +202,40 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             raise ValueError("~progressive_shared_accept_f_min must be finite")
         if not math.isfinite(self._obligation_match_qvis_min_f):
             raise ValueError("~obligation_match_qvis_min_f must be finite")
+        if self.frontier_max_regions < 2:
+            raise ValueError("~frontier_max_regions must be >= 2")
+        if (not math.isfinite(self.frontier_softmin_temperature) or
+                self.frontier_softmin_temperature <= 0.0):
+            raise ValueError(
+                "~frontier_softmin_temperature must be positive finite")
+        if (not math.isfinite(self.frontier_step_inf) or
+                self.frontier_step_inf <= 0.0):
+            raise ValueError("~frontier_step_inf must be positive finite")
+        if (not math.isfinite(self.frontier_recompute_q_inf) or
+                self.frontier_recompute_q_inf <= 0.0):
+            raise ValueError(
+                "~frontier_recompute_q_inf must be positive finite")
+        for name, value in (
+                ("frontier_base_weight_scale", self.frontier_base_weight_scale),
+                ("frontier_cycle_weight_scale", self.frontier_cycle_weight_scale),
+                ("frontier_base_qvis_weight_scale",
+                 self.frontier_base_qvis_weight_scale),
+                ("frontier_cycle_qvis_weight_scale",
+                 self.frontier_cycle_qvis_weight_scale)):
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("~{} must be nonnegative finite".format(name))
+        if (not math.isfinite(self.frontier_gradient_eps) or
+                self.frontier_gradient_eps <= 0.0):
+            raise ValueError("~frontier_gradient_eps must be positive finite")
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
+        self.frontier_target_pub = rospy.Publisher(
+            self.frontier_target_topic,
+            Float64MultiArray, queue_size=1, latch=True)
+        self.frontier_summary_pub = rospy.Publisher(
+            self.frontier_summary_topic,
+            String, queue_size=1, latch=True)
         self.active_set_bundle_sub = rospy.Subscriber(
             self.active_set_bundle_topic, Float64MultiArray,
             self._active_set_bundle_cb, queue_size=1)
@@ -625,6 +705,228 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 oid))
         return [active_id] + others
 
+    def _dependency_cycle_active(
+            self, stack: List[int], earliest_ids: List[int]) -> bool:
+        if len(stack) < 2:
+            return False
+        current = int(stack[-1])
+        earliest = set(int(v) for v in earliest_ids)
+        if current in earliest:
+            return False
+        return any(int(oid) in earliest for oid in stack[:-1])
+
+    def _compute_visibility_frontier(self):
+        if not self.frontier_steering_enabled:
+            return None
+
+        with self._obligation_lock:
+            copied = [dict(ob) for ob in self._obligations]
+            stack = [
+                int(oid) for oid in self._repair_stack
+                if any(int(ob["id"]) == int(oid) for ob in self._obligations)
+            ]
+        if len(copied) < 2:
+            return None
+
+        by_id = {int(ob["id"]): ob for ob in copied}
+        if not by_id:
+            return None
+        active_id = stack[-1] if stack else min(by_id)
+        priority = self._progressive_priority_order(by_id, active_id)
+        considered = [
+            oid for oid in priority
+            if oid in by_id][:self.frontier_max_regions]
+        if len(considered) < 2:
+            return None
+
+        measured = (
+            None if self._latest_measured_q is None
+            else np.asarray(
+                self._latest_measured_q, dtype=np.float64).copy())
+        if (measured is None or measured.shape != (7,) or
+                not np.all(np.isfinite(measured))):
+            self._frontier_last_mode = "no_measured_q"
+            return None
+
+        cycle_active = self._dependency_cycle_active(
+            stack, self._last_active_layer_ids)
+        quantized_q = tuple(
+            int(round(float(v) / self.frontier_recompute_q_inf))
+            for v in measured)
+        geometry_key = tuple(
+            (int(oid), tuple(by_id[oid].get("keys", ())))
+            for oid in considered)
+        cache_key = (
+            tuple(considered),
+            geometry_key,
+            quantized_q,
+            bool(cycle_active))
+
+        with self._frontier_lock:
+            if self._frontier_cache_key == cache_key:
+                return self._frontier_cache
+
+        q = torch.tensor(
+            measured.reshape(1, 7),
+            device=self.device, dtype=torch.float32)
+        f_values = []
+        gradients = []
+        valid_ids = []
+        try:
+            for oid in considered:
+                points = np.asarray(
+                    by_id[oid].get("points", []),
+                    dtype=np.float64).reshape(-1, 3)
+                if (points.shape[0] == 0 or
+                        not np.all(np.isfinite(points))):
+                    continue
+                x = torch.tensor(
+                    points, device=self.device, dtype=torch.float32)
+                f_tensor, grad_tensor, _ = model_value_and_grad_q(
+                    x, q, self.model)
+                f_val = float(f_tensor[0].detach().cpu().item())
+                grad = grad_tensor[0].detach().cpu().numpy().astype(
+                    np.float64)
+                if (not math.isfinite(f_val) or
+                        grad.shape != (7,) or
+                        not np.all(np.isfinite(grad))):
+                    continue
+                f_values.append(f_val)
+                gradients.append(grad)
+                valid_ids.append(int(oid))
+        except Exception as exc:
+            self._frontier_error_count += 1
+            self._frontier_last_mode = "gradient_eval_error"
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_blocker_stack] visibility frontier gradient "
+                "evaluation failed: %s", exc)
+            return None
+
+        if len(valid_ids) < 2:
+            self._frontier_last_mode = "insufficient_valid_regions"
+            return None
+
+        f_arr = np.asarray(f_values, dtype=np.float64)
+        grad_arr = np.asarray(gradients, dtype=np.float64)
+        logits = -f_arr / self.frontier_softmin_temperature
+        logits -= float(np.max(logits))
+        weights = np.exp(logits)
+        denom = float(np.sum(weights))
+        if not math.isfinite(denom) or denom <= 0.0:
+            self._frontier_last_mode = "invalid_softmin_weights"
+            return None
+        weights /= denom
+
+        direction = np.sum(weights[:, None] * grad_arr, axis=0)
+        direction_norm_inf = float(np.max(np.abs(direction)))
+        if (not math.isfinite(direction_norm_inf) or
+                direction_norm_inf <= self.frontier_gradient_eps):
+            self._frontier_last_mode = "degenerate_softmin_gradient"
+            return None
+
+        step = (
+            self.frontier_step_inf *
+            direction / direction_norm_inf)
+        target = measured + step
+        target_tensor = torch.tensor(
+            target.reshape(1, 7),
+            device=self.device, dtype=torch.float32)
+        target_tensor, _ = self._clamp(target_tensor)
+        target = target_tensor[0].detach().cpu().numpy().astype(
+            np.float64)
+        target_shift_inf = float(
+            np.max(np.abs(target - measured)))
+
+        frontier_weight_scale = (
+            self.frontier_cycle_weight_scale
+            if cycle_active else self.frontier_base_weight_scale)
+        qvis_weight_scale = (
+            self.frontier_cycle_qvis_weight_scale
+            if cycle_active else self.frontier_base_qvis_weight_scale)
+        mode = (
+            "cycle_boosted_softmin_frontier"
+            if cycle_active else "base_softmin_frontier")
+        result = {
+            "active": True,
+            "target": target,
+            "frontier_weight_scale": float(frontier_weight_scale),
+            "qvis_weight_scale": float(qvis_weight_scale),
+            "cycle_active": bool(cycle_active),
+            "mode": mode,
+            "considered_ids": list(valid_ids),
+            "f_values": {
+                int(oid): float(fv)
+                for oid, fv in zip(valid_ids, f_arr)},
+            "softmin_weights": {
+                int(oid): float(w)
+                for oid, w in zip(valid_ids, weights)},
+            "direction_norm_inf": direction_norm_inf,
+            "target_shift_inf": target_shift_inf,
+        }
+        with self._frontier_lock:
+            self._frontier_cache_key = cache_key
+            self._frontier_cache = result
+            self._frontier_compute_count += 1
+            self._frontier_last_mode = mode
+            self._frontier_last_considered_ids = list(valid_ids)
+            self._frontier_last_f_values = dict(result["f_values"])
+            self._frontier_last_softmin_weights = dict(
+                result["softmin_weights"])
+            self._frontier_last_direction_norm_inf = direction_norm_inf
+            self._frontier_last_target_shift_inf = target_shift_inf
+            self._frontier_last_weight_scale = float(
+                frontier_weight_scale)
+            self._frontier_last_qvis_weight_scale = float(
+                qvis_weight_scale)
+            self._frontier_last_cycle_active = bool(cycle_active)
+        return result
+
+    def _publish_visibility_frontier(self) -> None:
+        if not hasattr(self, "frontier_target_pub"):
+            return
+        result = self._compute_visibility_frontier()
+        msg = Float64MultiArray()
+        if result is None:
+            msg.data = [0.0, 0.0, 1.0] + [0.0] * 7
+        else:
+            msg.data = [
+                1.0,
+                float(result["frontier_weight_scale"]),
+                float(result["qvis_weight_scale"]),
+                *[float(v) for v in np.asarray(
+                    result["target"], dtype=np.float64).reshape(7)],
+            ]
+            self._frontier_publish_count += 1
+        self.frontier_target_pub.publish(msg)
+
+        summary = String()
+        summary.data = (
+            "policy=softmin_visibility_frontier"
+            f" enabled={int(self.frontier_steering_enabled)}"
+            f" active={int(result is not None)}"
+            f" mode={self._frontier_last_mode}"
+            f" cycle_active={int(self._frontier_last_cycle_active)}"
+            f" considered_ids="
+            f"{':'.join(str(v) for v in self._frontier_last_considered_ids) or 'none'}"
+            f" f_values="
+            f"{';'.join(str(k)+':' + f'{v:.5f}' for k,v in sorted(self._frontier_last_f_values.items())) or 'none'}"
+            f" softmin_weights="
+            f"{';'.join(str(k)+':' + f'{v:.4f}' for k,v in sorted(self._frontier_last_softmin_weights.items())) or 'none'}"
+            f" direction_norm_inf="
+            f"{self._frontier_last_direction_norm_inf:.6f}"
+            f" target_shift_inf="
+            f"{self._frontier_last_target_shift_inf:.6f}"
+            f" frontier_weight_scale="
+            f"{self._frontier_last_weight_scale:.6f}"
+            f" qvis_weight_scale="
+            f"{self._frontier_last_qvis_weight_scale:.6f}"
+            f" compute_count={self._frontier_compute_count}"
+            f" publish_count={self._frontier_publish_count}"
+            f" error_count={self._frontier_error_count}"
+        )
+        self.frontier_summary_pub.publish(summary)
+
     def _region_learned_slack(self, ob, q_vis):
         points = np.asarray(ob.get("points", []), dtype=np.float64).reshape(-1, 3)
         if points.shape[0] == 0 or not np.all(np.isfinite(points)):
@@ -1046,6 +1348,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
     def _publish_schedule(self) -> None:
         super()._publish_schedule()
         if getattr(self, "_c49_ready", False):
+            self._publish_visibility_frontier()
             self._publish_blocker_stack_summary()
 
     def _publish_blocker_stack_summary(self) -> None:
@@ -1124,5 +1427,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f"{':'.join(str(v) for v in self._progressive_shared_last_dropped_ids) or 'none'}"
             f" progressive_shared_slacks="
             f"{';'.join(str(k)+':' + ('inf' if not math.isfinite(v) else f'{v:.4f}') for k,v in sorted(self._progressive_shared_last_slacks.items())) or 'none'}"
+            f" frontier_enabled={int(self.frontier_steering_enabled)}"
+            f" frontier_mode={self._frontier_last_mode}"
+            f" frontier_cycle_active={int(self._frontier_last_cycle_active)}"
+            f" frontier_considered_ids="
+            f"{':'.join(str(v) for v in self._frontier_last_considered_ids) or 'none'}"
+            f" frontier_direction_norm_inf="
+            f"{self._frontier_last_direction_norm_inf:.6f}"
+            f" frontier_target_shift_inf="
+            f"{self._frontier_last_target_shift_inf:.6f}"
+            f" frontier_weight_scale="
+            f"{self._frontier_last_weight_scale:.6f}"
+            f" frontier_qvis_weight_scale="
+            f"{self._frontier_last_qvis_weight_scale:.6f}"
+            f" frontier_compute_count={self._frontier_compute_count}"
+            f" frontier_publish_count={self._frontier_publish_count}"
+            f" frontier_error_count={self._frontier_error_count}"
         )
         self.blocker_stack_summary_pub.publish(msg)
