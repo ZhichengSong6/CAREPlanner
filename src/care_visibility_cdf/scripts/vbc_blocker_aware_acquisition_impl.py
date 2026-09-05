@@ -1138,19 +1138,29 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
 
         child_regions = []
-        parent_key_sets = []
+        family_records = {}
         for parent in parents:
             parent_id = int(parent["id"])
             depth = int(parent.get("refinement_depth", 0))
             points = np.asarray(
                 parent.get("points", []),
                 dtype=np.float64).reshape(-1, 3)
+            parent_centroid = np.asarray(
+                parent.get("centroid", np.mean(points, axis=0)),
+                dtype=np.float64).reshape(3)
+            family_id = parent_id
+            family_records[family_id] = {
+                "family_id": family_id,
+                "root_centroid": parent_centroid.copy(),
+                "root_xyz_min": np.min(points, axis=0).copy(),
+                "root_xyz_max": np.max(points, axis=0).copy(),
+                "root_keys": tuple(parent.get("keys", ())),
+                "child_ids": [],
+            }
             region = {
                 "points": points.copy(),
                 "keys": tuple(parent.get("keys", ())),
-                "centroid": np.asarray(
-                    parent.get("centroid", np.mean(points, axis=0)),
-                    dtype=np.float64).reshape(3),
+                "centroid": parent_centroid.copy(),
                 "refinement_depth": depth + 1,
                 "parent_obligation_id": parent_id,
                 "root_obligation_id": int(
@@ -1160,13 +1170,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     if int(parent.get("root_obligation_id", -1)) >= 0
                     else parent_id),
                 "refinement_reason": "adaptive_dependency_conflict",
+                "refinement_family_id": family_id,
             }
             split = self._split_region_for_refinement(
                 region, force_split=True)
             if len(split) <= 1:
                 continue
             child_regions.extend(split)
-            parent_key_sets.append(tuple(parent.get("keys", ())))
 
         if not child_regions:
             with self._adaptive_refinement_lock:
@@ -1223,11 +1233,15 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 if int(ob["id"]) not in set(parent_ids)]
             self._obligations.extend(children)
 
+        for child in children:
+            fid = int(child.get("refinement_family_id", -1))
+            if fid in family_records:
+                family_records[fid]["child_ids"].append(int(child["id"]))
+
         with self._adaptive_refinement_lock:
-            for keys in parent_key_sets:
-                frozen = tuple(sorted(set(keys)))
-                if frozen and frozen not in self._adaptive_refined_key_sets:
-                    self._adaptive_refined_key_sets.append(frozen)
+            for fid, record in family_records.items():
+                if record["child_ids"]:
+                    self._adaptive_refinement_families[int(fid)] = record
             self._pending_refinement_ids = []
             self._adaptive_refinement_success_count += 1
             self._adaptive_refinement_parent_count += len(parent_ids)
