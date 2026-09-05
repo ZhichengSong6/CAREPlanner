@@ -99,6 +99,29 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._frontier_last_qvis_weight_scale = 1.0
         self._frontier_last_cycle_active = False
 
+        # Multi-seed certified sensing frontier. A small q_seed bank generates
+        # alternative learned q_vis basins for the SAME active obligation.
+        # Exact VBC feedback serially advances through the bank; rejected
+        # hypothetical-path blockers are deferred until all alternatives fail.
+        self._certified_frontier_lock = threading.RLock()
+        self._certified_frontier_bank_key = None
+        self._certified_frontier_bank = []
+        self._certified_frontier_index = 0
+        self._certified_frontier_exhausted = False
+        self._certified_frontier_last_vbc_stamp_ns = "none"
+        self._certified_frontier_bank_build_count = 0
+        self._certified_frontier_bank_build_ms = math.nan
+        self._certified_frontier_projector_ms = math.nan
+        self._certified_frontier_screen_ms = math.nan
+        self._certified_frontier_last_selected_score = math.nan
+        self._certified_frontier_last_selected_seed = "none"
+        self._certified_frontier_unsafe_switch_count = 0
+        self._certified_frontier_safe_candidate_count = 0
+        self._certified_frontier_exhausted_count = 0
+        self._certified_frontier_deferred_bundle_count = 0
+        self._certified_frontier_deferred_point_count = 0
+        self._certified_frontier_stuck_count = 0
+
         # Adaptive-resolution obligations. Coarse regions remain the default.
         # A verified recursive dependency cycle may request one refinement of
         # the conflicting spatial obligations. Refined zones are remembered so
@@ -190,6 +213,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # which still must pass final GCDF + exact VBC before execution.
         self.vbc_gated_frontier_step_enabled = bool(rospy.get_param(
             "~vbc_gated_frontier_step_enabled", False))
+        self.certified_frontier_search_enabled = bool(rospy.get_param(
+            "~certified_frontier_search_enabled", False))
+        self.certified_frontier_seed_count = int(rospy.get_param(
+            "~certified_frontier_seed_count", 4))
+        self.certified_frontier_seed_perturbation = float(rospy.get_param(
+            "~certified_frontier_seed_perturbation", 0.20))
+        self.certified_frontier_recompute_q_inf = float(rospy.get_param(
+            "~certified_frontier_recompute_q_inf", 0.05))
+        self.certified_frontier_min_gain = float(rospy.get_param(
+            "~certified_frontier_min_gain", -0.02))
         self.frontier_max_regions = int(rospy.get_param(
             "~frontier_max_regions", 3))
         self.frontier_softmin_temperature = float(rospy.get_param(
@@ -253,6 +286,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             raise ValueError("~progressive_shared_accept_f_min must be finite")
         if not math.isfinite(self._obligation_match_qvis_min_f):
             raise ValueError("~obligation_match_qvis_min_f must be finite")
+        if self.certified_frontier_seed_count < 1:
+            raise ValueError("~certified_frontier_seed_count must be >= 1")
+        if (not math.isfinite(self.certified_frontier_seed_perturbation) or
+                self.certified_frontier_seed_perturbation <= 0.0):
+            raise ValueError(
+                "~certified_frontier_seed_perturbation must be positive finite")
+        if (not math.isfinite(self.certified_frontier_recompute_q_inf) or
+                self.certified_frontier_recompute_q_inf <= 0.0):
+            raise ValueError(
+                "~certified_frontier_recompute_q_inf must be positive finite")
+        if not math.isfinite(self.certified_frontier_min_gain):
+            raise ValueError("~certified_frontier_min_gain must be finite")
         if self.frontier_max_regions < 2:
             raise ValueError("~frontier_max_regions must be >= 2")
         if (not math.isfinite(self.frontier_softmin_temperature) or
