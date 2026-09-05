@@ -432,11 +432,35 @@ class OptimizedTrajectoryContinuityNode:
         except Exception:
             cycle_count = 0
 
+        def parse_ids(text):
+            out = []
+            for token in str(text).split(":"):
+                try:
+                    out.append(int(token))
+                except Exception:
+                    pass
+            return out
+
+        stack_ids = parse_ids(stack)
+        earliest_ids = parse_ids(earliest)
+        try:
+            target_id = int(target)
+        except Exception:
+            target_id = -1
+
+        # Reconstruct the actual dependency-cycle predicate instead of trusting
+        # a sticky diagnostic reason string: while targeting the stack top, the
+        # earliest VBC layer requires an already-stacked ancestor first.
+        ancestor_blocks_target = bool(
+            len(stack_ids) >= 2 and
+            target_id in stack_ids and
+            target_id not in earliest_ids and
+            any(oid in stack_ids and oid != target_id for oid in earliest_ids))
         active = bool(
             self.cycle_recovery_enabled and
-            reason == "existing_stack_cycle_not_pushed" and
-            stack not in ("", "none"))
-        signature = "{}|{}|{}".format(stack, target, earliest)
+            cycle_count > 0 and
+            ancestor_blocks_target)
+        signature = "{}|{}".format(stack, target)
 
         with self._lock:
             previously_active = self._cycle_recovery_active
