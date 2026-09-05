@@ -201,7 +201,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "/care_planner/active_sensing/visibility_frontier_summary"))
 
         self.adaptive_refinement_enabled = bool(rospy.get_param(
-            "~adaptive_refinement_enabled", True))
+            "~adaptive_refinement_enabled", False))
         self.adaptive_refinement_max_depth = int(rospy.get_param(
             "~adaptive_refinement_max_depth", 1))
         self.adaptive_refinement_target_diameter_m = float(rospy.get_param(
