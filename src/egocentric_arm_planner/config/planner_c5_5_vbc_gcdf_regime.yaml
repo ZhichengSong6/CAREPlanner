@@ -126,11 +126,11 @@ local_planner:
   repair_task_tracking_scale: 0.0
   visibility_waypoint_weight: 3000.0
 
-  # Unified visibility-frontier objective. q_vis remains the long-range
-  # attractor, while the learned soft-min frontier target acts on q_2
-  # (0.10 s at dt=0.05). The producer sends relative weights: low influence in
-  # ordinary multi-O REPAIR, frontier-dominant when a dependency cycle is live.
-  # This is objective-only; final GCDF + exact VBC still gate every commit.
+  # The formal full-q_vis experiment disables the external frontier producer.
+  # In REPAIR the current active q_vis is therefore used directly as the
+  # synthetic terminal-horizon (1.0 s) visibility objective. This parameter is
+  # retained for legacy/diagnostic frontier modes only. Hard CDF constraints,
+  # final GCDF, and exact VBC remain the safety authorities.
   visibility_frontier_horizon_step: 2
   visibility_frontier_topic: /care_planner/active_sensing/visibility_frontier_target
 
