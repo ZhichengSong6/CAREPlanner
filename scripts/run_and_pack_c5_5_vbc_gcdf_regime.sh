@@ -63,7 +63,16 @@ export SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-true}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 export CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-true}"
-export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-true}"
+# Strict Phase-E/C5.5 semantics: the trusted-free body prior is startup-only.
+# Do not allow the formal runner to revive the old moving 10-cm free bubble.
+export TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY=false
+# Prefer one local measured-q -> active-q_vis frontier step. The long-range
+# q_vis objective is suppressed while this local target is active; every
+# proposal still passes final GCDF + exact VBC before execution.
+export VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-true}"
+# Keep refinement available as an opt-in diagnostic, but do not let it
+# dominate the first strict-frontier qualification.
+export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
 
 python3 -m py_compile \
   "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
@@ -85,9 +94,10 @@ echo "[C5.40] PROBE success: matching execution token reaches certified prefix d
 echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
-echo "[VISIBILITY FRONTIER] unified multi-O learned soft-min steering enabled in blocker-aware REPAIR"
-echo "[VISIBILITY FRONTIER] base: q_vis dominant + weak local frontier; cycle soft-min is deferred to adaptive refinement"
-echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; coarse 0.12m by default; learned-incompatible dependency cycles refine conflicting O once (<=4 children/parent)"
+echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
+echo "[VISIBILITY FRONTIER] vbc_gated_single_obligation_step=${VBC_GATED_FRONTIER_STEP_ENABLED}; q_vis is long-range direction only"
+echo "[VISIBILITY FRONTIER] every local frontier proposal remains final-GCDF + exact-VBC gated"
+echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; retained as opt-in fallback, not the primary strict-Phase-E mechanism"
 echo "[ADAPTIVE O] refined zones stay refined on later active-set updates; final GCDF + exact VBC unchanged"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
