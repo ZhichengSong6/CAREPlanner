@@ -610,10 +610,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self, region: Dict[str, object], force_split: bool = True):
         """Deterministically bisect one spatial region at finer resolution.
 
-        We split along the axis with the largest spatial range and stop once
-        every child is within the refined diameter or the configured child cap
-        is reached. A conflict region with >=2 points is forced to split at
-        least once even when its diameter is already close to one map voxel.
+        Children define persistent spatial partitions. Their partition anchors
+        are frozen at refinement time; later blocker voxels are routed to the
+        nearest live child in the same family rather than spawning new
+        obligations merely because their voxel key was not present originally.
         """
         pts = np.asarray(
             region.get("points", []), dtype=np.float64).reshape(-1, 3)
@@ -657,13 +657,15 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             must_split = False
 
         out = []
+        family_id = int(region.get("refinement_family_id", -1))
         for idx in clusters:
             child_pts = pts[idx].copy()
             keys = tuple(sorted({self._cell_key(p) for p in child_pts}))
+            anchor = np.mean(child_pts, axis=0)
             child = {
                 "points": child_pts,
                 "keys": keys,
-                "centroid": np.mean(child_pts, axis=0),
+                "centroid": anchor.copy(),
                 "refinement_depth": int(region.get("refinement_depth", 1)),
                 "parent_obligation_id": int(
                     region.get("parent_obligation_id", -1)),
@@ -673,35 +675,150 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     region.get(
                         "refinement_reason",
                         "adaptive_dependency_conflict")),
+                "refinement_family_id": family_id,
+                "refinement_partition_anchor": anchor.copy(),
             }
             out.append(child)
         return out
 
+    def _refinement_family_snapshot(self):
+        with self._adaptive_refinement_lock:
+            family_records = {
+                int(fid): {
+                    "family_id": int(fid),
+                    "root_centroid": np.asarray(
+                        fam["root_centroid"], dtype=np.float64).copy(),
+                    "root_xyz_min": np.asarray(
+                        fam["root_xyz_min"], dtype=np.float64).copy(),
+                    "root_xyz_max": np.asarray(
+                        fam["root_xyz_max"], dtype=np.float64).copy(),
+                    "child_ids": list(fam.get("child_ids", [])),
+                }
+                for fid, fam in self._adaptive_refinement_families.items()
+            }
+        if not family_records:
+            return []
+
+        with self._obligation_lock:
+            live = {
+                int(ob["id"]): dict(ob)
+                for ob in self._obligations
+                if int(ob.get("refinement_depth", 0)) > 0
+            }
+
+        out = []
+        for fid, fam in sorted(family_records.items()):
+            children = []
+            for oid in fam["child_ids"]:
+                ob = live.get(int(oid))
+                if ob is None:
+                    continue
+                anchor = np.asarray(
+                    ob.get(
+                        "refinement_partition_anchor",
+                        ob.get("centroid", [math.nan] * 3)),
+                    dtype=np.float64).reshape(3)
+                if not np.all(np.isfinite(anchor)):
+                    continue
+                children.append({
+                    "id": int(oid),
+                    "anchor": anchor.copy(),
+                    "refinement_depth": int(
+                        ob.get("refinement_depth", 1)),
+                    "parent_obligation_id": int(
+                        ob.get("parent_obligation_id", -1)),
+                    "root_obligation_id": int(
+                        ob.get("root_obligation_id", -1)),
+                })
+            if children:
+                fam["children"] = children
+                out.append(fam)
+        return out
+
     def _cluster_regions(self, points: np.ndarray):
-        """Keep coarse clustering except inside an already-refined spatial zone."""
+        """Coarse everywhere, persistent fine partitions only where refined.
+
+        A point is routed into an existing refined family when it lies inside
+        the original parent bounding box expanded by a small physical margin.
+        Within that family, nearest frozen child anchor determines ownership.
+        This lets nearby newly exposed blocker voxels enlarge an existing child
+        instead of creating O11/O12-style obligation proliferation.
+        """
         coarse = super()._cluster_regions(points)
         if not getattr(self, "adaptive_refinement_enabled", False):
             return coarse
-        with self._adaptive_refinement_lock:
-            refined_key_sets = [
-                set(keys) for keys in self._adaptive_refined_key_sets]
-        if not refined_key_sets:
+
+        families = self._refinement_family_snapshot()
+        if not families:
             return coarse
 
         out = []
+        margin = float(self.adaptive_refinement_family_margin_m)
         for region in coarse:
-            keys = set(region.get("keys", ()))
-            in_refined_zone = any(keys & root for root in refined_key_sets)
-            if not in_refined_zone:
-                out.append(region)
+            pts = np.asarray(
+                region.get("points", []),
+                dtype=np.float64).reshape(-1, 3)
+            if pts.shape[0] == 0:
                 continue
-            refined_region = dict(region)
-            refined_region["refinement_depth"] = 1
-            refined_region["parent_obligation_id"] = -1
-            refined_region["root_obligation_id"] = -1
-            refined_region["refinement_reason"] = "persistent_refined_zone"
-            out.extend(self._split_region_for_refinement(
-                refined_region, force_split=True))
+
+            grouped = {}
+            unassigned = []
+            for point in pts:
+                candidates = []
+                for fam in families:
+                    lo = fam["root_xyz_min"] - margin
+                    hi = fam["root_xyz_max"] + margin
+                    if np.all(point >= lo) and np.all(point <= hi):
+                        root_dist = float(np.linalg.norm(
+                            point - fam["root_centroid"]))
+                        candidates.append((root_dist, fam))
+                if not candidates:
+                    unassigned.append(point.copy())
+                    continue
+
+                _, fam = min(candidates, key=lambda item: item[0])
+                child = min(
+                    fam["children"],
+                    key=lambda item: float(np.linalg.norm(
+                        point - item["anchor"])))
+                key = (int(fam["family_id"]), int(child["id"]))
+                grouped.setdefault(
+                    key, {"family": fam, "child": child, "points": []})
+                grouped[key]["points"].append(point.copy())
+
+            if unassigned:
+                rp = np.asarray(unassigned, dtype=np.float64).reshape(-1, 3)
+                out.append({
+                    "points": rp,
+                    "keys": tuple(sorted({
+                        self._cell_key(p) for p in rp})),
+                    "centroid": np.mean(rp, axis=0),
+                })
+
+            for (_fid, _cid), item in sorted(grouped.items()):
+                rp = np.asarray(
+                    item["points"], dtype=np.float64).reshape(-1, 3)
+                child = item["child"]
+                out.append({
+                    "points": rp,
+                    "keys": tuple(sorted({
+                        self._cell_key(p) for p in rp})),
+                    "centroid": np.mean(rp, axis=0),
+                    "preferred_child_id": int(child["id"]),
+                    "refinement_family_id": int(
+                        item["family"]["family_id"]),
+                    "refinement_depth": int(
+                        child["refinement_depth"]),
+                    "parent_obligation_id": int(
+                        child["parent_obligation_id"]),
+                    "root_obligation_id": int(
+                        child["root_obligation_id"]),
+                    "refinement_partition_anchor": np.asarray(
+                        child["anchor"], dtype=np.float64).copy(),
+                    "refinement_reason": "persistent_family_partition",
+                })
+                self._adaptive_refinement_family_route_count += int(
+                    rp.shape[0])
         return out
 
     def _cross_visibility_f_min(self, target_ob, q_vis) -> float:
