@@ -49,6 +49,10 @@ struct GridPoint
   // 1 = most recently observed as occupied. Confidence distinguishes
   // UNKNOWN (low confidence) from observed FREE (high confidence).
   float occupancy = 0.0f;
+  // Static Phase-E evidence: this voxel has been positively established FREE
+  // either by the one-shot initial body prior or by a real ToF ray traversal.
+  // When enabled by config, this evidence does not decay back to UNKNOWN.
+  bool persistent_free = false;
   double last_seen_time = -1.0;
 };
 
@@ -229,6 +233,11 @@ private:
     nh.param(
         "confidence_map/ray_persistent_occupied",
         ray_persistent_occupied_,
+        false);
+
+    nh.param(
+        "confidence_map/persistent_free_evidence",
+        persistent_free_evidence_,
         false);
 
     nh.param<std::string>(
@@ -528,6 +537,7 @@ private:
           p.confidence = 0.0f;
           p.current_visibility = 0.0f;
           p.occupancy = 0.0f;
+          p.persistent_free = false;
           p.last_seen_time = -1.0;
 
           grid_points_.push_back(p);
@@ -602,6 +612,10 @@ private:
           gp.last_seen_time = stamp_sec;
           gp.confidence = 1.0f;
           gp.occupancy = 0.0f;
+          if (persistent_free_evidence_)
+          {
+            gp.persistent_free = true;
+          }
 
           // This is a robot-body known-clear prior, not a live sensor ray.
           // Do not set current_visibility=1 here.
@@ -855,6 +869,10 @@ private:
       {
         p.confidence = 1.0f;
         p.last_seen_time = now_sec;
+        if (persistent_free_evidence_ && p.occupancy <= 0.5f)
+        {
+          p.persistent_free = true;
+        }
       }
       else
       {
@@ -879,6 +897,17 @@ private:
     const double now_sec = now.toSec();
     for (auto& p : grid_points_)
     {
+      // Static-world evidence must remain certified after it has been
+      // positively established. This is deliberately different from the
+      // legacy confidence-memory decay used by dynamic/ideal-FOV experiments.
+      if ((persistent_free_evidence_ &&
+           p.persistent_free && p.occupancy <= 0.5f) ||
+          (ray_persistent_occupied_ && p.occupancy > 0.5f))
+      {
+        p.confidence = 1.0f;
+        continue;
+      }
+
       if (p.current_visibility > 0.5f)
       {
         continue;
@@ -1056,6 +1085,7 @@ private:
       if (occupied_mask[i] != 0)
       {
         gp.occupancy = 1.0f;
+        gp.persistent_free = false;
         gp.current_visibility = 1.0f;
         gp.confidence = 1.0f;
         gp.last_seen_time = stamp_sec;
@@ -1073,6 +1103,10 @@ private:
         else
         {
           gp.occupancy = 0.0f;
+          if (persistent_free_evidence_)
+          {
+            gp.persistent_free = true;
+          }
         }
         gp.current_visibility = 1.0f;
         gp.confidence = 1.0f;
@@ -1107,12 +1141,18 @@ private:
     std::size_t known_free = 0;
     std::size_t known_occupied = 0;
     std::size_t unknown = 0;
+    std::size_t persistent_free = 0;
 
     for (const auto& gp : grid_points_)
     {
       if (gp.current_visibility > 0.5f)
       {
         ++visible_now;
+      }
+
+      if (gp.persistent_free && gp.occupancy <= 0.5f)
+      {
+        ++persistent_free;
       }
 
       if (gp.confidence <= 1e-4f)
@@ -1158,6 +1198,7 @@ private:
         << " visible_now=" << visible_now
         << " known_free=" << known_free
         << " known_occupied=" << known_occupied
+        << " persistent_free=" << persistent_free
         << " unknown=" << unknown
         << " observation_age_s=" << observation_age;
     msg.data = oss.str();
@@ -1779,6 +1820,7 @@ private:
     ROS_INFO_STREAM("temporal_decay_time: " << temporal_decay_time_);
     ROS_INFO_STREAM("observation_mode: " << observation_mode_);
     ROS_INFO_STREAM("ray_observation_topic: " << ray_observation_topic_);
+    ROS_INFO_STREAM("persistent_free_evidence: " << persistent_free_evidence_);
     ROS_INFO_STREAM("e3_summary_topic: " << e3_summary_topic_);
     ROS_INFO_STREAM("query_service: " << query_service_name_);
     ROS_INFO_STREAM("marker_topic: " << marker_topic_);
@@ -1863,6 +1905,7 @@ private:
   double ray_min_valid_range_ = 0.10;
   double ray_max_valid_range_ = 1.50;
   bool ray_persistent_occupied_ = false;
+  bool persistent_free_evidence_ = false;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
