@@ -84,6 +84,8 @@ echo "[C5.40] PROBE success: matching execution token reaches certified prefix d
 echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
+echo "[VISIBILITY FRONTIER] unified multi-O learned soft-min steering enabled in blocker-aware REPAIR"
+echo "[VISIBILITY FRONTIER] base: q_vis dominant + weak local frontier; dependency cycle: frontier dominant + q_vis guidance reduced; final GCDF + exact VBC unchanged"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
 echo "[C5.5] NORMAL exact-VBC view: full horizon"
