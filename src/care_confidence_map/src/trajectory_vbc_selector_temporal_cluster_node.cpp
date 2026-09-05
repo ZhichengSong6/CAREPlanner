@@ -151,6 +151,12 @@ private:
     Eigen::Vector3d point_base = Eigen::Vector3d::Zero();
     std::string link_name = "none";
     int sample_index_in_link = -1;
+    std::string source_type = "unknown";
+    int source_collision_index = -1;
+    Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
+    double raw_sample_radius_m = 0.0;
+    double swept_radius_m = 0.0;
+    double point_center_distance_m = 0.0;
     int sweep_eval_timestep = -1;
     int sweep_original_timestep = -1;
     double sweep_time_s = 0.0;
@@ -163,6 +169,12 @@ private:
     Eigen::Vector3d point_base = Eigen::Vector3d::Zero();
     std::string link_name = "none";
     int sample_index_in_link = -1;
+    std::string source_type = "unknown";
+    int source_collision_index = -1;
+    Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
+    double raw_sample_radius_m = 0.0;
+    double swept_radius_m = 0.0;
+    double point_center_distance_m = 0.0;
     double confidence = 0.0;
     double current_visibility = 0.0;
     int sweep_eval_timestep = -1;
@@ -608,6 +620,13 @@ private:
               voxel.point_base = point;
               voxel.link_name = sample.link_name;
               voxel.sample_index_in_link = sample.sample_index_in_link;
+              voxel.source_type = sample.source_type;
+              voxel.source_collision_index = sample.source_collision_index;
+              voxel.sample_center_base = sample.center_base;
+              voxel.raw_sample_radius_m = std::max(0.0, sample.radius);
+              voxel.swept_radius_m = radius;
+              voxel.point_center_distance_m =
+                  (point - sample.center_base).norm();
               voxel.sweep_eval_timestep = k;
               voxel.sweep_original_timestep =
                   original_indices[static_cast<std::size_t>(k)];
@@ -1088,6 +1107,26 @@ private:
         << " confidence=" << representative.confidence
         << " link=" << representative.link_name
         << " sample_index=" << representative.sample_index_in_link
+        << " source_type=" << representative.source_type
+        << " source_collision_index=" << representative.source_collision_index
+        << " raw_sample_center_xyz=["
+        << representative.sample_center_base.x() << ","
+        << representative.sample_center_base.y() << ","
+        << representative.sample_center_base.z() << "]"
+        << " raw_sample_radius_m=" << representative.raw_sample_radius_m
+        << " swept_radius_m=" << representative.swept_radius_m
+        << " blocker_center_distance_m="
+        << representative.point_center_distance_m
+        << " inside_raw_body_sphere="
+        << static_cast<int>(
+             representative.point_center_distance_m <=
+             representative.raw_sample_radius_m + 1e-9)
+        << " margin_shell_only="
+        << static_cast<int>(
+             representative.point_center_distance_m >
+             representative.raw_sample_radius_m + 1e-9 &&
+             representative.point_center_distance_m <=
+             representative.swept_radius_m + 1e-9)
         << " sweep_eval_t=" << representative.sweep_eval_timestep
         << " sweep_original_t=" << representative.sweep_original_timestep
         // Keep the legacy guard diagnostic key.  In temporal-cluster mode this
@@ -1224,6 +1263,12 @@ private:
         candidate.point_base = voxel.point_base;
         candidate.link_name = voxel.link_name;
         candidate.sample_index_in_link = voxel.sample_index_in_link;
+        candidate.source_type = voxel.source_type;
+        candidate.source_collision_index = voxel.source_collision_index;
+        candidate.sample_center_base = voxel.sample_center_base;
+        candidate.raw_sample_radius_m = voxel.raw_sample_radius_m;
+        candidate.swept_radius_m = voxel.swept_radius_m;
+        candidate.point_center_distance_m = voxel.point_center_distance_m;
         candidate.confidence = confidence;
         candidate.current_visibility = current_visibility;
         candidate.sweep_eval_timestep = voxel.sweep_eval_timestep;
@@ -1239,6 +1284,12 @@ private:
           it->second.point_base = voxel.point_base;
           it->second.link_name = voxel.link_name;
           it->second.sample_index_in_link = voxel.sample_index_in_link;
+          it->second.source_type = voxel.source_type;
+          it->second.source_collision_index = voxel.source_collision_index;
+          it->second.sample_center_base = voxel.sample_center_base;
+          it->second.raw_sample_radius_m = voxel.raw_sample_radius_m;
+          it->second.swept_radius_m = voxel.swept_radius_m;
+          it->second.point_center_distance_m = voxel.point_center_distance_m;
           it->second.sweep_eval_timestep = voxel.sweep_eval_timestep;
           it->second.sweep_original_timestep = voxel.sweep_original_timestep;
           it->second.sweep_time_s = voxel.sweep_time_s;
