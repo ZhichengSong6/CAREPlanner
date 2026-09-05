@@ -32,9 +32,10 @@
   <arg name="confidence_query_service"
        default="/care_planner/confidence_map/query" />
   <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
-  <!-- C5.29: temporal VBC checks the full body-sphere swept volume.
-       Keep this aligned with the GCDF proximity margin. -->
-  <arg name="swept_volume_margin_m" default="0.025" />
+  <!-- Visibility certification checks the conservative body-sphere model
+       itself. Collision/GCDF clearance inflation is independent and must not
+       silently enlarge the set of mandatory visibility obligations. -->
+  <arg name="swept_volume_margin_m" default="0.0" />
 
   <!-- The controlled C4.3 path already sets prefer_predicted_trajectory=true;
        the frozen C4.2 path leaves it false. Use that existing routing signal so
