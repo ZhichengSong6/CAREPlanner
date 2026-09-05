@@ -120,6 +120,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._certified_frontier_exhausted_count = 0
         self._certified_frontier_deferred_bundle_count = 0
         self._certified_frontier_deferred_point_count = 0
+        self._certified_frontier_last_deferred_serial = -1
         self._certified_frontier_stuck_count = 0
 
         # Adaptive-resolution obligations. Coarse regions remain the default.
@@ -1820,32 +1821,45 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
     def _defer_bundle_for_certified_frontier(
             self, serial: int, raw: np.ndarray) -> bool:
-        """Keep hypothetical-path blockers local while alternatives remain."""
+        """Keep the latest hypothetical blocker pending while alternatives remain.
+
+        Crucially, a deferred bundle is NOT marked processed. If every q_vis
+        alternative is exact-VBC unsafe, the same latest coherent bundle is
+        still available and is materialized on the next processing cycle.
+        """
         if not getattr(self, "certified_frontier_search_enabled", False):
             return False
         with self._obligation_lock:
-            has_obligation = bool(self._obligations)
-        if not has_obligation:
+            existing_ids = [int(ob["id"]) for ob in self._obligations]
+            stack = [
+                int(v) for v in self._repair_stack
+                if int(v) in set(existing_ids)]
+        if not existing_ids:
             return False
+        active_id = stack[-1] if stack else min(existing_ids)
+
         with self._certified_frontier_lock:
             active = bool(self._certified_frontier_bank)
             exhausted = bool(self._certified_frontier_exhausted)
-        if not active or exhausted:
-            return False
+            bank_key = self._certified_frontier_bank_key
+            bank_active_id = (
+                int(bank_key[0])
+                if isinstance(bank_key, tuple) and len(bank_key) >= 1
+                else -1)
+            if not active or exhausted or bank_active_id != int(active_id):
+                return False
+            if int(serial) != self._certified_frontier_last_deferred_serial:
+                self._certified_frontier_last_deferred_serial = int(serial)
+                self._certified_frontier_deferred_bundle_count += 1
+                self._certified_frontier_deferred_point_count += int(
+                    np.asarray(raw).reshape(-1, 3).shape[0])
 
-        with self._obligation_lock:
-            self._processed_active_set_serial = max(
-                self._processed_active_set_serial, serial)
         if self._coherent_bundle_enabled:
             with self._coherent_bundle_lock:
                 if self._coherent_bundle_seq == serial:
-                    self._coherent_bundle_pending_nonempty = False
-                    self._coherent_bundle_processed_count += 1
+                    self._coherent_bundle_pending_nonempty = True
                     self._coherent_bundle_last_reason = (
-                        "certified_frontier_deferred")
-        self._certified_frontier_deferred_bundle_count += 1
-        self._certified_frontier_deferred_point_count += int(
-            np.asarray(raw).reshape(-1, 3).shape[0])
+                        "certified_frontier_pending_alternatives")
         self._last_process_reason = "certified_frontier_try_alternatives"
         return True
 
