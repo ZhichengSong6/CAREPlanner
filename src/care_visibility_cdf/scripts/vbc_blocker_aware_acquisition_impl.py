@@ -98,6 +98,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._frontier_last_qvis_weight_scale = 1.0
         self._frontier_last_cycle_active = False
 
+        # Adaptive-resolution obligations. Coarse regions remain the default.
+        # A verified recursive dependency cycle may request one refinement of
+        # the conflicting spatial obligations. Refined zones are remembered so
+        # later active-set updates cannot silently merge the children back into
+        # the old coarse cluster.
+        self._adaptive_refinement_lock = threading.RLock()
+        self._adaptive_refined_key_sets = []
+        self._pending_refinement_ids: List[int] = []
+        self._adaptive_refinement_trigger_count = 0
+        self._adaptive_refinement_success_count = 0
+        self._adaptive_refinement_failure_count = 0
+        self._adaptive_refinement_skip_count = 0
+        self._adaptive_refinement_parent_count = 0
+        self._adaptive_refinement_child_count = 0
+        self._adaptive_refinement_last_parent_ids: List[int] = []
+        self._adaptive_refinement_last_child_ids: List[int] = []
+        self._adaptive_refinement_last_reason = "startup"
+        self._adaptive_refinement_last_cross_f_ab = math.nan
+        self._adaptive_refinement_last_cross_f_ba = math.nan
+
         # Obligation identity coherence. Spatial proximity alone is insufficient:
         # a matched obligation may keep its old q_vis only while that q_vis still
         # makes the newly observed region learned-visible. These fields exist
@@ -180,6 +200,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "~frontier_summary_topic",
             "/care_planner/active_sensing/visibility_frontier_summary"))
 
+        self.adaptive_refinement_enabled = bool(rospy.get_param(
+            "~adaptive_refinement_enabled", True))
+        self.adaptive_refinement_max_depth = int(rospy.get_param(
+            "~adaptive_refinement_max_depth", 1))
+        self.adaptive_refinement_target_diameter_m = float(rospy.get_param(
+            "~adaptive_refinement_target_diameter_m", 0.055))
+        self.adaptive_refinement_max_children = int(rospy.get_param(
+            "~adaptive_refinement_max_children_per_parent", 4))
+        self.adaptive_refinement_min_points = int(rospy.get_param(
+            "~adaptive_refinement_min_points", 2))
+        self.adaptive_refinement_cross_visibility_threshold = float(
+            rospy.get_param(
+                "~adaptive_refinement_cross_visibility_threshold", 0.0))
+
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
             "/care_planner/active_sensing/blocker_stack_summary"))
@@ -227,6 +261,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if (not math.isfinite(self.frontier_gradient_eps) or
                 self.frontier_gradient_eps <= 0.0):
             raise ValueError("~frontier_gradient_eps must be positive finite")
+        if self.adaptive_refinement_max_depth < 1:
+            raise ValueError("~adaptive_refinement_max_depth must be >= 1")
+        if (not math.isfinite(self.adaptive_refinement_target_diameter_m) or
+                self.adaptive_refinement_target_diameter_m <= 0.0):
+            raise ValueError(
+                "~adaptive_refinement_target_diameter_m must be positive finite")
+        if self.adaptive_refinement_max_children < 2:
+            raise ValueError(
+                "~adaptive_refinement_max_children_per_parent must be >= 2")
+        if self.adaptive_refinement_min_points < 2:
+            raise ValueError("~adaptive_refinement_min_points must be >= 2")
+        if not math.isfinite(
+                self.adaptive_refinement_cross_visibility_threshold):
+            raise ValueError(
+                "~adaptive_refinement_cross_visibility_threshold must be finite")
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
@@ -539,6 +588,338 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
+    def _split_region_for_refinement(
+            self, region: Dict[str, object], force_split: bool = True):
+        """Deterministically bisect one spatial region at finer resolution.
+
+        We split along the axis with the largest spatial range and stop once
+        every child is within the refined diameter or the configured child cap
+        is reached. A conflict region with >=2 points is forced to split at
+        least once even when its diameter is already close to one map voxel.
+        """
+        pts = np.asarray(
+            region.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if pts.shape[0] < self.adaptive_refinement_min_points:
+            return [dict(region)]
+
+        clusters = [list(range(pts.shape[0]))]
+        must_split = bool(force_split)
+
+        while len(clusters) < self.adaptive_refinement_max_children:
+            candidates = []
+            for ci, idx in enumerate(clusters):
+                if len(idx) < 2:
+                    continue
+                diam = self._diameter(pts[idx])
+                needs = (
+                    diam > self.adaptive_refinement_target_diameter_m + 1e-9)
+                if needs or (must_split and len(clusters) == 1):
+                    candidates.append((diam, len(idx), ci))
+            if not candidates:
+                break
+
+            _, _, ci = max(candidates)
+            idx = clusters[ci]
+            local = pts[idx]
+            ranges = np.ptp(local, axis=0)
+            axis = int(np.argmax(ranges))
+            ordered = sorted(
+                idx,
+                key=lambda ii: (
+                    float(pts[ii, axis]),
+                    float(pts[ii, (axis + 1) % 3]),
+                    float(pts[ii, (axis + 2) % 3])))
+            mid = len(ordered) // 2
+            left = ordered[:mid]
+            right = ordered[mid:]
+            if not left or not right:
+                break
+            clusters[ci] = left
+            clusters.insert(ci + 1, right)
+            must_split = False
+
+        out = []
+        for idx in clusters:
+            child_pts = pts[idx].copy()
+            keys = tuple(sorted({self._cell_key(p) for p in child_pts}))
+            child = {
+                "points": child_pts,
+                "keys": keys,
+                "centroid": np.mean(child_pts, axis=0),
+                "refinement_depth": int(region.get("refinement_depth", 1)),
+                "parent_obligation_id": int(
+                    region.get("parent_obligation_id", -1)),
+                "root_obligation_id": int(
+                    region.get("root_obligation_id", -1)),
+                "refinement_reason": str(
+                    region.get(
+                        "refinement_reason",
+                        "adaptive_dependency_conflict")),
+            }
+            out.append(child)
+        return out
+
+    def _cluster_regions(self, points: np.ndarray):
+        """Keep coarse clustering except inside an already-refined spatial zone."""
+        coarse = super()._cluster_regions(points)
+        if not getattr(self, "adaptive_refinement_enabled", False):
+            return coarse
+        with self._adaptive_refinement_lock:
+            refined_key_sets = [
+                set(keys) for keys in self._adaptive_refined_key_sets]
+        if not refined_key_sets:
+            return coarse
+
+        out = []
+        for region in coarse:
+            keys = set(region.get("keys", ()))
+            in_refined_zone = any(keys & root for root in refined_key_sets)
+            if not in_refined_zone:
+                out.append(region)
+                continue
+            refined_region = dict(region)
+            refined_region["refinement_depth"] = 1
+            refined_region["parent_obligation_id"] = -1
+            refined_region["root_obligation_id"] = -1
+            refined_region["refinement_reason"] = "persistent_refined_zone"
+            out.extend(self._split_region_for_refinement(
+                refined_region, force_split=True))
+        return out
+
+    def _cross_visibility_f_min(self, target_ob, q_vis) -> float:
+        points = np.asarray(
+            target_ob.get("points", []),
+            dtype=np.float64).reshape(-1, 3)
+        qv = np.asarray(q_vis, dtype=np.float64).reshape(-1)
+        if (points.shape[0] == 0 or qv.shape != (7,) or
+                not np.all(np.isfinite(points)) or
+                not np.all(np.isfinite(qv))):
+            return -math.inf
+        x = torch.tensor(
+            points, device=self.device, dtype=torch.float32)
+        q = torch.tensor(
+            qv.reshape(1, 7), device=self.device, dtype=torch.float32)
+        values = self._per_point_values(x, q)
+        return float(np.min(values)) if values.size else -math.inf
+
+    def _request_cycle_refinement(self, current_id: int, blocker_id: int) -> bool:
+        """Request refinement only for a learned-incompatible dependency pair."""
+        if not self.adaptive_refinement_enabled:
+            return False
+        with self._obligation_lock:
+            by_id = {
+                int(ob["id"]): dict(ob) for ob in self._obligations}
+        if current_id not in by_id or blocker_id not in by_id:
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = "missing_cycle_obligation"
+            return False
+
+        a = by_id[int(current_id)]
+        b = by_id[int(blocker_id)]
+        try:
+            f_b_at_a = self._cross_visibility_f_min(b, a.get("q_vis", []))
+            f_a_at_b = self._cross_visibility_f_min(a, b.get("q_vis", []))
+        except Exception as exc:
+            self._adaptive_refinement_failure_count += 1
+            self._adaptive_refinement_last_reason = "cross_visibility_error"
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_blocker_stack] adaptive refinement cross-visibility "
+                "evaluation failed: %s", exc)
+            return False
+
+        self._adaptive_refinement_last_cross_f_ab = float(f_b_at_a)
+        self._adaptive_refinement_last_cross_f_ba = float(f_a_at_b)
+        threshold = self.adaptive_refinement_cross_visibility_threshold
+        incompatible = bool(
+            math.isfinite(f_b_at_a) and math.isfinite(f_a_at_b) and
+            f_b_at_a < threshold and f_a_at_b < threshold)
+        if not incompatible:
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = (
+                "cycle_pair_cross_visible_no_refine")
+            return False
+
+        refinable = []
+        for oid in (int(current_id), int(blocker_id)):
+            ob = by_id[oid]
+            depth = int(ob.get("refinement_depth", 0))
+            point_count = int(np.asarray(
+                ob.get("points", []),
+                dtype=np.float64).reshape(-1, 3).shape[0])
+            if (depth < self.adaptive_refinement_max_depth and
+                    point_count >= self.adaptive_refinement_min_points):
+                refinable.append(oid)
+
+        if not refinable:
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = (
+                "cycle_pair_at_refinement_floor")
+            return False
+
+        with self._adaptive_refinement_lock:
+            if self._pending_refinement_ids:
+                return True
+            self._pending_refinement_ids = sorted(set(refinable))
+            self._adaptive_refinement_trigger_count += 1
+            self._adaptive_refinement_last_parent_ids = list(
+                self._pending_refinement_ids)
+            self._adaptive_refinement_last_reason = (
+                "cycle_pair_refinement_requested")
+        rospy.logwarn(
+            "[vbc_blocker_stack] ADAPTIVE REFINE request parents=%s "
+            "cross_f=(%+.4f,%+.4f) threshold=%+.4f",
+            ":".join(str(v) for v in refinable),
+            f_b_at_a, f_a_at_b, threshold)
+        return True
+
+    def _process_pending_refinement(
+            self, trajectory, trajectory_received,
+            trajectory_source: str, sweep_s: float) -> bool:
+        with self._adaptive_refinement_lock:
+            parent_ids = list(self._pending_refinement_ids)
+        if not parent_ids:
+            return False
+
+        with self._obligation_lock:
+            by_id = {
+                int(ob["id"]): dict(ob) for ob in self._obligations}
+        parents = [by_id[oid] for oid in parent_ids if oid in by_id]
+        if len(parents) != len(parent_ids):
+            with self._adaptive_refinement_lock:
+                self._pending_refinement_ids = []
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = (
+                "parent_disappeared_before_refinement")
+            return False
+
+        child_regions = []
+        parent_key_sets = []
+        for parent in parents:
+            parent_id = int(parent["id"])
+            depth = int(parent.get("refinement_depth", 0))
+            points = np.asarray(
+                parent.get("points", []),
+                dtype=np.float64).reshape(-1, 3)
+            region = {
+                "points": points.copy(),
+                "keys": tuple(parent.get("keys", ())),
+                "centroid": np.asarray(
+                    parent.get("centroid", np.mean(points, axis=0)),
+                    dtype=np.float64).reshape(3),
+                "refinement_depth": depth + 1,
+                "parent_obligation_id": parent_id,
+                "root_obligation_id": int(
+                    parent.get(
+                        "root_obligation_id",
+                        parent_id)
+                    if int(parent.get("root_obligation_id", -1)) >= 0
+                    else parent_id),
+                "refinement_reason": "adaptive_dependency_conflict",
+            }
+            split = self._split_region_for_refinement(
+                region, force_split=True)
+            if len(split) <= 1:
+                continue
+            child_regions.extend(split)
+            parent_key_sets.append(tuple(parent.get("keys", ())))
+
+        if not child_regions:
+            with self._adaptive_refinement_lock:
+                self._pending_refinement_ids = []
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = "no_splittable_parent"
+            return False
+
+        with self._obligation_lock:
+            surviving_count = sum(
+                1 for ob in self._obligations
+                if int(ob["id"]) not in set(parent_ids))
+        if surviving_count + len(child_regions) > self.max_obligations:
+            with self._adaptive_refinement_lock:
+                self._pending_refinement_ids = []
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = (
+                "refinement_capacity_exceeded")
+            rospy.logwarn(
+                "[vbc_blocker_stack] adaptive refinement skipped: "
+                "survivors=%d children=%d max_obligations=%d",
+                surviving_count, len(child_regions), self.max_obligations)
+            return False
+
+        children = []
+        try:
+            for region in child_regions:
+                child = self._generate_new_obligation(
+                    region, trajectory, float(sweep_s),
+                    trajectory_received, trajectory_source)
+                children.append(child)
+        except Exception as exc:
+            self._adaptive_refinement_failure_count += 1
+            self._adaptive_refinement_last_reason = (
+                "child_qvis_generation_failed")
+            with self._adaptive_refinement_lock:
+                self._pending_refinement_ids = []
+            rospy.logerr(
+                "[vbc_blocker_stack] adaptive refinement child generation "
+                "failed; keeping coarse parents: %s", exc)
+            return False
+
+        with self._obligation_lock:
+            existing_ids = {int(ob["id"]) for ob in self._obligations}
+            if not all(oid in existing_ids for oid in parent_ids):
+                self._adaptive_refinement_skip_count += 1
+                self._adaptive_refinement_last_reason = (
+                    "parent_cleared_during_child_generation")
+                with self._adaptive_refinement_lock:
+                    self._pending_refinement_ids = []
+                return False
+            self._obligations = [
+                ob for ob in self._obligations
+                if int(ob["id"]) not in set(parent_ids)]
+            self._obligations.extend(children)
+
+        with self._adaptive_refinement_lock:
+            for keys in parent_key_sets:
+                frozen = tuple(sorted(set(keys)))
+                if frozen and frozen not in self._adaptive_refined_key_sets:
+                    self._adaptive_refined_key_sets.append(frozen)
+            self._pending_refinement_ids = []
+            self._adaptive_refinement_success_count += 1
+            self._adaptive_refinement_parent_count += len(parent_ids)
+            self._adaptive_refinement_child_count += len(children)
+            self._adaptive_refinement_last_child_ids = [
+                int(ob["id"]) for ob in children]
+            self._adaptive_refinement_last_reason = (
+                "coarse_parents_replaced_by_children")
+
+        # The dependency graph referred to the removed coarse nodes. Rebuild it
+        # from exact VBC evidence instead of inheriting a stale parent cycle.
+        child_ids = [int(ob["id"]) for ob in children]
+        new_root = self._select_nearest_qvis_id(child_ids)
+        with self._obligation_lock:
+            self._repair_stack = [new_root] if new_root is not None else []
+        self._pending_blocker_id = None
+        self._pending_blocker_count = 0
+        self._last_active_layer_ids = []
+        self._last_active_layer_sweep_s = math.nan
+        self._last_switch_reason = "adaptive_refinement_reset_stack"
+
+        with self._progressive_shared_lock:
+            self._progressive_shared_cache_key = None
+            self._progressive_shared_cache = None
+        with self._frontier_lock:
+            self._frontier_cache_key = None
+            self._frontier_cache = None
+
+        rospy.logwarn(
+            "[vbc_blocker_stack] ADAPTIVE REFINE success parents=%s "
+            "children=%s new_root=%s",
+            ":".join(str(v) for v in parent_ids),
+            ":".join(str(v) for v in child_ids),
+            str(new_root))
+        return True
+
     def _match_candidate_compatible(
             self, ob: Dict[str, object], region: Dict[str, object]) -> bool:
         """Require the stored q_vis to remain valid for refreshed geometry.
@@ -552,6 +933,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._qvis_match_check_count += 1
         oid = int(ob.get("id", -1))
         self._qvis_match_last_obligation_id = oid
+
+        if int(ob.get("refinement_depth", 0)) > 0:
+            ob_keys = set(ob.get("keys", ()))
+            region_keys = set(region.get("keys", ()))
+            if region_keys and not region_keys.issubset(ob_keys):
+                self._qvis_match_reject_count += 1
+                self._qvis_match_last_f_min = math.nan
+                self._qvis_match_last_reason = (
+                    "refined_child_rejects_coarse_geometry")
+                return False
 
         q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
         points = np.asarray(
@@ -750,6 +1141,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         cycle_active = self._dependency_cycle_active(
             stack, self._last_active_layer_ids)
+        if cycle_active and self.adaptive_refinement_enabled:
+            self._frontier_last_mode = (
+                "cycle_deferred_to_adaptive_refinement")
+            self._frontier_last_cycle_active = True
+            self._frontier_last_weight_scale = 0.0
+            self._frontier_last_qvis_weight_scale = 1.0
+            return None
         quantized_q = tuple(
             int(round(float(v) / self.frontier_recompute_q_inf))
             for v in measured)
@@ -1183,8 +1581,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
         if blocker in stack:
             # Do not create O1->O4->O1 cycles from rejected hypothetical plans.
+            # First ask whether this is also a learned visibility conflict. If
+            # so, refine the coarse spatial representation instead of repeatedly
+            # negotiating between incompatible whole-region q_vis targets.
             self._stack_cycle_block_count += 1
-            self._last_switch_reason = "existing_stack_cycle_not_pushed"
+            if self._request_cycle_refinement(int(current), int(blocker)):
+                self._last_switch_reason = "adaptive_refinement_pending"
+            else:
+                self._last_switch_reason = "existing_stack_cycle_not_pushed"
             return
 
         if self._pending_blocker_id == blocker:
@@ -1318,6 +1722,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._last_process_reason = "generation_failed"
         self._prune_or_initialize_stack()
         self._consider_active_layer(active_ids, new_ids, float(sweep))
+        self._process_pending_refinement(
+            trajectory, trajectory_received,
+            trajectory_source, float(sweep))
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
@@ -1443,5 +1850,35 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" frontier_compute_count={self._frontier_compute_count}"
             f" frontier_publish_count={self._frontier_publish_count}"
             f" frontier_error_count={self._frontier_error_count}"
+            f" adaptive_refinement_enabled="
+            f"{int(self.adaptive_refinement_enabled)}"
+            f" adaptive_refinement_target_diameter_m="
+            f"{self.adaptive_refinement_target_diameter_m:.6f}"
+            f" adaptive_refinement_max_depth="
+            f"{self.adaptive_refinement_max_depth}"
+            f" adaptive_refinement_trigger_count="
+            f"{self._adaptive_refinement_trigger_count}"
+            f" adaptive_refinement_success_count="
+            f"{self._adaptive_refinement_success_count}"
+            f" adaptive_refinement_failure_count="
+            f"{self._adaptive_refinement_failure_count}"
+            f" adaptive_refinement_skip_count="
+            f"{self._adaptive_refinement_skip_count}"
+            f" adaptive_refinement_parent_count="
+            f"{self._adaptive_refinement_parent_count}"
+            f" adaptive_refinement_child_count="
+            f"{self._adaptive_refinement_child_count}"
+            f" adaptive_refinement_last_parents="
+            f"{':'.join(str(v) for v in self._adaptive_refinement_last_parent_ids) or 'none'}"
+            f" adaptive_refinement_last_children="
+            f"{':'.join(str(v) for v in self._adaptive_refinement_last_child_ids) or 'none'}"
+            f" adaptive_refinement_cross_f_ab="
+            f"{self._adaptive_refinement_last_cross_f_ab:.6f}"
+            f" adaptive_refinement_cross_f_ba="
+            f"{self._adaptive_refinement_last_cross_f_ba:.6f}"
+            f" adaptive_refinement_refined_zone_count="
+            f"{len(self._adaptive_refined_key_sets)}"
+            f" adaptive_refinement_reason="
+            f"{self._adaptive_refinement_last_reason}"
         )
         self.blocker_stack_summary_pub.publish(msg)
