@@ -93,6 +93,9 @@ class OptimizedTrajectoryContinuityNode:
             "/care_planner/c4_4/probe_active"))
         self.joint_state_topic = str(rospy.get_param(
             "~joint_state_topic", "/care_arm/joint_states"))
+        self.blocker_stack_summary_topic = str(rospy.get_param(
+            "~blocker_stack_summary_topic",
+            "/care_planner/active_sensing/blocker_stack_summary"))
         self.probe_start_rebase_enabled = bool(rospy.get_param(
             "~probe_start_rebase_enabled", True))
         self.probe_rebase_max_shift_inf = float(rospy.get_param(
@@ -159,6 +162,28 @@ class OptimizedTrajectoryContinuityNode:
         self.repair_acceleration_limits = [float(v) for v in rospy.get_param(
             "~repair_acceleration_limits", [3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0])]
 
+        # Cycle-aware visibility frontier recovery. This never bypasses either
+        # safety gate: it only shortens the exact executable REPAIR prefix that
+        # will still pass final GCDF and exact VBC before commit.
+        self.cycle_recovery_enabled = bool(rospy.get_param(
+            "~cycle_recovery_enabled", False))
+        raw_cycle_prefixes = rospy.get_param(
+            "~cycle_recovery_prefixes_s", [0.15, 0.10, 0.05])
+        if not isinstance(raw_cycle_prefixes, (list, tuple)):
+            raise ValueError("~cycle_recovery_prefixes_s must be a list")
+        fallback_prefixes = [float(v) for v in raw_cycle_prefixes]
+        ladder = [float(self.repair_execution_prefix_s)] + [
+            v for v in fallback_prefixes
+            if v <= self.repair_execution_prefix_s + 1e-12]
+        self.cycle_recovery_prefixes_s = []
+        for value in sorted(ladder, reverse=True):
+            if value <= 0.0 or not math.isfinite(value):
+                raise ValueError(
+                    "~cycle_recovery_prefixes_s must contain positive finite values")
+            if not self.cycle_recovery_prefixes_s or abs(
+                    value - self.cycle_recovery_prefixes_s[-1]) > 1e-9:
+                self.cycle_recovery_prefixes_s.append(value)
+
         if self.rate <= 0.0:
             raise ValueError("~rate must be positive")
         if self.continuation_enabled:
@@ -208,6 +233,8 @@ class OptimizedTrajectoryContinuityNode:
             raise ValueError("~probe_velocity_cap must be positive")
         if self.probe_time_scale_max < 1.0:
             raise ValueError("~probe_time_scale_max must be >= 1")
+        if not self.cycle_recovery_prefixes_s:
+            raise ValueError("cycle recovery prefix ladder is empty")
 
         self._repair_active = False
         self._probe_active = False
@@ -314,6 +341,21 @@ class OptimizedTrajectoryContinuityNode:
         self._last_probe_speed_max_before = math.nan
         self._last_probe_speed_max_after = math.nan
         self._last_probe_effective_prefix_s = math.nan
+
+        self._cycle_recovery_active = False
+        self._cycle_recovery_signature = "none"
+        self._cycle_recovery_stack = "none"
+        self._cycle_recovery_earliest_layer_ids = "none"
+        self._cycle_recovery_cycle_count = 0
+        self._cycle_recovery_prefix_index = 0
+        self._cycle_recovery_activation_count = 0
+        self._cycle_recovery_clear_count = 0
+        self._cycle_recovery_backoff_count = 0
+        self._cycle_recovery_safe_commit_count = 0
+        self._cycle_recovery_floor_unsafe_count = 0
+        self._cycle_recovery_last_reason = "startup"
+        self._last_cycle_recovery_prefix_s = self.repair_execution_prefix_s
+
         self._gcdf_outstanding_diag = None
         self._outstanding_diag = None
         self._last_verification_diag = None
@@ -353,6 +395,9 @@ class OptimizedTrajectoryContinuityNode:
             self.probe_active_topic, Bool, self._probe_active_cb, queue_size=1)
         self.joint_state_sub = rospy.Subscriber(
             self.joint_state_topic, JointState, self._joint_state_cb, queue_size=1)
+        self.blocker_stack_sub = rospy.Subscriber(
+            self.blocker_stack_summary_topic, String,
+            self._blocker_stack_summary_cb, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
 
@@ -361,7 +406,7 @@ class OptimizedTrajectoryContinuityNode:
             "[optimized_trajectory_continuity] SELECTOR-CYCLE VERIFY raw=%s "
             "final_gcdf=%s verify=%s committed=%s audit=%s continuation=%d "
             "audit_enabled=%d repair_prefix=%d prefix=%.3fs brake_dt=%.3fs "
-            "hold=%.3fs timeout=%.3fs",
+            "hold=%.3fs cycle_recovery=%d ladder=%s timeout=%.3fs",
             self.input_topic, self.final_gcdf_query_topic,
             self.verification_topic, self.committed_topic,
             self.execution_audit_topic,
@@ -369,7 +414,91 @@ class OptimizedTrajectoryContinuityNode:
             int(self.execution_audit_enabled),
             int(self.repair_prefix_verification_enabled),
             self.repair_execution_prefix_s, self.repair_brake_dt_s,
-            self.repair_hold_s, self.verification_timeout_s)
+            self.repair_hold_s, int(self.cycle_recovery_enabled),
+            ":".join("{:.3f}".format(v) for v in self.cycle_recovery_prefixes_s),
+            self.verification_timeout_s)
+
+    def _blocker_stack_summary_cb(self, msg):
+        """Track a live recursive blocker cycle without changing stack semantics."""
+        if msg is None:
+            return
+        fields = _tokens(msg.data)
+        reason = fields.get("switch_reason", "")
+        stack = fields.get("stack", "none")
+        earliest = fields.get("earliest_layer_ids", "none")
+        target = fields.get("current_target_id", "-1")
+        try:
+            cycle_count = int(fields.get("cycle_block_count", "0"))
+        except Exception:
+            cycle_count = 0
+
+        active = bool(
+            self.cycle_recovery_enabled and
+            reason == "existing_stack_cycle_not_pushed" and
+            stack not in ("", "none"))
+        signature = "{}|{}|{}".format(stack, target, earliest)
+
+        with self._lock:
+            previously_active = self._cycle_recovery_active
+            previous_signature = self._cycle_recovery_signature
+
+            self._cycle_recovery_cycle_count = max(
+                self._cycle_recovery_cycle_count, cycle_count)
+            self._cycle_recovery_stack = stack
+            self._cycle_recovery_earliest_layer_ids = earliest
+
+            if active:
+                if (not previously_active or
+                        signature != previous_signature):
+                    self._cycle_recovery_prefix_index = 0
+                    self._cycle_recovery_activation_count += 1
+                    self._cycle_recovery_last_reason = "cycle_detected"
+                self._cycle_recovery_active = True
+                self._cycle_recovery_signature = signature
+            else:
+                if previously_active:
+                    self._cycle_recovery_clear_count += 1
+                    self._cycle_recovery_last_reason = "cycle_cleared"
+                self._cycle_recovery_active = False
+                self._cycle_recovery_signature = "none"
+                self._cycle_recovery_prefix_index = 0
+
+            self._publish_summary_locked()
+
+    def _cycle_recovery_prefix_locked(self):
+        if not (self.cycle_recovery_enabled and self._cycle_recovery_active):
+            return float(self.repair_execution_prefix_s), False
+        idx = min(
+            max(0, int(self._cycle_recovery_prefix_index)),
+            len(self.cycle_recovery_prefixes_s) - 1)
+        return float(self.cycle_recovery_prefixes_s[idx]), True
+
+    def _cycle_recovery_backoff_locked(self, used_prefix_s):
+        if not (self.cycle_recovery_enabled and self._cycle_recovery_active):
+            return
+        # Resolve the attempted prefix against the configured discrete ladder.
+        idx = min(
+            range(len(self.cycle_recovery_prefixes_s)),
+            key=lambda i: abs(
+                self.cycle_recovery_prefixes_s[i] - float(used_prefix_s)))
+        if idx + 1 < len(self.cycle_recovery_prefixes_s):
+            self._cycle_recovery_prefix_index = idx + 1
+            self._cycle_recovery_backoff_count += 1
+            self._cycle_recovery_last_reason = "exact_vbc_unsafe_backoff"
+            self._last_cycle_recovery_prefix_s = float(
+                self.cycle_recovery_prefixes_s[idx + 1])
+            rospy.logwarn(
+                "[optimized_trajectory_continuity] CYCLE FRONTIER backoff "
+                "stack=%s earliest=%s prefix %.3f -> %.3f s",
+                self._cycle_recovery_stack,
+                self._cycle_recovery_earliest_layer_ids,
+                float(used_prefix_s),
+                self._last_cycle_recovery_prefix_s)
+        else:
+            self._cycle_recovery_floor_unsafe_count += 1
+            self._cycle_recovery_last_reason = "exact_vbc_unsafe_at_floor"
+            self._last_cycle_recovery_prefix_s = float(
+                self.cycle_recovery_prefixes_s[-1])
 
     def _joint_state_cb(self, msg):
         if msg is None or len(msg.name) != len(msg.position):
@@ -1023,10 +1152,20 @@ class OptimizedTrajectoryContinuityNode:
         view = "full_horizon"
         prefix_mode = bool(pending_repair or pending_probe)
         if self.repair_prefix_verification_enabled and prefix_mode:
+            cycle_prefix_s, cycle_prefix_active = (
+                self._cycle_recovery_prefix_locked()
+                if pending_repair and not pending_probe
+                else (self.repair_execution_prefix_s, False))
             effective_prefix_s = (
                 self.probe_execution_prefix_s *
                 float(speed_diag.get("time_scale", 1.0))
-                if pending_probe else self.repair_execution_prefix_s)
+                if pending_probe else cycle_prefix_s)
+            diag["cycle_recovery_active"] = int(cycle_prefix_active)
+            diag["cycle_recovery_prefix_index"] = int(
+                self._cycle_recovery_prefix_index if cycle_prefix_active else 0)
+            diag["cycle_recovery_prefix_s"] = float(effective_prefix_s)
+            diag["cycle_recovery_cycle_count"] = int(
+                self._cycle_recovery_cycle_count)
             self._last_probe_effective_prefix_s = (
                 effective_prefix_s if pending_probe
                 else self._last_probe_effective_prefix_s)
@@ -1044,6 +1183,7 @@ class OptimizedTrajectoryContinuityNode:
             if pending_repair:
                 view = "repair_prefix_brake_hold"
                 self._repair_prefix_build_count += 1
+                self._last_cycle_recovery_prefix_s = float(effective_prefix_s)
             else:
                 view = "probe_prefix_brake_hold"
                 self._probe_prefix_build_count += 1
@@ -1137,6 +1277,8 @@ class OptimizedTrajectoryContinuityNode:
             "probe_speed_max_before={} probe_speed_max_after={} "
             "probe_time_scale={} probe_time_scale_clamped={} "
             "probe_effective_prefix_s={} "
+            "cycle_recovery_active={} cycle_recovery_prefix_index={} "
+            "cycle_recovery_prefix_s={} cycle_recovery_cycle_count={} "
             "precommit_suffix_phase_s={} precommit_suffix_start_shift_inf={} "
             "total_start_shift_inf={} "
             "raw_start_measured_mismatch_inf_at_dispatch={} "
@@ -1176,6 +1318,10 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "probe_time_scale"),
             self._diag_value(diag, "probe_time_scale_clamped"),
             self._diag_value(diag, "probe_effective_prefix_s"),
+            self._diag_value(diag, "cycle_recovery_active"),
+            self._diag_value(diag, "cycle_recovery_prefix_index"),
+            self._diag_value(diag, "cycle_recovery_prefix_s"),
+            self._diag_value(diag, "cycle_recovery_cycle_count"),
             self._diag_value(diag, "precommit_suffix_phase_s"),
             self._diag_value(diag, "precommit_suffix_start_shift_inf"),
             self._diag_value(diag, "total_start_shift_inf"),
@@ -1545,6 +1691,15 @@ class OptimizedTrajectoryContinuityNode:
                         self._verification_unsafe_count += 1
                         if was_repair and view == "repair_prefix_brake_hold":
                             self._repair_prefix_unsafe_count += 1
+                            if self._cycle_recovery_active:
+                                attempted_prefix = (
+                                    float(diag.get(
+                                        "cycle_recovery_prefix_s",
+                                        self.repair_execution_prefix_s))
+                                    if diag is not None
+                                    else self.repair_execution_prefix_s)
+                                self._cycle_recovery_backoff_locked(
+                                    attempted_prefix)
                         if was_probe and view == "probe_prefix_brake_hold":
                             self._probe_prefix_unsafe_count += 1
                         self._last_verification_result = "unsafe"
@@ -1641,6 +1796,10 @@ class OptimizedTrajectoryContinuityNode:
                             if committed is not None:
                                 if was_repair and view == "repair_prefix_brake_hold":
                                     self._repair_prefix_safe_count += 1
+                                    if self._cycle_recovery_active:
+                                        self._cycle_recovery_safe_commit_count += 1
+                                        self._cycle_recovery_last_reason = (
+                                            "certified_frontier_commit")
                                 if was_probe and view == "probe_prefix_brake_hold":
                                     self._probe_prefix_safe_count += 1
                                 self._last_verification_result = "safe"
@@ -1832,6 +1991,30 @@ class OptimizedTrajectoryContinuityNode:
             "repair_active={}".format(int(self._repair_active)),
             "probe_active={}".format(int(self._probe_active)),
             "repair_prefix_enabled={}".format(int(self.repair_prefix_verification_enabled)),
+            "cycle_recovery_enabled={}".format(int(self.cycle_recovery_enabled)),
+            "cycle_recovery_active={}".format(int(self._cycle_recovery_active)),
+            "cycle_recovery_signature={}".format(self._cycle_recovery_signature),
+            "cycle_recovery_stack={}".format(self._cycle_recovery_stack),
+            "cycle_recovery_earliest_layer_ids={}".format(
+                self._cycle_recovery_earliest_layer_ids),
+            "cycle_recovery_cycle_count={}".format(
+                self._cycle_recovery_cycle_count),
+            "cycle_recovery_prefix_index={}".format(
+                self._cycle_recovery_prefix_index),
+            "cycle_recovery_prefix_s={:.6f}".format(
+                self._last_cycle_recovery_prefix_s),
+            "cycle_recovery_activation_count={}".format(
+                self._cycle_recovery_activation_count),
+            "cycle_recovery_clear_count={}".format(
+                self._cycle_recovery_clear_count),
+            "cycle_recovery_backoff_count={}".format(
+                self._cycle_recovery_backoff_count),
+            "cycle_recovery_safe_commit_count={}".format(
+                self._cycle_recovery_safe_commit_count),
+            "cycle_recovery_floor_unsafe_count={}".format(
+                self._cycle_recovery_floor_unsafe_count),
+            "cycle_recovery_last_reason={}".format(
+                self._cycle_recovery_last_reason),
             "final_gcdf_enabled={}".format(int(self.final_gcdf_enabled)),
             "final_gcdf_outstanding={}".format(int(self._gcdf_outstanding is not None)),
             "final_gcdf_outstanding_seq={}".format(int(self._gcdf_outstanding_seq)),
