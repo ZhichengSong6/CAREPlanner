@@ -74,6 +74,7 @@ python3 -m py_compile \
   src/egocentric_arm_planner/scripts/execution_gcdf_safety_monitor_node.py \
   scripts/wait_for_phase_d_goal.py \
   scripts/analyze_tracker_execution_breakdown.py \
+  src/care_visibility_cdf/scripts/vbc_multi_deadline_obligation_impl.py \
   src/care_visibility_cdf/scripts/vbc_visibility_acquisition_impl.py \
   src/care_visibility_cdf/scripts/vbc_blocker_aware_acquisition_impl.py
 python3 - <<'PY'
