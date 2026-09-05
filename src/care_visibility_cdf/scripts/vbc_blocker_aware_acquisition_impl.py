@@ -1574,7 +1574,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         build_start = time.perf_counter()
         projector_ms = 0.0
-        screen_start = time.perf_counter()
+        screen_ms = 0.0
 
         x = torch.tensor(
             points, device=self.device, dtype=torch.float32)
@@ -1582,6 +1582,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             measured.reshape(1, 7),
             device=self.device, dtype=torch.float32)
 
+        screen_started = time.perf_counter()
         try:
             _, grad_tensor, _ = model_value_and_grad_q(
                 x, q_measured, self.model)
@@ -1599,6 +1600,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         current_f_min = (
             float(np.min(current_values))
             if current_values.size else -math.inf)
+        screen_ms += 1000.0 * (
+            time.perf_counter() - screen_started)
 
         order = list(np.argsort(-np.abs(grad)))
         seed_specs = [("existing_qvis", None)]
@@ -1675,7 +1678,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             q_target = torch.tensor(
                 target.reshape(1, 7),
                 device=self.device, dtype=torch.float32)
+            target_screen_started = time.perf_counter()
             target_values = self._per_point_values(x, q_target)
+            screen_ms += 1000.0 * (
+                time.perf_counter() - target_screen_started)
             target_f_min = (
                 float(np.min(target_values))
                 if target_values.size else -math.inf)
@@ -1707,7 +1713,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "projector_ms": float(generation_ms),
             })
 
-        screen_ms = 1000.0 * (time.perf_counter() - screen_start)
         raw_candidates.sort(
             key=lambda item: (
                 float(item["score"]),
@@ -2171,6 +2176,33 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" compute_count={self._frontier_compute_count}"
             f" publish_count={self._frontier_publish_count}"
             f" error_count={self._frontier_error_count}"
+            f" certified_search="
+            f"{int(getattr(self, 'certified_frontier_search_enabled', False))}"
+            f" bank_size={len(self._certified_frontier_bank)}"
+            f" bank_index={self._certified_frontier_index}"
+            f" bank_exhausted={int(self._certified_frontier_exhausted)}"
+            f" selected_seed={self._certified_frontier_last_selected_seed}"
+            f" selected_score="
+            f"{self._certified_frontier_last_selected_score:.6f}"
+            f" bank_build_count="
+            f"{self._certified_frontier_bank_build_count}"
+            f" bank_build_ms="
+            f"{self._certified_frontier_bank_build_ms:.6f}"
+            f" bank_projector_ms="
+            f"{self._certified_frontier_projector_ms:.6f}"
+            f" bank_screen_ms="
+            f"{self._certified_frontier_screen_ms:.6f}"
+            f" unsafe_switch_count="
+            f"{self._certified_frontier_unsafe_switch_count}"
+            f" safe_candidate_count="
+            f"{self._certified_frontier_safe_candidate_count}"
+            f" exhausted_count="
+            f"{self._certified_frontier_exhausted_count}"
+            f" deferred_bundle_count="
+            f"{self._certified_frontier_deferred_bundle_count}"
+            f" deferred_point_count="
+            f"{self._certified_frontier_deferred_point_count}"
+            f" stuck_count={self._certified_frontier_stuck_count}"
         )
         self.frontier_summary_pub.publish(summary)
 
