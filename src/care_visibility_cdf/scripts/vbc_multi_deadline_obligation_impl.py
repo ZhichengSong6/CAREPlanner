@@ -325,6 +325,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             parent_obligation_id if parent_obligation_id >= 0 else -1))
         refinement_reason = str(region.get(
             "refinement_reason", "coarse_discovery"))
+        refinement_family_id = int(region.get(
+            "refinement_family_id", -1))
+        refinement_partition_anchor = np.asarray(
+            region.get("refinement_partition_anchor", source_centroid),
+            dtype=np.float64).reshape(3)
 
         ob = {
             "id": int(self._next_obligation_id),
@@ -350,6 +355,9 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "parent_obligation_id": parent_obligation_id,
             "root_obligation_id": root_obligation_id,
             "refinement_reason": refinement_reason,
+            "refinement_family_id": refinement_family_id,
+            "refinement_partition_anchor":
+                refinement_partition_anchor.copy(),
             "q_vis": q_vis,
             "q_zero": np.asarray(result["q_zero"], dtype=np.float64),
             "deadline_abs_s": deadline_abs,
@@ -386,6 +394,9 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_parent_obligation_id": parent_obligation_id,
             "c4_6_root_obligation_id": root_obligation_id,
             "c4_6_refinement_reason": refinement_reason,
+            "c4_6_refinement_family_id": refinement_family_id,
+            "c4_6_refinement_partition_anchor":
+                refinement_partition_anchor.tolist(),
         })
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = Path(self.output_root) / (
