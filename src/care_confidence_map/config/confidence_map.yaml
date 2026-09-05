@@ -24,6 +24,10 @@ confidence_map:
   # switches this node to real ToF ray integration.
   observation_mode: ideal_fov
 
+  # Frozen baseline keeps legacy temporal confidence decay. Phase-E's
+  # real ray config explicitly enables persistent FREE evidence instead.
+  persistent_free_evidence: false
+
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
