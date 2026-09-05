@@ -540,6 +540,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         all_regions_handled = True
 
         for region in regions:
+            routed = self._absorb_refined_partition_region(
+                region, trajectory, float(sweep_s),
+                trajectory_received, "final_gcdf_rejected")
+            if routed is not None:
+                if int(routed) < 0:
+                    all_regions_handled = False
+                    self._last_gcdf_recovery_reason = (
+                        "refined_family_absorb_retry")
+                else:
+                    active_ids.append(int(routed))
+                    self._schedule_matched_obligations += 1
+                    self._gcdf_recovery_match_count += 1
+                continue
+
             with self._obligation_lock:
                 matched = self._match_existing(region)
                 if matched is not None:
@@ -2029,6 +2043,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         new_ids: List[int] = []
         all_regions_handled = True
         for region in regions:
+            routed = self._absorb_refined_partition_region(
+                region, trajectory, float(sweep),
+                trajectory_received, trajectory_source)
+            if routed is not None:
+                if int(routed) < 0:
+                    all_regions_handled = False
+                else:
+                    active_ids.append(int(routed))
+                    self._schedule_matched_obligations += 1
+                continue
+
             with self._obligation_lock:
                 matched = self._match_existing(region)
                 if matched is not None:
