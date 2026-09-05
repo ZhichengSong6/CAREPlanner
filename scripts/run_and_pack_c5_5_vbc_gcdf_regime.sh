@@ -75,13 +75,6 @@ export LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 # q_vis objective is suppressed while this local target is active; every
 # proposal still passes final GCDF + exact VBC before execution.
 export VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-true}"
-# Bounded local sensing-action search: score 15 cheap direct local actions in
-# one nominal-FOV batch, but certify at most four through the existing
-# Sparse-SCP -> final GCDF -> exact VBC pipeline.
-export LOCAL_SENSING_ACTION_SEARCH_ENABLED="${LOCAL_SENSING_ACTION_SEARCH_ENABLED:-true}"
-export LOCAL_SENSING_ACTION_STEP_INF="${LOCAL_SENSING_ACTION_STEP_INF:-0.04}"
-export LOCAL_SENSING_ACTION_MAX_TRIALS="${LOCAL_SENSING_ACTION_MAX_TRIALS:-4}"
-export LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF="${LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF:-0.03}"
 # Keep refinement available as an opt-in diagnostic, but do not let it
 # dominate the first strict-frontier qualification.
 export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
@@ -109,8 +102,6 @@ echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladde
 echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
 echo "[MARGIN SPLIT] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[VISIBILITY FRONTIER] vbc_gated_single_obligation_step=${VBC_GATED_FRONTIER_STEP_ENABLED}; q_vis is long-range direction only"
-echo "[LOCAL SENSING ACTION] enabled=${LOCAL_SENSING_ACTION_SEARCH_ENABLED}; step_inf=${LOCAL_SENSING_ACTION_STEP_INF}; max_trials=${LOCAL_SENSING_ACTION_MAX_TRIALS}; recompute_q_inf=${LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF}"
-echo "[LOCAL SENSING ACTION] 15 local directions are nominal-FOV ranked in one batch; only top trials enter Sparse-SCP + final GCDF + exact VBC"
 echo "[VISIBILITY FRONTIER] every local frontier proposal remains final-GCDF + exact-VBC gated"
 echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; retained as opt-in fallback, not the primary strict-Phase-E mechanism"
 echo "[ADAPTIVE O] refined zones stay refined on later active-set updates; final GCDF + exact VBC unchanged"
