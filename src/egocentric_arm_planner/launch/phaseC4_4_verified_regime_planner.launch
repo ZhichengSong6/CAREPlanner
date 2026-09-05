@@ -123,6 +123,9 @@
 
   <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
   <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
+  <!-- Strict diagnostic A/B only. This controls the MAIN trajectory-risk
+       instance; local/final/execution GCDF exporters remain refresh=false. -->
+  <arg name="trajectory_risk_refresh_body_prior_before_query" default="false" />
   <arg name="forbidden_space_pair_publish_enabled" default="false" />
   <arg name="forbidden_space_pair_topic"
        default="/care_planner/trajectory_risk/body_sweep_anchors" />
@@ -607,6 +610,8 @@
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="$(arg trajectory_risk_input_topic)" />
     <arg name="active_sensing_target_topic" value="/care_planner/active_sensing/legacy_target_candidate" />
+    <arg name="refresh_body_prior_before_query"
+         value="$(arg trajectory_risk_refresh_body_prior_before_query)" />
     <arg name="forbidden_space_pair_publish_enabled"
          value="$(arg forbidden_space_pair_publish_enabled)" />
     <arg name="forbidden_space_pair_topic"
