@@ -585,6 +585,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         self._prune_or_initialize_stack()
         self._consider_active_layer(active_ids, new_ids, sweep_s)
+        self._process_pending_refinement(
+            trajectory, trajectory_received,
+            "final_gcdf_rejected", float(sweep_s))
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
