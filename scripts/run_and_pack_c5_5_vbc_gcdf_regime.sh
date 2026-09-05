@@ -66,6 +66,11 @@ export CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-true}"
 # Strict Phase-E/C5.5 semantics: the trusted-free body prior is startup-only.
 # Do not allow the formal runner to revive the old moving 10-cm free bubble.
 export TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY=false
+# Visibility and collision margins are intentionally different:
+#   VBC certifies the conservative body-sphere approximation itself.
+#   GCDF keeps the independent collision-clearance proximity margin.
+export VBC_SWEPT_VOLUME_MARGIN_M=0.0
+export LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 # Prefer one local measured-q -> active-q_vis frontier step. The long-range
 # q_vis objective is suppressed while this local target is active; every
 # proposal still passes final GCDF + exact VBC before execution.
@@ -95,6 +100,7 @@ echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
 echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
+echo "[MARGIN SPLIT] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[VISIBILITY FRONTIER] vbc_gated_single_obligation_step=${VBC_GATED_FRONTIER_STEP_ENABLED}; q_vis is long-range direction only"
 echo "[VISIBILITY FRONTIER] every local frontier proposal remains final-GCDF + exact-VBC gated"
 echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; retained as opt-in fallback, not the primary strict-Phase-E mechanism"
