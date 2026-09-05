@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from collections import OrderedDict
 from typing import Dict, List
 
@@ -836,6 +837,214 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             qv.reshape(1, 7), device=self.device, dtype=torch.float32)
         values = self._per_point_values(x, q)
         return float(np.min(values)) if values.size else -math.inf
+
+    def _merge_refined_child_region(self, child, region):
+        by_key = {}
+        old_points = np.asarray(
+            child.get("points", []), dtype=np.float64).reshape(-1, 3)
+        new_points = np.asarray(
+            region.get("points", []), dtype=np.float64).reshape(-1, 3)
+        for p in old_points:
+            by_key[self._cell_key(p)] = p.copy()
+        before_keys = set(by_key.keys())
+        for p in new_points:
+            by_key[self._cell_key(p)] = p.copy()
+        keys = tuple(sorted(by_key.keys()))
+        points = np.asarray(
+            [by_key[k] for k in keys], dtype=np.float64).reshape(-1, 3)
+        added = len(set(keys) - before_keys)
+        return {
+            "points": points,
+            "keys": keys,
+            "centroid": np.mean(points, axis=0),
+            "preferred_child_id": int(child["id"]),
+            "refinement_family_id": int(
+                child.get("refinement_family_id", -1)),
+            "refinement_depth": int(child.get("refinement_depth", 1)),
+            "parent_obligation_id": int(
+                child.get("parent_obligation_id", -1)),
+            "root_obligation_id": int(
+                child.get("root_obligation_id", -1)),
+            "refinement_partition_anchor": np.asarray(
+                child.get(
+                    "refinement_partition_anchor",
+                    child.get("centroid", [math.nan] * 3)),
+                dtype=np.float64).reshape(3).copy(),
+            "refinement_reason": "persistent_family_absorb",
+            "_new_point_count": int(added),
+        }
+
+    def _regenerate_refined_child_qvis(
+            self, child_id: int, merged_region,
+            trajectory, sweep_time_s: float, trajectory_received,
+            trajectory_source: str) -> bool:
+        measured = (
+            None if self._latest_measured_q is None
+            else np.asarray(
+                self._latest_measured_q, dtype=np.float64).copy())
+        if (measured is None or measured.shape != (7,) or
+                not np.all(np.isfinite(measured))):
+            return False
+
+        self._seed_override = measured
+        started = time.perf_counter()
+        try:
+            result = self._generate_active_set_waypoint(
+                merged_region["points"], trajectory,
+                float(sweep_time_s), trajectory_received)
+        except Exception as exc:
+            self._adaptive_refinement_qvis_regen_failure_count += 1
+            self._adaptive_refinement_last_reason = (
+                "family_child_qvis_regeneration_failed")
+            rospy.logerr(
+                "[vbc_blocker_stack] refined child q_vis regeneration "
+                "failed child=%d: %s", int(child_id), exc)
+            return False
+        finally:
+            generation_ms = 1000.0 * (
+                time.perf_counter() - started)
+            self._seed_override = None
+
+        q_vis = np.asarray(
+            result["q_vis"], dtype=np.float64).reshape(7)
+        q_zero = np.asarray(
+            result["q_zero"], dtype=np.float64).reshape(7)
+        points = np.asarray(
+            merged_region["points"], dtype=np.float64).reshape(-1, 3)
+        centroid = np.asarray(
+            merged_region["centroid"], dtype=np.float64).reshape(3)
+        keys = tuple(merged_region["keys"])
+        xyz_min = np.min(points, axis=0)
+        xyz_max = np.max(points, axis=0)
+        deadline_abs = float(result["deadline_absolute_ros_s"])
+        now_s = rospy.Time.now().to_sec()
+        min_hit = self._rest_min_hit_time(measured, q_vis)
+        deadline_remaining = deadline_abs - now_s
+
+        with self._obligation_lock:
+            live = next(
+                (ob for ob in self._obligations
+                 if int(ob["id"]) == int(child_id)),
+                None)
+            if live is None:
+                return False
+
+            live["points"] = points.copy()
+            live["keys"] = keys
+            live["centroid"] = centroid.copy()
+            live["q_vis_source_points"] = points.copy()
+            live["q_vis_source_keys"] = keys
+            live["q_vis_source_centroid"] = centroid.copy()
+            live["q_vis_source_xyz_min"] = xyz_min.copy()
+            live["q_vis_source_xyz_max"] = xyz_max.copy()
+            live["geometry_changed_since_qvis"] = False
+            live["last_match_centroid_shift_m"] = 0.0
+            live["max_centroid_shift_from_qvis_m"] = 0.0
+            live["last_geometry_match_source"] = (
+                "persistent_family_qvis_regenerated")
+            live["last_seen_ros_s"] = now_s
+            live["q_vis"] = q_vis.copy()
+            live["q_zero"] = q_zero.copy()
+            live["deadline_abs_s"] = deadline_abs
+            live["discovered_sweep_time_s"] = float(sweep_time_s)
+            live["trajectory_source"] = str(trajectory_source)
+            live["min_hit_time_from_measured_rest_s"] = float(min_hit)
+            live["deadline_remaining_at_discovery_s"] = float(
+                deadline_remaining)
+            live["reachable_before_discovered_deadline_lower_bound"] = bool(
+                min_hit <= max(0.0, deadline_remaining) + 1e-9)
+            live["final_f_min"] = float(result["final_f_min"])
+            live["shared_solution_mode"] = str(
+                result["shared_solution_mode"])
+            live["q_vis_generation_ms"] = float(generation_ms)
+            live["q_vis_regeneration_count"] = int(
+                live.get("q_vis_regeneration_count", 0)) + 1
+
+        with self._progressive_shared_lock:
+            self._progressive_shared_cache_key = None
+            self._progressive_shared_cache = None
+        with self._frontier_lock:
+            self._frontier_cache_key = None
+            self._frontier_cache = None
+
+        self._adaptive_refinement_qvis_regen_count += 1
+        self._adaptive_refinement_last_reason = (
+            "family_child_absorbed_qvis_regenerated")
+        rospy.logwarn(
+            "[vbc_blocker_stack] ADAPTIVE FAMILY regenerate child=%d "
+            "points=%d min_f=%+.4f qvis_ms=%.3f",
+            int(child_id), int(points.shape[0]),
+            float(result["final_f_min"]), float(generation_ms))
+        return True
+
+    def _absorb_refined_partition_region(
+            self, region, trajectory, sweep_time_s: float,
+            trajectory_received, trajectory_source: str):
+        """Absorb routed blocker voxels into an existing refined child.
+
+        Returns child id on success, -1 when the routed child must be retried,
+        and None when the region is not owned by a persistent family.
+        """
+        child_id = int(region.get("preferred_child_id", -1))
+        family_id = int(region.get("refinement_family_id", -1))
+        if child_id < 0 or family_id < 0:
+            return None
+
+        with self._obligation_lock:
+            child = next(
+                (dict(ob) for ob in self._obligations
+                 if int(ob["id"]) == child_id),
+                None)
+        if child is None:
+            return None
+        if int(child.get("refinement_family_id", -1)) != family_id:
+            return None
+
+        merged = self._merge_refined_child_region(child, region)
+        try:
+            f_min = self._cross_visibility_f_min(
+                merged, child.get("q_vis", []))
+        except Exception as exc:
+            self._adaptive_refinement_qvis_regen_failure_count += 1
+            self._adaptive_refinement_last_reason = (
+                "family_child_absorb_visibility_eval_failed")
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_blocker_stack] refined child compatibility "
+                "evaluation failed child=%d: %s", child_id, exc)
+            return -1
+
+        self._adaptive_refinement_last_family_id = family_id
+        self._adaptive_refinement_last_child_id = child_id
+        self._adaptive_refinement_last_absorb_f_min = float(f_min)
+        added = int(merged.get("_new_point_count", 0))
+
+        if (math.isfinite(f_min) and
+                f_min + 1e-9 >= self._obligation_match_qvis_min_f):
+            with self._obligation_lock:
+                live = next(
+                    (ob for ob in self._obligations
+                     if int(ob["id"]) == child_id),
+                    None)
+                if live is None:
+                    return None
+                self._update_matched_geometry_diagnostics(
+                    live, merged, "persistent_family_absorb")
+            self._adaptive_refinement_qvis_reuse_count += 1
+            self._adaptive_refinement_absorb_count += 1
+            self._adaptive_refinement_absorbed_point_count += added
+            self._adaptive_refinement_last_reason = (
+                "family_child_absorbed_qvis_reused")
+            return child_id
+
+        if not self._regenerate_refined_child_qvis(
+                child_id, merged, trajectory, float(sweep_time_s),
+                trajectory_received, trajectory_source):
+            return -1
+
+        self._adaptive_refinement_absorb_count += 1
+        self._adaptive_refinement_absorbed_point_count += added
+        return child_id
 
     def _request_cycle_refinement(self, current_id: int, blocker_id: int) -> bool:
         """Request refinement only for a learned-incompatible dependency pair."""
