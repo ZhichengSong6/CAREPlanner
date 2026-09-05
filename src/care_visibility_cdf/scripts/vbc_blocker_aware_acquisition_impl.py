@@ -217,7 +217,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.certified_frontier_search_enabled = bool(rospy.get_param(
             "~certified_frontier_search_enabled", False))
         self.certified_frontier_seed_count = int(rospy.get_param(
-            "~certified_frontier_seed_count", 4))
+            "~certified_frontier_seed_count", 3))
         self.certified_frontier_seed_perturbation = float(rospy.get_param(
             "~certified_frontier_seed_perturbation", 0.20))
         self.certified_frontier_recompute_q_inf = float(rospy.get_param(
