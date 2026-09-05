@@ -116,10 +116,11 @@
        default="/tmp/care_collision_cdf_gpu_c5_4.sock" />
   <arg name="local_scp_selector_jsonl"
        default="/tmp/c5_4_local_scp_selector.jsonl" />
-  <!-- C5.27 parameter study: low-confidence voxel support radius outside the
-       body approximation. This one parameter is used by the C5.4 selector for
-       BOTH local and final GCDF channels. -->
+  <!-- Collision/GCDF clearance remains independent from visibility
+       certification. The body-sphere approximation itself is conservative;
+       VBC therefore adds no extra spatial inflation by default. -->
   <arg name="local_scp_proximity_margin" default="0.025" />
+  <arg name="vbc_swept_volume_margin_m" default="0.0" />
 
   <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
   <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
@@ -688,7 +689,7 @@
       <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
       <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
       <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
-      <arg name="swept_volume_margin_m" value="$(arg local_scp_proximity_margin)" />
+      <arg name="swept_volume_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/trajectory_risk/vbc_active_set_points" />
@@ -721,7 +722,7 @@
       <arg name="candidate_active_topic" value="/care_planner/execution_vbc/audit_active_unused" />
       <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
       <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
-      <arg name="swept_volume_margin_m" value="$(arg local_scp_proximity_margin)" />
+      <arg name="swept_volume_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
       <arg name="temporal_layer_mpc_steps" value="2" />
       <arg name="region_max_diameter_m" value="0.12" />
       <arg name="active_set_points_topic" value="/care_planner/execution_vbc/audit_active_set_unused" />
