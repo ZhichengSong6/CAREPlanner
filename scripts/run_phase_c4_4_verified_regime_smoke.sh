@@ -13,6 +13,7 @@ USE_RVIZ="${USE_RVIZ:-false}"
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
 TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
+TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY="${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY:-false}"
 EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
 EXECUTION_GCDF_WARNING_MARGIN="${EXECUTION_GCDF_WARNING_MARGIN:-0.05}"
 EXECUTION_GCDF_HARD_MARGIN="${EXECUTION_GCDF_HARD_MARGIN:-0.0}"
@@ -260,6 +261,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
   selector_predicted_trajectory_timeout:="${PREDICTION_TIMEOUT}" \
   trajectory_risk_input_topic:="${TRAJECTORY_RISK_INPUT_TOPIC}" \
+  trajectory_risk_refresh_body_prior_before_query:="${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}" \
   forbidden_space_pair_publish_enabled:="${FORBIDDEN_SPACE_PAIR_PUBLISH_ENABLED}" \
   forbidden_space_pair_topic:="${FORBIDDEN_SPACE_PAIR_TOPIC}" \
   forbidden_space_confidence_threshold:="${FORBIDDEN_SPACE_CONFIDENCE_THRESHOLD}" \
@@ -436,6 +438,7 @@ fi
 
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
 echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
+echo "[BODY PRIOR A/B] main_trajectory_risk_refresh=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}; local/final/execution exporters remain false"
 echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
@@ -455,6 +458,7 @@ use_rviz=${USE_RVIZ}
 world_file=${WORLD_FILE}
 confidence_map_config_file=${CONFIDENCE_MAP_CONFIG_FILE}
 tof_fusion_enabled=${TOF_FUSION_ENABLED}
+main_trajectory_risk_refresh_body_prior_before_query=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}
 execution_gcdf_audit_enabled=${EXECUTION_GCDF_AUDIT_ENABLED}
 execution_gcdf_warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}
 execution_gcdf_hard_margin=${EXECUTION_GCDF_HARD_MARGIN}
