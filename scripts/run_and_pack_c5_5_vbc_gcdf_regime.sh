@@ -62,6 +62,7 @@ export PROBE_PREFIX_S="${PROBE_PREFIX_S:-0.15}"
 export SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-true}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
+export CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-true}"
 
 python3 -m py_compile \
   "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
@@ -82,6 +83,7 @@ echo "[C5.9] EXECUTION VBC: elapsed suffixes use a separate audit-only topic; tr
 echo "[C5.40] PROBE success: matching execution token reaches certified prefix duration; brake+hold remains fallback while replacement is certified"
 echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
+echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
 echo "[C5.5] NORMAL exact-VBC view: full horizon"
