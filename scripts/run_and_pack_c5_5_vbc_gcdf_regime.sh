@@ -75,6 +75,13 @@ export LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 # q_vis objective is suppressed while this local target is active; every
 # proposal still passes final GCDF + exact VBC before execution.
 export VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-true}"
+# Multi-seed q_vis search: one baseline + three nearby projector seeds.
+# Exact VBC feedback serially rotates alternatives before creating nested O.
+export CERTIFIED_FRONTIER_SEARCH_ENABLED="${CERTIFIED_FRONTIER_SEARCH_ENABLED:-true}"
+export CERTIFIED_FRONTIER_SEED_COUNT="${CERTIFIED_FRONTIER_SEED_COUNT:-4}"
+export CERTIFIED_FRONTIER_SEED_PERTURBATION="${CERTIFIED_FRONTIER_SEED_PERTURBATION:-0.20}"
+export CERTIFIED_FRONTIER_RECOMPUTE_Q_INF="${CERTIFIED_FRONTIER_RECOMPUTE_Q_INF:-0.05}"
+export CERTIFIED_FRONTIER_MIN_GAIN="${CERTIFIED_FRONTIER_MIN_GAIN:--0.02}"
 # Keep refinement available as an opt-in diagnostic, but do not let it
 # dominate the first strict-frontier qualification.
 export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
@@ -102,6 +109,8 @@ echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladde
 echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
 echo "[MARGIN SPLIT] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[VISIBILITY FRONTIER] vbc_gated_single_obligation_step=${VBC_GATED_FRONTIER_STEP_ENABLED}; q_vis is long-range direction only"
+echo "[CERTIFIED FRONTIER] enabled=${CERTIFIED_FRONTIER_SEARCH_ENABLED}; seeds=${CERTIFIED_FRONTIER_SEED_COUNT}; seed_delta=${CERTIFIED_FRONTIER_SEED_PERTURBATION}; recompute_q_inf=${CERTIFIED_FRONTIER_RECOMPUTE_Q_INF}"
+echo "[CERTIFIED FRONTIER] exact-VBC unsafe rotates q_vis basin before promoting nested blocker; timing recorded in visibility_frontier_summary.csv"
 echo "[VISIBILITY FRONTIER] every local frontier proposal remains final-GCDF + exact-VBC gated"
 echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; retained as opt-in fallback, not the primary strict-Phase-E mechanism"
 echo "[ADAPTIVE O] refined zones stay refined on later active-set updates; final GCDF + exact VBC unchanged"
