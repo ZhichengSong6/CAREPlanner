@@ -15,6 +15,7 @@ RUN_SECONDS="${RUN_SECONDS:-20}"
 GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
+RUN_ORACLE_DIAGNOSTICS="${RUN_ORACLE_DIAGNOSTICS:-false}"
 
 OLD_CASE_FILE="${OLD_CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_c2_vbc_cases.json}"
 OLD_CASE_ID="${OLD_CASE_ID:-case_014}"
@@ -49,7 +50,7 @@ echo "================================================================"
 echo "PHASE-E BLOCKER A/B/C ONE-SHOT DIAGNOSTIC"
 echo "git head     : $(git rev-parse HEAD)"
 echo "run seconds  : ${RUN_SECONDS} per case"
-echo "oracle       : ENABLED (diagnostic only; never steering/safety)"
+echo "runtime oracle: ${RUN_ORACLE_DIAGNOSTICS} (offline A/B analyzer still runs oracle)"
 echo "case A       : ${OLD_CASE_ID}"
 echo "case B       : ${NEW_CASE_ID}"
 echo "result root  : ${ROOT}"
@@ -67,7 +68,7 @@ run_case() {
   echo ""
   echo "==================== RUN ${label}: ${case_id} ===================="
 
-  ENABLE_ORACLE_DIAGNOSTICS=true \
+  ENABLE_ORACLE_DIAGNOSTICS="${RUN_ORACLE_DIAGNOSTICS}" \
   CASE_FILE="${case_file}" \
   CASE_ID="${case_id}" \
   RUN_SECONDS="${RUN_SECONDS}" \
@@ -174,7 +175,7 @@ old_case_id=${OLD_CASE_ID}
 new_case_file=${NEW_CASE_FILE}
 new_case_id=${NEW_CASE_ID}
 run_seconds_per_case=${RUN_SECONDS}
-enable_oracle_diagnostics=true
+enable_oracle_diagnostics=${RUN_ORACLE_DIAGNOSTICS}
 moving_body_prior_refresh=false
 EOF
 
