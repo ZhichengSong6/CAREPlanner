@@ -116,6 +116,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._sensing_action_bank = []
         self._sensing_action_index = 0
         self._sensing_action_exhausted = False
+        self._sensing_action_exhausted_key = None
         self._sensing_action_last_vbc_stamp_ns = "none"
         self._sensing_action_build_count = 0
         self._sensing_action_build_ms = math.nan
@@ -1548,6 +1549,328 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if current in earliest:
             return False
         return any(int(oid) in earliest for oid in stack[:-1])
+
+    def _build_local_sensing_action_bank(
+            self, active_id: int, active, measured: np.ndarray):
+        """Rank direct local sensing motions without rerunning the projector.
+
+        Candidate generation is deliberately cheap: one short step toward the
+        existing q_vis plus +/- one-joint steps. The whole bank is scored in one
+        batched nominal 8-sensor FOV evaluation on the active blocker region.
+        Only top-K targets are later sent, one at a time, through the unchanged
+        Sparse-SCP -> final GCDF -> exact VBC pipeline.
+        """
+        if (not self.local_sensing_action_search_enabled or
+                self._sensing_action_oracle is None):
+            return None
+
+        points = np.asarray(
+            active.get("points", []), dtype=np.float64).reshape(-1, 3)
+        q_vis = np.asarray(
+            active.get("q_vis", []), dtype=np.float64).reshape(-1)
+        if (points.shape[0] == 0 or not np.all(np.isfinite(points)) or
+                q_vis.shape != (7,) or not np.all(np.isfinite(q_vis))):
+            return None
+
+        quantized_q = tuple(
+            int(round(float(v) / self.local_sensing_action_recompute_q_inf))
+            for v in measured)
+        geometry_key = tuple(active.get("keys", ()))
+        bank_key = (int(active_id), geometry_key, quantized_q)
+
+        with self._sensing_action_lock:
+            if self._sensing_action_exhausted_key == bank_key:
+                return None
+            if (self._sensing_action_bank_key == bank_key and
+                    self._sensing_action_bank):
+                return list(self._sensing_action_bank)
+
+        started = time.perf_counter()
+        candidates = []
+
+        # 1) Existing learned long-range hint, but only a short local step.
+        delta = q_vis - measured
+        delta_inf = float(np.max(np.abs(delta)))
+        if math.isfinite(delta_inf) and delta_inf > self.frontier_gradient_eps:
+            q = measured + min(
+                self.local_sensing_action_step_inf, delta_inf) * delta / delta_inf
+            candidates.append(("toward_qvis", q))
+
+        # 2) Direct local maneuver primitives. These are intentionally NOT
+        # projector seeds; they are candidate actions around the current q.
+        for joint in range(7):
+            for sign in (-1.0, 1.0):
+                q = measured.copy()
+                q[joint] += sign * self.local_sensing_action_step_inf
+                candidates.append((
+                    "j{}_{:+.3f}".format(
+                        joint + 1,
+                        sign * self.local_sensing_action_step_inf),
+                    q))
+
+        # Clamp once as a batch and remove duplicates / no-motion actions.
+        labels = [item[0] for item in candidates]
+        q_batch = torch.tensor(
+            np.asarray([item[1] for item in candidates], dtype=np.float64),
+            device=self.device, dtype=torch.float32)
+        q_batch, _ = self._clamp(q_batch)
+        q_np = q_batch.detach().cpu().numpy().astype(np.float64)
+
+        unique_labels = []
+        unique_q = []
+        for label, q in zip(labels, q_np):
+            if np.max(np.abs(q - measured)) <= 1e-6:
+                continue
+            if any(np.max(np.abs(q - prev)) <= 1e-5 for prev in unique_q):
+                continue
+            unique_labels.append(label)
+            unique_q.append(q.copy())
+        if not unique_q:
+            return None
+
+        q_batch = torch.tensor(
+            np.asarray(unique_q, dtype=np.float64),
+            device=self.device, dtype=torch.float32)
+        q_current = torch.tensor(
+            measured.reshape(1, 7),
+            device=self.device, dtype=torch.float32)
+        x = torch.tensor(
+            points, device=self.device, dtype=torch.float32)
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        oracle_started = time.perf_counter()
+        try:
+            with torch.no_grad():
+                current_g = oracle_visibility_g(
+                    x, q_current, self._sensing_action_oracle)
+                bank_g = oracle_visibility_g(
+                    x, q_batch, self._sensing_action_oracle)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        except Exception as exc:
+            self._frontier_error_count += 1
+            rospy.logerr_throttle(
+                1.0,
+                "[local_sensing_action] batched nominal-FOV scoring failed: %s",
+                exc)
+            return None
+        oracle_ms = 1000.0 * (time.perf_counter() - oracle_started)
+
+        current_g = current_g.detach().cpu().numpy()
+        bank_g = bank_g.detach().cpu().numpy()
+        if current_g.ndim == 0:
+            current_g = current_g.reshape(1, 1)
+        elif current_g.ndim == 1:
+            current_g = current_g.reshape(-1, 1)
+        if bank_g.ndim == 1:
+            bank_g = bank_g.reshape(1, -1)
+
+        if (bank_g.shape[0] != points.shape[0] or
+                bank_g.shape[1] != len(unique_q)):
+            rospy.logerr_throttle(
+                1.0,
+                "[local_sensing_action] unexpected oracle shape points=%d "
+                "candidates=%d got=%s",
+                points.shape[0], len(unique_q), str(bank_g.shape))
+            return None
+
+        current_visible = int(np.count_nonzero(current_g[:, 0] >= 0.0))
+        current_min_g = float(np.min(current_g[:, 0]))
+        current_mean_g = float(np.mean(current_g[:, 0]))
+
+        ranked = []
+        for idx, (label, q) in enumerate(zip(unique_labels, unique_q)):
+            margins = bank_g[:, idx]
+            visible_count = int(np.count_nonzero(margins >= 0.0))
+            visible_gain = int(visible_count - current_visible)
+            min_g = float(np.min(margins))
+            mean_g = float(np.mean(margins))
+            min_gain = float(min_g - current_min_g)
+            mean_gain = float(mean_g - current_mean_g)
+            qvis_dist = float(np.max(np.abs(q - q_vis)))
+            motion_inf = float(np.max(np.abs(q - measured)))
+            ranked.append({
+                "source": label,
+                "target": q.copy(),
+                "visible_count": visible_count,
+                "visible_fraction": float(visible_count) / float(points.shape[0]),
+                "visible_gain": visible_gain,
+                "min_margin": min_g,
+                "min_margin_gain": min_gain,
+                "mean_margin_gain": mean_gain,
+                "qvis_dist_inf": qvis_dist,
+                "motion_inf": motion_inf,
+            })
+
+        # Lexicographic ranking avoids another hand-tuned weighted objective:
+        # first expose more blocker points, then improve the worst FOV margin,
+        # then mean margin, and only then prefer q_vis proximity / shorter motion.
+        ranked.sort(
+            key=lambda item: (
+                int(item["visible_gain"]),
+                float(item["min_margin_gain"]),
+                float(item["mean_margin_gain"]),
+                -float(item["qvis_dist_inf"]),
+                -float(item["motion_inf"])),
+            reverse=True)
+
+        selected = ranked[:self.local_sensing_action_max_trials]
+        build_ms = 1000.0 * (time.perf_counter() - started)
+        with self._sensing_action_lock:
+            self._sensing_action_bank_key = bank_key
+            self._sensing_action_bank = list(selected)
+            self._sensing_action_index = 0
+            self._sensing_action_exhausted = False
+            self._sensing_action_last_vbc_stamp_ns = "none"
+            self._sensing_action_build_count += 1
+            self._sensing_action_build_ms = float(build_ms)
+            self._sensing_action_oracle_ms = float(oracle_ms)
+            self._sensing_action_raw_candidate_count = len(ranked)
+            self._sensing_action_ranked_candidate_count = len(selected)
+            if selected:
+                first = selected[0]
+                self._sensing_action_last_selected_source = str(first["source"])
+                self._sensing_action_last_visible_gain = int(
+                    first["visible_gain"])
+                self._sensing_action_last_min_margin_gain = float(
+                    first["min_margin_gain"])
+                self._sensing_action_last_visible_fraction = float(
+                    first["visible_fraction"])
+
+        rospy.logwarn(
+            "[local_sensing_action] BANK active_O=%d raw=%d trials=%d "
+            "build=%.3fms oracle=%.3fms top=%s",
+            int(active_id), len(ranked), len(selected),
+            build_ms, oracle_ms,
+            ",".join(
+                "{}(vis+{},dg={:+.3f})".format(
+                    item["source"], item["visible_gain"],
+                    item["min_margin_gain"])
+                for item in selected))
+        return list(selected)
+
+    def _sensing_action_bank_active_for(self, current_id: int) -> bool:
+        if not self.local_sensing_action_search_enabled:
+            return False
+        with self._sensing_action_lock:
+            key = self._sensing_action_bank_key
+            return bool(
+                self._sensing_action_bank and
+                not self._sensing_action_exhausted and
+                isinstance(key, tuple) and len(key) >= 1 and
+                int(key[0]) == int(current_id))
+
+    def _force_dependency_push_after_sensing_exhausted(
+            self, current_id: int) -> None:
+        """Fallback only after all local sensing actions are certified unsafe."""
+        with self._obligation_lock:
+            existing = {int(ob["id"]) for ob in self._obligations}
+            stack = [
+                int(v) for v in self._repair_stack
+                if int(v) in existing]
+        candidates = [
+            int(v) for v in self._last_active_layer_ids
+            if int(v) in existing and int(v) != int(current_id)
+            and int(v) not in stack]
+        if not candidates:
+            candidates = [
+                oid for oid in sorted(existing)
+                if oid != int(current_id) and oid not in stack]
+        blocker = self._select_nearest_qvis_id(candidates)
+        if blocker is None:
+            self._last_switch_reason = "sensing_action_exhausted_no_dependency"
+            return
+
+        with self._obligation_lock:
+            existing = {int(ob["id"]) for ob in self._obligations}
+            if (blocker in existing and blocker not in self._repair_stack):
+                self._repair_stack.append(int(blocker))
+                self._stack_push_count += 1
+                self._sensing_action_forced_dependency_push_count += 1
+                self._last_switch_reason = (
+                    "local_sensing_action_exhausted_dependency")
+                rospy.logwarn(
+                    "[local_sensing_action] all trials unsafe -> PUSH "
+                    "dependency=%d (urgency threshold bypassed) stack=%s",
+                    int(blocker),
+                    ":".join(str(v) for v in self._repair_stack))
+
+    def _candidate_vbc_summary_callback(self, msg: String) -> None:
+        """Rotate direct local sensing actions using exact candidate VBC."""
+        super()._candidate_vbc_summary_callback(msg)
+        if (msg is None or
+                not getattr(
+                    self, "local_sensing_action_search_enabled", False)):
+            return
+        fields = dict(self._tokenize_summary(str(msg.data)))
+        if fields.get("trajectory_source") != "predicted":
+            return
+        stamp = str(fields.get("trajectory_stamp_ns", "none"))
+        if stamp == "none":
+            return
+
+        publish_new_target = False
+        exhausted_current = None
+        with self._sensing_action_lock:
+            if stamp == self._sensing_action_last_vbc_stamp_ns:
+                return
+            self._sensing_action_last_vbc_stamp_ns = stamp
+            if not self._sensing_action_bank:
+                return
+
+            if fields.get("has_violation") == "0":
+                self._sensing_action_safe_candidate_count += 1
+                return
+            if fields.get("has_violation") != "1":
+                return
+
+            if self._sensing_action_index + 1 < len(self._sensing_action_bank):
+                self._sensing_action_index += 1
+                item = self._sensing_action_bank[self._sensing_action_index]
+                self._sensing_action_switch_count += 1
+                self._sensing_action_last_selected_source = str(item["source"])
+                self._sensing_action_last_visible_gain = int(
+                    item["visible_gain"])
+                self._sensing_action_last_min_margin_gain = float(
+                    item["min_margin_gain"])
+                self._sensing_action_last_visible_fraction = float(
+                    item["visible_fraction"])
+                publish_new_target = True
+                rospy.logwarn(
+                    "[local_sensing_action] exact VBC UNSAFE stamp=%s -> "
+                    "trial %d/%d source=%s vis_gain=%d dg=%+.4f",
+                    stamp, self._sensing_action_index + 1,
+                    len(self._sensing_action_bank), item["source"],
+                    int(item["visible_gain"]),
+                    float(item["min_margin_gain"]))
+            elif not self._sensing_action_exhausted:
+                self._sensing_action_exhausted = True
+                self._sensing_action_exhausted_key = (
+                    self._sensing_action_bank_key)
+                self._sensing_action_exhausted_count += 1
+                if (isinstance(self._sensing_action_bank_key, tuple) and
+                        len(self._sensing_action_bank_key) >= 1):
+                    exhausted_current = int(
+                        self._sensing_action_bank_key[0])
+                rospy.logerr(
+                    "[local_sensing_action] CERTIFIED_SENSING_FRONTIER_STUCK "
+                    "all %d ranked local actions exact-VBC unsafe",
+                    len(self._sensing_action_bank))
+
+        if publish_new_target:
+            with self._frontier_lock:
+                self._frontier_cache_key = None
+                self._frontier_cache = None
+            self._publish_visibility_frontier()
+        elif exhausted_current is not None:
+            self._force_dependency_push_after_sensing_exhausted(
+                exhausted_current)
+            with self._frontier_lock:
+                self._frontier_cache_key = None
+                self._frontier_cache = None
+            self._publish_schedule()
+            self._publish_blocker_stack_summary()
 
     def _compute_visibility_frontier(self):
         if not self.frontier_steering_enabled:
