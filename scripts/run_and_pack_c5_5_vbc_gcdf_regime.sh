@@ -63,6 +63,7 @@ export SMOOTH_HANDOFF_ENABLED="${SMOOTH_HANDOFF_ENABLED:-true}"
 export REPAIR_BRAKE_DT_S="${REPAIR_BRAKE_DT_S:-0.05}"
 export REPAIR_HOLD_S="${REPAIR_HOLD_S:-0.10}"
 export CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-true}"
+export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-true}"
 
 python3 -m py_compile \
   "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
@@ -86,7 +87,7 @@ echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
 echo "[VISIBILITY FRONTIER] unified multi-O learned soft-min steering enabled in blocker-aware REPAIR"
 echo "[VISIBILITY FRONTIER] base: q_vis dominant + weak local frontier; cycle soft-min is deferred to adaptive refinement"
-echo "[ADAPTIVE O] coarse 0.12m by default; learned-incompatible dependency cycles refine conflicting O once (<=4 children/parent)"
+echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; coarse 0.12m by default; learned-incompatible dependency cycles refine conflicting O once (<=4 children/parent)"
 echo "[ADAPTIVE O] refined zones stay refined on later active-set updates; final GCDF + exact VBC unchanged"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
