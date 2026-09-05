@@ -512,6 +512,8 @@ if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
   record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
 fi
 record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
+record_topic /care_planner/active_sensing/visibility_frontier_summary "${OUT}/visibility_frontier_summary.csv"
+record_topic /care_planner/active_sensing/visibility_frontier_target "${OUT}/visibility_frontier_target.csv"
 record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
 record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
 record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
