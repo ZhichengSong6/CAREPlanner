@@ -60,6 +60,7 @@ USE_LOCAL_SPARSE_SCP="${USE_LOCAL_SPARSE_SCP:-false}"
 LOCAL_SCP_GPU_SOCKET="${LOCAL_SCP_GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
 LOCAL_SCP_SELECTOR_JSONL="${LOCAL_SCP_SELECTOR_JSONL:-/tmp/c5_4_local_scp_selector.jsonl}"
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
+VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
 LOCAL_SCP_CANDIDATE_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC:-/care_planner/local_planner/candidate_trajectory}"
 LOCAL_SCP_SUMMARY_TOPIC="${LOCAL_SCP_SUMMARY_TOPIC:-/care_planner/local_planner/summary}"
 LOCAL_SCP_REPLAN_TOPIC="${LOCAL_SCP_REPLAN_TOPIC:-/care_planner/local_planner/replan_request}"
@@ -305,6 +306,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   local_scp_gpu_socket:="${LOCAL_SCP_GPU_SOCKET}" \
   local_scp_selector_jsonl:="${LOCAL_SCP_SELECTOR_JSONL}" \
   local_scp_proximity_margin:="${LOCAL_SCP_PROXIMITY_MARGIN}" \
+  vbc_swept_volume_margin_m:="${VBC_SWEPT_VOLUME_MARGIN_M}" \
   repair_prefix_verification_enabled:="${REPAIR_PREFIX_VERIFY}" \
   repair_execution_prefix_s:="${REPAIR_PREFIX_S}" \
   probe_execution_prefix_s:="${PROBE_PREFIX_S}" \
@@ -442,6 +444,7 @@ echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMI
 echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
 echo "[BODY PRIOR A/B] main_trajectory_risk_refresh=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}; local/final/execution exporters remain false"
 echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
+echo "[MARGIN SPLIT] VBC swept margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
 RUNTIME_HEAD="$(git rev-parse HEAD)"
@@ -468,6 +471,7 @@ execution_gcdf_stale_timeout_s=${EXECUTION_GCDF_STALE_TIMEOUT_S}
 gcdf_body_inflation_m=${GCDF_BODY_INFLATION_M}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
+vbc_swept_volume_margin_m=${VBC_SWEPT_VOLUME_MARGIN_M}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
 commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
 final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
