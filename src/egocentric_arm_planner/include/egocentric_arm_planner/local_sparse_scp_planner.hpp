@@ -37,6 +37,16 @@ private:
     Eigen::VectorXd q;
   };
 
+  // Learned visibility-frontier steering is an objective-only hint. The
+  // producer supplies a short local target plus relative weights; hard GCDF
+  // and exact VBC remain the only executable safety authorities.
+  struct FrontierObjective {
+    bool active = false;
+    double frontier_weight_scale = 0.0;
+    double qvis_weight_scale = 1.0;
+    Eigen::VectorXd q;
+  };
+
   struct SparseSolveResult {
     bool solved = false;
     std::string status = "not_solved";
@@ -66,6 +76,8 @@ private:
   void referenceCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void waypointScheduleCallback(
+      const std_msgs::Float64MultiArrayConstPtr& msg);
+  void visibilityFrontierCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void singleWaypointActiveCallback(const std_msgs::BoolConstPtr& msg);
   void singleWaypointQCallback(
@@ -119,6 +131,7 @@ private:
       const Eigen::MatrixXd& u_ref,
       const Eigen::VectorXd& previous_command,
       const std::vector<DeadlineWaypoint>& schedule,
+      const FrontierObjective& frontier,
       bool repair_mode,
       bool probe_mode,
       double trust_radius,
@@ -153,6 +166,7 @@ private:
   ros::Subscriber joint_state_sub_;
   ros::Subscriber reference_sub_;
   ros::Subscriber waypoint_schedule_sub_;
+  ros::Subscriber visibility_frontier_sub_;
   ros::Subscriber single_waypoint_active_sub_;
   ros::Subscriber single_waypoint_q_sub_;
   ros::Subscriber recovery_sub_;
@@ -177,6 +191,7 @@ private:
   sensor_msgs::JointState latest_joint_state_;
   trajectory_msgs::JointTrajectory latest_reference_;
   std::vector<DeadlineWaypoint> latest_schedule_;
+  FrontierObjective latest_frontier_;
   bool latest_single_waypoint_active_ = false;
   bool has_single_waypoint_q_ = false;
   Eigen::VectorXd latest_single_waypoint_q_;
@@ -244,6 +259,7 @@ private:
   Eigen::MatrixXd plan_q_bar_;
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
+  FrontierObjective plan_frontier_;
   bool plan_repair_mode_ = false;
   bool plan_probe_mode_ = false;
   std::string plan_initialization_mode_ = "task_reference";
@@ -307,6 +323,9 @@ private:
   bool probe_feasibility_restoration_enabled_ = false;
   int probe_feasibility_restoration_max_attempts_ = 1;
   double visibility_waypoint_weight_ = 3000.0;
+  // The frontier target acts on an early local state while q_vis remains the
+  // long-range visibility attractor.
+  int visibility_frontier_horizon_step_ = 2;
 
   double cdf_safety_margin_ = 0.0;
   double cdf_slack_linear_weight_ = 500.0;
@@ -352,6 +371,8 @@ private:
   std::string reference_topic_ = "/care_planner/task_trajectory";
   std::string waypoint_schedule_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_schedule";
+  std::string visibility_frontier_topic_ =
+      "/care_planner/active_sensing/visibility_frontier_target";
   std::string single_waypoint_active_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_active";
   std::string single_waypoint_q_topic_ =
