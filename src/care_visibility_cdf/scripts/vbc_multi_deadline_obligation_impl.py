@@ -318,6 +318,14 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             if source_points.shape[0]
             else np.asarray([math.nan, math.nan, math.nan], dtype=np.float64))
 
+        refinement_depth = int(region.get("refinement_depth", 0))
+        parent_obligation_id = int(region.get("parent_obligation_id", -1))
+        root_obligation_id = int(region.get(
+            "root_obligation_id",
+            parent_obligation_id if parent_obligation_id >= 0 else -1))
+        refinement_reason = str(region.get(
+            "refinement_reason", "coarse_discovery"))
+
         ob = {
             "id": int(self._next_obligation_id),
             "points": source_points.copy(),
@@ -338,6 +346,10 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "last_match_centroid_shift_m": 0.0,
             "max_centroid_shift_from_qvis_m": 0.0,
             "last_geometry_match_source": "discovery",
+            "refinement_depth": refinement_depth,
+            "parent_obligation_id": parent_obligation_id,
+            "root_obligation_id": root_obligation_id,
+            "refinement_reason": refinement_reason,
             "q_vis": q_vis,
             "q_zero": np.asarray(result["q_zero"], dtype=np.float64),
             "deadline_abs_s": deadline_abs,
@@ -370,6 +382,10 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_q_vis_source_xyz_min": source_xyz_min.tolist(),
             "c4_6_q_vis_source_xyz_max": source_xyz_max.tolist(),
             "c4_6_q_vis_source_point_count": int(source_points.shape[0]),
+            "c4_6_refinement_depth": refinement_depth,
+            "c4_6_parent_obligation_id": parent_obligation_id,
+            "c4_6_root_obligation_id": root_obligation_id,
+            "c4_6_refinement_reason": refinement_reason,
         })
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = Path(self.output_root) / (
@@ -377,9 +393,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         path.write_text(json.dumps(trace, indent=2, allow_nan=True))
 
         rospy.logwarn(
-            "[vbc_multi_deadline] ADD obligation=%d points=%d deadline_rem=%.3fs "
-            "Tmin_rest=%.3fs reachable_lb=%d min_f=%+.4f qvis_ms=%.3f q_vis=%s",
-            ob["id"], len(ob["points"]), deadline_remaining, min_hit,
+            "[vbc_multi_deadline] ADD obligation=%d points=%d depth=%d parent=%d "
+            "deadline_rem=%.3fs Tmin_rest=%.3fs reachable_lb=%d "
+            "min_f=%+.4f qvis_ms=%.3f q_vis=%s",
+            ob["id"], len(ob["points"]), refinement_depth,
+            parent_obligation_id, deadline_remaining, min_hit,
             int(ob["reachable_before_discovered_deadline_lower_bound"]),
             ob["final_f_min"], q_vis_generation_ms, _fmt(q_vis, 4))
         return ob
