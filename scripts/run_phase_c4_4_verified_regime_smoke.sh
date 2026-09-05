@@ -85,6 +85,10 @@ REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
 CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-false}"
 ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
 VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-false}"
+LOCAL_SENSING_ACTION_SEARCH_ENABLED="${LOCAL_SENSING_ACTION_SEARCH_ENABLED:-false}"
+LOCAL_SENSING_ACTION_STEP_INF="${LOCAL_SENSING_ACTION_STEP_INF:-0.04}"
+LOCAL_SENSING_ACTION_MAX_TRIALS="${LOCAL_SENSING_ACTION_MAX_TRIALS:-4}"
+LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF="${LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF:-0.03}"
 ENABLE_ORACLE_DIAGNOSTICS="${ENABLE_ORACLE_DIAGNOSTICS:-false}"
 
 # Optional online task-success stop. Defaults off here so historical C4/C5
@@ -238,7 +242,7 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _local_sensing_action_search_enabled:=${LOCAL_SENSING_ACTION_SEARCH_ENABLED} _local_sensing_action_step_inf:=${LOCAL_SENSING_ACTION_STEP_INF} _local_sensing_action_max_trials:=${LOCAL_SENSING_ACTION_MAX_TRIALS} _local_sensing_action_recompute_q_inf:=${LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -487,6 +491,10 @@ probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPE
 probe_repair_requires_visibility_obligation=true
 adaptive_refinement_enabled=${ADAPTIVE_REFINEMENT_ENABLED}
 adaptive_refinement_policy=coarse_default_refine_learned_incompatible_dependency_cycle_once
+local_sensing_action_search_enabled=${LOCAL_SENSING_ACTION_SEARCH_ENABLED}
+local_sensing_action_step_inf=${LOCAL_SENSING_ACTION_STEP_INF}
+local_sensing_action_max_trials=${LOCAL_SENSING_ACTION_MAX_TRIALS}
+local_sensing_action_recompute_q_inf=${LOCAL_SENSING_ACTION_RECOMPUTE_Q_INF}
 probe_solver_failure_uses_blocker_rediscovery=true
 probe_vbc_unsafe_uses_blocker_rediscovery=true
 probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
