@@ -340,6 +340,32 @@ report = {
         "qvis_match_last_f_min": num(
             last_blk.get("qvis_match_last_f_min")),
         "qvis_match_last_reason": last_blk.get("qvis_match_last_reason"),
+        "adaptive_refinement_enabled": integer(
+            last_blk.get("adaptive_refinement_enabled"), 0),
+        "adaptive_refinement_trigger_count": integer(
+            last_blk.get("adaptive_refinement_trigger_count"), 0),
+        "adaptive_refinement_success_count": integer(
+            last_blk.get("adaptive_refinement_success_count"), 0),
+        "adaptive_refinement_failure_count": integer(
+            last_blk.get("adaptive_refinement_failure_count"), 0),
+        "adaptive_refinement_skip_count": integer(
+            last_blk.get("adaptive_refinement_skip_count"), 0),
+        "adaptive_refinement_parent_count": integer(
+            last_blk.get("adaptive_refinement_parent_count"), 0),
+        "adaptive_refinement_child_count": integer(
+            last_blk.get("adaptive_refinement_child_count"), 0),
+        "adaptive_refinement_last_parents": last_blk.get(
+            "adaptive_refinement_last_parents"),
+        "adaptive_refinement_last_children": last_blk.get(
+            "adaptive_refinement_last_children"),
+        "adaptive_refinement_cross_f_ab": num(
+            last_blk.get("adaptive_refinement_cross_f_ab")),
+        "adaptive_refinement_cross_f_ba": num(
+            last_blk.get("adaptive_refinement_cross_f_ba")),
+        "adaptive_refinement_refined_zone_count": integer(
+            last_blk.get("adaptive_refinement_refined_zone_count"), 0),
+        "adaptive_refinement_reason": last_blk.get(
+            "adaptive_refinement_reason"),
         "blocker_stack": last_blk.get("stack"),
         "blocker_switch_reason": last_blk.get("switch_reason"),
         "regime_state": last_reg.get("state"),
@@ -362,7 +388,7 @@ case_id=${CASE_ID}
 world_file=${WORLD_FILE}
 confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 run_seconds=${RUN_SECONDS}
-planner_semantics=c5_41_qvis_compatible_obligation_identity
+planner_semantics=adaptive_resolution_visibility_obligations
 EOF
 
 rm -f "${UPLOAD_ZIP}"
