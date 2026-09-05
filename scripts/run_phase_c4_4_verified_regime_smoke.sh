@@ -424,6 +424,7 @@ expect_rosparam_bool() {
 expect_rosparam_bool /optimized_trajectory_continuity/final_gcdf_enabled "${FINAL_EXECUTABLE_GCDF_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/continuation_enabled "${COMMITTED_CONTINUATION_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/execution_audit_enabled "${EXECUTION_AUDIT_STREAM_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/cycle_recovery_enabled "${CYCLE_RECOVERY_ENABLED}"
 
 if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
   if ! rosnode list | grep -q '^/probe_single_flight_gate$'; then
