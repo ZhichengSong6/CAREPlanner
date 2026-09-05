@@ -104,7 +104,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # later active-set updates cannot silently merge the children back into
         # the old coarse cluster.
         self._adaptive_refinement_lock = threading.RLock()
-        self._adaptive_refined_key_sets = []
+        self._adaptive_refinement_families = {}
         self._pending_refinement_ids: List[int] = []
         self._adaptive_refinement_trigger_count = 0
         self._adaptive_refinement_success_count = 0
@@ -117,6 +117,15 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._adaptive_refinement_last_reason = "startup"
         self._adaptive_refinement_last_cross_f_ab = math.nan
         self._adaptive_refinement_last_cross_f_ba = math.nan
+        self._adaptive_refinement_family_route_count = 0
+        self._adaptive_refinement_absorb_count = 0
+        self._adaptive_refinement_absorbed_point_count = 0
+        self._adaptive_refinement_qvis_reuse_count = 0
+        self._adaptive_refinement_qvis_regen_count = 0
+        self._adaptive_refinement_qvis_regen_failure_count = 0
+        self._adaptive_refinement_last_family_id = -1
+        self._adaptive_refinement_last_child_id = -1
+        self._adaptive_refinement_last_absorb_f_min = math.nan
 
         # Obligation identity coherence. Spatial proximity alone is insufficient:
         # a matched obligation may keep its old q_vis only while that q_vis still
@@ -213,6 +222,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.adaptive_refinement_cross_visibility_threshold = float(
             rospy.get_param(
                 "~adaptive_refinement_cross_visibility_threshold", 0.0))
+        self.adaptive_refinement_family_margin_m = float(rospy.get_param(
+            "~adaptive_refinement_family_margin_m", 0.075))
 
         self.blocker_stack_summary_topic = str(rospy.get_param(
             "~blocker_stack_summary_topic",
@@ -276,6 +287,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self.adaptive_refinement_cross_visibility_threshold):
             raise ValueError(
                 "~adaptive_refinement_cross_visibility_threshold must be finite")
+        if (not math.isfinite(self.adaptive_refinement_family_margin_m) or
+                self.adaptive_refinement_family_margin_m < 0.0):
+            raise ValueError(
+                "~adaptive_refinement_family_margin_m must be nonnegative finite")
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
