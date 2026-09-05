@@ -29,7 +29,13 @@ from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
-from evaluate_direct_vs_projection_ascent import model_value_and_grad_q
+from evaluate_direct_vs_projection_ascent import (
+    DEFAULT_JOINT_NAMES,
+    DEFAULT_SENSOR_FRAMES,
+    PinocchioFOVOracle,
+    model_value_and_grad_q,
+    oracle_visibility_g,
+)
 
 
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
@@ -98,6 +104,32 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._frontier_last_weight_scale = 0.0
         self._frontier_last_qvis_weight_scale = 1.0
         self._frontier_last_cycle_active = False
+
+        # Local certified sensing-action search. Unlike the abandoned multi-seed
+        # experiment, this does not rerun the VisCDF projector. It generates a
+        # tiny bank of direct local q targets around measured q, ranks them with
+        # batched nominal sensor-FOV gain on the CURRENT obligation, and lets the
+        # existing Local Sparse-SCP + hard GCDF + exact VBC pipeline certify them.
+        self._sensing_action_lock = threading.RLock()
+        self._sensing_action_oracle = None
+        self._sensing_action_bank_key = None
+        self._sensing_action_bank = []
+        self._sensing_action_index = 0
+        self._sensing_action_exhausted = False
+        self._sensing_action_last_vbc_stamp_ns = "none"
+        self._sensing_action_build_count = 0
+        self._sensing_action_build_ms = math.nan
+        self._sensing_action_oracle_ms = math.nan
+        self._sensing_action_raw_candidate_count = 0
+        self._sensing_action_ranked_candidate_count = 0
+        self._sensing_action_switch_count = 0
+        self._sensing_action_safe_candidate_count = 0
+        self._sensing_action_exhausted_count = 0
+        self._sensing_action_forced_dependency_push_count = 0
+        self._sensing_action_last_selected_source = "none"
+        self._sensing_action_last_visible_gain = 0
+        self._sensing_action_last_min_margin_gain = math.nan
+        self._sensing_action_last_visible_fraction = math.nan
 
         # Adaptive-resolution obligations. Coarse regions remain the default.
         # A verified recursive dependency cycle may request one refinement of
@@ -190,6 +222,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # which still must pass final GCDF + exact VBC before execution.
         self.vbc_gated_frontier_step_enabled = bool(rospy.get_param(
             "~vbc_gated_frontier_step_enabled", False))
+        self.local_sensing_action_search_enabled = bool(rospy.get_param(
+            "~local_sensing_action_search_enabled", False))
+        self.local_sensing_action_step_inf = float(rospy.get_param(
+            "~local_sensing_action_step_inf", 0.04))
+        self.local_sensing_action_max_trials = int(rospy.get_param(
+            "~local_sensing_action_max_trials", 4))
+        self.local_sensing_action_recompute_q_inf = float(rospy.get_param(
+            "~local_sensing_action_recompute_q_inf", 0.03))
         self.frontier_max_regions = int(rospy.get_param(
             "~frontier_max_regions", 3))
         self.frontier_softmin_temperature = float(rospy.get_param(
@@ -253,6 +293,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             raise ValueError("~progressive_shared_accept_f_min must be finite")
         if not math.isfinite(self._obligation_match_qvis_min_f):
             raise ValueError("~obligation_match_qvis_min_f must be finite")
+        if (not math.isfinite(self.local_sensing_action_step_inf) or
+                self.local_sensing_action_step_inf <= 0.0):
+            raise ValueError(
+                "~local_sensing_action_step_inf must be positive finite")
+        if self.local_sensing_action_max_trials < 1:
+            raise ValueError("~local_sensing_action_max_trials must be >= 1")
+        if (not math.isfinite(self.local_sensing_action_recompute_q_inf) or
+                self.local_sensing_action_recompute_q_inf <= 0.0):
+            raise ValueError(
+                "~local_sensing_action_recompute_q_inf must be positive finite")
         if self.frontier_max_regions < 2:
             raise ValueError("~frontier_max_regions must be >= 2")
         if (not math.isfinite(self.frontier_softmin_temperature) or
@@ -297,6 +347,22 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self.adaptive_refinement_family_margin_m < 0.0):
             raise ValueError(
                 "~adaptive_refinement_family_margin_m must be nonnegative finite")
+
+        if self.local_sensing_action_search_enabled:
+            # Runtime scoring uses only the nominal physical sensor geometry.
+            # This is separate from the expensive diagnostic oracle path and
+            # never participates in the safety decision itself.
+            self._sensing_action_oracle = PinocchioFOVOracle(
+                urdf_path=str(self.urdf_path),
+                joint_names=list(DEFAULT_JOINT_NAMES),
+                sensor_frames=list(DEFAULT_SENSOR_FRAMES),
+                horizontal_fov_deg=float(self.nominal_hfov),
+                vertical_fov_deg=float(self.nominal_vfov),
+                z_min=float(self.nominal_z_min),
+                z_max=float(self.nominal_z_max),
+                delta=0.0,
+                base_frame="base_link",
+            )
 
         self.blocker_stack_summary_pub = rospy.Publisher(
             self.blocker_stack_summary_topic, String, queue_size=1, latch=True)
