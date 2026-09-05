@@ -85,11 +85,6 @@ REPAIR_HOLD_S="${REPAIR_HOLD_S:-${C4_REPAIR_HOLD_S:-0.10}}"
 CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-false}"
 ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
 VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-false}"
-CERTIFIED_FRONTIER_SEARCH_ENABLED="${CERTIFIED_FRONTIER_SEARCH_ENABLED:-false}"
-CERTIFIED_FRONTIER_SEED_COUNT="${CERTIFIED_FRONTIER_SEED_COUNT:-3}"
-CERTIFIED_FRONTIER_SEED_PERTURBATION="${CERTIFIED_FRONTIER_SEED_PERTURBATION:-0.20}"
-CERTIFIED_FRONTIER_RECOMPUTE_Q_INF="${CERTIFIED_FRONTIER_RECOMPUTE_Q_INF:-0.05}"
-CERTIFIED_FRONTIER_MIN_GAIN="${CERTIFIED_FRONTIER_MIN_GAIN:--0.02}"
 ENABLE_ORACLE_DIAGNOSTICS="${ENABLE_ORACLE_DIAGNOSTICS:-false}"
 
 # Optional online task-success stop. Defaults off here so historical C4/C5
@@ -243,7 +238,7 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _certified_frontier_search_enabled:=${CERTIFIED_FRONTIER_SEARCH_ENABLED} _certified_frontier_seed_count:=${CERTIFIED_FRONTIER_SEED_COUNT} _certified_frontier_seed_perturbation:=${CERTIFIED_FRONTIER_SEED_PERTURBATION} _certified_frontier_recompute_q_inf:=${CERTIFIED_FRONTIER_RECOMPUTE_Q_INF} _certified_frontier_min_gain:=${CERTIFIED_FRONTIER_MIN_GAIN} _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -492,11 +487,6 @@ probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPE
 probe_repair_requires_visibility_obligation=true
 adaptive_refinement_enabled=${ADAPTIVE_REFINEMENT_ENABLED}
 adaptive_refinement_policy=coarse_default_refine_learned_incompatible_dependency_cycle_once
-certified_frontier_search_enabled=${CERTIFIED_FRONTIER_SEARCH_ENABLED}
-certified_frontier_seed_count=${CERTIFIED_FRONTIER_SEED_COUNT}
-certified_frontier_seed_perturbation=${CERTIFIED_FRONTIER_SEED_PERTURBATION}
-certified_frontier_recompute_q_inf=${CERTIFIED_FRONTIER_RECOMPUTE_Q_INF}
-certified_frontier_min_gain=${CERTIFIED_FRONTIER_MIN_GAIN}
 probe_solver_failure_uses_blocker_rediscovery=true
 probe_vbc_unsafe_uses_blocker_rediscovery=true
 probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
@@ -525,7 +515,6 @@ record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
 record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
 record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
 record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
-record_topic /care_planner/active_sensing/visibility_frontier_summary "${OUT}/visibility_frontier_summary.csv"
 if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
   record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
   record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
