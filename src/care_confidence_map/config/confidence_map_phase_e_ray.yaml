@@ -35,11 +35,6 @@ confidence_map:
   ray_min_valid_range: 0.05
   ray_max_valid_range: 1.50
 
-  # Static Phase-E evidence semantics: cells established FREE by the
-  # one-shot initial body prior or by real ToF ray traversal remain FREE.
-  # No moving body-prior refresh is permitted.
-  persistent_free_evidence: true
-
   # Phase E5 static-obstacle safety: once an obstacle voxel is observed,
   # later free-ray traversal cannot erase it in a single coarse-grid update.
   # This is intentionally enabled for the current static Gazebo world.
