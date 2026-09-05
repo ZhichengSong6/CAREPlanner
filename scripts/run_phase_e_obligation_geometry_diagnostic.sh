@@ -364,6 +364,24 @@ report = {
             last_blk.get("adaptive_refinement_cross_f_ba")),
         "adaptive_refinement_refined_zone_count": integer(
             last_blk.get("adaptive_refinement_refined_zone_count"), 0),
+        "adaptive_refinement_family_route_count": integer(
+            last_blk.get("adaptive_refinement_family_route_count"), 0),
+        "adaptive_refinement_absorb_count": integer(
+            last_blk.get("adaptive_refinement_absorb_count"), 0),
+        "adaptive_refinement_absorbed_point_count": integer(
+            last_blk.get("adaptive_refinement_absorbed_point_count"), 0),
+        "adaptive_refinement_qvis_reuse_count": integer(
+            last_blk.get("adaptive_refinement_qvis_reuse_count"), 0),
+        "adaptive_refinement_qvis_regen_count": integer(
+            last_blk.get("adaptive_refinement_qvis_regen_count"), 0),
+        "adaptive_refinement_qvis_regen_failure_count": integer(
+            last_blk.get("adaptive_refinement_qvis_regen_failure_count"), 0),
+        "adaptive_refinement_last_family_id": integer(
+            last_blk.get("adaptive_refinement_last_family_id"), -1),
+        "adaptive_refinement_last_child_id": integer(
+            last_blk.get("adaptive_refinement_last_child_id"), -1),
+        "adaptive_refinement_last_absorb_f_min": num(
+            last_blk.get("adaptive_refinement_last_absorb_f_min")),
         "adaptive_refinement_reason": last_blk.get(
             "adaptive_refinement_reason"),
         "blocker_stack": last_blk.get("stack"),
@@ -388,7 +406,7 @@ case_id=${CASE_ID}
 world_file=${WORLD_FILE}
 confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 run_seconds=${RUN_SECONDS}
-planner_semantics=adaptive_resolution_visibility_obligations
+planner_semantics=persistent_spatial_partition_visibility_obligations
 EOF
 
 rm -f "${UPLOAD_ZIP}"
