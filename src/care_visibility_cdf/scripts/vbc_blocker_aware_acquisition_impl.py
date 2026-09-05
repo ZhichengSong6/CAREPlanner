@@ -1882,7 +1882,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 int(oid) for oid in self._repair_stack
                 if any(int(ob["id"]) == int(oid) for ob in self._obligations)
             ]
-        if len(copied) < 2:
+        if len(copied) < 1:
+            return None
+        if (len(copied) < 2 and
+                not self.vbc_gated_frontier_step_enabled):
             return None
 
         by_id = {int(ob["id"]): ob for ob in copied}
@@ -1908,23 +1911,51 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._frontier_last_mode = "invalid_active_qvis"
                 return None
 
-            delta = q_vis - measured
-            delta_inf = float(np.max(np.abs(delta)))
-            if not math.isfinite(delta_inf):
-                self._frontier_last_mode = "invalid_active_qvis_delta"
-                return None
+            target = None
+            mode = "vbc_gated_single_obligation_frontier_step"
+            selected_direction_norm_inf = math.nan
 
-            if delta_inf <= self.frontier_gradient_eps:
-                target = q_vis.copy()
-            else:
-                step_inf = min(self.frontier_step_inf, delta_inf)
-                target = measured + step_inf * delta / delta_inf
-                target_tensor = torch.tensor(
-                    target.reshape(1, 7),
-                    device=self.device, dtype=torch.float32)
-                target_tensor, _ = self._clamp(target_tensor)
-                target = target_tensor[0].detach().cpu().numpy().astype(
-                    np.float64)
+            if self.local_sensing_action_search_enabled:
+                bank = self._build_local_sensing_action_bank(
+                    int(active_id), active, measured)
+                if bank:
+                    with self._sensing_action_lock:
+                        idx = min(
+                            self._sensing_action_index,
+                            len(bank) - 1)
+                        item = bank[idx]
+                    target = np.asarray(
+                        item["target"], dtype=np.float64).reshape(7).copy()
+                    selected_direction_norm_inf = float(
+                        np.max(np.abs(target - measured)))
+                    mode = "local_certified_sensing_action_search"
+                    self._sensing_action_last_selected_source = str(
+                        item["source"])
+                    self._sensing_action_last_visible_gain = int(
+                        item["visible_gain"])
+                    self._sensing_action_last_min_margin_gain = float(
+                        item["min_margin_gain"])
+                    self._sensing_action_last_visible_fraction = float(
+                        item["visible_fraction"])
+
+            if target is None:
+                delta = q_vis - measured
+                delta_inf = float(np.max(np.abs(delta)))
+                if not math.isfinite(delta_inf):
+                    self._frontier_last_mode = "invalid_active_qvis_delta"
+                    return None
+                if delta_inf <= self.frontier_gradient_eps:
+                    target = q_vis.copy()
+                else:
+                    step_inf = min(self.frontier_step_inf, delta_inf)
+                    target = measured + step_inf * delta / delta_inf
+                    target_tensor = torch.tensor(
+                        target.reshape(1, 7),
+                        device=self.device, dtype=torch.float32)
+                    target_tensor, _ = self._clamp(target_tensor)
+                    target = target_tensor[0].detach().cpu().numpy().astype(
+                        np.float64)
+                selected_direction_norm_inf = delta_inf
 
             target_shift_inf = float(
                 np.max(np.abs(target - measured)))
@@ -1936,11 +1967,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "frontier_weight_scale": 1.0,
                 "qvis_weight_scale": 0.0,
                 "cycle_active": bool(cycle_active),
-                "mode": "vbc_gated_single_obligation_frontier_step",
+                "mode": mode,
                 "considered_ids": [int(active_id)],
                 "f_values": {},
                 "softmin_weights": {},
-                "direction_norm_inf": delta_inf,
+                "direction_norm_inf": selected_direction_norm_inf,
                 "target_shift_inf": target_shift_inf,
             }
             with self._frontier_lock:
@@ -1951,7 +1982,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._frontier_last_considered_ids = [int(active_id)]
                 self._frontier_last_f_values = {}
                 self._frontier_last_softmin_weights = {}
-                self._frontier_last_direction_norm_inf = delta_inf
+                self._frontier_last_direction_norm_inf = (
+                    selected_direction_norm_inf)
                 self._frontier_last_target_shift_inf = target_shift_inf
                 self._frontier_last_weight_scale = 1.0
                 self._frontier_last_qvis_weight_scale = 0.0
@@ -2381,6 +2413,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
             return
+
+        if self._sensing_action_bank_active_for(int(current)):
+            self._pending_blocker_id = None
+            self._pending_blocker_count = 0
+            self._last_switch_reason = "local_sensing_action_trials_active"
+            return
+
         # ROS trajectory times are floating-point values. A nominal 0.30 s
         # layer may arrive as 0.30000000000000004; treating that as strictly
         # beyond a 0.30 s blocker horizon silently prevents the second
