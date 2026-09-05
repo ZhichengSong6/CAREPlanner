@@ -55,6 +55,8 @@
   <arg name="smooth_handoff_enabled" default="false" />
   <arg name="repair_brake_dt_s" default="0.05" />
   <arg name="repair_hold_s" default="0.10" />
+  <!-- Cycle recovery is opt-in so historical C4/C5 baselines remain frozen. -->
+  <arg name="cycle_recovery_enabled" default="false" />
 
   <!-- Commit-pipeline capabilities. Legacy C4.x preserves its old behavior;
        C5.4+ enables final executable GCDF and lets the full-trajectory tracker
@@ -283,6 +285,11 @@
            value="$(arg repair_brake_dt_s)" />
     <param name="repair_hold_s"
            value="$(arg repair_hold_s)" />
+    <param name="cycle_recovery_enabled"
+           value="$(arg cycle_recovery_enabled)" />
+    <param name="blocker_stack_summary_topic"
+           value="/care_planner/active_sensing/blocker_stack_summary" />
+    <rosparam param="cycle_recovery_prefixes_s">[0.15, 0.10, 0.05]</rosparam>
     <param name="repair_active_topic"
            value="$(arg recovery_trigger_topic)" />
     <param name="probe_active_topic"
