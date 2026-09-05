@@ -185,6 +185,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         self.frontier_steering_enabled = bool(rospy.get_param(
             "~frontier_steering_enabled", True))
+        # Phase-E strict mode: use q_vis only as a long-range direction.
+        # The local planner is pulled toward one short measured-q -> q_vis step,
+        # which still must pass final GCDF + exact VBC before execution.
+        self.vbc_gated_frontier_step_enabled = bool(rospy.get_param(
+            "~vbc_gated_frontier_step_enabled", False))
         self.frontier_max_regions = int(rospy.get_param(
             "~frontier_max_regions", 3))
         self.frontier_softmin_temperature = float(rospy.get_param(
@@ -1495,12 +1500,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if not by_id:
             return None
         active_id = stack[-1] if stack else min(by_id)
-        priority = self._progressive_priority_order(by_id, active_id)
-        considered = [
-            oid for oid in priority
-            if oid in by_id][:self.frontier_max_regions]
-        if len(considered) < 2:
-            return None
 
         measured = (
             None if self._latest_measured_q is None
@@ -1509,6 +1508,72 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if (measured is None or measured.shape != (7,) or
                 not np.all(np.isfinite(measured))):
             self._frontier_last_mode = "no_measured_q"
+            return None
+
+        if self.vbc_gated_frontier_step_enabled:
+            active = by_id.get(int(active_id))
+            q_vis = np.asarray(
+                [] if active is None else active.get("q_vis", []),
+                dtype=np.float64).reshape(-1)
+            if (q_vis.shape != (7,) or not np.all(np.isfinite(q_vis))):
+                self._frontier_last_mode = "invalid_active_qvis"
+                return None
+
+            delta = q_vis - measured
+            delta_inf = float(np.max(np.abs(delta)))
+            if not math.isfinite(delta_inf):
+                self._frontier_last_mode = "invalid_active_qvis_delta"
+                return None
+
+            if delta_inf <= self.frontier_gradient_eps:
+                target = q_vis.copy()
+            else:
+                step_inf = min(self.frontier_step_inf, delta_inf)
+                target = measured + step_inf * delta / delta_inf
+                target_tensor = torch.tensor(
+                    target.reshape(1, 7),
+                    device=self.device, dtype=torch.float32)
+                target_tensor, _ = self._clamp(target_tensor)
+                target = target_tensor[0].detach().cpu().numpy().astype(
+                    np.float64)
+
+            target_shift_inf = float(
+                np.max(np.abs(target - measured)))
+            cycle_active = self._dependency_cycle_active(
+                stack, self._last_active_layer_ids)
+            result = {
+                "active": True,
+                "target": target,
+                "frontier_weight_scale": 1.0,
+                "qvis_weight_scale": 0.0,
+                "cycle_active": bool(cycle_active),
+                "mode": "vbc_gated_single_obligation_frontier_step",
+                "considered_ids": [int(active_id)],
+                "f_values": {},
+                "softmin_weights": {},
+                "direction_norm_inf": delta_inf,
+                "target_shift_inf": target_shift_inf,
+            }
+            with self._frontier_lock:
+                self._frontier_cache_key = None
+                self._frontier_cache = result
+                self._frontier_compute_count += 1
+                self._frontier_last_mode = result["mode"]
+                self._frontier_last_considered_ids = [int(active_id)]
+                self._frontier_last_f_values = {}
+                self._frontier_last_softmin_weights = {}
+                self._frontier_last_direction_norm_inf = delta_inf
+                self._frontier_last_target_shift_inf = target_shift_inf
+                self._frontier_last_weight_scale = 1.0
+                self._frontier_last_qvis_weight_scale = 0.0
+                self._frontier_last_cycle_active = bool(cycle_active)
+            return result
+
+        priority = self._progressive_priority_order(by_id, active_id)
+        considered = [
+            oid for oid in priority
+            if oid in by_id][:self.frontier_max_regions]
+        if len(considered) < 2:
             return None
 
         cycle_active = self._dependency_cycle_active(
@@ -1672,8 +1737,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
         summary = String()
         summary.data = (
-            "policy=softmin_visibility_frontier"
+            "policy=visibility_frontier"
             f" enabled={int(self.frontier_steering_enabled)}"
+            f" vbc_gated_step={int(self.vbc_gated_frontier_step_enabled)}"
             f" active={int(result is not None)}"
             f" mode={self._frontier_last_mode}"
             f" cycle_active={int(self._frontier_last_cycle_active)}"
