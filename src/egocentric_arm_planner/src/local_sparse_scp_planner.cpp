@@ -72,6 +72,8 @@ bool LocalSparseSCPPlanner::initialize(
 
   latest_executed_command_ = Eigen::VectorXd::Zero(dof_);
   latest_single_waypoint_q_ = Eigen::VectorXd::Zero(dof_);
+  latest_frontier_.q = Eigen::VectorXd::Zero(dof_);
+  plan_frontier_.q = Eigen::VectorXd::Zero(dof_);
 
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1,
@@ -82,6 +84,9 @@ bool LocalSparseSCPPlanner::initialize(
   waypoint_schedule_sub_ = nh_.subscribe(
       waypoint_schedule_topic_, 1,
       &LocalSparseSCPPlanner::waypointScheduleCallback, this);
+  visibility_frontier_sub_ = nh_.subscribe(
+      visibility_frontier_topic_, 1,
+      &LocalSparseSCPPlanner::visibilityFrontierCallback, this);
   single_waypoint_active_sub_ = nh_.subscribe(
       single_waypoint_active_topic_, 1,
       &LocalSparseSCPPlanner::singleWaypointActiveCallback, this);
@@ -227,6 +232,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<double>("local_planner/visibility_waypoint_weight",
                      visibility_waypoint_weight_,
                      visibility_waypoint_weight_);
+  pnh_.param<int>("local_planner/visibility_frontier_horizon_step",
+                  visibility_frontier_horizon_step_,
+                  visibility_frontier_horizon_step_);
 
   pnh_.param<double>("local_planner/cdf/safety_margin",
                      cdf_safety_margin_, cdf_safety_margin_);
@@ -302,6 +310,9 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/waypoint_schedule_topic",
                           waypoint_schedule_topic_,
                           waypoint_schedule_topic_);
+  pnh_.param<std::string>("local_planner/visibility_frontier_topic",
+                          visibility_frontier_topic_,
+                          visibility_frontier_topic_);
   pnh_.param<std::string>("local_planner/single_waypoint_active_topic",
                           single_waypoint_active_topic_,
                           single_waypoint_active_topic_);
@@ -360,6 +371,8 @@ bool LocalSparseSCPPlanner::loadConfig() {
       probe_feasibility_restoration_max_attempts_ < 0 ||
       probe_task_horizon_steps_ < 1 ||
       probe_task_horizon_steps_ > num_intervals_ ||
+      visibility_frontier_horizon_step_ < 1 ||
+      visibility_frontier_horizon_step_ > num_intervals_ ||
       cdf_constraint_horizon_steps_ < 1 ||
       cdf_constraint_horizon_steps_ > num_intervals_) {
     ROS_ERROR("[LocalSparseSCPPlanner] invalid local_planner parameters");
@@ -469,6 +482,52 @@ void LocalSparseSCPPlanner::waypointScheduleCallback(
   latest_schedule_ = incoming;
   if (changed && repair_mode_ && visibility_waypoint_weight_ > 0.0)
     requestPlanLocked("visibility_schedule_changed");
+}
+
+void LocalSparseSCPPlanner::visibilityFrontierCallback(
+    const std_msgs::Float64MultiArrayConstPtr& msg) {
+  // Message layout:
+  // [active, frontier_weight_scale, qvis_weight_scale, q_frontier(7)]
+  if (!msg || msg->data.size() != 10) return;
+
+  const bool active = msg->data[0] > 0.5;
+  const double frontier_scale = msg->data[1];
+  const double qvis_scale = msg->data[2];
+  if (!std::isfinite(frontier_scale) ||
+      !std::isfinite(qvis_scale) ||
+      frontier_scale < 0.0 ||
+      qvis_scale < 0.0) {
+    return;
+  }
+
+  Eigen::VectorXd q = Eigen::VectorXd::Zero(dof_);
+  for (int j = 0; j < dof_; ++j) {
+    q[j] = msg->data[3 + static_cast<std::size_t>(j)];
+  }
+  if (active && !finiteVector(q)) return;
+  if (!active) q.setZero();
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool changed =
+      active != latest_frontier_.active ||
+      std::fabs(frontier_scale -
+                latest_frontier_.frontier_weight_scale) > 1e-5 ||
+      std::fabs(qvis_scale -
+                latest_frontier_.qvis_weight_scale) > 1e-5 ||
+      latest_frontier_.q.size() != dof_ ||
+      (q - latest_frontier_.q).lpNorm<Eigen::Infinity>() > 1e-4;
+
+  latest_frontier_.active = active;
+  latest_frontier_.frontier_weight_scale = frontier_scale;
+  latest_frontier_.qvis_weight_scale = qvis_scale;
+  latest_frontier_.q = q;
+
+  if (changed && repair_mode_ && visibility_waypoint_weight_ > 0.0) {
+    requestPlanLocked(
+        active
+            ? "visibility_frontier_changed"
+            : "visibility_frontier_cleared");
+  }
 }
 
 void LocalSparseSCPPlanner::singleWaypointActiveCallback(
@@ -975,6 +1034,7 @@ bool LocalSparseSCPPlanner::startPlan() {
   bool has_single_waypoint_q = false;
   Eigen::VectorXd single_waypoint_q;
   Eigen::VectorXd previous_command;
+  FrontierObjective frontier;
   bool repair = false;
   bool probe = false;
   std::string reason;
@@ -998,6 +1058,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     previous_command = latest_executed_command_;
     if (previous_command.size() != dof_)
       previous_command = Eigen::VectorXd::Zero(dof_);
+    frontier = latest_frontier_;
     repair = repair_mode_;
     probe = probe_mode_;
     reason = plan_request_reason_;
@@ -1016,6 +1077,9 @@ bool LocalSparseSCPPlanner::startPlan() {
   // terminal-horizon obligation for that active q_vis.
   if (!repair) {
     schedule.clear();
+    frontier.active = false;
+    frontier.frontier_weight_scale = 0.0;
+    frontier.qvis_weight_scale = 1.0;
   } else if (schedule.empty() &&
              single_waypoint_active &&
              has_single_waypoint_q &&
@@ -1094,6 +1158,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_q_bar_ = q_init;
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
+    plan_frontier_ = frontier;
     plan_repair_mode_ = repair;
     plan_probe_mode_ = probe;
     plan_initialization_mode_ = initialization_mode;
@@ -1124,7 +1189,10 @@ bool LocalSparseSCPPlanner::startPlan() {
       << " repair=" << static_cast<int>(repair)
       << " probe=" << static_cast<int>(probe)
       << " init=" << initialization_mode
-      << " vis_obligations=" << schedule.size());
+      << " vis_obligations=" << schedule.size()
+      << " frontier_active=" << static_cast<int>(frontier.active)
+      << " frontier_weight_scale=" << frontier.frontier_weight_scale
+      << " qvis_weight_scale=" << frontier.qvis_weight_scale);
   publishSummary("plan_started");
   return true;
 }
@@ -1167,6 +1235,7 @@ void LocalSparseSCPPlanner::workerLoop() {
     Eigen::MatrixXd q_bar, u_bar, q_ref, u_ref;
     Eigen::VectorXd previous_command;
     std::vector<DeadlineWaypoint> schedule;
+    FrontierObjective frontier;
     bool repair = false;
     bool probe = false;
     double trust = 0.0;
@@ -1228,6 +1297,7 @@ void LocalSparseSCPPlanner::workerLoop() {
       u_ref = plan_u_ref_;
       previous_command = plan_previous_command_;
       schedule = plan_schedule_;
+      frontier = plan_frontier_;
       trust = trust_radius_;
       slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
@@ -1251,6 +1321,7 @@ void LocalSparseSCPPlanner::workerLoop() {
             u_ref,
             previous_command,
             schedule,
+            frontier,
             repair,
             probe,
             trust,
@@ -1272,6 +1343,7 @@ void LocalSparseSCPPlanner::workerLoop() {
               u_ref,
               previous_command,
               schedule,
+              frontier,
               repair,
               probe,
               trust,
@@ -1521,6 +1593,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     const Eigen::MatrixXd& u_ref,
     const Eigen::VectorXd& previous_command,
     const std::vector<DeadlineWaypoint>& schedule,
+    const FrontierObjective& frontier,
     bool repair_mode,
     bool probe_mode,
     double trust_radius,
@@ -1751,8 +1824,14 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  // Visibility obligations are trajectory-level objectives. Each absolute
-  // deadline selects the nearest future q_k in this local horizon.
+  // Visibility obligations are long-range trajectory objectives. A learned
+  // frontier target may simultaneously lower their weight and add a short
+  // local visibility-improvement objective; neither changes hard safety.
+  const double qvis_weight =
+      visibility_waypoint_weight_ *
+      ((repair_mode && frontier.active)
+           ? frontier.qvis_weight_scale
+           : 1.0);
   const double now_s = ros::Time::now().toSec();
   for (const auto& wp : schedule) {
     if (wp.q.size() != dof_) continue;
@@ -1763,8 +1842,25 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     for (int j = 0; j < dof_; ++j) {
       addQuadraticTarget(
           qIndex(k, j),
-          visibility_waypoint_weight_,
+          qvis_weight,
           wp.q[j]);
+    }
+  }
+
+  if (repair_mode &&
+      frontier.active &&
+      frontier.q.size() == dof_ &&
+      finiteVector(frontier.q) &&
+      frontier.frontier_weight_scale > 0.0) {
+    const int k_frontier = std::max(
+        1, std::min(visibility_frontier_horizon_step_, num_intervals_));
+    const double frontier_weight =
+        visibility_waypoint_weight_ * frontier.frontier_weight_scale;
+    for (int j = 0; j < dof_; ++j) {
+      addQuadraticTarget(
+          qIndex(k_frontier, j),
+          frontier_weight,
+          frontier.q[j]);
     }
   }
 
@@ -2131,6 +2227,11 @@ void LocalSparseSCPPlanner::publishSummary(
   double plan_cdf_roundtrip_max_ms = 0.0;
   int plan_cdf_roundtrip_count = 0;
   std::string init_mode = "unknown";
+  bool frontier_active = false;
+  double frontier_weight_scale = 0.0;
+  double frontier_qvis_weight_scale = 1.0;
+  double frontier_target_shift_inf =
+      std::numeric_limits<double>::quiet_NaN();
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -2181,6 +2282,17 @@ void LocalSparseSCPPlanner::publishSummary(
     plan_cdf_roundtrip_max_ms = plan_cdf_roundtrip_max_ms_;
     plan_cdf_roundtrip_count = plan_cdf_roundtrip_count_;
     init_mode = plan_initialization_mode_;
+    frontier_active = plan_frontier_.active;
+    frontier_weight_scale = plan_frontier_.frontier_weight_scale;
+    frontier_qvis_weight_scale = plan_frontier_.qvis_weight_scale;
+    if (plan_frontier_.q.size() == dof_ &&
+        plan_q_current_.size() == dof_ &&
+        finiteVector(plan_frontier_.q) &&
+        finiteVector(plan_q_current_)) {
+      frontier_target_shift_inf =
+          (plan_frontier_.q - plan_q_current_)
+              .lpNorm<Eigen::Infinity>();
+    }
   }
 
   std::ostringstream oss;
@@ -2235,6 +2347,11 @@ void LocalSparseSCPPlanner::publishSummary(
       << smooth_handoff_replan_suppressed_busy_count
       << " stale_mode_candidate_discard_count="
       << stale_mode_candidate_discard_count
+      << " frontier_active=" << static_cast<int>(frontier_active)
+      << " frontier_horizon_step=" << visibility_frontier_horizon_step_
+      << " frontier_weight_scale=" << frontier_weight_scale
+      << " frontier_qvis_weight_scale=" << frontier_qvis_weight_scale
+      << " frontier_target_shift_inf=" << frontier_target_shift_inf
       << " handoff_velocity_weight=" << handoff_velocity_weight_
       << " batches=" << batches
       << " cdf_roundtrip_ms=" << last_cdf_roundtrip_ms
