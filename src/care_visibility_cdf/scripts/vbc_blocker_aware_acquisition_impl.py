@@ -1854,7 +1854,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 int(oid) for oid in self._repair_stack
                 if any(int(ob["id"]) == int(oid) for ob in self._obligations)
             ]
-        if len(copied) < 2:
+        if len(copied) < 1:
+            return None
+        if len(copied) < 2 and not self.vbc_gated_frontier_step_enabled:
             return None
 
         by_id = {int(ob["id"]): ob for ob in copied}
@@ -1880,24 +1882,66 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._frontier_last_mode = "invalid_active_qvis"
                 return None
 
-            delta = q_vis - measured
-            delta_inf = float(np.max(np.abs(delta)))
-            if not math.isfinite(delta_inf):
-                self._frontier_last_mode = "invalid_active_qvis_delta"
-                return None
+            mode = "vbc_gated_single_obligation_frontier_step"
+            target = None
+            selected_q_vis = q_vis.copy()
+            selected_score = math.nan
+            selected_seed = "existing_qvis"
 
-            if delta_inf <= self.frontier_gradient_eps:
-                target = q_vis.copy()
-            else:
-                step_inf = min(self.frontier_step_inf, delta_inf)
-                target = measured + step_inf * delta / delta_inf
-                target_tensor = torch.tensor(
-                    target.reshape(1, 7),
-                    device=self.device, dtype=torch.float32)
-                target_tensor, _ = self._clamp(target_tensor)
-                target = target_tensor[0].detach().cpu().numpy().astype(
-                    np.float64)
+            if self.certified_frontier_search_enabled:
+                bank = self._build_certified_frontier_bank(
+                    int(active_id), active, measured)
+                if bank:
+                    with self._certified_frontier_lock:
+                        idx = min(
+                            self._certified_frontier_index,
+                            len(bank) - 1)
+                        exhausted = bool(
+                            self._certified_frontier_exhausted)
+                    if exhausted:
+                        # Do not keep replaying a trajectory already proven
+                        # unsafe in every tested visibility basin. Hold until
+                        # the deferred blocker is promoted or map evidence
+                        # changes the active obligation.
+                        target = measured.copy()
+                        selected_q_vis = np.asarray(
+                            bank[idx]["q_vis"],
+                            dtype=np.float64).reshape(7)
+                        selected_score = float(bank[idx]["score"])
+                        selected_seed = str(bank[idx]["seed_label"])
+                        mode = "certified_frontier_stuck_hold"
+                    else:
+                        item = bank[idx]
+                        target = np.asarray(
+                            item["target"],
+                            dtype=np.float64).reshape(7).copy()
+                        selected_q_vis = np.asarray(
+                            item["q_vis"],
+                            dtype=np.float64).reshape(7).copy()
+                        selected_score = float(item["score"])
+                        selected_seed = str(item["seed_label"])
+                        mode = "certified_multi_seed_frontier"
 
+            if target is None:
+                delta = q_vis - measured
+                delta_inf = float(np.max(np.abs(delta)))
+                if not math.isfinite(delta_inf):
+                    self._frontier_last_mode = "invalid_active_qvis_delta"
+                    return None
+                if delta_inf <= self.frontier_gradient_eps:
+                    target = q_vis.copy()
+                else:
+                    step_inf = min(self.frontier_step_inf, delta_inf)
+                    target = measured + step_inf * delta / delta_inf
+                    target_tensor = torch.tensor(
+                        target.reshape(1, 7),
+                        device=self.device, dtype=torch.float32)
+                    target_tensor, _ = self._clamp(target_tensor)
+                    target = target_tensor[0].detach().cpu().numpy().astype(
+                        np.float64)
+
+            delta_inf = float(np.max(
+                np.abs(selected_q_vis - measured)))
             target_shift_inf = float(
                 np.max(np.abs(target - measured)))
             cycle_active = self._dependency_cycle_active(
@@ -1908,12 +1952,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "frontier_weight_scale": 1.0,
                 "qvis_weight_scale": 0.0,
                 "cycle_active": bool(cycle_active),
-                "mode": "vbc_gated_single_obligation_frontier_step",
+                "mode": mode,
                 "considered_ids": [int(active_id)],
                 "f_values": {},
                 "softmin_weights": {},
                 "direction_norm_inf": delta_inf,
                 "target_shift_inf": target_shift_inf,
+                "selected_score": selected_score,
+                "selected_seed": selected_seed,
             }
             with self._frontier_lock:
                 self._frontier_cache_key = None
@@ -1928,6 +1974,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._frontier_last_weight_scale = 1.0
                 self._frontier_last_qvis_weight_scale = 0.0
                 self._frontier_last_cycle_active = bool(cycle_active)
+            if math.isfinite(selected_score):
+                self._certified_frontier_last_selected_score = float(
+                    selected_score)
+            self._certified_frontier_last_selected_seed = selected_seed
             return result
 
         priority = self._progressive_priority_order(by_id, active_id)
@@ -2448,6 +2498,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                         self._coherent_bundle_processed_count += 1
                         self._coherent_bundle_last_reason = "processed_empty"
             self._last_process_reason = "empty_active_set"
+            return
+
+        if self._defer_bundle_for_certified_frontier(serial, raw):
+            self._publish_schedule()
+            self._publish_blocker_stack_summary()
             return
 
         with self._lock:
