@@ -58,6 +58,9 @@ private:
     int selected_cdf_rows = 0;
     int selected_unknown_cdf_rows = 0;
     int selected_occupied_cdf_rows = 0;
+    // Exact batch-pair identities that actually entered the hard QP as
+    // UNKNOWN rows. Used to route local-GCDF blockers directly to sensing.
+    std::vector<int> selected_unknown_pair_indices;
     int screened_safe_rows = 0;
     int skipped_step0_rows = 0;
     int skipped_horizon_rows = 0;
@@ -146,6 +149,12 @@ private:
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
       const std::string& frame_id);
+  bool publishLocalGcdfRecoveryEvidence(
+      const care_collision_cdf::CollisionCDFConstraintBatch& batch,
+      const SparseSolveResult& result,
+      const Eigen::MatrixXd& q_bar,
+      const Eigen::MatrixXd& u_bar,
+      const std::string& frame_id);
   trajectory_msgs::JointTrajectory makeTrajectoryMessage(
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
@@ -184,6 +193,8 @@ private:
   ros::Publisher task_obstacle_blocked_pub_;
   ros::Publisher task_uncertified_pub_;
   ros::Publisher force_vbc_bootstrap_pub_;
+  ros::Publisher gcdf_recovery_trajectory_pub_;
+  ros::Publisher gcdf_recovery_event_pub_;
 
   ros::Timer timer_;
 
@@ -405,6 +416,13 @@ private:
       "/care_planner/local_planner/task_uncertified";
   std::string force_vbc_bootstrap_topic_ =
       "/care_planner/trajectory_risk/force_bootstrap";
+  // Shared GCDF->sensing evidence channel. Final-GCDF already publishes here;
+  // local hard-GCDF uses the same wire format so blocker-aware acquisition can
+  // consume either source without re-running a smaller VBC geometry filter.
+  std::string gcdf_recovery_trajectory_topic_ =
+      "/care_planner/final_gcdf/recovery_trajectory";
+  std::string gcdf_recovery_event_topic_ =
+      "/care_planner/final_gcdf/recovery_visibility_event";
 
   unsigned long long plan_sequence_ = 0;
   unsigned long long cdf_batch_received_ = 0;
@@ -413,6 +431,8 @@ private:
   unsigned long long solve_failure_count_ = 0;
   unsigned long long probe_feasibility_restore_count_ = 0;
   unsigned long long probe_feasibility_restore_success_count_ = 0;
+  unsigned long long local_gcdf_recovery_event_count_ = 0;
+  unsigned long long local_gcdf_recovery_drop_count_ = 0;
 };
 
 }  // namespace egocentric_arm_planner
