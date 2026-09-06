@@ -54,33 +54,48 @@ current_body_prior:
   # This file is set by confidence_map.launch so that $(find ...) works.
   body_samples_file: ""
 
-  # Cold-start trusted-motion envelope around the INITIAL robot body only.
+  # Cold-start trusted envelope around the INITIAL robot body only.
   #
-  # The scalar is only a fallback. Formal Phase-E uses per-link inflations
-  # derived from the measured 50-ms MAX first-order Cartesian body motion under
-  # the current planner velocity limits (10k random feasible q diagnostic,
-  # analyze_link_kinematic_motion_envelope.py). Values are meters:
-  #   link1       0.41 cm
-  #   link2       1.87 cm
-  #   link3       5.33 cm
-  #   link4      10.21 cm
-  #   wrist1     14.06 cm
-  #   wrist2     14.12 cm
-  #   wrist3     17.00 cm
+  # For links that actually participate in local hard-GCDF (link2 and distal),
+  # the extra radius is:
   #
-  # This is NOT a collision margin and NOT a permanent FREE-space privilege.
-  # It belongs to a separate bootstrap-confidence provenance layer that can be
-  # removed before subsequent goals without erasing real ToF observations.
+  #   startup_extra(link)
+  #     = 50-ms MAX Cartesian center motion
+  #       + GCDF body-proxy inflation
+  #       + local forbidden-voxel selector proximity band
+  #     = rho_motion(link) + 0.015 + 0.025 m.
+  #
+  # The 0.015 m term is the GCDF body-sphere inflation used by formal Phase-E.
+  # The 0.025 m term is NOT another collision margin: it is the local selector
+  # band used to retrieve nearby UNKNOWN/OCCUPIED voxel centers. Adding both
+  # here prevents the cold-start confidence layer from being geometrically
+  # smaller than the GCDF query footprint at q0.
+  #
+  # 50-ms MAX motion values from analyze_link_kinematic_motion_envelope.py:
+  #   link2       0.0187 m  -> startup extra 0.0587 m
+  #   link3       0.0533 m  -> startup extra 0.0933 m
+  #   link4       0.1021 m  -> startup extra 0.1421 m
+  #   wrist1      0.1406 m  -> startup extra 0.1806 m
+  #   wrist2      0.1412 m  -> startup extra 0.1812 m
+  #   wrist3      0.1700 m  -> startup extra 0.2100 m
+  #
+  # base_link and link1 are ignored by trajectory_risk/local hard-GCDF, so they
+  # do not receive this +0.040 m GCDF-query-footprint term. link1 retains only
+  # its measured 50-ms motion envelope.
+  #
+  # This is NOT a permanent FREE-space privilege. It belongs to the separate
+  # bootstrap-confidence provenance layer and can be removed before subsequent
+  # goals without erasing real ToF observations.
   inflation_radius: 0.0
   link_inflation_radius:
     base_link: 0.0
     link1: 0.0041
-    link2: 0.0187
-    link3: 0.0533
-    link4: 0.1021
-    wrist_link1: 0.1406
-    wrist_link2: 0.1412
-    wrist_link3: 0.1700
+    link2: 0.0587
+    link3: 0.0933
+    link4: 0.1421
+    wrist_link1: 0.1806
+    wrist_link2: 0.1812
+    wrist_link3: 0.2100
 
   # IMPORTANT: disabled here. initialize_body_prior_once.py waits until all
   # required body TFs are available, performs one complete refresh, then locks.
