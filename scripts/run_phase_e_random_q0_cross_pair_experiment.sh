@@ -30,6 +30,8 @@ SEED="${SEED:-20260906}"
 MIN_START_GOAL_EE_DISTANCE_M="${MIN_START_GOAL_EE_DISTANCE_M:-0.15}"
 Q0_REQUIRED_CLEARANCE_M="${Q0_REQUIRED_CLEARANCE_M:-0.06}"
 Q0_BODY_INFLATION_M="${Q0_BODY_INFLATION_M:-0.015}"
+STARTUP_PRIOR_INFLATION_M="${STARTUP_PRIOR_INFLATION_M:-0.10}"
+STARTUP_PRIOR_REQUIRED_CLEARANCE_M="${STARTUP_PRIOR_REQUIRED_CLEARANCE_M:-0.0}"
 OFFLINE_GEOMETRY_CONDA_ENV="${OFFLINE_GEOMETRY_CONDA_ENV:-viscdf}"
 BUILD_ONLY="${BUILD_ONLY:-false}"
 
@@ -38,34 +40,41 @@ CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confi
 
 cd "${REPO}"
 
-# Locate the original obstacle-aware goal pool containing terminal_best_q.
-if [[ -z "${SOURCE_POOL:-}" ]]; then
-  CANDIDATES=(
-    "${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
-    "${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool.json"
-    "${REPO}/src/egocentric_arm_planner/config/phase_e_obstacle_core30_v1.json"
-  )
-  for p in "${CANDIDATES[@]}"; do
-    if [[ -f "${p}" ]] && python3 - "${p}" <<'PY' >/dev/null 2>&1
-import json,sys
-d=json.load(open(sys.argv[1]))
-c=d.get("cases",[])
-raise SystemExit(0 if len(c)==30 and all("terminal_best_q" in x for x in c) else 1)
-PY
-    then
-      SOURCE_POOL="${p}"
-      break
-    fi
-  done
+# Locate the fixed 30-target pool and a larger obstacle-selected q0 pool.
+# Targets remain the original 30 goals. q0 candidates default to the existing
+# 200-goal pool so we can enforce the current +10 cm startup-prior envelope
+# without hand-picking poses.
+if [[ -z "${TARGET_POOL:-}" ]]; then
+  TARGET_POOL="${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
+fi
+if [[ -z "${Q0_SOURCE_POOL:-}" ]]; then
+  Q0_SOURCE_POOL="${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_200.json"
 fi
 
-if [[ -z "${SOURCE_POOL:-}" || ! -f "${SOURCE_POOL}" ]]; then
-  echo "[ERROR] Could not find the original 30-case obstacle-aware goal pool"
-  echo "        containing terminal_best_q."
-  echo ""
-  echo "Set it explicitly, e.g.:"
-  echo '  SOURCE_POOL=/path/to/phase_e_obstacle_goal_pool_30.json \\'
-  echo "    bash scripts/run_phase_e_random_q0_cross_pair_experiment.sh"
+if [[ ! -f "${TARGET_POOL}" ]]; then
+  echo "[ERROR] target pool not found: ${TARGET_POOL}"
+  exit 2
+fi
+if [[ ! -f "${Q0_SOURCE_POOL}" ]]; then
+  echo "[ERROR] q0 source pool not found: ${Q0_SOURCE_POOL}"
+  exit 2
+fi
+
+if ! python3 - "${TARGET_POOL}" "${Q0_SOURCE_POOL}" <<'PY'
+import json,sys
+tp,qp=sys.argv[1:]
+t=json.load(open(tp)).get("cases",[])
+q=json.load(open(qp)).get("cases",[])
+if len(t)!=30:
+    raise SystemExit(f"target pool must contain 30 cases, got {len(t)}")
+if len(q)<30:
+    raise SystemExit(f"q0 source pool must contain >=30 cases, got {len(q)}")
+if not all("terminal_best_q" in x for x in q):
+    raise SystemExit("q0 source pool contains cases without terminal_best_q")
+print(f"[POOL OK] targets={len(t)} q0_candidates={len(q)}")
+PY
+then
+  echo "[ERROR] target/q0 source pool validation failed"
   exit 2
 fi
 
@@ -128,7 +137,8 @@ mkdir -p "${ROOT}" "${SUMMARY_DIR}" "${ARTIFACT_DIR}" "${LOG_DIR}"
 echo "================================================================"
 echo "BUILDING RANDOM-FEASIBLE-q0 CROSS PAIRS"
 echo "================================================================"
-echo "source pool : ${SOURCE_POOL}"
+echo "target pool : ${TARGET_POOL}"
+echo "q0 pool     : ${Q0_SOURCE_POOL}"
 echo "world       : ${WORLD_FILE}"
 echo "seed        : ${SEED}"
 echo
@@ -136,10 +146,13 @@ echo
 "${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" \
   python scripts/build_phase_e_random_q0_cross_pairs.py \
   --repo "${REPO}" \
-  --source-pool "${SOURCE_POOL}" \
+  --target-pool "${TARGET_POOL}" \
+  --q0-source-pool "${Q0_SOURCE_POOL}" \
   --world "${WORLD_FILE}" \
   --body-inflation "${Q0_BODY_INFLATION_M}" \
   --required-q0-clearance "${Q0_REQUIRED_CLEARANCE_M}" \
+  --startup-prior-inflation "${STARTUP_PRIOR_INFLATION_M}" \
+  --required-startup-prior-clearance "${STARTUP_PRIOR_REQUIRED_CLEARANCE_M}" \
   --min-start-goal-ee-distance "${MIN_START_GOAL_EE_DISTANCE_M}" \
   --seed "${SEED}" \
   --output-json "${CASE_FILE}"
@@ -176,7 +189,8 @@ cat > "${ROOT}/experiment_metadata.txt" <<EOF
 benchmark=phase_e_random_feasible_q0_cross_pairs
 git_head=$(git rev-parse HEAD)
 git_branch=$(git branch --show-current)
-source_pool=${SOURCE_POOL}
+target_pool=${TARGET_POOL}
+q0_source_pool=${Q0_SOURCE_POOL}
 case_file=${CASE_FILE}
 case_count=${#CASES[@]}
 world_file=${WORLD_FILE}
@@ -185,6 +199,8 @@ seed=${SEED}
 offline_geometry_conda_env=${OFFLINE_GEOMETRY_CONDA_ENV}
 q0_body_inflation_m=${Q0_BODY_INFLATION_M}
 q0_required_obstacle_clearance_m=${Q0_REQUIRED_CLEARANCE_M}
+startup_prior_inflation_m=${STARTUP_PRIOR_INFLATION_M}
+startup_prior_required_clearance_m=${STARTUP_PRIOR_REQUIRED_CLEARANCE_M}
 min_start_goal_ee_distance_m=${MIN_START_GOAL_EE_DISTANCE_M}
 run_seconds_watchdog=${RUN_SECONDS}
 early_stop_on_goal=${EARLY_STOP_ON_GOAL}
@@ -264,7 +280,8 @@ print("target case :", c["case_id"])
 print("q0 source   :", c["initial_q_source_case_id"])
 print("initial_q   :", c["initial_q"])
 print("start-goal EE distance:", c["cross_pair_start_goal_ee_distance_m"])
-print("q0 obstacle clearance :", c["initial_q_source_terminal_clearance_m"])
+print("q0 collision clearance:", c["initial_q_source_collision_clearance_m"])
+print("startup prior clearance:", c["initial_q_source_startup_prior_clearance_m"])
 PY
   echo "================================================================"
 
@@ -354,7 +371,8 @@ for p in sorted(glob.glob(os.path.join(summary_dir,"*.json"))):
     row=dict(r)
     row["initial_q_source_case_id"]=c["initial_q_source_case_id"]
     row["start_goal_ee_distance_m"]=c["cross_pair_start_goal_ee_distance_m"]
-    row["q0_obstacle_clearance_m"]=c["initial_q_source_terminal_clearance_m"]
+    row["q0_obstacle_clearance_m"]=c["initial_q_source_collision_clearance_m"]
+    row["q0_startup_prior_clearance_m"]=c["initial_q_source_startup_prior_clearance_m"]
     row["initial_q"]=c["initial_q"]
     rows.append(row)
 rows.sort(key=lambda r:r["case_id"])
@@ -370,7 +388,7 @@ report={
 json.dump(report,open(out_json,"w"),indent=2)
 fields=[
   "case_id","initial_q_source_case_id","start_goal_ee_distance_m",
-  "q0_obstacle_clearance_m","task_success","overall_safe","time_to_success_s",
+  "q0_obstacle_clearance_m","q0_startup_prior_clearance_m","task_success","overall_safe","time_to_success_s",
   "final_position_error_m","best_position_error_m","commit_count",
   "candidate_vbc_records","candidate_vbc_unsafe_records",
   "execution_vbc_records","execution_vbc_unsafe_records",
