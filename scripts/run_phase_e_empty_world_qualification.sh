@@ -31,6 +31,10 @@ GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
 EXPECTED_CASE_COUNT="${EXPECTED_CASE_COUNT:-30}"
 KEEP_CASE_ZIPS="${KEEP_CASE_ZIPS:-0}"
+# Scientific control for the historical qualification: these 30 cases are the
+# common home-pose experiment, not the later random-q0 diagnostic.
+REQUIRE_NEAR_ZERO_INITIAL_Q="${REQUIRE_NEAR_ZERO_INITIAL_Q:-true}"
+NEAR_ZERO_INITIAL_Q_TOL_RAD="${NEAR_ZERO_INITIAL_Q_TOL_RAD:-0.0001}"
 
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map_phase_e_ray.yaml}"
@@ -99,6 +103,31 @@ if [[ "${EXPECTED_CASE_COUNT}" -gt 0 && "${#CASES[@]}" -ne "${EXPECTED_CASE_COUN
   exit 5
 fi
 
+if [[ "${REQUIRE_NEAR_ZERO_INITIAL_Q}" == "true" || "${REQUIRE_NEAR_ZERO_INITIAL_Q}" == "1" ]]; then
+  python3 - "${CASE_FILE}" "${NEAR_ZERO_INITIAL_Q_TOL_RAD}" <<'PY'
+import json,sys
+path,tol_s=sys.argv[1:]
+tol=float(tol_s)
+d=json.load(open(path))
+bad=[]
+worst=0.0
+for case in d.get("cases",[]):
+    q=case.get("initial_q",[0.0]*7)
+    if len(q)!=7:
+        raise SystemExit("ERROR: invalid initial_q length for "+str(case.get("case_id")))
+    m=max(abs(float(x)) for x in q)
+    worst=max(worst,m)
+    if m>tol:
+        bad.append((case.get("case_id"),m,q))
+if bad:
+    print("[ERROR] qualification requires historical near-zero q0; found nonzero cases:")
+    for cid,m,q in bad[:10]:
+        print("  ",cid,"max_abs_q=",m,"q=",q)
+    raise SystemExit(6)
+print(f"[Q0 PREFLIGHT OK] all {len(d.get('cases',[]))} cases near zero; max |q0|={worst:.3e} rad <= {tol:.3e}")
+PY
+fi
+
 STAMP="${BATCH_STAMP:-$(date +%Y%m%d-%H%M%S)}"
 GIT_SHORT="$(git rev-parse --short=8 HEAD)"
 BATCH_ID="${BATCH_ID:-phase_e_empty_qualification_${STAMP}_${GIT_SHORT}}"
@@ -125,6 +154,10 @@ confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 tof_fusion_enabled=true
 execution_gcdf_audit_enabled=true
 gcdf_body_inflation_m=0.015
+startup_bootstrap_policy=per_link_50ms_max_transient_layer
+startup_bootstrap_config=${CONFIDENCE_MAP_CONFIG_FILE}
+require_near_zero_initial_q=${REQUIRE_NEAR_ZERO_INITIAL_Q}
+near_zero_initial_q_tol_rad=${NEAR_ZERO_INITIAL_Q_TOL_RAD}
 run_seconds_watchdog=${RUN_SECONDS}
 early_stop_on_goal=${EARLY_STOP_ON_GOAL}
 qualification_rule=all_cases_task_success
@@ -159,6 +192,8 @@ echo "map         : real ToF ray"
 echo "E5 audit    : enabled"
 echo "watchdog    : ${RUN_SECONDS}s"
 echo "early stop  : ${EARLY_STOP_ON_GOAL}"
+echo "q0 control  : near-zero required=${REQUIRE_NEAR_ZERO_INITIAL_Q}, tol=${NEAR_ZERO_INITIAL_Q_TOL_RAD} rad"
+echo "bootstrap   : per-link 50-ms MAX transient layer"
 echo "================================================================"
 
 for CASE_ID in "${CASES[@]}"; do
