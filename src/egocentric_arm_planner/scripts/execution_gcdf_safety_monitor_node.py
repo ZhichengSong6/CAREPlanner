@@ -69,6 +69,12 @@ class ExecutionGCDFSafetyMonitor:
         self.last_warning_count = 0
         self.last_hard_count = 0
         self.last_source = "none"
+        self.last_min_occupied_pair_index = -1
+        self.last_min_occupied_timestep = -1
+        self.last_min_occupied_point = [math.nan, math.nan, math.nan]
+        self.last_min_occupied_raw_center_clearance = math.nan
+        self.last_min_occupied_volume_clearance = math.nan
+        self.last_min_occupied_learned_d = math.nan
 
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=10)
@@ -129,6 +135,8 @@ class ExecutionGCDFSafetyMonitor:
         all_d = []
         learned_valid = []
         raw_center_clearance_valid = []
+        min_occupied_pair = None
+        hard_occupied_records = []
 
         for i in range(n):
             learned_d = float(learned_distances[i])
@@ -156,10 +164,36 @@ class ExecutionGCDFSafetyMonitor:
 
             occupied_d.append(d)
             all_d.append(d)
+
+            j = 3 * i
+            point = [math.nan, math.nan, math.nan]
+            if j + 2 < len(msg.point_flat):
+                point = [
+                    float(msg.point_flat[j]),
+                    float(msg.point_flat[j + 1]),
+                    float(msg.point_flat[j + 2]),
+                ]
+            timestep = (
+                int(msg.original_timestep[i])
+                if i < len(msg.original_timestep) else -1)
+
+            record = {
+                "pair_index": i,
+                "timestep": timestep,
+                "point": point,
+                "learned_d": learned_d,
+                "raw_center_clearance": raw_clearance,
+                "volume_clearance": d,
+            }
+            if (min_occupied_pair is None or
+                    d < min_occupied_pair["volume_clearance"]):
+                min_occupied_pair = record
+
             if d < self.warning_margin:
                 warning_count += 1
             if d < self.hard_margin:
                 hard_count += 1
+                hard_occupied_records.append(record)
 
         d_min = self._finite_min(all_d)
         unknown_min = self._finite_min(unknown_d)
@@ -186,6 +220,26 @@ class ExecutionGCDFSafetyMonitor:
             self.last_warning_count = warning_count
             self.last_hard_count = hard_count
             self.last_source = source_name
+            if min_occupied_pair is not None:
+                self.last_min_occupied_pair_index = int(
+                    min_occupied_pair["pair_index"])
+                self.last_min_occupied_timestep = int(
+                    min_occupied_pair["timestep"])
+                self.last_min_occupied_point = list(
+                    min_occupied_pair["point"])
+                self.last_min_occupied_raw_center_clearance = float(
+                    min_occupied_pair["raw_center_clearance"])
+                self.last_min_occupied_volume_clearance = float(
+                    min_occupied_pair["volume_clearance"])
+                self.last_min_occupied_learned_d = float(
+                    min_occupied_pair["learned_d"])
+            else:
+                self.last_min_occupied_pair_index = -1
+                self.last_min_occupied_timestep = -1
+                self.last_min_occupied_point = [math.nan, math.nan, math.nan]
+                self.last_min_occupied_raw_center_clearance = math.nan
+                self.last_min_occupied_volume_clearance = math.nan
+                self.last_min_occupied_learned_d = math.nan
 
             # A fresh batch clears stale transport hold.
             self.stale_hold = False
@@ -198,6 +252,40 @@ class ExecutionGCDFSafetyMonitor:
                 self.clear_consecutive = 0
                 if not self.hard_hold:
                     self.hard_event_count += 1
+                    if min_occupied_pair is not None:
+                        hard_voxels = []
+                        seen = set()
+                        for rec in hard_occupied_records:
+                            p = rec["point"]
+                            key = tuple(p)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            hard_voxels.append(
+                                "[{:.3f},{:.3f},{:.3f}]".format(
+                                    p[0], p[1], p[2]))
+                        p = min_occupied_pair["point"]
+                        ground_band = (
+                            math.isfinite(p[2]) and
+                            p[2] <= 0.5 * self.voxel_resolution_m + 1e-9)
+                        rospy.logerr(
+                            "[EXECUTION_GCDF_OCCUPIED_BLOCKER] "
+                            "voxel=[%.6f,%.6f,%.6f] "
+                            "pair_index=%d timestep=%d "
+                            "raw_center_clearance=%.6f "
+                            "voxel_volume_clearance=%.6f learned_d=%.6f "
+                            "ground_band_candidate=%d "
+                            "hard_occupied_voxel_count=%d "
+                            "all_hard_occupied_voxels=%s",
+                            p[0], p[1], p[2],
+                            int(min_occupied_pair["pair_index"]),
+                            int(min_occupied_pair["timestep"]),
+                            float(min_occupied_pair["raw_center_clearance"]),
+                            float(min_occupied_pair["volume_clearance"]),
+                            float(min_occupied_pair["learned_d"]),
+                            int(ground_band),
+                            len(hard_voxels),
+                            ";".join(hard_voxels))
                 self.hard_hold = True
                 self._maybe_replan_locked(now, "hard")
             else:
@@ -260,6 +348,11 @@ class ExecutionGCDFSafetyMonitor:
             "occupied_min={} learned_d_min={} raw_center_clearance_min={} "
             "voxel_half_diagonal_m={} pair_count={} unknown_pairs={} occupied_pairs={} "
             "warning_pairs={} hard_pairs={} min_source={} "
+            "min_occupied_pair_index={} min_occupied_timestep={} "
+            "min_occupied_point={} "
+            "min_occupied_raw_center_clearance={} "
+            "min_occupied_volume_clearance={} "
+            "min_occupied_learned_d={} "
             "warning_event_count={} hard_event_count={} stale_event_count={} "
             "replan_count={} hard_hold={} stale_hold={} batch_age_s={}"
         ).format(
@@ -270,6 +363,19 @@ class ExecutionGCDFSafetyMonitor:
             self.last_pair_count, self.last_unknown_count,
             self.last_occupied_count, self.last_warning_count,
             self.last_hard_count, self.last_source,
+            self.last_min_occupied_pair_index,
+            self.last_min_occupied_timestep,
+            (
+                "{:.6f},{:.6f},{:.6f}".format(
+                    self.last_min_occupied_point[0],
+                    self.last_min_occupied_point[1],
+                    self.last_min_occupied_point[2])
+                if all(math.isfinite(v) for v in self.last_min_occupied_point)
+                else "nan,nan,nan"
+            ),
+            self.last_min_occupied_raw_center_clearance,
+            self.last_min_occupied_volume_clearance,
+            self.last_min_occupied_learned_d,
             self.warning_event_count, self.hard_event_count,
             self.stale_event_count, self.replan_count,
             int(self.hard_hold), int(self.stale_hold), age)
