@@ -236,9 +236,10 @@ class C44VerifiedRegimeManager:
         self.repair_completion_time = None
         self.repair_completion_event_count = 0
 
-        # C5.11: solver failure and active-sensing demand are separate facts.
-        # A failed PROBE task QP may request blocker rediscovery, but REPAIR is
-        # entered only after a persistent visibility waypoint/obligation exists.
+        # C5.11/C5.43: solver failure and active-sensing demand are separate
+        # facts. A failed NORMAL or PROBE task QP may request same-SCP-trajectory
+        # blocker rediscovery, but REPAIR is entered only after a persistent
+        # visibility waypoint/obligation exists.
         self.visibility_waypoint_active = False
         self.blocker_rediscovery_pending = False
         self.blocker_rediscovery_origin = "none"
@@ -335,8 +336,9 @@ class C44VerifiedRegimeManager:
         old = self.state
         self.state = new_state
         self.last_transition_reason = reason
-        # Blocker rediscovery is a PROBE-only fail-closed substate. Any real
-        # regime transition terminates that substate.
+        # Blocker rediscovery is a fail-closed substate used by NORMAL and
+        # PROBE_NORMAL task-QP failures. Any real regime transition terminates
+        # that substate.
         self.blocker_rediscovery_pending = False
         self.blocker_rediscovery_origin = "none"
         if self.blocker_rediscovery_force_bootstrap:
@@ -456,10 +458,13 @@ class C44VerifiedRegimeManager:
             elif self.task_infeasible_pending and self.state == self.NORMAL:
                 self.task_infeasible_pending = False
                 self.task_uncertified_pending = False
-                self.task_infeasible_repair_entry_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_planner_infeasible_after_gate_release",
-                    self.execution_ready_time)
+                # C5.43: UNKNOWN-only task infeasibility is evidence that the
+                # failed SCP trajectory intersects low-confidence space, but it
+                # is not yet a steering obligation. Stay NORMAL and rediscover
+                # the blocker on the exact SCP query trajectory. REPAIR starts
+                # only after visibility_waypoint_active confirms q_vis exists.
+                self._begin_blocker_rediscovery_locked(
+                    "task_normal_infeasible_after_gate_release")
             elif self.task_uncertified_pending and self.state == self.NORMAL:
                 self.task_uncertified_pending = False
                 self.task_infeasible_pending = False
@@ -481,9 +486,9 @@ class C44VerifiedRegimeManager:
 
     def _begin_blocker_rediscovery_locked(
             self, origin, force_bootstrap=True):
-        """Fail closed in PROBE until a real visibility obligation exists.
+        """Fail closed until a real visibility obligation exists.
 
-        Numerical task-QP failures need same-SCP-trajectory VBC rediscovery.
+        NORMAL/PROBE task-QP failures need same-SCP-trajectory VBC rediscovery.
         Exact-VBC rejection already carries a VBC active set, while final-GCDF
         rejection now exports the exact low-confidence voxels from the rejected
         executable trajectory.  Those latter two paths must not replace their
@@ -510,7 +515,7 @@ class C44VerifiedRegimeManager:
             self.visibility_waypoint_active = value
             if (not value or not self.blocker_rediscovery_pending or
                     not self.execution_ready or
-                    self.state != self.PROBE_NORMAL):
+                    self.state not in (self.NORMAL, self.PROBE_NORMAL)):
                 return
 
             origin = self.blocker_rediscovery_origin
@@ -547,7 +552,7 @@ class C44VerifiedRegimeManager:
         with self._lock:
             if (not self.blocker_rediscovery_pending or
                     not self.blocker_rediscovery_force_bootstrap or
-                    self.state != self.PROBE_NORMAL):
+                    self.state not in (self.NORMAL, self.PROBE_NORMAL)):
                 return
 
             if has_violation:
@@ -558,7 +563,8 @@ class C44VerifiedRegimeManager:
 
             # A fresh SAME-SCP-trajectory VBC SAFE verdict means this solver
             # failure is not attributable to a low-confidence swept volume on
-            # the exact GCDF linearization. Stay in PROBE and replan.
+            # the exact GCDF linearization. Stay in the current task regime
+            # (NORMAL or PROBE_NORMAL) and replan; do not manufacture REPAIR.
             self.blocker_rediscovery_vbc_safe_count += 1
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
@@ -635,9 +641,14 @@ class C44VerifiedRegimeManager:
                     self._transition_locked(
                         self.REPAIR, "task_probe_infeasible", now)
             else:
-                self.task_infeasible_repair_entry_count += 1
-                self._transition_locked(
-                    self.REPAIR, "task_planner_infeasible", now)
+                # C5.43: NORMAL UNKNOWN-infeasibility must not jump directly
+                # into REPAIR. The local hard-GCDF batch identifies an
+                # epistemic blocker, while the temporal VBC selector is the
+                # authority that turns the exact failed SCP trajectory into a
+                # persistent visibility obligation/q_vis. Keep NORMAL held and
+                # request same-SCP-trajectory rediscovery first.
+                self._begin_blocker_rediscovery_locked(
+                    "task_normal_infeasible")
 
     def _task_obstacle_blocked_cb(self, msg):
         """Known OCCUPIED geometry is a planning problem, never a sensing one."""
