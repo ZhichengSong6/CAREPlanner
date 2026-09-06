@@ -463,8 +463,16 @@ class C44VerifiedRegimeManager:
                 # is not yet a steering obligation. Stay NORMAL and rediscover
                 # the blocker on the exact SCP query trajectory. REPAIR starts
                 # only after visibility_waypoint_active confirms q_vis exists.
-                self._begin_blocker_rediscovery_locked(
-                    "task_normal_infeasible_after_gate_release")
+                if self.visibility_waypoint_active:
+                    self.task_infeasible_repair_entry_count += 1
+                    self._transition_locked(
+                        self.REPAIR,
+                        "task_normal_infeasible_gcdf_obligation_ready_after_gate_release",
+                        self.execution_ready_time)
+                else:
+                    self._begin_blocker_rediscovery_locked(
+                        "task_normal_infeasible_after_gate_release",
+                        force_bootstrap=False)
             elif self.task_uncertified_pending and self.state == self.NORMAL:
                 self.task_uncertified_pending = False
                 self.task_infeasible_pending = False
@@ -488,11 +496,11 @@ class C44VerifiedRegimeManager:
             self, origin, force_bootstrap=True):
         """Fail closed until a real visibility obligation exists.
 
-        NORMAL/PROBE task-QP failures need same-SCP-trajectory VBC rediscovery.
-        Exact-VBC rejection already carries a VBC active set, while final-GCDF
-        rejection now exports the exact low-confidence voxels from the rejected
-        executable trajectory.  Those latter two paths must not replace their
-        stronger evidence with a guessed task-bootstrap blocker.
+        C5.43 local hard-GCDF task failures publish exact UNKNOWN blocker voxels
+        directly to sensing and therefore call this with force_bootstrap=False.
+        Legacy/numerical rediscovery paths may still request same-SCP VBC with
+        force_bootstrap=True. Exact GCDF evidence must never be replaced by a
+        narrower swept-body reclassification.
         """
         self.blocker_rediscovery_pending = True
         self.blocker_rediscovery_origin = str(origin)
@@ -635,20 +643,29 @@ class C44VerifiedRegimeManager:
                 if (self.repair_completion_gate_enabled and
                         not self.visibility_waypoint_active):
                     self._begin_blocker_rediscovery_locked(
-                        "task_probe_infeasible")
+                        "task_probe_infeasible",
+                        force_bootstrap=False)
                 else:
                     self.task_infeasible_repair_entry_count += 1
                     self._transition_locked(
                         self.REPAIR, "task_probe_infeasible", now)
             else:
-                # C5.43: NORMAL UNKNOWN-infeasibility must not jump directly
-                # into REPAIR. The local hard-GCDF batch identifies an
-                # epistemic blocker, while the temporal VBC selector is the
-                # authority that turns the exact failed SCP trajectory into a
-                # persistent visibility obligation/q_vis. Keep NORMAL held and
-                # request same-SCP-trajectory rediscovery first.
-                self._begin_blocker_rediscovery_locked(
-                    "task_normal_infeasible")
+                # C5.43: local hard-GCDF now publishes its exact selected
+                # UNKNOWN voxels directly into the GCDF recovery/sensing
+                # channel. Do not ask the narrower VBC swept-body selector to
+                # re-judge those points. If the obligation already arrived,
+                # enter REPAIR immediately; otherwise wait fail-closed for the
+                # direct GCDF obligation callback.
+                if self.visibility_waypoint_active:
+                    self.task_infeasible_repair_entry_count += 1
+                    self._transition_locked(
+                        self.REPAIR,
+                        "task_normal_infeasible_gcdf_obligation_ready",
+                        now)
+                else:
+                    self._begin_blocker_rediscovery_locked(
+                        "task_normal_infeasible",
+                        force_bootstrap=False)
 
     def _task_obstacle_blocked_cb(self, msg):
         """Known OCCUPIED geometry is a planning problem, never a sensing one."""
