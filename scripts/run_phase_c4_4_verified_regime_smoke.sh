@@ -149,23 +149,29 @@ else
   exit 1
 fi
 
-if ! GOAL_LINE="$(python3 - "${CASE_FILE}" "${CASE_ID}" <<'PY'
+if ! CASE_LINE="$(python3 - "${CASE_FILE}" "${CASE_ID}" <<'PY'
 import json,sys
 p,cid=sys.argv[1:]
 d=json.load(open(p)); c=next((x for x in d['cases'] if x['case_id']==cid),None)
 if c is None:
     raise SystemExit('unknown case_id: '+cid)
-print(*c['goal_position'],*c['goal_orientation'])
+q0=c.get('initial_q',[0.0]*7)
+if len(q0)!=7:
+    raise SystemExit('initial_q must have 7 values for '+cid)
+print(*c['goal_position'],*c['goal_orientation'],*q0)
 PY
 )"; then
   echo "[ERROR] failed to resolve controlled-trial CASE_ID=${CASE_ID}" >&2
   exit 2
 fi
-read -r GX GY GZ GQX GQY GQZ GQW <<< "${GOAL_LINE}"
-if [[ -z "${GX:-}" || -z "${GY:-}" || -z "${GZ:-}" || -z "${GQW:-}" ]]; then
-  echo "[ERROR] incomplete goal resolved for CASE_ID=${CASE_ID}: ${GOAL_LINE}" >&2
+read -r GX GY GZ GQX GQY GQZ GQW \
+  IQ1 IQ2 IQ3 IQ4 IQ5 IQ6 IQ7 <<< "${CASE_LINE}"
+if [[ -z "${GX:-}" || -z "${GY:-}" || -z "${GZ:-}" || -z "${GQW:-}" || -z "${IQ7:-}" ]]; then
+  echo "[ERROR] incomplete case resolved for CASE_ID=${CASE_ID}: ${CASE_LINE}" >&2
   exit 2
 fi
+INITIAL_Q_TOL_RAD="${INITIAL_Q_TOL_RAD:-0.03}"
+echo "[INITIAL Q] [${IQ1}, ${IQ2}, ${IQ3}, ${IQ4}, ${IQ5}, ${IQ6}, ${IQ7}]"
 
 GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
 REC_PIDS=()
@@ -190,7 +196,15 @@ trap cleanup EXIT INT TERM
 echo "[VIS] gazebo_gui=${GAZEBO_GUI} use_rviz=${USE_RVIZ} world_file=${WORLD_FILE}"
 setsid roslaunch arm_description gazebo_velocity_control.launch \
   world_file:="${WORLD_FILE}" \
-  gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" > "${LOG}/gazebo.log" 2>&1 &
+  gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" \
+  initial_joint1:="${IQ1}" \
+  initial_joint2:="${IQ2}" \
+  initial_joint3:="${IQ3}" \
+  initial_joint4:="${IQ4}" \
+  initial_wrist_joint1:="${IQ5}" \
+  initial_wrist_joint2:="${IQ6}" \
+  initial_wrist_joint3:="${IQ7}" \
+  > "${LOG}/gazebo.log" 2>&1 &
 GAZEBO_PID=$!
 
 echo "[WAIT] Gazebo robot/controller readiness: waiting for one /care_arm/joint_states message"
@@ -228,6 +242,47 @@ then
   rosnode list 2>/dev/null || true
   echo "[DEBUG] gazebo log: ${LOG}/gazebo.log"
   tail -n 260 "${LOG}/gazebo.log" 2>/dev/null || true
+  exit 1
+fi
+
+echo "[WAIT] validating measured Gazebo initial q against case initial_q"
+if ! python3 - "${INITIAL_Q_TOL_RAD}" "${IQ1}" "${IQ2}" "${IQ3}" "${IQ4}" "${IQ5}" "${IQ6}" "${IQ7}" <<'PY'
+import sys
+import time
+import rospy
+from sensor_msgs.msg import JointState
+
+tol=float(sys.argv[1])
+target=[float(x) for x in sys.argv[2:9]]
+names=['joint1','joint2','joint3','joint4','wrist_joint1','wrist_joint2','wrist_joint3']
+
+rospy.init_node('careplanner_initial_q_validator', anonymous=True, disable_signals=True)
+deadline=time.time()+8.0
+last=None
+while time.time()<deadline and not rospy.is_shutdown():
+    try:
+        msg=rospy.wait_for_message('/care_arm/joint_states', JointState, timeout=1.0)
+    except rospy.ROSException:
+        continue
+    idx={n:i for i,n in enumerate(msg.name)}
+    if not all(n in idx for n in names):
+        continue
+    q=[float(msg.position[idx[n]]) for n in names]
+    err=max(abs(a-b) for a,b in zip(q,target))
+    last=(q,err)
+    if err<=tol:
+        print('[INITIAL Q OK] measured={} target={} err_inf={:.6f} rad'.format(q,target,err))
+        raise SystemExit(0)
+if last is None:
+    print('[ERROR] no complete joint state available for initial-q validation', file=sys.stderr)
+else:
+    print('[ERROR] initial q mismatch: measured={} target={} err_inf={:.6f} rad tol={:.6f}'.format(
+        last[0],target,last[1],tol), file=sys.stderr)
+raise SystemExit(2)
+PY
+then
+  echo "[ERROR] Gazebo did not settle at requested initial_q before planner startup"
+  tail -n 220 "${LOG}/gazebo.log" 2>/dev/null || true
   exit 1
 fi
 
@@ -459,6 +514,8 @@ branch=${RUNTIME_BRANCH}
 head=${RUNTIME_HEAD}
 case_id=${CASE_ID}
 run_id=${RUN_ID:-${CASE_ID}}
+initial_q=[${IQ1},${IQ2},${IQ3},${IQ4},${IQ5},${IQ6},${IQ7}]
+initial_q_tolerance_rad=${INITIAL_Q_TOL_RAD}
 gazebo_gui=${GAZEBO_GUI}
 use_rviz=${USE_RVIZ}
 world_file=${WORLD_FILE}
