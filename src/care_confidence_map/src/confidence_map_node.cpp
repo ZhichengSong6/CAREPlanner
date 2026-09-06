@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -43,7 +44,11 @@ struct GridPoint
   float y = 0.0f;
   float z = 0.0f;
 
+  // Sensor-derived confidence only. The cold-start bootstrap is stored in a
+  // separate provenance layer so it can be removed without erasing genuine
+  // ToF observations acquired during the first task.
   float confidence = 0.0f;
+  float bootstrap_confidence = 0.0f;
   float current_visibility = 0.0f;
   // Phase E3 semantic state. 0 = not occupied / unknown-or-free,
   // 1 = most recently observed as occupied. Confidence distinguishes
@@ -135,6 +140,10 @@ public:
     refresh_body_prior_service_ =
         nh_.advertiseService(refresh_body_prior_service_name_,
                              &ConfidenceMapNode::handleRefreshBodyPrior,
+                             this);
+    deactivate_body_prior_service_ =
+        nh_.advertiseService(deactivate_body_prior_service_name_,
+                             &ConfidenceMapNode::handleDeactivateBodyPrior,
                              this);
 
     const double update_period = 1.0 / std::max(0.1, update_rate_);
@@ -332,9 +341,51 @@ private:
              current_body_prior_risk_samples_only_,
              false);
 
+    // Legacy scalar remains as a fallback for links not listed below. Phase-E
+    // now uses per-link cold-start envelopes derived from the 50-ms MAX
+    // Cartesian motion of each link under the planner velocity limits.
     nh.param("current_body_prior/inflation_radius",
              current_body_prior_inflation_radius_,
-             0.10);
+             0.0);
+
+    current_body_prior_link_inflation_radius_.clear();
+    XmlRpc::XmlRpcValue link_inflation_xml;
+    if (nh.getParam("current_body_prior/link_inflation_radius", link_inflation_xml))
+    {
+      if (link_inflation_xml.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+      {
+        ROS_ERROR("[confidence_map_node] current_body_prior/link_inflation_radius must be a map.");
+        return false;
+      }
+
+      for (auto it = link_inflation_xml.begin(); it != link_inflation_xml.end(); ++it)
+      {
+        const std::string link_name = it->first;
+        const XmlRpc::XmlRpcValue& value = it->second;
+        double inflation = 0.0;
+        if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+        {
+          inflation = static_cast<double>(value);
+        }
+        else if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+        {
+          inflation = static_cast<int>(value);
+        }
+        else
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid inflation for link "
+                           << link_name << ": expected numeric value");
+          return false;
+        }
+        if (!std::isfinite(inflation) || inflation < 0.0)
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid inflation for link "
+                           << link_name << ": " << inflation);
+          return false;
+        }
+        current_body_prior_link_inflation_radius_[link_name] = inflation;
+      }
+    }
 
     nh.param("current_body_prior/tf_timeout",
              current_body_prior_tf_timeout_,
@@ -354,6 +405,11 @@ private:
         "current_body_prior/marker_topic",
         current_body_prior_marker_topic_,
         "/care_planner/confidence_map/current_body_prior_markers");
+
+    nh.param<std::string>(
+        "current_body_prior/deactivate_service",
+        deactivate_body_prior_service_name_,
+        "/care_planner/confidence_map/deactivate_body_prior");
 
     if (!current_body_prior_enabled_)
     {
@@ -526,6 +582,7 @@ private:
           p.y = static_cast<float>(y);
           p.z = static_cast<float>(z);
           p.confidence = 0.0f;
+          p.bootstrap_confidence = 0.0f;
           p.current_visibility = 0.0f;
           p.occupancy = 0.0f;
           p.last_seen_time = -1.0;
@@ -542,6 +599,21 @@ private:
   int gridLinearIndex(int ix, int iy, int iz) const
   {
     return ix * ny_ * nz_ + iy * nz_ + iz;
+  }
+
+  float effectiveConfidence(const GridPoint& p) const
+  {
+    return std::max(p.confidence, p.bootstrap_confidence);
+  }
+
+  double currentBodyPriorInflationForLink(const std::string& link_name) const
+  {
+    const auto it = current_body_prior_link_inflation_radius_.find(link_name);
+    if (it != current_body_prior_link_inflation_radius_.end())
+    {
+      return it->second;
+    }
+    return current_body_prior_inflation_radius_;
   }
 
   void markSphereAsKnownClear(
@@ -578,7 +650,7 @@ private:
     iy_max = std::min(ny_ - 1, iy_max);
     iz_max = std::min(nz_ - 1, iz_max);
 
-    const double stamp_sec = stamp.toSec();
+    (void)stamp;
 
     for (int ix = ix_min; ix <= ix_max; ++ix)
     {
@@ -599,9 +671,11 @@ private:
           }
 
           GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
-          gp.last_seen_time = stamp_sec;
-          gp.confidence = 1.0f;
-          gp.occupancy = 0.0f;
+
+          // Cold-start provenance only: do NOT overwrite sensor confidence,
+          // occupancy, or last_seen_time. A real ToF observation always remains
+          // independently preserved when this bootstrap layer is later removed.
+          gp.bootstrap_confidence = 1.0f;
 
           // This is a robot-body known-clear prior, not a live sensor ray.
           // Do not set current_visibility=1 here.
@@ -688,8 +762,9 @@ private:
 
       const tf2::Transform T_map_link = transformMsgToTf2(tf_msg);
       const tf2::Vector3 center_map = T_map_link * sample.center_link;
-      const double radius =
-          sample.radius + current_body_prior_inflation_radius_;
+      const double link_inflation =
+          currentBodyPriorInflationForLink(sample.link_name);
+      const double radius = sample.radius + link_inflation;
 
       markSphereAsKnownClear(
           center_map, radius, now, &last_body_prior_updated_cells_);
@@ -721,6 +796,8 @@ private:
                       << oss.str());
       return false;
     }
+
+    current_body_prior_active_ = true;
 
     ROS_INFO_STREAM_THROTTLE(
         1.0,
@@ -1115,7 +1192,8 @@ private:
         ++visible_now;
       }
 
-      if (gp.confidence <= 1e-4f)
+      const float effective_confidence = effectiveConfidence(gp);
+      if (effective_confidence <= 1e-4f)
       {
         ++unknown;
       }
@@ -1159,6 +1237,7 @@ private:
         << " known_free=" << known_free
         << " known_occupied=" << known_occupied
         << " unknown=" << unknown
+        << " bootstrap_active=" << static_cast<int>(current_body_prior_active_)
         << " observation_age_s=" << observation_age;
     msg.data = oss.str();
     return msg;
@@ -1191,7 +1270,7 @@ private:
 
       const GridPoint& voxel = grid_points_[index];
 
-      res.confidence.push_back(voxel.confidence);
+      res.confidence.push_back(effectiveConfidence(voxel));
       res.current_visibility.push_back(voxel.current_visibility);
       res.inside_map.push_back(1);
     }
@@ -1212,6 +1291,42 @@ private:
     return true;
   }
 
+  bool handleDeactivateBodyPrior(
+      std_srvs::Trigger::Request&,
+      std_srvs::Trigger::Response& res)
+  {
+    std::size_t cleared_cells = 0;
+    std::size_t preserved_sensor_cells = 0;
+    for (auto& gp : grid_points_)
+    {
+      if (gp.bootstrap_confidence > 1e-4f)
+      {
+        ++cleared_cells;
+        if (gp.confidence > 1e-4f)
+        {
+          ++preserved_sensor_cells;
+        }
+        gp.bootstrap_confidence = 0.0f;
+      }
+    }
+
+    current_body_prior_active_ = false;
+    last_body_prior_spheres_.clear();
+    publishCurrentBodyPriorMarkers();
+
+    std::ostringstream oss;
+    oss << "bootstrap_deactivated=1"
+        << ", cleared_cells=" << cleared_cells
+        << ", preserved_sensor_cells=" << preserved_sensor_cells;
+    res.success = true;
+    res.message = oss.str();
+
+    ROS_WARN_STREAM("[confidence_map_node] COLD-START BOOTSTRAP REMOVED: "
+                    << oss.str()
+                    << ". Sensor-derived confidence/occupancy is preserved.");
+    return true;
+  }
+
   void printConfidenceStatsThrottled() const
   {
     int currently_visible_count = 0;
@@ -1225,7 +1340,7 @@ private:
 
     for (const auto& p : grid_points_)
     {
-      const double c = static_cast<double>(p.confidence);
+      const double c = static_cast<double>(effectiveConfidence(p));
       min_conf = std::min(min_conf, c);
       max_conf = std::max(max_conf, c);
       sum_conf += c;
@@ -1309,13 +1424,14 @@ private:
       *iter_x = p.x;
       *iter_y = p.y;
       *iter_z = p.z;
-      *iter_conf = p.confidence;
+      const float effective_confidence = effectiveConfidence(p);
+      *iter_conf = effective_confidence;
       *iter_vis = p.current_visibility;
       *iter_occ = p.occupancy;
       // RViz-compatible intensity: occupied known cells appear stronger than
       // free known cells while unknown remains near zero.
       *iter_intensity =
-          p.occupancy > 0.5f ? 2.0f : p.confidence;
+          p.occupancy > 0.5f ? 2.0f : effective_confidence;
 
       ++iter_x;
       ++iter_y;
@@ -1608,9 +1724,10 @@ private:
     marker.color.a = 1.0f;
 
     std::ostringstream oss;
-    oss << "current body prior"
-        << "\nbody samples + " << current_body_prior_inflation_radius_ << " m"
-        << "\nconfidence=1, visibility=0"
+    oss << "cold-start body bootstrap"
+        << "\nper-link kinematic inflation (fallback="
+        << current_body_prior_inflation_radius_ << " m)"
+        << "\nbootstrap confidence=1, visibility=0"
         << "\nsamples=" << last_body_prior_transformed_samples_
         << ", cells=" << last_body_prior_updated_cells_;
 
@@ -1629,7 +1746,7 @@ private:
     delete_marker.action = visualization_msgs::Marker::DELETEALL;
     array.markers.push_back(delete_marker);
 
-    if (!current_body_prior_enabled_)
+    if (!current_body_prior_enabled_ || !current_body_prior_active_)
     {
       return array;
     }
@@ -1789,10 +1906,18 @@ private:
     ROS_INFO_STREAM("current_body_prior:");
     ROS_INFO_STREAM("  enabled: " << current_body_prior_enabled_);
     ROS_INFO_STREAM("  body_samples_file: " << current_body_prior_body_samples_file_);
-    ROS_INFO_STREAM("  inflation_radius: " << current_body_prior_inflation_radius_);
+    ROS_INFO_STREAM("  fallback_inflation_radius: " << current_body_prior_inflation_radius_);
+    ROS_INFO_STREAM("  link_inflation_radius entries: "
+                    << current_body_prior_link_inflation_radius_.size());
+    for (const auto& kv : current_body_prior_link_inflation_radius_)
+    {
+      ROS_INFO_STREAM("    " << kv.first << ": " << kv.second);
+    }
+    ROS_INFO_STREAM("  active: " << current_body_prior_active_);
     ROS_INFO_STREAM("  refresh_on_startup: " << current_body_prior_refresh_on_startup_);
     ROS_INFO_STREAM("  risk_samples_only: " << current_body_prior_risk_samples_only_);
     ROS_INFO_STREAM("  refresh_service: " << refresh_body_prior_service_name_);
+    ROS_INFO_STREAM("  deactivate_service: " << deactivate_body_prior_service_name_);
     ROS_INFO_STREAM("  marker_topic: " << current_body_prior_marker_topic_);
     ROS_INFO_STREAM("  last_transformed_samples: " << last_body_prior_transformed_samples_);
     ROS_INFO_STREAM("  last_updated_cells: " << last_body_prior_updated_cells_);
@@ -1833,6 +1958,7 @@ private:
   ros::Subscriber ray_observation_sub_;
   ros::ServiceServer query_service_;
   ros::ServiceServer refresh_body_prior_service_;
+  ros::ServiceServer deactivate_body_prior_service_;
 
   ros::Timer update_timer_;
   ros::Timer publish_timer_;
@@ -1892,11 +2018,15 @@ private:
   bool current_body_prior_lock_after_complete_refresh_ = false;
   bool current_body_prior_locked_ = false;
   bool current_body_prior_risk_samples_only_ = false;
-  double current_body_prior_inflation_radius_ = 0.10;
+  bool current_body_prior_active_ = false;
+  double current_body_prior_inflation_radius_ = 0.0;
+  std::map<std::string, double> current_body_prior_link_inflation_radius_;
   double current_body_prior_tf_timeout_ = 0.05;
   std::string current_body_prior_body_samples_file_;
   std::string refresh_body_prior_service_name_ =
       "/care_planner/confidence_map/refresh_body_prior";
+  std::string deactivate_body_prior_service_name_ =
+      "/care_planner/confidence_map/deactivate_body_prior";
   std::string current_body_prior_marker_topic_ =
       "/care_planner/confidence_map/current_body_prior_markers";
   care_confidence_map::BodySampleModel current_body_sample_model_;
