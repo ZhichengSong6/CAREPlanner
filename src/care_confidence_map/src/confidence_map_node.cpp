@@ -678,8 +678,8 @@ private:
           gp.bootstrap_confidence = 1.0f;
 
           // This is a robot-body known-clear prior, not a live sensor ray.
-          // Do not set current_visibility=1 here.
-          gp.current_visibility = 0.0f;
+          // Leave current_visibility untouched as well: a real ToF packet may
+          // already have arrived before the one-shot bootstrap refresh.
 
           *updated_cells += 1;
         }
