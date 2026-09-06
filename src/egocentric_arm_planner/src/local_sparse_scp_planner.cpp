@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -131,6 +133,12 @@ bool LocalSparseSCPPlanner::initialize(
       nh_.advertise<std_msgs::Bool>(task_uncertified_topic_, 10, false);
   force_vbc_bootstrap_pub_ =
       nh_.advertise<std_msgs::Bool>(force_vbc_bootstrap_topic_, 1, true);
+  gcdf_recovery_trajectory_pub_ =
+      nh_.advertise<trajectory_msgs::JointTrajectory>(
+          gcdf_recovery_trajectory_topic_, 2, false);
+  gcdf_recovery_event_pub_ =
+      nh_.advertise<std_msgs::Float64MultiArray>(
+          gcdf_recovery_event_topic_, 2, false);
 
   std_msgs::Bool bootstrap_init;
   bootstrap_init.data = false;
@@ -356,6 +364,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
   pnh_.param<std::string>("local_planner/force_vbc_bootstrap_topic",
                           force_vbc_bootstrap_topic_,
                           force_vbc_bootstrap_topic_);
+  pnh_.param<std::string>("local_planner/gcdf_recovery_trajectory_topic",
+                          gcdf_recovery_trajectory_topic_,
+                          gcdf_recovery_trajectory_topic_);
+  pnh_.param<std::string>("local_planner/gcdf_recovery_event_topic",
+                          gcdf_recovery_event_topic_,
+                          gcdf_recovery_event_topic_);
 
   if (planner_poll_rate_ <= 0.0 ||
       max_scp_iterations_ < 1 ||
@@ -1497,6 +1511,9 @@ void LocalSparseSCPPlanner::workerLoop() {
           // failure as obstacle-only. In a mixed batch the UNKNOWN rows may be
           // the actual cause of infeasibility (and are active constraints).
           if (result.selected_unknown_cdf_rows > 0) {
+            const bool recovery_published =
+                publishLocalGcdfRecoveryEvidence(
+                    *batch, result, q_bar, u_bar, current_frame_id_);
             task_infeasible_pub_.publish(blocked_msg);
             ROS_WARN_STREAM(
                 "[LocalSparseSCPPlanner] task QP "
@@ -1507,6 +1524,8 @@ void LocalSparseSCPPlanner::workerLoop() {
                 << (probe ? "PROBE_NORMAL" : "NORMAL")
                 << " unknown_rows=" << result.selected_unknown_cdf_rows
                 << " occupied_rows=" << result.selected_occupied_cdf_rows
+                << " exact_gcdf_recovery_published="
+                << static_cast<int>(recovery_published)
                 << " -> publish visibility-repair signal");
           } else if (result.selected_occupied_cdf_rows > 0) {
             task_obstacle_blocked_pub_.publish(blocked_msg);
@@ -1706,6 +1725,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       ++out.selected_occupied_cdf_rows;
     } else {
       ++out.selected_unknown_cdf_rows;
+      out.selected_unknown_pair_indices.push_back(i);
     }
 
     SelectedRow row;
@@ -2187,6 +2207,119 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
   candidate_trajectory_pub_.publish(
       makeTrajectoryMessage(
           q, u, frame_id, ros::Time::now()));
+}
+
+
+bool LocalSparseSCPPlanner::publishLocalGcdfRecoveryEvidence(
+    const care_collision_cdf::CollisionCDFConstraintBatch& batch,
+    const SparseSolveResult& result,
+    const Eigen::MatrixXd& q_bar,
+    const Eigen::MatrixXd& u_bar,
+    const std::string& frame_id) {
+  if (result.selected_unknown_pair_indices.empty()) {
+    ++local_gcdf_recovery_drop_count_;
+    return false;
+  }
+  if (batch.header.stamp.isZero()) {
+    ++local_gcdf_recovery_drop_count_;
+    ROS_WARN(
+        "[LocalSparseSCPPlanner] local-GCDF recovery dropped: zero batch stamp");
+    return false;
+  }
+
+  int earliest = std::numeric_limits<int>::max();
+  for (const int pair : result.selected_unknown_pair_indices) {
+    if (pair < 0 ||
+        pair >= static_cast<int>(batch.original_timestep.size())) {
+      continue;
+    }
+    earliest = std::min(
+        earliest,
+        batch.original_timestep[static_cast<std::size_t>(pair)]);
+  }
+  if (earliest < 1 || earliest > num_intervals_) {
+    ++local_gcdf_recovery_drop_count_;
+    ROS_WARN_STREAM(
+        "[LocalSparseSCPPlanner] local-GCDF recovery dropped: invalid earliest="
+        << earliest);
+    return false;
+  }
+
+  std::set<std::tuple<double, double, double>> seen;
+  std::vector<std::tuple<double, double, double>> points;
+  for (const int pair : result.selected_unknown_pair_indices) {
+    if (pair < 0 ||
+        pair >= static_cast<int>(batch.original_timestep.size()) ||
+        batch.original_timestep[static_cast<std::size_t>(pair)] != earliest) {
+      continue;
+    }
+    const std::size_t j = static_cast<std::size_t>(3 * pair);
+    if (j + 2 >= batch.point_flat.size()) {
+      continue;
+    }
+    const double x = batch.point_flat[j];
+    const double y = batch.point_flat[j + 1];
+    const double z = batch.point_flat[j + 2];
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      continue;
+    }
+    const auto key = std::make_tuple(x, y, z);
+    if (seen.insert(key).second) {
+      points.push_back(key);
+    }
+  }
+
+  if (points.empty()) {
+    ++local_gcdf_recovery_drop_count_;
+    ROS_WARN(
+        "[LocalSparseSCPPlanner] local-GCDF recovery dropped: no earliest UNKNOWN points");
+    return false;
+  }
+
+  const unsigned long long seq = ++local_gcdf_recovery_event_count_;
+  trajectory_msgs::JointTrajectory trajectory =
+      makeTrajectoryMessage(
+          q_bar, u_bar, frame_id, batch.header.stamp);
+  trajectory.header.seq = static_cast<uint32_t>(
+      seq & 0xffffffffULL);
+
+  std_msgs::Float64MultiArray event;
+  const double sweep_s = static_cast<double>(earliest) * dt_;
+  event.data.reserve(6 + 3 * points.size());
+  event.data.push_back(static_cast<double>(seq));
+  event.data.push_back(static_cast<double>(batch.header.stamp.sec));
+  event.data.push_back(static_cast<double>(batch.header.stamp.nsec));
+  event.data.push_back(sweep_s);
+  event.data.push_back(static_cast<double>(earliest));
+  event.data.push_back(static_cast<double>(points.size()));
+  for (const auto& p : points) {
+    event.data.push_back(std::get<0>(p));
+    event.data.push_back(std::get<1>(p));
+    event.data.push_back(std::get<2>(p));
+  }
+
+  // Publish trajectory first so the blocker-aware acquisition cache can match
+  // the subsequent exact-voxel event by immutable header stamp.
+  gcdf_recovery_trajectory_pub_.publish(trajectory);
+  gcdf_recovery_event_pub_.publish(event);
+
+  std::ostringstream point_oss;
+  bool first = true;
+  for (const auto& p : points) {
+    if (!first) point_oss << ";";
+    first = false;
+    point_oss << "[" << std::get<0>(p) << ","
+              << std::get<1>(p) << ","
+              << std::get<2>(p) << "]";
+  }
+  ROS_WARN_STREAM(
+      "[LOCAL_GCDF_RECOVERY] seq=" << seq
+      << " stamp=" << batch.header.stamp
+      << " earliest_timestep=" << earliest
+      << " sweep_s=" << sweep_s
+      << " point_count=" << points.size()
+      << " points=" << point_oss.str());
+  return true;
 }
 
 void LocalSparseSCPPlanner::publishSummary(
