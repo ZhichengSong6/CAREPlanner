@@ -11,8 +11,8 @@ set -euo pipefail
 # Design:
 #   - same 30 target EE goals as the original obstacle-selected pool
 #   - every target used exactly once
-#   - every terminal_best_q used exactly once as q0
-#   - fixed seeded derangement; no source is paired with its own goal
+#   - q0 pool regenerated directly in joint space in the obstacle world
+#   - 30 distinct q0 samples assigned one-to-one to the 30 targets
 #   - q0 obstacle clearance is recomputed before the batch starts
 #   - obstacle world is used for BOTH q0 feasibility and execution
 #
@@ -30,8 +30,12 @@ SEED="${SEED:-20260906}"
 MIN_START_GOAL_EE_DISTANCE_M="${MIN_START_GOAL_EE_DISTANCE_M:-0.15}"
 Q0_REQUIRED_CLEARANCE_M="${Q0_REQUIRED_CLEARANCE_M:-0.06}"
 Q0_BODY_INFLATION_M="${Q0_BODY_INFLATION_M:-0.015}"
-STARTUP_PRIOR_INFLATION_M="${STARTUP_PRIOR_INFLATION_M:-0.10}"
+# This diagnostic intentionally removes the extra trusted-free shell. The
+# robot's raw occupied body is still marked known-free at startup.
+STARTUP_PRIOR_INFLATION_M="${STARTUP_PRIOR_INFLATION_M:-0.0}"
 STARTUP_PRIOR_REQUIRED_CLEARANCE_M="${STARTUP_PRIOR_REQUIRED_CLEARANCE_M:-0.0}"
+Q0_POOL_TARGET_COUNT="${Q0_POOL_TARGET_COUNT:-80}"
+Q0_POOL_MAX_SAMPLES="${Q0_POOL_MAX_SAMPLES:-100000}"
 OFFLINE_GEOMETRY_CONDA_ENV="${OFFLINE_GEOMETRY_CONDA_ENV:-viscdf}"
 BUILD_ONLY="${BUILD_ONLY:-false}"
 
@@ -40,41 +44,27 @@ CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confi
 
 cd "${REPO}"
 
-# Locate the fixed 30-target pool and a larger obstacle-selected q0 pool.
-# Targets remain the original 30 goals. q0 candidates default to the existing
-# 200-goal pool so we can enforce the current +10 cm startup-prior envelope
-# without hand-picking poses.
+# Keep the original 30 targets fixed. Initial configurations are regenerated
+# directly in joint space in the SAME obstacle world; they are not recycled
+# from goal IK solutions.
 if [[ -z "${TARGET_POOL:-}" ]]; then
   TARGET_POOL="${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
-fi
-if [[ -z "${Q0_SOURCE_POOL:-}" ]]; then
-  Q0_SOURCE_POOL="${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_200.json"
 fi
 
 if [[ ! -f "${TARGET_POOL}" ]]; then
   echo "[ERROR] target pool not found: ${TARGET_POOL}"
   exit 2
 fi
-if [[ ! -f "${Q0_SOURCE_POOL}" ]]; then
-  echo "[ERROR] q0 source pool not found: ${Q0_SOURCE_POOL}"
-  exit 2
-fi
 
-if ! python3 - "${TARGET_POOL}" "${Q0_SOURCE_POOL}" <<'PY'
+if ! python3 - "${TARGET_POOL}" <<'PY'
 import json,sys
-tp,qp=sys.argv[1:]
-t=json.load(open(tp)).get("cases",[])
-q=json.load(open(qp)).get("cases",[])
+t=json.load(open(sys.argv[1])).get("cases",[])
 if len(t)!=30:
     raise SystemExit(f"target pool must contain 30 cases, got {len(t)}")
-if len(q)<30:
-    raise SystemExit(f"q0 source pool must contain >=30 cases, got {len(q)}")
-if not all("terminal_best_q" in x for x in q):
-    raise SystemExit("q0 source pool contains cases without terminal_best_q")
-print(f"[POOL OK] targets={len(t)} q0_candidates={len(q)}")
+print(f"[TARGET POOL OK] targets={len(t)}")
 PY
 then
-  echo "[ERROR] target/q0 source pool validation failed"
+  echo "[ERROR] target pool validation failed"
   exit 2
 fi
 
@@ -129,19 +119,53 @@ LOG_DIR="${ROOT}/logs"
 FINAL_JSON="${ROOT}/experiment_summary.json"
 FINAL_CSV="${ROOT}/experiment_summary.csv"
 FINAL_ZIP="${REPO}/CAREPlanner_PHASE_E_RANDOM_Q0_CROSS_PAIRS_${BATCH_ID}.zip"
+Q0_SOURCE_POOL="${ROOT}/random_initial_q_pool.json"
+EXPERIMENT_CONFIDENCE_MAP_CONFIG_FILE="${ROOT}/confidence_map_phase_e_random_q0.yaml"
 
 rm -rf "${ROOT}"
 rm -f "${FINAL_ZIP}"
 mkdir -p "${ROOT}" "${SUMMARY_DIR}" "${ARTIFACT_DIR}" "${LOG_DIR}"
 
 echo "================================================================"
-echo "BUILDING RANDOM-FEASIBLE-q0 CROSS PAIRS"
+echo "GENERATING DIRECT RANDOM q0 POOL"
 echo "================================================================"
 echo "target pool : ${TARGET_POOL}"
-echo "q0 pool     : ${Q0_SOURCE_POOL}"
 echo "world       : ${WORLD_FILE}"
 echo "seed        : ${SEED}"
+echo "startup prior extra inflation : ${STARTUP_PRIOR_INFLATION_M} m"
 echo
+
+# Build an experiment-local confidence-map config so the formal Phase-E config
+# remains untouched. Only current_body_prior/inflation_radius is changed.
+python3 - "${CONFIDENCE_MAP_CONFIG_FILE}" "${EXPERIMENT_CONFIDENCE_MAP_CONFIG_FILE}" "${STARTUP_PRIOR_INFLATION_M}" <<'PY'
+import sys,yaml
+src,dst,inflate=sys.argv[1:]
+d=yaml.safe_load(open(src))
+d.setdefault("current_body_prior",{})["inflation_radius"]=float(inflate)
+with open(dst,"w") as f:
+    yaml.safe_dump(d,f,sort_keys=False)
+print("[CONFIG] experiment confidence map:",dst)
+print("[CONFIG] startup prior inflation:",float(inflate))
+PY
+CONFIDENCE_MAP_CONFIG_FILE="${EXPERIMENT_CONFIDENCE_MAP_CONFIG_FILE}"
+
+"${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" \
+  python scripts/generate_phase_e_random_initial_q_pool.py \
+  --repo "${REPO}" \
+  --world "${WORLD_FILE}" \
+  --target-count "${Q0_POOL_TARGET_COUNT}" \
+  --max-samples "${Q0_POOL_MAX_SAMPLES}" \
+  --seed "${SEED}" \
+  --risk-body-inflation "${Q0_BODY_INFLATION_M}" \
+  --min-obstacle-clearance "${Q0_REQUIRED_CLEARANCE_M}" \
+  --startup-prior-inflation "${STARTUP_PRIOR_INFLATION_M}" \
+  --min-startup-prior-clearance "${STARTUP_PRIOR_REQUIRED_CLEARANCE_M}" \
+  --output-json "${Q0_SOURCE_POOL}"
+
+echo
+echo "================================================================"
+echo "BUILDING 30 TARGET × RANDOM-q0 CROSS PAIRS"
+echo "================================================================"
 
 "${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" \
   python scripts/build_phase_e_random_q0_cross_pairs.py \
@@ -177,8 +201,8 @@ if [[ "${BUILD_ONLY}" == "true" || "${BUILD_ONLY}" == "1" ]]; then
   echo "BUILD-ONLY PREFLIGHT COMPLETE"
   echo "================================================================"
   echo "[OK] Pinocchio environment verified"
-  echo "[OK] 30 obstacle-feasible q0 configurations revalidated"
-  echo "[OK] 30 one-to-one cross pairs generated"
+  echo "[OK] direct random-q0 pool generated in obstacle world"
+  echo "[OK] 30 distinct q0 configurations assigned to 30 targets"
   echo "[CASE FILE] ${CASE_FILE}"
   echo "No Gazebo/ROS experiment was started."
   echo "================================================================"
@@ -191,6 +215,7 @@ git_head=$(git rev-parse HEAD)
 git_branch=$(git branch --show-current)
 target_pool=${TARGET_POOL}
 q0_source_pool=${Q0_SOURCE_POOL}
+q0_sampling=direct_joint_space_random
 case_file=${CASE_FILE}
 case_count=${#CASES[@]}
 world_file=${WORLD_FILE}
@@ -262,7 +287,7 @@ echo "PHASE-E RANDOM FEASIBLE q0 CROSS-PAIR EXPERIMENT"
 echo "================================================================"
 echo "cases       : ${#CASES[@]}"
 echo "world       : obstacle world"
-echo "q0 source   : one-to-one terminal_best_q derangement"
+echo "q0 source   : direct joint-space random feasible samples"
 echo "VBC margin  : raw body, +0.0 m"
 echo "steering    : canonical local frontier/q_vis (not full-q_vis experiment)"
 echo "watchdog    : ${RUN_SECONDS}s"
