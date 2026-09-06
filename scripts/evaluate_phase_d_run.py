@@ -197,10 +197,34 @@ def main():
             x=num(local_plan_ms.get(k)); y=num(safety_pipeline_ms.get(k))
             certified_compute_est[k]=(x+y) if math.isfinite(x) and math.isfinite(y) else None
 
+    legacy_phase=num(lp.get("phase_s"),None)
+    legacy_wall=num(lp.get("wall_elapsed_s"),None)
+    legacy_master=num(lp.get("master_duration_s"),None)
+    legacy_updates=integer(lp.get("update_count"),0)
+    legacy_frozen=integer(lp.get("frozen_count"),0)
+    legacy_stale=bool(
+        goal.get("task_success") and
+        legacy_phase is not None and
+        legacy_master is not None and
+        legacy_master > 1e-6 and
+        legacy_phase < 0.95 * legacy_master)
+    # C5.43/Phase-E authoritative task completion is measured-state FK to the
+    # requested EE goal. The old nominal-progress gate tracks a legacy master
+    # trajectory and may freeze after active-sensing/measured-state replans; do
+    # not report that stale projection as the real final task phase.
+    authoritative_phase=None if legacy_stale else legacy_phase
+
     out={"phase":"D.1","method":a.method,"trial_id":a.trial_id,"case_id":a.case_id,"difficulty":case.get("difficulty_bin"),
          "goal_position":case["goal_position"],"goal_orientation_xyzw":case["goal_orientation"],
          "success_thresholds":{"position_tolerance_m":a.position_tolerance_m,"orientation_tolerance_rad":a.orientation_tolerance_rad,"required_hold_s":a.success_hold_s},**goal,
-         "final_task_phase_s":num(lp.get("phase_s"),None),"final_wall_elapsed_s":num(lp.get("wall_elapsed_s"),None),
+         "task_progress_authority":"measured_fk_goal",
+         "final_task_phase_s":authoritative_phase,
+         "final_wall_elapsed_s":legacy_wall,
+         "legacy_nominal_progress_phase_s":legacy_phase,
+         "legacy_nominal_progress_master_duration_s":legacy_master,
+         "legacy_nominal_progress_update_count":legacy_updates,
+         "legacy_nominal_progress_frozen_count":legacy_frozen,
+         "legacy_nominal_progress_stale":legacy_stale,
          "overall_safe":gcdf_ok and vbc_ok and exe_ok,"gcdf_commit_certified":gcdf_ok,"vbc_commit_certified":vbc_ok,"execution_vbc_safe":exe_ok,
          "commit_count":commits,"final_gcdf_safe_count":gs,"final_gcdf_unsafe_rejection_count":gu,"final_gcdf_timeout_count":gt,
          "verification_safe_count":vs,"verification_unsafe_rejection_count":vu,"verification_timeout_count":vt,
