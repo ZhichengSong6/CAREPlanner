@@ -157,6 +157,7 @@ startup_bootstrap_policy=per_link_50ms_max_transient_layer
 startup_bootstrap_config=${CONFIDENCE_MAP_CONFIG_FILE}
 require_near_zero_initial_q=${REQUIRE_NEAR_ZERO_INITIAL_Q}
 near_zero_initial_q_tol_rad=${NEAR_ZERO_INITIAL_Q_TOL_RAD}
+force_exact_zero_initial_q=true
 run_seconds_watchdog=${RUN_SECONDS}
 early_stop_on_goal=${EARLY_STOP_ON_GOAL}
 qualification_rule=all_cases_task_success
@@ -220,6 +221,7 @@ for CASE_ID in "${CASES[@]}"; do
     TOF_FUSION_ENABLED=true \
     EXECUTION_GCDF_AUDIT_ENABLED=true \
     GCDF_BODY_INFLATION_M=0.015 \
+    FORCE_ZERO_INITIAL_Q=true \
     EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL}" \
     GAZEBO_GUI="${GAZEBO_GUI}" \
     USE_RVIZ="${USE_RVIZ}" \
