@@ -640,15 +640,20 @@ class C44VerifiedRegimeManager:
                     self._publish_summary()
                     return
                 self.probe_failure_count += 1
-                if (self.repair_completion_gate_enabled and
-                        not self.visibility_waypoint_active):
+                # Local hard-GCDF publishes exact UNKNOWN blocker evidence for
+                # PROBE exactly as for NORMAL. Wait for that obligation rather
+                # than letting completion-gate configuration decide whether a
+                # sensing target exists.
+                if not self.visibility_waypoint_active:
                     self._begin_blocker_rediscovery_locked(
                         "task_probe_infeasible",
                         force_bootstrap=False)
                 else:
                     self.task_infeasible_repair_entry_count += 1
                     self._transition_locked(
-                        self.REPAIR, "task_probe_infeasible", now)
+                        self.REPAIR,
+                        "task_probe_infeasible_gcdf_obligation_ready",
+                        now)
             else:
                 # C5.43: local hard-GCDF now publishes its exact selected
                 # UNKNOWN voxels directly into the GCDF recovery/sensing
