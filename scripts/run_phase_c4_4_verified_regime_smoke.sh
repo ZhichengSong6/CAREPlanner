@@ -171,6 +171,20 @@ if [[ -z "${GX:-}" || -z "${GY:-}" || -z "${GZ:-}" || -z "${GQW:-}" || -z "${IQ7
   exit 2
 fi
 INITIAL_Q_TOL_RAD="${INITIAL_Q_TOL_RAD:-0.03}"
+FORCE_ZERO_INITIAL_Q="${FORCE_ZERO_INITIAL_Q:-false}"
+if [[ "${FORCE_ZERO_INITIAL_Q}" == "true" || "${FORCE_ZERO_INITIAL_Q}" == "1" ]]; then
+  IQ1="0.0"; IQ2="0.0"; IQ3="0.0"; IQ4="0.0"; IQ5="0.0"; IQ6="0.0"; IQ7="0.0"
+  echo "[INITIAL Q] qualification override: exact zero/home configuration"
+else
+  # Gazebo spawn_model's argparse may misparse negative scientific notation
+  # (e.g. -8e-07) as an option token after -J. Canonicalize all joint values
+  # to fixed-point decimal strings before passing them through roslaunch.
+  read -r IQ1 IQ2 IQ3 IQ4 IQ5 IQ6 IQ7 <<< "$(python3 - "${IQ1}" "${IQ2}" "${IQ3}" "${IQ4}" "${IQ5}" "${IQ6}" "${IQ7}" <<'PY'
+import sys
+print(*(f"{float(x):.12f}" for x in sys.argv[1:8]))
+PY
+)"
+fi
 echo "[INITIAL Q] [${IQ1}, ${IQ2}, ${IQ3}, ${IQ4}, ${IQ5}, ${IQ6}, ${IQ7}]"
 
 GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
