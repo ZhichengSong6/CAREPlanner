@@ -603,7 +603,19 @@ private:
 
   float effectiveConfidence(const GridPoint& p) const
   {
-    return std::max(p.confidence, p.bootstrap_confidence);
+    const float bootstrap = current_body_prior_active_
+        ? p.bootstrap_confidence
+        : 0.0f;
+    return std::max(p.confidence, bootstrap);
+  }
+
+  void clearBootstrapConfidenceLayer()
+  {
+    for (auto& gp : grid_points_)
+    {
+      gp.bootstrap_confidence = 0.0f;
+    }
+    current_body_prior_active_ = false;
   }
 
   double currentBodyPriorInflationForLink(const std::string& link_name) const
@@ -705,6 +717,9 @@ private:
       return true;
     }
 
+    // Retries must be atomic from the planner's perspective. Remove any
+    // incomplete bootstrap from the previous attempt before rebuilding it.
+    clearBootstrapConfidenceLayer();
     last_body_prior_spheres_.clear();
     last_body_prior_refresh_time_ = now;
     last_body_prior_updated_cells_ = 0;
@@ -797,12 +812,18 @@ private:
       return false;
     }
 
-    current_body_prior_active_ = true;
+    // Only a complete TF refresh is allowed to become an effective FREE
+    // bootstrap. Partial attempts remain invisible to confidence queries and
+    // are cleared on the next retry.
+    current_body_prior_active_ =
+        (last_body_prior_transformed_samples_ > 0 &&
+         last_body_prior_skipped_samples_ == 0);
 
     ROS_INFO_STREAM_THROTTLE(
         1.0,
         "[confidence_map_node] current_body_prior refreshed: "
-            << oss.str());
+            << oss.str()
+            << ", active=" << static_cast<int>(current_body_prior_active_));
 
     publishCurrentBodyPriorMarkers();
 
