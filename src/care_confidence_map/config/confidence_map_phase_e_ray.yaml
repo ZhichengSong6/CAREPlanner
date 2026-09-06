@@ -50,7 +50,7 @@ confidence_map:
 
   # Diagnostic-only 3x3x3 snapshot for the current empty-world UNKNOWN blocker.
   # Triggered only when a confidence-query request actually touches this voxel.
-  debug_neighborhood_watch_enabled: true
+  debug_neighborhood_watch_enabled: false
   debug_neighborhood_watch_x: 0.00
   debug_neighborhood_watch_y: -0.10
   debug_neighborhood_watch_z: 0.15
