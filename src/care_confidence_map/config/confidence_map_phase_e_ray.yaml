@@ -54,8 +54,33 @@ current_body_prior:
   # This file is set by confidence_map.launch so that $(find ...) works.
   body_samples_file: ""
 
-  # Small trusted-clear envelope around the initial body geometry.
-  inflation_radius: 0.10
+  # Cold-start trusted-motion envelope around the INITIAL robot body only.
+  #
+  # The scalar is only a fallback. Formal Phase-E uses per-link inflations
+  # derived from the measured 50-ms MAX first-order Cartesian body motion under
+  # the current planner velocity limits (10k random feasible q diagnostic,
+  # analyze_link_kinematic_motion_envelope.py). Values are meters:
+  #   link1       0.41 cm
+  #   link2       1.87 cm
+  #   link3       5.33 cm
+  #   link4      10.21 cm
+  #   wrist1     14.06 cm
+  #   wrist2     14.12 cm
+  #   wrist3     17.00 cm
+  #
+  # This is NOT a collision margin and NOT a permanent FREE-space privilege.
+  # It belongs to a separate bootstrap-confidence provenance layer that can be
+  # removed before subsequent goals without erasing real ToF observations.
+  inflation_radius: 0.0
+  link_inflation_radius:
+    base_link: 0.0
+    link1: 0.0041
+    link2: 0.0187
+    link3: 0.0533
+    link4: 0.1021
+    wrist_link1: 0.1406
+    wrist_link2: 0.1412
+    wrist_link3: 0.1700
 
   # IMPORTANT: disabled here. initialize_body_prior_once.py waits until all
   # required body TFs are available, performs one complete refresh, then locks.
@@ -72,6 +97,9 @@ current_body_prior:
 
   tf_timeout: 0.05
   refresh_service: /care_planner/confidence_map/refresh_body_prior
+  # Multi-goal/session orchestrators should call this before goal 2 (or after an
+  # explicit map/session reset policy decides the cold-start phase is over).
+  deactivate_service: /care_planner/confidence_map/deactivate_body_prior
   marker_topic: /care_planner/confidence_map/current_body_prior_markers
 
 sensor_model:
