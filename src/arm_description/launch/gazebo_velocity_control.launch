@@ -19,6 +19,17 @@
   <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
   <arg name="verbose" default="false" />
 
+  <!-- Optional initial joint configuration. Defaults preserve the historical
+       zero/home spawn. ROS1 gazebo_ros spawn_model applies these through -J
+       before the Phase-E planner stack is started. -->
+  <arg name="initial_joint1" default="0.0" />
+  <arg name="initial_joint2" default="0.0" />
+  <arg name="initial_joint3" default="0.0" />
+  <arg name="initial_joint4" default="0.0" />
+  <arg name="initial_wrist_joint1" default="0.0" />
+  <arg name="initial_wrist_joint2" default="0.0" />
+  <arg name="initial_wrist_joint3" default="0.0" />
+
   <include file="$(find arm_description)/launch/load_robot_description.launch">
     <arg name="robot_urdf" value="$(arg robot_urdf)" />
   </include>
@@ -43,7 +54,14 @@
               -z 0.0
               -R 0.0
               -P 0.0
-              -Y 0.0" />
+              -Y 0.0
+              -J joint1 $(arg initial_joint1)
+              -J joint2 $(arg initial_joint2)
+              -J joint3 $(arg initial_joint3)
+              -J joint4 $(arg initial_joint4)
+              -J wrist_joint1 $(arg initial_wrist_joint1)
+              -J wrist_joint2 $(arg initial_wrist_joint2)
+              -J wrist_joint3 $(arg initial_wrist_joint3)" />
 
   <rosparam file="$(find arm_description)/config/controllers.yaml" command="load" />
 
