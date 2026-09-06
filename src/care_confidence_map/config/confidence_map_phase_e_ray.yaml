@@ -35,10 +35,18 @@ confidence_map:
   ray_min_valid_range: 0.05
   ray_max_valid_range: 1.50
 
-  # Phase E5 static-obstacle safety: once an obstacle voxel is observed,
-  # later free-ray traversal cannot erase it in a single coarse-grid update.
-  # This is intentionally enabled for the current static Gazebo world.
+  # TEMPORARY legacy/static-world latch retained for this provenance run so
+  # occupancy semantics stay identical while we trace the ghost voxel source.
+  # This is not the desired final dynamic-obstacle policy.
   ray_persistent_occupied: true
+
+  # Diagnostic-only occupancy provenance watch. No mapping/planning semantics
+  # are changed. We are tracing the empty-world ghost voxel that triggered
+  # final/execution GCDF in phase_e_goal_000.
+  debug_occupancy_watch_enabled: true
+  debug_occupancy_watch_x: 0.20
+  debug_occupancy_watch_y: -0.05
+  debug_occupancy_watch_z: 0.45
 
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
