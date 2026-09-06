@@ -21,8 +21,9 @@ class InitialBodyPriorInitializer:
 
     This preserves the intended bootstrap semantics: the trusted-free region is
     constructed around the robot's initial pose and then remains fixed in the
-    world.  Subsequent confidence evolution comes only from the normal temporal
-    decay and sensor updates.
+    world for the first task. The confidence-map node stores it in a separate
+    provenance layer, so a later multi-goal/session transition can remove only
+    the bootstrap while preserving all genuine sensor-derived observations.
     """
 
     _TRANSFORMED_RE = re.compile(r"transformed_samples=(\d+)")
