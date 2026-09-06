@@ -153,7 +153,7 @@ confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 tof_fusion_enabled=true
 execution_gcdf_audit_enabled=true
 gcdf_body_inflation_m=0.015
-startup_bootstrap_policy=per_link_50ms_max_transient_layer
+startup_bootstrap_policy=per_link_50ms_max_plus_gcdf_query_footprint
 startup_bootstrap_config=${CONFIDENCE_MAP_CONFIG_FILE}
 require_near_zero_initial_q=${REQUIRE_NEAR_ZERO_INITIAL_Q}
 near_zero_initial_q_tol_rad=${NEAR_ZERO_INITIAL_Q_TOL_RAD}
@@ -193,7 +193,7 @@ echo "E5 audit    : enabled"
 echo "watchdog    : ${RUN_SECONDS}s"
 echo "early stop  : ${EARLY_STOP_ON_GOAL}"
 echo "q0 control  : near-zero required=${REQUIRE_NEAR_ZERO_INITIAL_Q}, tol=${NEAR_ZERO_INITIAL_Q_TOL_RAD} rad"
-echo "bootstrap   : per-link 50-ms MAX transient layer"
+echo "bootstrap   : per-link 50-ms MAX + 1.5cm body inflation + 2.5cm selector band"
 echo "================================================================"
 
 for CASE_ID in "${CASES[@]}"; do
