@@ -130,6 +130,12 @@ def body_inside_workspace(
 ) -> bool:
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
     for s, c in zip(spheres, centers):
+        # The confidence map starts at z=0 while the fixed proximal robot
+        # geometry intentionally extends slightly below that plane. These links
+        # are also ignored by the VBC swept-risk selector, so do not make the
+        # random-q0 sampler impossible because of fixed pedestal geometry.
+        if s.link_name in {"base_link", "link1"}:
+            continue
         r = float(s.radius) + boundary_margin_m
         if (
             c[0] - r < xmin or c[0] + r > xmax
