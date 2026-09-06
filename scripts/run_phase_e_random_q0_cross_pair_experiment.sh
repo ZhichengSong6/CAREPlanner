@@ -31,6 +31,7 @@ MIN_START_GOAL_EE_DISTANCE_M="${MIN_START_GOAL_EE_DISTANCE_M:-0.15}"
 Q0_REQUIRED_CLEARANCE_M="${Q0_REQUIRED_CLEARANCE_M:-0.06}"
 Q0_BODY_INFLATION_M="${Q0_BODY_INFLATION_M:-0.015}"
 OFFLINE_GEOMETRY_CONDA_ENV="${OFFLINE_GEOMETRY_CONDA_ENV:-viscdf}"
+BUILD_ONLY="${BUILD_ONLY:-false}"
 
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_obstacles.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map_phase_e_ray.yaml}"
@@ -88,10 +89,8 @@ else
 fi
 
 echo "[PREFLIGHT] offline geometry env=${OFFLINE_GEOMETRY_CONDA_ENV}"
-if ! "${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" python - <<'PY'
-import pinocchio as pin
-print("[PREFLIGHT OK] pinocchio", pin.__version__)
-PY
+if ! "${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" \
+  python -c 'import pinocchio as pin; print("[PREFLIGHT OK] pinocchio", pin.__version__)'
 then
   echo "[ERROR] Pinocchio preflight failed in conda env: ${OFFLINE_GEOMETRY_CONDA_ENV}"
   echo "        Historical Phase-E geometry scripts were run in env 'viscdf'."
@@ -157,6 +156,20 @@ PY
 if [[ "${#CASES[@]}" -ne 30 ]]; then
   echo "[ERROR] generated case file has ${#CASES[@]} cases, expected 30"
   exit 4
+fi
+
+if [[ "${BUILD_ONLY}" == "true" || "${BUILD_ONLY}" == "1" ]]; then
+  echo
+  echo "================================================================"
+  echo "BUILD-ONLY PREFLIGHT COMPLETE"
+  echo "================================================================"
+  echo "[OK] Pinocchio environment verified"
+  echo "[OK] 30 obstacle-feasible q0 configurations revalidated"
+  echo "[OK] 30 one-to-one cross pairs generated"
+  echo "[CASE FILE] ${CASE_FILE}"
+  echo "No Gazebo/ROS experiment was started."
+  echo "================================================================"
+  exit 0
 fi
 
 cat > "${ROOT}/experiment_metadata.txt" <<EOF
