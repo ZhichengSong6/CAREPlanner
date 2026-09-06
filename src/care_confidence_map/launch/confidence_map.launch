@@ -22,8 +22,9 @@
   <!-- Bootstrap the trusted-free envelope around the INITIAL robot pose only.
        The helper retries until all body TFs are available, calls the existing
        refresh service once successfully, latches ready=true, and never refreshes
-       again. The region therefore stays fixed in world coordinates and then
-       evolves only through normal confidence decay and sensor observations. -->
+       again. The map node keeps this in a separate bootstrap provenance layer;
+       /care_planner/confidence_map/deactivate_body_prior removes that layer for
+       subsequent goals without erasing genuine sensor observations. -->
   <node if="$(arg initialize_body_prior_once)"
         pkg="care_confidence_map"
         type="initialize_body_prior_once.py"
