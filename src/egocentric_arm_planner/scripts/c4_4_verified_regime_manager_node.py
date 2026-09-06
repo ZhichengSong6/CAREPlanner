@@ -558,7 +558,7 @@ class C44VerifiedRegimeManager:
             if has_violation:
                 self.blocker_rediscovery_vbc_unsafe_count += 1
                 self.last_transition_reason = (
-                    "probe_blocker_confirmed_wait_visibility_waypoint")
+                    "blocker_rediscovery_confirmed_wait_visibility_waypoint")
                 return
 
             # A fresh SAME-SCP-trajectory VBC SAFE verdict means this solver
@@ -570,7 +570,7 @@ class C44VerifiedRegimeManager:
             self.blocker_rediscovery_origin = "none"
             self.blocker_rediscovery_force_bootstrap = False
             self.last_transition_reason = (
-                "probe_no_visibility_blocker_after_solver_failure_replan")
+                "no_visibility_blocker_after_solver_failure_replan")
             request_replan = True
             clear_bootstrap = True
 
