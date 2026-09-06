@@ -61,7 +61,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-TOKEN = re.compile(r"([A-Za-z0-9_]+)=([^\\s]+)")
+TOKEN = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 
 XYZ = Tuple[float, float, float]
 BlockerKey = Tuple[XYZ, str, int]
