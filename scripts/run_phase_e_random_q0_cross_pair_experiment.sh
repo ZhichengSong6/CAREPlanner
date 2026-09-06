@@ -30,6 +30,7 @@ SEED="${SEED:-20260906}"
 MIN_START_GOAL_EE_DISTANCE_M="${MIN_START_GOAL_EE_DISTANCE_M:-0.15}"
 Q0_REQUIRED_CLEARANCE_M="${Q0_REQUIRED_CLEARANCE_M:-0.06}"
 Q0_BODY_INFLATION_M="${Q0_BODY_INFLATION_M:-0.015}"
+OFFLINE_GEOMETRY_CONDA_ENV="${OFFLINE_GEOMETRY_CONDA_ENV:-viscdf}"
 
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_obstacles.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map_phase_e_ray.yaml}"
@@ -72,6 +73,31 @@ if [[ ! -f "${WORLD_FILE}" ]]; then
   exit 3
 fi
 
+# The offline q0 builder uses Pinocchio. Historical Phase-E geometry
+# generation was run in the 'viscdf' conda environment (Pinocchio 4.1.0).
+# Resolve conda explicitly and preflight the dependency before any batch work.
+if command -v conda >/dev/null 2>&1; then
+  CONDA_EXE="$(command -v conda)"
+elif [[ -x "${HOME}/anaconda3/bin/conda" ]]; then
+  CONDA_EXE="${HOME}/anaconda3/bin/conda"
+elif [[ -x "${HOME}/miniconda3/bin/conda" ]]; then
+  CONDA_EXE="${HOME}/miniconda3/bin/conda"
+else
+  echo "[ERROR] conda executable not found"
+  exit 5
+fi
+
+echo "[PREFLIGHT] offline geometry env=${OFFLINE_GEOMETRY_CONDA_ENV}"
+if ! "${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" python - <<'PY'
+import pinocchio as pin
+print("[PREFLIGHT OK] pinocchio", pin.__version__)
+PY
+then
+  echo "[ERROR] Pinocchio preflight failed in conda env: ${OFFLINE_GEOMETRY_CONDA_ENV}"
+  echo "        Historical Phase-E geometry scripts were run in env 'viscdf'."
+  exit 6
+fi
+
 # Keep ROS/Gazebo on system Python; GPU/NCDF workers activate their own envs.
 if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
   if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
@@ -108,7 +134,8 @@ echo "world       : ${WORLD_FILE}"
 echo "seed        : ${SEED}"
 echo
 
-python3 scripts/build_phase_e_random_q0_cross_pairs.py \
+"${CONDA_EXE}" run -n "${OFFLINE_GEOMETRY_CONDA_ENV}" \
+  python scripts/build_phase_e_random_q0_cross_pairs.py \
   --repo "${REPO}" \
   --source-pool "${SOURCE_POOL}" \
   --world "${WORLD_FILE}" \
@@ -142,6 +169,7 @@ case_count=${#CASES[@]}
 world_file=${WORLD_FILE}
 confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}
 seed=${SEED}
+offline_geometry_conda_env=${OFFLINE_GEOMETRY_CONDA_ENV}
 q0_body_inflation_m=${Q0_BODY_INFLATION_M}
 q0_required_obstacle_clearance_m=${Q0_REQUIRED_CLEARANCE_M}
 min_start_goal_ee_distance_m=${MIN_START_GOAL_EE_DISTANCE_M}
