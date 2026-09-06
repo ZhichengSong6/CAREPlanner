@@ -161,6 +161,8 @@ force_exact_zero_initial_q=true
 run_seconds_watchdog=${RUN_SECONDS}
 early_stop_on_goal=${EARLY_STOP_ON_GOAL}
 qualification_rule=all_cases_task_success
+task_success_authority=measured_joint_states_fk_to_requested_ee_goal
+legacy_nominal_progress_role=diagnostic_only_non_authoritative_after_active_sensing_replans
 cases=${CASES[*]}
 EOF
 
@@ -363,6 +365,8 @@ fields = [
     "execution_vbc_records", "execution_vbc_unsafe_records",
     "max_remaining_obligation_count", "obligation_clear_events",
     "tracking_error_max_rad",
+    "task_progress_authority", "legacy_nominal_progress_stale",
+    "legacy_nominal_progress_phase_s",
 ]
 with open(out_csv, "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=fields)
@@ -386,6 +390,11 @@ with open(out_csv, "w", newline="") as f:
             "max_remaining_obligation_count": r.get("max_remaining_obligation_count"),
             "obligation_clear_events": r.get("obligation_clear_events"),
             "tracking_error_max_rad": nested(r, "tracking_error_inf", "max"),
+            "task_progress_authority": r.get("task_progress_authority"),
+            "legacy_nominal_progress_stale": int(bool(
+                r.get("legacy_nominal_progress_stale"))),
+            "legacy_nominal_progress_phase_s": r.get(
+                "legacy_nominal_progress_phase_s"),
         })
 
 print(json.dumps({
