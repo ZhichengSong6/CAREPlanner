@@ -23,7 +23,7 @@ set -euo pipefail
 #   EARLY_STOP_ON_GOAL=true means successful cases terminate immediately.
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
-DEFAULT_CASE_FILE="${REPO}/src/egocentric_arm_planner/config/phase_e_obstacle_core30_v1.json"
+DEFAULT_CASE_FILE="${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
 CASE_FILE="${CASE_FILE:-${DEFAULT_CASE_FILE}}"
 RUN_SECONDS="${RUN_SECONDS:-45}"
 EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-true}"
@@ -60,10 +60,9 @@ if [[ ! -f "${CASE_FILE}" ]]; then
   echo "[ERROR] Phase-E qualification case file not found:"
   echo "        ${CASE_FILE}"
   echo ""
-  echo "The repository currently may only contain the frozen Core-12 file."
-  echo "Point CASE_FILE at the frozen obstacle-selected 30-goal JSON, e.g.:"
-  echo "  CASE_FILE=/path/to/phase_e_obstacle_core30_v1.json \\"
-  echo "  bash scripts/run_phase_e_empty_world_qualification.sh"
+  echo "The historical Phase-E 30-goal qualification file is expected at:"
+  echo "  ${REPO}/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
+  echo "This is the same 30-goal pool used by the previous 0/30 qualification."
   echo ""
   echo "For a Core-12 smoke only:"
   echo "  CASE_FILE=${REPO}/src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json \\"
