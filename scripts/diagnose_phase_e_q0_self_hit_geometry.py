@@ -139,18 +139,21 @@ def load_visual_meshes(urdf_path: Path, repo: Path) -> List[VisualMesh]:
 def load_stl_triangles(path: Path) -> np.ndarray:
     data = path.read_bytes()
     # Binary STL: 80-byte header + uint32 count + 50 bytes per triangle.
+    # Accept harmless trailing bytes instead of requiring exact file length.
     if len(data) >= 84:
         n = struct.unpack_from("<I", data, 80)[0]
-        if 84 + 50 * n == len(data):
-            tris = np.empty((n, 3, 3), dtype=np.float64)
-            off = 84
-            for i in range(n):
-                vals = struct.unpack_from("<12fH", data, off)
-                tris[i, 0] = vals[3:6]
-                tris[i, 1] = vals[6:9]
-                tris[i, 2] = vals[9:12]
-                off += 50
-            return tris
+        expected = 84 + 50 * n
+        if n > 0 and expected <= len(data):
+            dtype = np.dtype([
+                ("normal", "<f4", (3,)),
+                ("v0", "<f4", (3,)),
+                ("v1", "<f4", (3,)),
+                ("v2", "<f4", (3,)),
+                ("attr", "<u2"),
+            ])
+            rec = np.frombuffer(data, dtype=dtype, count=n, offset=84)
+            tris = np.stack([rec["v0"], rec["v1"], rec["v2"]], axis=1)
+            return np.asarray(tris, dtype=np.float64)
 
     # ASCII STL fallback.
     vertices: List[List[float]] = []
