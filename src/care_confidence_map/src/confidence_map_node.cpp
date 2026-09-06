@@ -260,6 +260,31 @@ private:
         debug_occupancy_watch_z_,
         0.0);
 
+    // Diagnostic-only 3x3x3 neighborhood snapshot around one watched voxel.
+    // A snapshot is emitted only when that voxel is actually queried by a
+    // planner/selector client, so the log captures the map state relevant to
+    // the blocker without changing any confidence/occupancy semantics.
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_enabled",
+        debug_neighborhood_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_x",
+        debug_neighborhood_watch_x_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_y",
+        debug_neighborhood_watch_y_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_z",
+        debug_neighborhood_watch_z_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_period_s",
+        debug_neighborhood_watch_period_s_,
+        1.0);
+
     nh.param<std::string>(
         "confidence_map/marker_topic",
         marker_topic_,
@@ -1428,7 +1453,155 @@ private:
       res.inside_map.push_back(1);
     }
 
+    maybeLogDebugNeighborhood(req);
     return true;
+  }
+
+  void maybeLogDebugNeighborhood(
+      const care_confidence_map::QueryConfidence::Request& req)
+  {
+    if (!debug_neighborhood_watch_enabled_ || grid_points_.empty())
+    {
+      return;
+    }
+
+    const tf2::Vector3 watch(
+        debug_neighborhood_watch_x_,
+        debug_neighborhood_watch_y_,
+        debug_neighborhood_watch_z_);
+    int watch_index = -1;
+    if (!positionToGridIndex(watch, watch_index))
+    {
+      return;
+    }
+
+    bool queried = false;
+    for (const auto& point : req.points)
+    {
+      int idx = -1;
+      if (positionToGridIndex(
+              tf2::Vector3(point.x, point.y, point.z), idx) &&
+          idx == watch_index)
+      {
+        queried = true;
+        break;
+      }
+    }
+    if (!queried)
+    {
+      return;
+    }
+
+    const ros::WallTime now = ros::WallTime::now();
+    if (!last_debug_neighborhood_log_wall_.isZero() &&
+        (now - last_debug_neighborhood_log_wall_).toSec() <
+            std::max(0.0, debug_neighborhood_watch_period_s_))
+    {
+      return;
+    }
+    last_debug_neighborhood_log_wall_ = now;
+
+    const int cx = watch_index / (ny_ * nz_);
+    const int rem = watch_index % (ny_ * nz_);
+    const int cy = rem / nz_;
+    const int cz = rem % nz_;
+
+    int inside_count = 0;
+    int unknown_count = 0;
+    int known_free_count = 0;
+    int occupied_count = 0;
+    int visible_now_count = 0;
+    int bootstrap_count = 0;
+
+    const GridPoint& center =
+        grid_points_[static_cast<std::size_t>(watch_index)];
+
+    ROS_WARN_STREAM(
+        "[CONFIDENCE_NEIGHBORHOOD_SUMMARY]"
+        << " center=[" << center.x << "," << center.y << "," << center.z << "]"
+        << " resolution=" << resolution_
+        << " sensor_conf=" << center.confidence
+        << " bootstrap_conf=" << center.bootstrap_confidence
+        << " effective_conf=" << effectiveConfidence(center)
+        << " occupancy=" << center.occupancy
+        << " visible_now=" << center.current_visibility
+        << " bootstrap_active=" << static_cast<int>(current_body_prior_active_));
+
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+      for (int dy = -1; dy <= 1; ++dy)
+      {
+        for (int dz = -1; dz <= 1; ++dz)
+        {
+          const int ix = cx + dx;
+          const int iy = cy + dy;
+          const int iz = cz + dz;
+          if (ix < 0 || ix >= nx_ ||
+              iy < 0 || iy >= ny_ ||
+              iz < 0 || iz >= nz_)
+          {
+            ROS_WARN_STREAM(
+                "[CONFIDENCE_NEIGHBORHOOD_CELL]"
+                << " offset=[" << dx << "," << dy << "," << dz << "]"
+                << " inside_map=0");
+            continue;
+          }
+
+          const int idx = ix * ny_ * nz_ + iy * nz_ + iz;
+          const GridPoint& gp =
+              grid_points_[static_cast<std::size_t>(idx)];
+          const float effective = effectiveConfidence(gp);
+          ++inside_count;
+
+          std::string state = "UNKNOWN";
+          if (gp.occupancy > 0.5f)
+          {
+            state = "OCCUPIED";
+            ++occupied_count;
+          }
+          else if (effective >= 0.5f)
+          {
+            state = "KNOWN_FREE";
+            ++known_free_count;
+          }
+          else
+          {
+            ++unknown_count;
+          }
+          if (gp.current_visibility > 0.5f)
+          {
+            ++visible_now_count;
+          }
+          if (current_body_prior_active_ &&
+              gp.bootstrap_confidence > 0.5f)
+          {
+            ++bootstrap_count;
+          }
+
+          ROS_WARN_STREAM(
+              "[CONFIDENCE_NEIGHBORHOOD_CELL]"
+              << " offset=[" << dx << "," << dy << "," << dz << "]"
+              << " point=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+              << " state=" << state
+              << " sensor_conf=" << gp.confidence
+              << " bootstrap_conf=" << gp.bootstrap_confidence
+              << " effective_conf=" << effective
+              << " occupancy=" << gp.occupancy
+              << " visible_now=" << gp.current_visibility
+              << " last_seen_time=" << gp.last_seen_time);
+        }
+      }
+    }
+
+    ROS_WARN_STREAM(
+        "[CONFIDENCE_NEIGHBORHOOD_COUNTS]"
+        << " center=[" << center.x << "," << center.y << "," << center.z << "]"
+        << " inside=" << inside_count
+        << " known_free=" << known_free_count
+        << " unknown=" << unknown_count
+        << " occupied=" << occupied_count
+        << " visible_now=" << visible_now_count
+        << " bootstrap_cells=" << bootstrap_count);
   }
 
   bool handleRefreshBodyPrior(
@@ -2146,6 +2319,13 @@ private:
   double debug_occupancy_watch_x_ = 0.0;
   double debug_occupancy_watch_y_ = 0.0;
   double debug_occupancy_watch_z_ = 0.0;
+
+  bool debug_neighborhood_watch_enabled_ = false;
+  double debug_neighborhood_watch_x_ = 0.0;
+  double debug_neighborhood_watch_y_ = 0.0;
+  double debug_neighborhood_watch_z_ = 0.0;
+  double debug_neighborhood_watch_period_s_ = 1.0;
+  ros::WallTime last_debug_neighborhood_log_wall_;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
