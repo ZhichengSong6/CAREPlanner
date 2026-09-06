@@ -48,6 +48,14 @@ confidence_map:
   debug_occupancy_watch_y: -0.05
   debug_occupancy_watch_z: 0.45
 
+  # Diagnostic-only 3x3x3 snapshot for the current empty-world UNKNOWN blocker.
+  # Triggered only when a confidence-query request actually touches this voxel.
+  debug_neighborhood_watch_enabled: true
+  debug_neighborhood_watch_x: 0.00
+  debug_neighborhood_watch_y: -0.10
+  debug_neighborhood_watch_z: 0.15
+  debug_neighborhood_watch_period_s: 1.0
+
   marker_topic: /care_planner/confidence_map/markers
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
