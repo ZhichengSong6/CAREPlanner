@@ -240,6 +240,26 @@ private:
         ray_persistent_occupied_,
         false);
 
+    // Diagnostic-only watched voxel provenance. This does not change mapping
+    // semantics; it records which sensor hit/free rays touch one configured
+    // coarse-grid voxel so false OCCUPIED cells can be traced to their source.
+    nh.param(
+        "confidence_map/debug_occupancy_watch_enabled",
+        debug_occupancy_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_x",
+        debug_occupancy_watch_x_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_y",
+        debug_occupancy_watch_y_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_z",
+        debug_occupancy_watch_z_,
+        0.0);
+
     nh.param<std::string>(
         "confidence_map/marker_topic",
         marker_topic_,
@@ -1018,6 +1038,23 @@ private:
     std::vector<uint8_t> free_mask(grid_points_.size(), 0);
     std::vector<uint8_t> occupied_mask(grid_points_.size(), 0);
 
+    int watched_index = -1;
+    if (debug_occupancy_watch_enabled_)
+    {
+      const tf2::Vector3 watched_point(
+          debug_occupancy_watch_x_,
+          debug_occupancy_watch_y_,
+          debug_occupancy_watch_z_);
+      if (!positionToGridIndex(watched_point, watched_index))
+      {
+        watched_index = -1;
+      }
+    }
+    std::map<int, std::size_t> watched_hit_counts;
+    std::map<int, std::size_t> watched_free_counts;
+    std::map<int, tf2::Vector3> watched_last_hit_endpoint;
+    std::map<int, tf2::Vector3> watched_last_hit_origin;
+
     std::size_t valid_rays = 0;
     std::size_t hit_rays = 0;
     std::size_t no_hit_rays = 0;
@@ -1041,7 +1078,7 @@ private:
            ++x_it, ++y_it, ++z_it,
            ++ox_it, ++oy_it, ++oz_it, ++sensor_it, ++hit_it)
       {
-        (void)(*sensor_it);
+        const int sensor_id = static_cast<int>(*sensor_it);
         const bool hit = (*hit_it != 0);
 
         const tf2::Vector3 endpoint(
@@ -1103,6 +1140,10 @@ private:
             if (positionToGridIndex(p, index))
             {
               free_mask[static_cast<std::size_t>(index)] = 1;
+              if (index == watched_index)
+              {
+                watched_free_counts[sensor_id] += 1;
+              }
             }
           }
         }
@@ -1113,10 +1154,20 @@ private:
           if (hit)
           {
             occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            if (endpoint_index == watched_index)
+            {
+              watched_hit_counts[sensor_id] += 1;
+              watched_last_hit_endpoint[sensor_id] = endpoint;
+              watched_last_hit_origin[sensor_id] = origin;
+            }
           }
           else
           {
             free_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            if (endpoint_index == watched_index)
+            {
+              watched_free_counts[sensor_id] += 1;
+            }
           }
         }
         else
@@ -1144,6 +1195,11 @@ private:
     std::size_t free_cells = 0;
     std::size_t occupied_cells = 0;
     std::size_t occupied_free_clear_suppressed = 0;
+
+    const float watched_occupancy_before =
+        (watched_index >= 0)
+            ? grid_points_[static_cast<std::size_t>(watched_index)].occupancy
+            : 0.0f;
 
     for (std::size_t i = 0; i < grid_points_.size(); ++i)
     {
@@ -1176,6 +1232,82 @@ private:
         gp.confidence = 1.0f;
         gp.last_seen_time = stamp_sec;
         ++free_cells;
+      }
+    }
+
+    if (watched_index >= 0 &&
+        (!watched_hit_counts.empty() || !watched_free_counts.empty()))
+    {
+      auto sensorNameForId = [this](int sensor_id) -> std::string
+      {
+        for (const auto& sensor : sensors_)
+        {
+          if (sensor.id == sensor_id)
+          {
+            return sensor.name;
+          }
+        }
+        return std::string("unknown");
+      };
+
+      std::ostringstream hit_oss;
+      bool first = true;
+      for (const auto& kv : watched_hit_counts)
+      {
+        if (!first) hit_oss << ";";
+        first = false;
+        hit_oss << kv.first << ":" << sensorNameForId(kv.first)
+                << "x" << kv.second;
+      }
+
+      std::ostringstream free_oss;
+      first = true;
+      for (const auto& kv : watched_free_counts)
+      {
+        if (!first) free_oss << ";";
+        first = false;
+        free_oss << kv.first << ":" << sensorNameForId(kv.first)
+                 << "x" << kv.second;
+      }
+
+      const GridPoint& watched_gp =
+          grid_points_[static_cast<std::size_t>(watched_index)];
+      ROS_WARN_STREAM(
+          "[OCCUPANCY_WATCH_PACKET] stamp=" << stamp.toSec()
+          << " voxel=[" << watched_gp.x << ","
+          << watched_gp.y << "," << watched_gp.z << "]"
+          << " hit_sensors={" << hit_oss.str() << "}"
+          << " free_sensors={" << free_oss.str() << "}"
+          << " occupancy_before=" << watched_occupancy_before
+          << " occupancy_after=" << watched_gp.occupancy
+          << " persistent_occupied=" << static_cast<int>(ray_persistent_occupied_));
+
+      for (const auto& kv : watched_hit_counts)
+      {
+        const int sensor_id = kv.first;
+        const auto ep_it = watched_last_hit_endpoint.find(sensor_id);
+        const auto origin_it = watched_last_hit_origin.find(sensor_id);
+        if (ep_it == watched_last_hit_endpoint.end() ||
+            origin_it == watched_last_hit_origin.end())
+        {
+          continue;
+        }
+        const tf2::Vector3& endpoint = ep_it->second;
+        const tf2::Vector3& origin = origin_it->second;
+        ROS_WARN_STREAM(
+            "[OCCUPANCY_WATCH_HIT] stamp=" << stamp.toSec()
+            << " sensor_id=" << sensor_id
+            << " sensor=" << sensorNameForId(sensor_id)
+            << " count=" << kv.second
+            << " endpoint=[" << endpoint.x() << ","
+            << endpoint.y() << "," << endpoint.z() << "]"
+            << " origin=[" << origin.x() << ","
+            << origin.y() << "," << origin.z() << "]"
+            << " range=" << (endpoint - origin).length()
+            << " transition_to_occupied="
+            << static_cast<int>(
+                   watched_occupancy_before <= 0.5f &&
+                   watched_gp.occupancy > 0.5f));
       }
     }
 
@@ -2010,6 +2142,10 @@ private:
   double ray_min_valid_range_ = 0.10;
   double ray_max_valid_range_ = 1.50;
   bool ray_persistent_occupied_ = false;
+  bool debug_occupancy_watch_enabled_ = false;
+  double debug_occupancy_watch_x_ = 0.0;
+  double debug_occupancy_watch_y_ = 0.0;
+  double debug_occupancy_watch_z_ = 0.0;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
