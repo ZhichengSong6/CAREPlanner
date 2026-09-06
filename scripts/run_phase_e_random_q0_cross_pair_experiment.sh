@@ -141,7 +141,11 @@ python3 - "${CONFIDENCE_MAP_CONFIG_FILE}" "${EXPERIMENT_CONFIDENCE_MAP_CONFIG_FI
 import sys,yaml
 src,dst,inflate=sys.argv[1:]
 d=yaml.safe_load(open(src))
-d.setdefault("current_body_prior",{})["inflation_radius"]=float(inflate)
+prior=d.setdefault("current_body_prior",{})
+prior["inflation_radius"]=float(inflate)
+# This diagnostic intentionally requests one uniform scalar startup envelope.
+# Remove the formal Phase-E per-link map so it cannot silently override it.
+prior.pop("link_inflation_radius",None)
 with open(dst,"w") as f:
     yaml.safe_dump(d,f,sort_keys=False)
 print("[CONFIG] experiment confidence map:",dst)
