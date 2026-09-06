@@ -31,7 +31,7 @@ ray_max_forward_depth: 0.75
 # Diagnostic-only provenance watch for the empty-world ghost voxel. This does
 # not change filtering; it logs raw finite depth pixels that transform into the
 # watched 5-cm confidence-map cell.
-debug_occupancy_watch_enabled: true
+debug_occupancy_watch_enabled: false
 debug_occupancy_watch_x: 0.20
 debug_occupancy_watch_y: -0.05
 debug_occupancy_watch_z: 0.45
