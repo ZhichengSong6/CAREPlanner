@@ -119,6 +119,16 @@ public:
     pnh_.param("ray_vertical_fov_deg", ray_vertical_fov_deg_, 72.0);
     pnh_.param("ray_max_forward_depth", ray_max_forward_depth_, 0.75);
 
+    // Diagnostic-only watched base-frame voxel. This traces raw finite depth
+    // returns before they are published as occupied ray endpoints.
+    pnh_.param("debug_occupancy_watch_enabled",
+               debug_occupancy_watch_enabled_, false);
+    pnh_.param("debug_occupancy_watch_x", debug_occupancy_watch_x_, 0.0);
+    pnh_.param("debug_occupancy_watch_y", debug_occupancy_watch_y_, 0.0);
+    pnh_.param("debug_occupancy_watch_z", debug_occupancy_watch_z_, 0.0);
+    pnh_.param("debug_occupancy_watch_half_extent",
+               debug_occupancy_watch_half_extent_, 0.025);
+
     if (!pnh_.getParam("input_topics", input_topics_) ||
         input_topics_.empty())
     {
@@ -367,6 +377,21 @@ private:
     return false;
   }
 
+  bool isWatchedOccupancyPoint(const tf2::Vector3& point) const
+  {
+    if (!debug_occupancy_watch_enabled_)
+    {
+      return false;
+    }
+    return
+        std::abs(point.x() - debug_occupancy_watch_x_) <=
+            debug_occupancy_watch_half_extent_ &&
+        std::abs(point.y() - debug_occupancy_watch_y_) <=
+            debug_occupancy_watch_half_extent_ &&
+        std::abs(point.z() - debug_occupancy_watch_z_) <=
+            debug_occupancy_watch_half_extent_;
+  }
+
   void cloudCallback(
       const sensor_msgs::PointCloud2ConstPtr& msg,
       std::size_t sensor_index)
@@ -503,7 +528,21 @@ private:
                     static_cast<double>(p_sensor.x),
                     static_cast<double>(p_sensor.y),
                     static_cast<double>(p_sensor.z));
-            if (isSelfPoint(p_base, spheres))
+            const bool is_self = isSelfPoint(p_base, spheres);
+            if (isWatchedOccupancyPoint(p_base))
+            {
+              ROS_WARN_STREAM(
+                  "[TOF_OCCUPANCY_WATCH_HIT] sensor_id=" << sensor_index
+                  << " source_frame=" << source_frame
+                  << " stamp=" << msg->header.stamp.toSec()
+                  << " raw_sensor=[" << p_sensor.x << ","
+                  << p_sensor.y << "," << p_sensor.z << "]"
+                  << " base=[" << p_base.x() << ","
+                  << p_base.y() << "," << p_base.z() << "]"
+                  << " is_self=" << static_cast<int>(is_self)
+                  << " self_sphere_count=" << spheres.size());
+            }
+            if (is_self)
             {
               ++ray_self_blocked;
               continue;
@@ -827,6 +866,11 @@ private:
   double ray_horizontal_fov_deg_ = 55.0;
   double ray_vertical_fov_deg_ = 72.0;
   double ray_max_forward_depth_ = 0.75;
+  bool debug_occupancy_watch_enabled_ = false;
+  double debug_occupancy_watch_x_ = 0.0;
+  double debug_occupancy_watch_y_ = 0.0;
+  double debug_occupancy_watch_z_ = 0.0;
+  double debug_occupancy_watch_half_extent_ = 0.025;
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
