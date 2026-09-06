@@ -141,11 +141,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._qvis_match_last_f_min = math.nan
         self._qvis_match_last_reason = "startup"
 
-        # C5.12 direct final-GCDF recovery evidence.  A rejected executable
-        # trajectory can expose low-confidence voxels that the task-bootstrap
-        # VBC does not report (notably braking-tail sweep).  Keep this evidence
-        # on a separate persistent channel and convert it into ordinary
-        # visibility obligations using the same VisCDF projector.
+        # C5.12/C5.43 direct GCDF recovery evidence. Final executable GCDF and
+        # local hard-GCDF may expose low-confidence voxels that the narrower VBC
+        # swept-body selector does not report. Both publish the same
+        # trajectory+exact-voxel transaction format and are converted directly
+        # into ordinary visibility obligations using the same VisCDF projector.
         self._gcdf_recovery_lock = threading.Lock()
         self._gcdf_recovery_trajectory = None
         self._gcdf_recovery_trajectory_received = None
@@ -153,6 +153,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._gcdf_recovery_cache_capacity = 8
         self._pending_gcdf_recovery_event = None
         self._processed_gcdf_recovery_seq = 0
+        # Header stamp is the immutable transaction identity. Sequence numbers
+        # are publisher-local diagnostics, so they cannot be used to order
+        # recovery events now that local and final GCDF share this channel.
+        self._processed_gcdf_recovery_stamps = OrderedDict()
+        self._processed_gcdf_recovery_stamp_capacity = 64
         self._gcdf_recovery_event_count = 0
         self._gcdf_recovery_generated_count = 0
         self._gcdf_recovery_match_count = 0
@@ -479,8 +484,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
 
         with self._gcdf_recovery_lock:
-            if seq <= self._processed_gcdf_recovery_seq:
-                self._last_gcdf_recovery_reason = "stale_processed_event"
+            if stamp_key in self._processed_gcdf_recovery_stamps:
+                self._last_gcdf_recovery_reason = "stale_processed_event_stamp"
                 return
             self._pending_gcdf_recovery_event = {
                 "seq": seq,
@@ -504,9 +509,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._visibility_episode_reopen_count += 1
             self.acquisition_complete_pub.publish(Bool(data=False))
             rospy.logwarn(
-                "[vbc_blocker_stack] FINAL-GCDF blocker reopens acquisition "
-                "episode seq=%d count=%d sweep=%.3fs",
-                seq, count, sweep_s)
+                "[vbc_blocker_stack] GCDF blocker reopens acquisition "
+                "episode seq=%d stamp=%s count=%d sweep=%.3fs",
+                seq, self._stamp_text(stamp_key), count, sweep_s)
 
     def _process_gcdf_recovery_event(self) -> None:
         with self._gcdf_recovery_lock:
@@ -518,10 +523,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
         seq = int(event["seq"])
         stamp_key = tuple(event["stamp_key"])
-        if seq <= self._processed_gcdf_recovery_seq:
+        with self._gcdf_recovery_lock:
+            already_processed = (
+                stamp_key in self._processed_gcdf_recovery_stamps)
+        if already_processed:
             with self._gcdf_recovery_lock:
                 self._pending_gcdf_recovery_event = None
-            self._last_gcdf_recovery_reason = "already_processed"
+            self._last_gcdf_recovery_reason = "already_processed_stamp"
             return
 
         with self._gcdf_recovery_lock:
@@ -547,7 +555,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         for region in regions:
             routed = self._absorb_refined_partition_region(
                 region, trajectory, float(sweep_s),
-                trajectory_received, "final_gcdf_rejected")
+                trajectory_received, "gcdf_rejected")
             if routed is not None:
                 if int(routed) < 0:
                     all_regions_handled = False
@@ -563,7 +571,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 matched = self._match_existing(region)
                 if matched is not None:
                     self._update_matched_geometry_diagnostics(
-                        matched, region, "final_gcdf_recovery")
+                        matched, region, "gcdf_recovery")
                     active_ids.append(int(matched["id"]))
                     self._schedule_matched_obligations += 1
                     self._gcdf_recovery_match_count += 1
@@ -579,13 +587,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     trajectory,
                     sweep_s,
                     trajectory_received,
-                    "final_gcdf_rejected")
+                    "gcdf_rejected")
             except Exception as exc:
                 self._schedule_generation_failures += 1
                 all_regions_handled = False
                 self._last_gcdf_recovery_reason = "generation_failed"
                 rospy.logerr(
-                    "[vbc_blocker_stack] final-GCDF obligation generation "
+                    "[vbc_blocker_stack] GCDF obligation generation "
                     "failed seq=%d: %s", seq, exc)
                 continue
 
@@ -599,7 +607,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     new_ids.append(oid)
                     self._gcdf_recovery_generated_count += 1
                     rospy.logwarn(
-                        "[vbc_blocker_stack] FINAL-GCDF ADD obligation=%d "
+                        "[vbc_blocker_stack] GCDF ADD obligation=%d "
                         "seq=%d points=%d sweep=%.3fs",
                         oid, seq, len(region["points"]), sweep_s)
                 elif matched is not None:
@@ -612,6 +620,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._gcdf_recovery_lock:
             self._processed_gcdf_recovery_seq = max(
                 self._processed_gcdf_recovery_seq, seq)
+            self._processed_gcdf_recovery_stamps[stamp_key] = seq
+            self._processed_gcdf_recovery_stamps.move_to_end(stamp_key)
+            while (len(self._processed_gcdf_recovery_stamps) >
+                   self._processed_gcdf_recovery_stamp_capacity):
+                self._processed_gcdf_recovery_stamps.popitem(last=False)
             self._gcdf_recovery_trajectory_cache.pop(stamp_key, None)
             if (self._pending_gcdf_recovery_event is not None and
                     int(self._pending_gcdf_recovery_event["seq"]) == seq):
@@ -622,7 +635,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._consider_active_layer(active_ids, new_ids, sweep_s)
         self._process_pending_refinement(
             trajectory, trajectory_received,
-            "final_gcdf_rejected", float(sweep_s))
+            "gcdf_rejected", float(sweep_s))
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
