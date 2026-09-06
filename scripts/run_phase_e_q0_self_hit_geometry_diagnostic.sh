@@ -58,6 +58,22 @@ timeout 30 rostopic echo -n 1 /link2_sensor2/tof/cloud >/dev/null
 echo "[RUN] exact visual-mesh ray intersection"
 python3 scripts/diagnose_phase_e_q0_self_hit_geometry.py   --repo "${REPO}"   --duration "${DURATION}"   --max-rays "${MAX_RAYS}"   --output-json "${JSON}"   2>&1 | tee "${LOG}"
 
+GIT_SHORT="$(git rev-parse --short=8 HEAD)"
+ZIP="${REPO}/CAREPlanner_PHASE_E_Q0_SELF_HIT_GEOMETRY_${STAMP}_${GIT_SHORT}.zip"
+rm -f "${ZIP}"
+python3 - "${ROOT}" "${ZIP}" <<'PY'
+import os, sys, zipfile
+root, dst = sys.argv[1:]
+with zipfile.ZipFile(dst, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+    for base, _, files in os.walk(root):
+        for name in files:
+            path = os.path.join(base, name)
+            z.write(path, os.path.relpath(path, root))
+print(dst)
+PY
+
 echo ""
 echo "[RESULT] ${JSON}"
 echo "[LOG]    ${LOG}"
+echo "[UPLOAD] ${ZIP}"
+ls -lh "${ZIP}"
