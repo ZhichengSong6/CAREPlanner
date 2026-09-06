@@ -6,7 +6,7 @@ set -euo pipefail
 # Scientific question:
 #   Does the strong Phase-E deadlock observed from the common zero/home pose
 #   persist when the SAME 30 target goals are started from obstacle-feasible
-#   configurations drawn from the same obstacle-aware goal pool?
+#   configurations sampled directly in joint space?
 #
 # Design:
 #   - same 30 target EE goals as the original obstacle-selected pool
