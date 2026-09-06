@@ -62,7 +62,7 @@ if [[ -z "${SOURCE_POOL:-}" || ! -f "${SOURCE_POOL}" ]]; then
   echo "        containing terminal_best_q."
   echo ""
   echo "Set it explicitly, e.g.:"
-  echo "  SOURCE_POOL=/path/to/phase_e_obstacle_goal_pool_30.json \"
+  echo '  SOURCE_POOL=/path/to/phase_e_obstacle_goal_pool_30.json \\'
   echo "    bash scripts/run_phase_e_random_q0_cross_pair_experiment.sh"
   exit 2
 fi
