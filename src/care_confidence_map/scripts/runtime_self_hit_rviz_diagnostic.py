@@ -37,7 +37,7 @@ import tf.transformations as tft
 import tf2_ros
 
 from geometry_msgs.msg import Point
-from sensor_msgs.msg import JointState
+from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Bool, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -215,31 +215,14 @@ class RuntimeSelfHitDiag:
 
         rospy.Subscriber(self.joint_topic, JointState, self.on_joint, queue_size=1)
         rospy.Subscriber(self.hard_hold_topic, Bool, self.on_hold, queue_size=1)
-        rospy.Subscriber(self.raw_topic, rospy.AnyMsg, self.on_any_cloud, queue_size=1)
-        # Replace AnyMsg subscriber after type discovery; this avoids startup
-        # ordering assumptions while still using a typed PointCloud2 callback.
-        self.any_sub = None
-        self.cloud_sub = None
+        self.cloud_sub = rospy.Subscriber(
+            self.raw_topic, PointCloud2, self.on_cloud, queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)
 
         rospy.logwarn(
             "[RUNTIME_SELF_HIT_DIAG] ready sensor_id=%d sensor=%s raw=%s "
             "urdf=%s; no mapping/planning semantics changed",
             self.sensor_id, self.sensor_name, self.raw_topic, self.urdf_path)
-
-    def on_any_cloud(self, _msg):
-        if self.cloud_sub is not None:
-            return
-        try:
-            if self.any_sub is not None:
-                self.any_sub.unregister()
-        except Exception:
-            pass
-        self.cloud_sub = rospy.Subscriber(
-            self.raw_topic,
-            __import__("sensor_msgs.msg", fromlist=["PointCloud2"]).PointCloud2,
-            self.on_cloud,
-            queue_size=1)
 
     def on_joint(self, msg):
         idx = {n: i for i, n in enumerate(msg.name)}
