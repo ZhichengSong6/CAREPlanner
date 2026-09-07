@@ -39,6 +39,9 @@ struct Sphere
 {
   tf2::Vector3 center;
   double radius = 0.0;
+  std::string link_name;
+  int sample_index_in_link = -1;
+  bool sensor_origin_proxy = false;
 };
 
 struct RaySample
@@ -128,6 +131,18 @@ public:
     pnh_.param("debug_occupancy_watch_z", debug_occupancy_watch_z_, 0.0);
     pnh_.param("debug_occupancy_watch_half_extent",
                debug_occupancy_watch_half_extent_, 0.025);
+
+    // Diagnostic-only hotspot watch for the intermittent empty-world occupied
+    // cluster. This logs only organized ray samples that could actually become
+    // occupancy endpoints; it never changes filtering or ray transport.
+    pnh_.param("debug_hotspot_watch_enabled",
+               debug_hotspot_watch_enabled_, false);
+    pnh_.param("debug_hotspot_x_min", debug_hotspot_x_min_, -0.025);
+    pnh_.param("debug_hotspot_x_max", debug_hotspot_x_max_, 0.075);
+    pnh_.param("debug_hotspot_y_min", debug_hotspot_y_min_, 0.025);
+    pnh_.param("debug_hotspot_y_max", debug_hotspot_y_max_, 0.125);
+    pnh_.param("debug_hotspot_z_min", debug_hotspot_z_min_, 0.225);
+    pnh_.param("debug_hotspot_z_max", debug_hotspot_z_max_, 0.425);
 
     if (!pnh_.getParam("input_topics", input_topics_) ||
         input_topics_.empty())
@@ -333,6 +348,9 @@ private:
       s.center = it->second * sample.center_link;
       s.radius = std::max(
           0.0, sample.radius + self_filter_padding_);
+      s.link_name = sample.link_name;
+      s.sample_index_in_link = sample.sample_index_in_link;
+      s.sensor_origin_proxy = false;
       spheres.push_back(s);
       ++transformed_body_samples;
     }
@@ -349,6 +367,9 @@ private:
         Sphere s;
         s.center = it->second.getOrigin();
         s.radius = sensor_origin_filter_radius_;
+        s.link_name = std::string("sensor_origin:") + frame;
+        s.sample_index_in_link = -1;
+        s.sensor_origin_proxy = true;
         spheres.push_back(s);
       }
     }
@@ -375,6 +396,45 @@ private:
       }
     }
     return false;
+  }
+
+  bool isHotspotPoint(const tf2::Vector3& point) const
+  {
+    if (!debug_hotspot_watch_enabled_)
+    {
+      return false;
+    }
+    return
+        point.x() >= debug_hotspot_x_min_ &&
+        point.x() <= debug_hotspot_x_max_ &&
+        point.y() >= debug_hotspot_y_min_ &&
+        point.y() <= debug_hotspot_y_max_ &&
+        point.z() >= debug_hotspot_z_min_ &&
+        point.z() <= debug_hotspot_z_max_;
+  }
+
+  int nearestSelfSphere(
+      const tf2::Vector3& point,
+      const std::vector<Sphere>& spheres,
+      double* signed_surface_distance) const
+  {
+    int best = -1;
+    double best_d = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i < spheres.size(); ++i)
+    {
+      const double d =
+          (point - spheres[i].center).length() - spheres[i].radius;
+      if (d < best_d)
+      {
+        best_d = d;
+        best = static_cast<int>(i);
+      }
+    }
+    if (signed_surface_distance)
+    {
+      *signed_surface_distance = best_d;
+    }
+    return best;
   }
 
   bool isWatchedOccupancyPoint(const tf2::Vector3& point) const
@@ -529,6 +589,45 @@ private:
                     static_cast<double>(p_sensor.y),
                     static_cast<double>(p_sensor.z));
             const bool is_self = isSelfPoint(p_base, spheres);
+            if (isHotspotPoint(p_base))
+            {
+              double nearest_signed_d =
+                  std::numeric_limits<double>::quiet_NaN();
+              const int nearest_i = nearestSelfSphere(
+                  p_base, spheres, &nearest_signed_d);
+              const Sphere* nearest =
+                  (nearest_i >= 0 &&
+                   nearest_i < static_cast<int>(spheres.size()))
+                      ? &spheres[static_cast<std::size_t>(nearest_i)]
+                      : nullptr;
+              ROS_WARN_STREAM(
+                  "[TOF_HOTSPOT_HIT] sensor_id=" << sensor_index
+                  << " source_frame=" << source_frame
+                  << " stamp=" << msg->header.stamp.toSec()
+                  << " raw_sensor=[" << p_sensor.x << ","
+                  << p_sensor.y << "," << p_sensor.z << "]"
+                  << " base=[" << p_base.x() << ","
+                  << p_base.y() << "," << p_base.z() << "]"
+                  << " is_self=" << static_cast<int>(is_self)
+                  << " nearest_self_link="
+                  << (nearest ? nearest->link_name : std::string("none"))
+                  << " nearest_self_sample="
+                  << (nearest ? nearest->sample_index_in_link : -1)
+                  << " nearest_is_sensor_origin="
+                  << static_cast<int>(
+                         nearest ? nearest->sensor_origin_proxy : false)
+                  << " nearest_center=["
+                  << (nearest ? nearest->center.x() : std::numeric_limits<double>::quiet_NaN()) << ","
+                  << (nearest ? nearest->center.y() : std::numeric_limits<double>::quiet_NaN()) << ","
+                  << (nearest ? nearest->center.z() : std::numeric_limits<double>::quiet_NaN()) << "]"
+                  << " nearest_radius="
+                  << (nearest ? nearest->radius : std::numeric_limits<double>::quiet_NaN())
+                  << " signed_surface_distance="
+                  << nearest_signed_d
+                  << " self_filter_padding=" << self_filter_padding_
+                  << " used_latest_tf_fallback="
+                  << static_cast<int>(used_latest_fallback));
+            }
             if (isWatchedOccupancyPoint(p_base))
             {
               ROS_WARN_STREAM(
@@ -871,6 +970,14 @@ private:
   double debug_occupancy_watch_y_ = 0.0;
   double debug_occupancy_watch_z_ = 0.0;
   double debug_occupancy_watch_half_extent_ = 0.025;
+
+  bool debug_hotspot_watch_enabled_ = false;
+  double debug_hotspot_x_min_ = -0.025;
+  double debug_hotspot_x_max_ = 0.075;
+  double debug_hotspot_y_min_ = 0.025;
+  double debug_hotspot_y_max_ = 0.125;
+  double debug_hotspot_z_min_ = 0.225;
+  double debug_hotspot_z_max_ = 0.425;
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
