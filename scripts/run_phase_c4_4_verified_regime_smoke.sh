@@ -99,6 +99,13 @@ GOAL_SETTLE_VELOCITY_INF_RAD_S="${GOAL_SETTLE_VELOCITY_INF_RAD_S:-0.05}"
 GOAL_SETTLE_TIMEOUT_S="${GOAL_SETTLE_TIMEOUT_S:-1.0}"
 GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.0}"
 
+# Recording profile:
+#   full             = historical diagnostics used by formal C4/C5 runs.
+#   self_filter_perf = lean Phase-E perception/safety recording for frequency
+#                      tests; avoids dozens of rostopic echo processes
+#                      perturbing Gazebo wall-clock real-time factor.
+RECORDING_PROFILE="${RECORDING_PROFILE:-full}"
+
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 
@@ -576,59 +583,74 @@ record_topic() {
   setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
   REC_PIDS+=("$!")
 }
-record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
-record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
-record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
-record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
-record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
-record_topic /care_planner/local_planner/task_infeasible "${OUT}/task_infeasible.csv"
-record_topic /care_planner/local_planner/task_obstacle_blocked "${OUT}/task_obstacle_blocked.csv"
-record_topic /care_planner/local_planner/task_uncertified "${OUT}/task_uncertified.csv"
-record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
-record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
-record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
-record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
-record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
-record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
-record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
-if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
-  record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
-  record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
-fi
-if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
-  record_topic /care_planner/execution_gcdf/selector_summary "${OUT}/execution_gcdf_selector_summary.csv"
-  record_topic /care_planner/execution_gcdf/safety_summary "${OUT}/execution_gcdf_safety_summary.csv"
-  record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
-fi
-record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
-record_topic /care_planner/active_sensing/visibility_frontier_summary "${OUT}/visibility_frontier_summary.csv"
-record_topic /care_planner/active_sensing/visibility_frontier_target "${OUT}/visibility_frontier_target.csv"
-record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
-record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
-record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
-record_topic /care_planner/final_gcdf/recovery_visibility_event "${OUT}/final_gcdf_recovery_event.csv"
-record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
-if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
-  record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
-  # Keep the historical filename for downstream summary scripts; fields that
-  # are specific to legacy MPC will simply be absent.
-  record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
+if [ "${RECORDING_PROFILE}" = "self_filter_perf" ]; then
+  echo "[RECORDING] profile=self_filter_perf (lean perception/safety set)"
+  record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+  if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
+    record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
+    record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
+  fi
+  if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
+    record_topic /care_planner/execution_gcdf/safety_summary "${OUT}/execution_gcdf_safety_summary.csv"
+    record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
+  fi
+  if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+    record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+  fi
+  record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+  record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
 else
-  record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+  echo "[RECORDING] profile=full"
+  record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
+  record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+  record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+  record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
+  record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
+  record_topic /care_planner/local_planner/task_infeasible "${OUT}/task_infeasible.csv"
+  record_topic /care_planner/local_planner/task_obstacle_blocked "${OUT}/task_obstacle_blocked.csv"
+  record_topic /care_planner/local_planner/task_uncertified "${OUT}/task_uncertified.csv"
+  record_topic /phase_b2_controlled_trial/summary "${OUT}/broker_summary.csv"
+  record_topic /care_planner/active_sensing/visibility_waypoint_summary "${OUT}/waypoint_summary.csv"
+  record_topic "${SCHEDULE_SUMMARY_TOPIC}" "${OUT}/waypoint_schedule_summary.csv"
+  record_topic "${SCHEDULE_TOPIC}" "${OUT}/waypoint_schedule.csv"
+  record_topic /care_planner/execution/gate_summary "${OUT}/gate_summary.csv"
+  record_topic /care_planner/active_sensing/visibility_acquisition_summary "${OUT}/visibility_acquisition_summary.csv"
+  record_topic /care_planner/active_sensing/visibility_acquisition_complete "${OUT}/visibility_acquisition_complete.csv"
+  if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
+    record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
+    record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
+  fi
+  if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
+    record_topic /care_planner/execution_gcdf/selector_summary "${OUT}/execution_gcdf_selector_summary.csv"
+    record_topic /care_planner/execution_gcdf/safety_summary "${OUT}/execution_gcdf_safety_summary.csv"
+    record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
+  fi
+  record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
+  record_topic /care_planner/active_sensing/visibility_frontier_summary "${OUT}/visibility_frontier_summary.csv"
+  record_topic /care_planner/active_sensing/visibility_frontier_target "${OUT}/visibility_frontier_target.csv"
+  record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
+  record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
+  record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
+  record_topic /care_planner/final_gcdf/recovery_visibility_event "${OUT}/final_gcdf_recovery_event.csv"
+  record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
+  if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+    record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
+    record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
+    record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
+  else
+    record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
+  fi
+  record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+  record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
+  record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
+  record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
+  record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
+  record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
+  record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
+  record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
+  record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
+  record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 fi
-record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
-record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
-record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
-record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
-record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
-record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
-# Visualization artifacts: preserve the upstream nominal task reference and the
-# exact safety-certified trajectory that the tracker receives.
-record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
-record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
-record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
-record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 
 echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, msg_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
 if ! python3 - "${INITIAL_GATE_MAX_TRIES}" "${INITIAL_GATE_ECHO_TIMEOUT}" <<'PY'
