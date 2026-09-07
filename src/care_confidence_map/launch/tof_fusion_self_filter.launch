@@ -1,14 +1,14 @@
 <launch>
   <arg name="config_file"
        default="$(find care_confidence_map)/config/tof_fusion_self_filter.yaml" />
-  <arg name="body_samples_file"
-       default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="self_filter_urdf_file"
+       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
 
   <node pkg="care_confidence_map"
         type="tof_fusion_self_filter_node"
         name="tof_fusion_self_filter"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
-    <param name="body_samples_file" value="$(arg body_samples_file)" />
+    <param name="self_filter_urdf_file" value="$(arg self_filter_urdf_file)" />
   </node>
 </launch>
