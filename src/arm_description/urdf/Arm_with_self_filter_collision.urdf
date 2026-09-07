@@ -128,9 +128,9 @@
         </material>
       </visual>
     <collision name="link3_proximal_body">
-      <origin xyz="-0.000 0 -0.037" rpy="0 0 0" />
+      <origin xyz="-0.000 0 -0.033" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.050" length="0.075" />
+        <cylinder radius="0.050" length="0.085" />
         </geometry>
       </collision>
     <collision name="link3_arm_body">
@@ -143,12 +143,6 @@
       <origin xyz="0.075 0 -0.135" rpy="0 0 0" />
       <geometry>
         <box size="0.025 0.056 0.055" />
-        </geometry>
-      </collision>
-    <collision name="link3_distal_joint">
-      <origin xyz="0.012 0 -0.212" rpy="0 1.57079632679 0" />
-      <geometry>
-        <cylinder radius="0.050" length="0.105" />
         </geometry>
       </collision>
     </link>
@@ -178,7 +172,7 @@
     <collision name="link4_proximal_joint">
       <origin xyz="0 0 -0.039" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.050" length="0.078" />
+        <cylinder radius="0.050" length="0.085" />
         </geometry>
       </collision>
     <collision name="link4_main_body">
@@ -304,7 +298,7 @@
     <collision name="wrist_link3_plate">
       <origin xyz="0 -0.020 0.006" rpy="0 0 0" />
       <geometry>
-        <box size="0.038 0.070 0.008" />
+        <box size="0.038 0.075 0.008" />
         </geometry>
       </collision>
     <collision name="wrist_link3_side_plate">
