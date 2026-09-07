@@ -21,6 +21,7 @@ RUN_SECONDS="${RUN_SECONDS:-20}"
 MAX_TRIALS_PER_CASE="${MAX_TRIALS_PER_CASE:-5}"
 GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
+RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED:-true}"
 CASES=(phase_e_goal_004 phase_e_goal_015 phase_e_goal_022)
 
 cd "${REPO}"
@@ -73,6 +74,7 @@ max_trials_per_case=${MAX_TRIALS_PER_CASE}
 hotspot_x=[-0.025,0.075]
 hotspot_y=[-0.025,0.125]
 hotspot_z=[0.225,0.425]
+runtime_self_hit_rviz_diag_enabled=${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}
 mapping_semantics_changed=false
 self_filter_semantics_changed=true_exact_dedicated_urdf_primitives_no_runtime_padding
 EOF
@@ -105,7 +107,7 @@ for CASE_ID in "${CASES[@]}"; do
     echo "================================================================"
 
     set +e
-    CASE_FILE="${CASE_FILE}"     CASE_ID="${CASE_ID}"     RUN_ID="${RUN_ID}"     RUN_SECONDS="${RUN_SECONDS}"     WORLD_FILE="${WORLD_FILE}"     CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE}"     TOF_FUSION_CONFIG_FILE="${TOF_FUSION_CONFIG_FILE}"     TOF_FUSION_ENABLED=true     EXECUTION_GCDF_AUDIT_ENABLED=true     GCDF_BODY_INFLATION_M=0.015     FORCE_ZERO_INITIAL_Q=true     EARLY_STOP_ON_GOAL=false     GAZEBO_GUI="${GAZEBO_GUI}"     USE_RVIZ="${USE_RVIZ}"       bash scripts/run_and_pack_phase_e5_execution_gcdf.sh
+    CASE_FILE="${CASE_FILE}"     CASE_ID="${CASE_ID}"     RUN_ID="${RUN_ID}"     RUN_SECONDS="${RUN_SECONDS}"     WORLD_FILE="${WORLD_FILE}"     CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE}"     TOF_FUSION_CONFIG_FILE="${TOF_FUSION_CONFIG_FILE}"     TOF_FUSION_ENABLED=true     RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}"     EXECUTION_GCDF_AUDIT_ENABLED=true     GCDF_BODY_INFLATION_M=0.015     FORCE_ZERO_INITIAL_Q=true     EARLY_STOP_ON_GOAL=false     GAZEBO_GUI="${GAZEBO_GUI}"     USE_RVIZ="${USE_RVIZ}"       bash scripts/run_and_pack_phase_e5_execution_gcdf.sh
     RC=$?
     set -e
 
