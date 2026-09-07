@@ -268,8 +268,13 @@ class ExecutionGCDFSafetyMonitor:
                         ground_band = (
                             math.isfinite(p[2]) and
                             p[2] <= 0.5 * self.voxel_resolution_m + 1e-9)
+                        blocker_stamp = (
+                            msg.header.stamp.to_sec()
+                            if msg.header.stamp != rospy.Time(0)
+                            else now.to_sec())
                         rospy.logerr(
                             "[EXECUTION_GCDF_OCCUPIED_BLOCKER] "
+                            "stamp=%.6f "
                             "voxel=[%.6f,%.6f,%.6f] "
                             "pair_index=%d timestep=%d "
                             "raw_center_clearance=%.6f "
@@ -277,6 +282,7 @@ class ExecutionGCDFSafetyMonitor:
                             "ground_band_candidate=%d "
                             "hard_occupied_voxel_count=%d "
                             "all_hard_occupied_voxels=%s",
+                            blocker_stamp,
                             p[0], p[1], p[2],
                             int(min_occupied_pair["pair_index"]),
                             int(min_occupied_pair["timestep"]),
