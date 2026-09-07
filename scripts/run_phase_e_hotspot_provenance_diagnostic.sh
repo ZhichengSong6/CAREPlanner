@@ -211,6 +211,141 @@ with open(out, "w") as dst:
 print(out)
 PY
 
+# Quantify whether the exact-URDF self filter preserves the 15 Hz output
+# cadence and where its callback cost is spent.
+python3 - "${ART_DIR}" "${ROOT}/self_filter_performance.csv" "${ROOT}/self_filter_performance.txt" <<'PY'
+import csv
+import glob
+import math
+import os
+import re
+import statistics
+import sys
+
+art, csv_out, txt_out = sys.argv[1:]
+tok = re.compile(r'([A-Za-z0-9_]+)=([^\s]+)')
+
+def fnum(v):
+    try:
+        return float(v)
+    except Exception:
+        return math.nan
+
+rows_out = []
+for path in sorted(glob.glob(os.path.join(
+        art, "*", "trial_*", "tof_fusion_summary.csv"))):
+    case_id = os.path.basename(os.path.dirname(os.path.dirname(path)))
+    trial = os.path.basename(os.path.dirname(path))
+
+    stamps = []
+    parsed = []
+    with open(path, newline="", errors="replace") as f:
+        rd = csv.reader(f)
+        hdr = next(rd, [])
+        if not hdr:
+            continue
+        ti = hdr.index("%time") if "%time" in hdr else 0
+        di = hdr.index("field.data") if "field.data" in hdr else 1
+        for row in rd:
+            if len(row) <= max(ti, di):
+                continue
+            try:
+                t = float(row[ti])
+                if t > 1e12:
+                    t /= 1e9
+                stamps.append(t)
+            except Exception:
+                pass
+            parsed.append(dict(tok.findall(",".join(row[di:]))))
+
+    # Drop startup transients from rate statistics.
+    steady_stamps = stamps[10:] if len(stamps) > 20 else stamps
+    topic_hz = math.nan
+    if len(steady_stamps) >= 2 and steady_stamps[-1] > steady_stamps[0]:
+        topic_hz = (len(steady_stamps) - 1) / (
+            steady_stamps[-1] - steady_stamps[0])
+
+    def vals(key):
+        out = []
+        for r in parsed[10:] if len(parsed) > 20 else parsed:
+            x = fnum(r.get(key))
+            if math.isfinite(x):
+                out.append(x)
+        return out
+
+    publish_hz = vals("publish_hz")
+    publish_ms = vals("publish_callback_ms")
+    cloud_mean = vals("cloud_callback_ms_mean")
+    cloud_max = vals("cloud_callback_ms_max")
+    tf_mean = vals("body_tf_lookup_ms_mean")
+    tf_max = vals("body_tf_lookup_ms_max")
+    sf_mean = vals("self_filter_ms_mean")
+    sf_max = vals("self_filter_ms_max")
+
+    last = parsed[-1] if parsed else {}
+    median_publish_hz = (
+        statistics.median(publish_hz) if publish_hz else math.nan)
+    frequency_ok = int(
+        math.isfinite(topic_hz) and topic_hz >= 14.5 and
+        math.isfinite(median_publish_hz) and median_publish_hz >= 14.5)
+
+    rows_out.append({
+        "case_id": case_id,
+        "trial": trial,
+        "samples": len(parsed),
+        "observed_summary_hz": topic_hz,
+        "median_publish_hz": median_publish_hz,
+        "median_publish_callback_ms": (
+            statistics.median(publish_ms) if publish_ms else math.nan),
+        "median_cloud_callback_ms_mean": (
+            statistics.median(cloud_mean) if cloud_mean else math.nan),
+        "max_cloud_callback_ms": max(cloud_max) if cloud_max else math.nan,
+        "median_body_tf_lookup_ms_mean": (
+            statistics.median(tf_mean) if tf_mean else math.nan),
+        "max_body_tf_lookup_ms": max(tf_max) if tf_max else math.nan,
+        "median_self_filter_ms_mean": (
+            statistics.median(sf_mean) if sf_mean else math.nan),
+        "max_self_filter_ms": max(sf_max) if sf_max else math.nan,
+        "body_tf_failures": int(fnum(last.get("body_tf_failures", 0)) or 0),
+        "dropped_for_body_tf": int(
+            fnum(last.get("dropped_for_body_tf", 0)) or 0),
+        "urdf_primitive_count": int(
+            fnum(last.get("urdf_primitive_count", 0)) or 0),
+        "frequency_ok_14p5hz": frequency_ok,
+    })
+
+fields = [
+    "case_id", "trial", "samples",
+    "observed_summary_hz", "median_publish_hz",
+    "median_publish_callback_ms",
+    "median_cloud_callback_ms_mean", "max_cloud_callback_ms",
+    "median_body_tf_lookup_ms_mean", "max_body_tf_lookup_ms",
+    "median_self_filter_ms_mean", "max_self_filter_ms",
+    "body_tf_failures", "dropped_for_body_tf",
+    "urdf_primitive_count", "frequency_ok_14p5hz",
+]
+with open(csv_out, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    w.writerows(rows_out)
+
+with open(txt_out, "w") as f:
+    f.write("Exact dedicated-URDF self-filter performance\n")
+    f.write("Target publish rate: 15 Hz; pass tolerance: >=14.5 Hz\n\n")
+    for r in rows_out:
+        f.write(
+            "{case_id} {trial}: observed={observed_summary_hz:.3f} Hz, "
+            "median_publish={median_publish_hz:.3f} Hz, "
+            "self_filter_mean={median_self_filter_ms_mean:.3f} ms, "
+            "cloud_callback_mean={median_cloud_callback_ms_mean:.3f} ms, "
+            "body_tf_mean={median_body_tf_lookup_ms_mean:.3f} ms, "
+            "drops={dropped_for_body_tf}, pass={frequency_ok_14p5hz}\n".format(**r)
+        )
+
+print(csv_out)
+print(txt_out)
+PY
+
 python3 - "${ROOT}" "${ZIP}" <<'PY'
 import os, sys, zipfile
 root, dst = sys.argv[1:]
@@ -226,5 +361,7 @@ echo ""
 echo "================ HOTSPOT PROVENANCE COMPLETE ================"
 cat "${SUMMARY}"
 echo "[PROVENANCE] ${ROOT}/provenance_report.txt"
+echo "[PERFORMANCE] ${ROOT}/self_filter_performance.txt"
+cat "${ROOT}/self_filter_performance.txt" || true
 echo "[UPLOAD ZIP] ${ZIP}"
 ls -lh "${ZIP}"
