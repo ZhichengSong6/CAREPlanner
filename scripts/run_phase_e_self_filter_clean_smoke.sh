@@ -208,6 +208,14 @@ for trial_dir in sorted(glob.glob(os.path.join(art, "*", "trial_*"))):
         "body_tf_failures": int(fnum(last.get("body_tf_failures", 0)) or 0),
         "dropped_for_body_tf": int(
             fnum(last.get("dropped_for_body_tf", 0)) or 0),
+        "callbacks_received": int(
+            fnum(last.get("callbacks_received", 0)) or 0),
+        "callbacks_processed": int(
+            fnum(last.get("callbacks_processed", 0)) or 0),
+        "callbacks_throttled": int(
+            fnum(last.get("callbacks_throttled", 0)) or 0),
+        "processing_keep_ratio": fnum(
+            last.get("processing_keep_ratio", math.nan)),
         "hard_event_count": hard_events,
         "occupied_hard_hold": occupied_hard,
     }
@@ -222,6 +230,8 @@ fields = [
     "median_publish_callback_ms", "median_cloud_callback_ms",
     "median_self_filter_ms", "median_body_tf_ms",
     "body_tf_failures", "dropped_for_body_tf",
+    "callbacks_received", "callbacks_processed", "callbacks_throttled",
+    "processing_keep_ratio",
     "hard_event_count", "occupied_hard_hold", "wall_15hz_pass",
 ]
 with open(csv_out, "w", newline="") as f:
@@ -241,6 +251,8 @@ with open(txt_out, "w") as f:
             "self_filter={median_self_filter_ms:.3f} ms, "
             "cloud_cb={median_cloud_callback_ms:.3f} ms, "
             "body_tf={median_body_tf_ms:.3f} ms, "
+            "keep_ratio={processing_keep_ratio:.3f}, "
+            "throttled={callbacks_throttled}, "
             "drops={dropped_for_body_tf}, "
             "occupied_HARD_HOLD={occupied_hard_hold}, "
             "15Hz_pass={wall_15hz_pass}\n".format(**r)
