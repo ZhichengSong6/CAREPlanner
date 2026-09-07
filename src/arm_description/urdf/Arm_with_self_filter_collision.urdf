@@ -302,9 +302,9 @@
         </geometry>
       </collision>
     <collision name="wrist_link3_side_plate">
-      <origin xyz="0 -0.050 -0.02" rpy="0 0 0" />
+      <origin xyz="-0.00 -0.050 -0.02" rpy="0 0 0" />
       <geometry>
-        <box size="0.048 0.010 0.068" />
+        <box size="0.06 0.010 0.068" />
         </geometry>
       </collision>
     <collision name="wrist_link3_sensor1_block">
@@ -317,6 +317,12 @@
       <origin xyz="-0.047 -0.041 -0.0255" rpy="0 0 -0.35" />
       <geometry>
         <box size="0.035 0.025 0.055" />
+        </geometry>
+      </collision>
+    <collision name="wrist_link3_sensor2_block2">
+      <origin xyz="-0.025 -0.045 -0.0255" rpy="0 0 -0.35" />
+      <geometry>
+        <box size="0.015 0.015 0.055" />
         </geometry>
       </collision>
     </link>
