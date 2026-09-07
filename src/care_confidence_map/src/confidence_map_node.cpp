@@ -285,6 +285,37 @@ private:
         debug_neighborhood_watch_period_s_,
         1.0);
 
+    // Diagnostic-only occupancy hotspot provenance. This records hit/free
+    // evidence for a small base-frame box without changing mapping semantics.
+    nh.param(
+        "confidence_map/debug_hotspot_watch_enabled",
+        debug_hotspot_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_hotspot_x_min",
+        debug_hotspot_x_min_,
+        -0.025);
+    nh.param(
+        "confidence_map/debug_hotspot_x_max",
+        debug_hotspot_x_max_,
+        0.075);
+    nh.param(
+        "confidence_map/debug_hotspot_y_min",
+        debug_hotspot_y_min_,
+        0.025);
+    nh.param(
+        "confidence_map/debug_hotspot_y_max",
+        debug_hotspot_y_max_,
+        0.125);
+    nh.param(
+        "confidence_map/debug_hotspot_z_min",
+        debug_hotspot_z_min_,
+        0.225);
+    nh.param(
+        "confidence_map/debug_hotspot_z_max",
+        debug_hotspot_z_max_,
+        0.425);
+
     nh.param<std::string>(
         "confidence_map/marker_topic",
         marker_topic_,
@@ -1080,6 +1111,33 @@ private:
     std::map<int, tf2::Vector3> watched_last_hit_endpoint;
     std::map<int, tf2::Vector3> watched_last_hit_origin;
 
+    // Hotspot provenance is indexed by confidence-map voxel index, then
+    // sensor id. It records only diagnostics; free/occupied masks below remain
+    // the sole mapping inputs.
+    std::map<int, std::map<int, std::size_t>> hotspot_hit_counts;
+    std::map<int, std::map<int, std::size_t>> hotspot_free_counts;
+    std::map<int, std::map<int, tf2::Vector3>> hotspot_last_hit_endpoint;
+    std::map<int, std::map<int, tf2::Vector3>> hotspot_last_hit_origin;
+
+    auto hotspotIndex = [this](int index) -> bool
+    {
+      if (!debug_hotspot_watch_enabled_ ||
+          index < 0 ||
+          index >= static_cast<int>(grid_points_.size()))
+      {
+        return false;
+      }
+      const GridPoint& gp =
+          grid_points_[static_cast<std::size_t>(index)];
+      return
+          gp.x >= debug_hotspot_x_min_ &&
+          gp.x <= debug_hotspot_x_max_ &&
+          gp.y >= debug_hotspot_y_min_ &&
+          gp.y <= debug_hotspot_y_max_ &&
+          gp.z >= debug_hotspot_z_min_ &&
+          gp.z <= debug_hotspot_z_max_;
+    };
+
     std::size_t valid_rays = 0;
     std::size_t hit_rays = 0;
     std::size_t no_hit_rays = 0;
@@ -1169,6 +1227,10 @@ private:
               {
                 watched_free_counts[sensor_id] += 1;
               }
+              if (hotspotIndex(index))
+              {
+                hotspot_free_counts[index][sensor_id] += 1;
+              }
             }
           }
         }
@@ -1185,6 +1247,12 @@ private:
               watched_last_hit_endpoint[sensor_id] = endpoint;
               watched_last_hit_origin[sensor_id] = origin;
             }
+            if (hotspotIndex(endpoint_index))
+            {
+              hotspot_hit_counts[endpoint_index][sensor_id] += 1;
+              hotspot_last_hit_endpoint[endpoint_index][sensor_id] = endpoint;
+              hotspot_last_hit_origin[endpoint_index][sensor_id] = origin;
+            }
           }
           else
           {
@@ -1192,6 +1260,10 @@ private:
             if (endpoint_index == watched_index)
             {
               watched_free_counts[sensor_id] += 1;
+            }
+            if (hotspotIndex(endpoint_index))
+            {
+              hotspot_free_counts[endpoint_index][sensor_id] += 1;
             }
           }
         }
@@ -1226,6 +1298,22 @@ private:
             ? grid_points_[static_cast<std::size_t>(watched_index)].occupancy
             : 0.0f;
 
+    std::map<int, float> hotspot_occupancy_before;
+    for (const auto& kv : hotspot_hit_counts)
+    {
+      hotspot_occupancy_before[kv.first] =
+          grid_points_[static_cast<std::size_t>(kv.first)].occupancy;
+    }
+    for (const auto& kv : hotspot_free_counts)
+    {
+      if (hotspot_occupancy_before.find(kv.first) ==
+          hotspot_occupancy_before.end())
+      {
+        hotspot_occupancy_before[kv.first] =
+            grid_points_[static_cast<std::size_t>(kv.first)].occupancy;
+      }
+    }
+
     for (std::size_t i = 0; i < grid_points_.size(); ++i)
     {
       GridPoint& gp = grid_points_[i];
@@ -1257,6 +1345,129 @@ private:
         gp.confidence = 1.0f;
         gp.last_seen_time = stamp_sec;
         ++free_cells;
+      }
+    }
+
+    if (debug_hotspot_watch_enabled_ &&
+        (!hotspot_hit_counts.empty() || !hotspot_free_counts.empty()))
+    {
+      auto sensorNameForId = [this](int sensor_id) -> std::string
+      {
+        for (const auto& sensor : sensors_)
+        {
+          if (sensor.id == sensor_id)
+          {
+            return sensor.name;
+          }
+        }
+        return std::string("unknown");
+      };
+
+      std::map<int, bool> touched;
+      for (const auto& kv : hotspot_hit_counts) touched[kv.first] = true;
+      for (const auto& kv : hotspot_free_counts) touched[kv.first] = true;
+
+      for (const auto& item : touched)
+      {
+        const int index = item.first;
+        const GridPoint& gp =
+            grid_points_[static_cast<std::size_t>(index)];
+        const auto hit_it = hotspot_hit_counts.find(index);
+        const auto free_it = hotspot_free_counts.find(index);
+
+        std::ostringstream hit_oss;
+        bool first = true;
+        if (hit_it != hotspot_hit_counts.end())
+        {
+          for (const auto& kv : hit_it->second)
+          {
+            if (!first) hit_oss << ";";
+            first = false;
+            hit_oss << kv.first << ":" << sensorNameForId(kv.first)
+                    << "x" << kv.second;
+          }
+        }
+
+        std::ostringstream free_oss;
+        first = true;
+        if (free_it != hotspot_free_counts.end())
+        {
+          for (const auto& kv : free_it->second)
+          {
+            if (!first) free_oss << ";";
+            first = false;
+            free_oss << kv.first << ":" << sensorNameForId(kv.first)
+                     << "x" << kv.second;
+          }
+        }
+
+        const float before =
+            hotspot_occupancy_before.count(index)
+                ? hotspot_occupancy_before[index]
+                : 0.0f;
+        const bool has_hit =
+            hit_it != hotspot_hit_counts.end() && !hit_it->second.empty();
+        const bool has_free =
+            free_it != hotspot_free_counts.end() && !free_it->second.empty();
+        const bool transition =
+            before <= 0.5f && gp.occupancy > 0.5f;
+        const bool suppressed_free =
+            ray_persistent_occupied_ &&
+            before > 0.5f &&
+            !has_hit &&
+            has_free &&
+            gp.occupancy > 0.5f;
+
+        ROS_WARN_STREAM(
+            "[HOTSPOT_MAP_PACKET] stamp=" << stamp.toSec()
+            << " voxel=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+            << " hit_sensors={" << hit_oss.str() << "}"
+            << " free_sensors={" << free_oss.str() << "}"
+            << " occupancy_before=" << before
+            << " occupancy_after=" << gp.occupancy
+            << " transition_to_occupied="
+            << static_cast<int>(transition)
+            << " free_clear_suppressed="
+            << static_cast<int>(suppressed_free)
+            << " persistent_occupied="
+            << static_cast<int>(ray_persistent_occupied_));
+
+        if (hit_it != hotspot_hit_counts.end())
+        {
+          for (const auto& kv : hit_it->second)
+          {
+            const int sensor_id = kv.first;
+            const auto ep_outer =
+                hotspot_last_hit_endpoint.find(index);
+            const auto origin_outer =
+                hotspot_last_hit_origin.find(index);
+            if (ep_outer == hotspot_last_hit_endpoint.end() ||
+                origin_outer == hotspot_last_hit_origin.end())
+            {
+              continue;
+            }
+            const auto ep = ep_outer->second.find(sensor_id);
+            const auto origin = origin_outer->second.find(sensor_id);
+            if (ep == ep_outer->second.end() ||
+                origin == origin_outer->second.end())
+            {
+              continue;
+            }
+            ROS_WARN_STREAM(
+                "[HOTSPOT_MAP_HIT] stamp=" << stamp.toSec()
+                << " voxel=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+                << " sensor_id=" << sensor_id
+                << " sensor=" << sensorNameForId(sensor_id)
+                << " count=" << kv.second
+                << " endpoint=[" << ep->second.x() << ","
+                << ep->second.y() << "," << ep->second.z() << "]"
+                << " origin=[" << origin->second.x() << ","
+                << origin->second.y() << "," << origin->second.z() << "]"
+                << " range=" << (ep->second - origin->second).length()
+                << " transition_to_occupied="
+                << static_cast<int>(transition));
+          }
+        }
       }
     }
 
@@ -2326,6 +2537,14 @@ private:
   double debug_neighborhood_watch_z_ = 0.0;
   double debug_neighborhood_watch_period_s_ = 1.0;
   ros::WallTime last_debug_neighborhood_log_wall_;
+
+  bool debug_hotspot_watch_enabled_ = false;
+  double debug_hotspot_x_min_ = -0.025;
+  double debug_hotspot_x_max_ = 0.075;
+  double debug_hotspot_y_min_ = 0.025;
+  double debug_hotspot_y_max_ = 0.125;
+  double debug_hotspot_z_min_ = 0.225;
+  double debug_hotspot_z_max_ = 0.425;
 
   ros::Time last_ray_observation_received_;
   ros::Time last_ray_observation_stamp_;
