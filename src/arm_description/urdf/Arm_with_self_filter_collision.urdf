@@ -50,7 +50,7 @@
         </material>
       </visual>
     <collision name="link1_lower_flange">
-      <origin xyz="0 0 0.0" rpy="0 0 0" />
+      <origin xyz="0 0 0.005" rpy="0 0 0" />
       <geometry>
         <cylinder radius="0.075" length="0.025" />
         </geometry>
@@ -250,7 +250,7 @@
     <collision name="wrist_link1_terminal">
       <origin xyz="0 0 0.136" rpy="0 1.57079632679 0" />
       <geometry>
-        <cylinder radius="0.010" length="0.09" />
+        <cylinder radius="0.012" length="0.09" />
         </geometry>
       </collision>
     </link>
