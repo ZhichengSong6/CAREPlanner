@@ -12,6 +12,7 @@ GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
 WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.world}"
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
+TOF_FUSION_CONFIG_FILE="${TOF_FUSION_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/tof_fusion_self_filter.yaml}"
 TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
 TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY="${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY:-false}"
 EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
@@ -329,6 +330,7 @@ echo "[MODE] region_schedule_mode=${REGION_SCHEDULE_MODE}"
 setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch \
   config_file:="${CONFIG_FILE}" \
   confidence_map_config_file:="${CONFIDENCE_MAP_CONFIG_FILE}" \
+  tof_fusion_config_file:="${TOF_FUSION_CONFIG_FILE}" \
   tof_fusion_enabled:="${TOF_FUSION_ENABLED}" \
   waypoint_weight:="${CARE_WEIGHT}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
