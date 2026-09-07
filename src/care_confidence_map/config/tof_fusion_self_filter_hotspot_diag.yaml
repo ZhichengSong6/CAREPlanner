@@ -9,17 +9,16 @@ ray_observation_topic: /care_planner/perception/tof_ray_observations
 input_voxel_leaf_size: 0.03
 output_voxel_leaf_size: 0.03
 
-# Existing body_samples.yaml contains the arm collision approximation.  The
-# padding absorbs TF/sample discretization error; small sensor-origin spheres
-# additionally remove returns from sensor housings that are not in that file.
-self_filter_padding: 0.015
-sensor_origin_filter_radius: 0.06
+# IMPORTANT: runtime self filtering uses the dedicated
+# Arm_with_self_filter_collision.urdf collision primitives directly.
+# The collision geometry in that URDF is already conservatively enlarged, so
+# NO additional runtime padding/inflation is applied here.
+#
+# Geometry and each depth cloud are evaluated at the same cloud timestamp.
+tf_timeout: 0.03
 
 sensor_timeout: 0.25
-tf_timeout: 0.03
-allow_latest_tf_fallback: true
 publish_rate: 15.0
-self_geometry_rate: 30.0
 
 # Phase E3 ray transport. We sample the organized 240x335 depth image rather
 # than publishing every pixel into the dense 5-cm map.
@@ -28,17 +27,14 @@ ray_horizontal_fov_deg: 55.0
 ray_vertical_fov_deg: 72.0
 ray_max_forward_depth: 0.75
 
-# Diagnostic-only provenance watch for the empty-world ghost voxel. This does
-# not change filtering; it logs raw finite depth pixels that transform into the
-# watched 5-cm confidence-map cell.
+# Diagnostic-only provenance watch for one legacy ghost voxel.
 debug_occupancy_watch_enabled: false
 debug_occupancy_watch_x: 0.20
 debug_occupancy_watch_y: -0.05
 debug_occupancy_watch_z: 0.45
 debug_occupancy_watch_half_extent: 0.025
 
-# Diagnostic-only hotspot provenance for the intermittent empty-world occupied
-# cluster. Mapping/self-filter semantics are unchanged.
+# Disabled in production. The hotspot diagnostic config enables this.
 debug_hotspot_watch_enabled: true
 debug_hotspot_x_min: -0.025
 debug_hotspot_x_max:  0.075
