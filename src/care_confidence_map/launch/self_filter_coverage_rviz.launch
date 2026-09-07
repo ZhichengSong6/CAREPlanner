@@ -1,0 +1,33 @@
+<launch>
+  <arg name="coverage_csv"
+       default="$(env HOME)/Project/CAREPlanner/outputs/self_filter_mesh_coverage/self_filter_mesh_coverage_worst_points.csv" />
+  <arg name="self_filter_urdf"
+       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+  <arg name="links"
+       default="link2,link1,link3,link4,wrist_link1,wrist_link3" />
+  <arg name="max_points_per_link" default="30" />
+  <arg name="min_outside_mm" default="0.1" />
+  <arg name="show_filter_geometry" default="true" />
+  <arg name="use_gui" default="true" />
+
+  <!-- Actual robot visual meshes and TF at zero/default joint configuration. -->
+  <include file="$(find arm_description)/launch/display_phase1.launch">
+    <arg name="robot_urdf" value="$(find arm_description)/urdf/Arm.urdf" />
+    <arg name="use_gui" value="$(arg use_gui)" />
+    <arg name="use_rviz" value="true" />
+    <!-- care_arm_phase1.rviz already subscribes to /care_planner/debug/markers -->
+  </include>
+
+  <node pkg="care_confidence_map"
+        type="self_filter_coverage_marker_publisher.py"
+        name="self_filter_coverage_marker_publisher"
+        output="screen">
+    <param name="coverage_csv" value="$(arg coverage_csv)" />
+    <param name="self_filter_urdf" value="$(arg self_filter_urdf)" />
+    <param name="links" value="$(arg links)" />
+    <param name="max_points_per_link" value="$(arg max_points_per_link)" />
+    <param name="min_outside_mm" value="$(arg min_outside_mm)" />
+    <param name="show_filter_geometry" value="$(arg show_filter_geometry)" />
+    <param name="marker_topic" value="/care_planner/debug/markers" />
+  </node>
+</launch>
