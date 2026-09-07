@@ -235,10 +235,16 @@
         <box size="0.090 0.015 0.060" />
         </geometry>
       </collision>
+    <collision name="wrist_link1_connector2">
+      <origin xyz="0.0 0.0 0.08" rpy="0 0 0" />
+      <geometry>
+        <box size="0.040 0.030 0.030" />
+        </geometry>
+      </collision>
     <collision name="wrist_link1_terminal">
       <origin xyz="0 0 0.136" rpy="0 1.57079632679 0" />
       <geometry>
-        <cylinder radius="0.010" length="0.086" />
+        <cylinder radius="0.010" length="0.09" />
         </geometry>
       </collision>
     </link>
