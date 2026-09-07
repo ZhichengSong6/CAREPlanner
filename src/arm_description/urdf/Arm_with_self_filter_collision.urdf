@@ -188,9 +188,9 @@
         </geometry>
       </collision>
     <collision name="link4_distal_joint">
-      <origin xyz="0 -0.205 -0.045" rpy="1.57079632679 0 0" />
+      <origin xyz="0 -0.20 -0.045" rpy="1.57079632679 0 0" />
       <geometry>
-        <cylinder radius="0.03" length="0.063" />
+        <cylinder radius="0.03" length="0.070" />
         </geometry>
       </collision>
     </link>
@@ -217,6 +217,12 @@
         <color rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
         </material>
       </visual>
+    <collision name="wrist_link1_linkage">
+      <origin xyz="0 0 0.01" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.020" length="0.030" />
+        </geometry>
+      </collision>    
     <collision name="wrist_link1_motor">
       <origin xyz="0 0 0.050" rpy="0 1.57079632679 0" />
       <geometry>
@@ -226,7 +232,7 @@
     <collision name="wrist_link1_connector">
       <origin xyz="0 0 0.111" rpy="0 0 0" />
       <geometry>
-        <box size="0.090 0.015 0.050" />
+        <box size="0.090 0.015 0.060" />
         </geometry>
       </collision>
     <collision name="wrist_link1_terminal">
