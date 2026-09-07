@@ -24,6 +24,8 @@
         output="screen">
     <param name="coverage_csv" value="$(arg coverage_csv)" />
     <param name="self_filter_urdf" value="$(arg self_filter_urdf)" />
+    <param name="reference_urdf"
+           value="$(find arm_description)/urdf/Arm.urdf" />
     <param name="links" value="$(arg links)" />
     <param name="max_points_per_link" value="$(arg max_points_per_link)" />
     <param name="min_outside_mm" value="$(arg min_outside_mm)" />
