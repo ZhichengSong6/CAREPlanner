@@ -1,0 +1,68 @@
+base_frame: base_link
+
+output_topic: /care_planner/perception/tof_fused_filtered
+summary_topic: /care_planner/perception/tof_fusion_summary
+ray_observation_topic: /care_planner/perception/tof_ray_observations
+
+# Downsample each 320x240 depth cloud before TF/self filtering, then remove
+# duplicate points again after merging all eight sensors.
+input_voxel_leaf_size: 0.03
+output_voxel_leaf_size: 0.03
+
+# Existing body_samples.yaml contains the arm collision approximation.  The
+# padding absorbs TF/sample discretization error; small sensor-origin spheres
+# additionally remove returns from sensor housings that are not in that file.
+self_filter_padding: 0.015
+sensor_origin_filter_radius: 0.06
+
+sensor_timeout: 0.25
+tf_timeout: 0.03
+allow_latest_tf_fallback: true
+publish_rate: 15.0
+self_geometry_rate: 30.0
+
+# Phase E3 ray transport. We sample the organized 240x335 depth image rather
+# than publishing every pixel into the dense 5-cm map.
+ray_pixel_stride: 8
+ray_horizontal_fov_deg: 55.0
+ray_vertical_fov_deg: 72.0
+ray_max_forward_depth: 0.75
+
+# Diagnostic-only provenance watch for the empty-world ghost voxel. This does
+# not change filtering; it logs raw finite depth pixels that transform into the
+# watched 5-cm confidence-map cell.
+debug_occupancy_watch_enabled: false
+debug_occupancy_watch_x: 0.20
+debug_occupancy_watch_y: -0.05
+debug_occupancy_watch_z: 0.45
+debug_occupancy_watch_half_extent: 0.025
+
+# Diagnostic-only hotspot provenance for the intermittent empty-world occupied
+# cluster. Mapping/self-filter semantics are unchanged.
+debug_hotspot_watch_enabled: true
+debug_hotspot_x_min: -0.025
+debug_hotspot_x_max:  0.075
+debug_hotspot_y_min:  0.025
+debug_hotspot_y_max:  0.125
+debug_hotspot_z_min:  0.225
+debug_hotspot_z_max:  0.425
+
+input_topics:
+  - /link2_sensor1/tof/cloud
+  - /link2_sensor2/tof/cloud
+  - /link3_sensor1/tof/cloud
+  - /link3_sensor2/tof/cloud
+  - /link4_sensor1/tof/cloud
+  - /link4_sensor2/tof/cloud
+  - /EE_sensor1/tof/cloud
+  - /EE_sensor2/tof/cloud
+
+sensor_frames:
+  - link2_sensor1_tof_link
+  - link2_sensor2_tof_link
+  - link3_sensor1_tof_link
+  - link3_sensor2_tof_link
+  - link4_sensor1_tof_link
+  - link4_sensor2_tof_link
+  - EE_sensor1_tof_link
+  - EE_sensor2_tof_link
