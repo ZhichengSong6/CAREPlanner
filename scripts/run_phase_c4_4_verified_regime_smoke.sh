@@ -14,6 +14,7 @@ WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.wor
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
 TOF_FUSION_CONFIG_FILE="${TOF_FUSION_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/tof_fusion_self_filter.yaml}"
 TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
+RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED:-false}"
 TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY="${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY:-false}"
 EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
 EXECUTION_GCDF_WARNING_MARGIN="${EXECUTION_GCDF_WARNING_MARGIN:-0.05}"
@@ -339,6 +340,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   confidence_map_config_file:="${CONFIDENCE_MAP_CONFIG_FILE}" \
   tof_fusion_config_file:="${TOF_FUSION_CONFIG_FILE}" \
   tof_fusion_enabled:="${TOF_FUSION_ENABLED}" \
+  runtime_self_hit_rviz_diag_enabled:="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}" \
   waypoint_weight:="${CARE_WEIGHT}" \
   vbc_min_margin_s:="${SAFETY_MARGIN}" \
   selector_predicted_trajectory_timeout:="${PREDICTION_TIMEOUT}" \
@@ -520,7 +522,7 @@ if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
 fi
 
 echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
-echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
+echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} runtime_self_hit_rviz_diag=${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
 echo "[BODY PRIOR A/B] main_trajectory_risk_refresh=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}; local/final/execution exporters remain false"
 echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
 echo "[MARGIN SPLIT] VBC swept margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
@@ -544,6 +546,7 @@ use_rviz=${USE_RVIZ}
 world_file=${WORLD_FILE}
 confidence_map_config_file=${CONFIDENCE_MAP_CONFIG_FILE}
 tof_fusion_enabled=${TOF_FUSION_ENABLED}
+runtime_self_hit_rviz_diag_enabled=${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}
 main_trajectory_risk_refresh_body_prior_before_query=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}
 execution_gcdf_audit_enabled=${EXECUTION_GCDF_AUDIT_ENABLED}
 execution_gcdf_warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}
