@@ -6,7 +6,7 @@ set -euo pipefail
 # Repeats the three cases that reproducibly produced non-ground execution
 # HARD_HOLD blockers. The diagnostic configs change no planning, mapping, or
 # self-filter thresholds. They only log:
-#   [TOF_HOTSPOT_HIT]   raw organized ToF hit + nearest labeled self sphere
+#   [TOF_HOTSPOT_HIT]   raw organized ToF hit + nearest exact URDF primitive
 #   [HOTSPOT_MAP_*]     packet-level HIT/FREE evidence and occupancy transition
 #   [EXECUTION_GCDF_OCCUPIED_BLOCKER] exact execution blocker voxel
 #
@@ -74,7 +74,7 @@ hotspot_x=[-0.025,0.075]
 hotspot_y=[0.025,0.125]
 hotspot_z=[0.225,0.425]
 mapping_semantics_changed=false
-self_filter_semantics_changed=false
+self_filter_semantics_changed=true_exact_dedicated_urdf_primitives_no_runtime_padding
 EOF
 
 echo "================================================================"
