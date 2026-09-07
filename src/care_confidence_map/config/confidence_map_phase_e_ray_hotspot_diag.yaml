@@ -58,7 +58,7 @@ confidence_map:
 
   # Diagnostic-only hotspot provenance. Records packet-level HIT/FREE evidence
   # for the suspended occupied cluster; does not change occupancy semantics.
-  debug_hotspot_watch_enabled: true
+  debug_hotspot_watch_enabled: false
   debug_hotspot_x_min: -0.025
   debug_hotspot_x_max:  0.075
   debug_hotspot_y_min:  0.025
