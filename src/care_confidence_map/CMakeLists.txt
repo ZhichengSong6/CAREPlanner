@@ -15,6 +15,7 @@ find_package(catkin REQUIRED COMPONENTS
   tf2
   tf2_ros
   tf2_geometry_msgs
+  urdf
   pcl_ros
   pcl_conversions
   message_generation
@@ -50,6 +51,7 @@ catkin_package(
     tf2
     tf2_ros
     tf2_geometry_msgs
+    urdf
     pcl_ros
     pcl_conversions
     message_runtime
@@ -116,9 +118,7 @@ add_dependencies(tof_fusion_self_filter_node
 )
 
 target_link_libraries(tof_fusion_self_filter_node
-  body_sample_model
   ${catkin_LIBRARIES}
-  yaml-cpp
 )
 
 add_executable(body_sample_model_node
