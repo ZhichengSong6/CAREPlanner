@@ -97,6 +97,12 @@
         <box size="0.086 0.138 0.155" />
         </geometry>
       </collision>
+    <collision name="link2_upper_joint">
+      <origin xyz="0 0 -0.04" rpy="0 0 0" />
+      <geometry>
+        <cylinder radius="0.071" length="0.155" />
+        </geometry>
+      </collision>
     </link>
   <joint name="joint2" type="revolute">
     <origin xyz="0.0377 0 0.145" rpy="1.5707963267949 0 1.5707963267949" />
