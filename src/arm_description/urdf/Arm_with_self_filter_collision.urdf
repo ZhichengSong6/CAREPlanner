@@ -52,7 +52,7 @@
     <collision name="link1_lower_flange">
       <origin xyz="0 0 0.008" rpy="0 0 0" />
       <geometry>
-        <cylinder radius="0.073" length="0.018" />
+        <cylinder radius="0.073" length="0.025" />
         </geometry>
       </collision>
     <collision name="link1_support">
@@ -136,7 +136,7 @@
     <collision name="link3_arm_body">
       <origin xyz="0.02 0 -0.127" rpy="0 0 0" />
       <geometry>
-        <box size="0.090 0.102 0.122" />
+        <box size="0.090 0.102 0.132" />
         </geometry>
       </collision>
     <collision name="link3_arm_body2">
@@ -274,7 +274,7 @@
     <collision name="wrist_link2_motor">
       <origin xyz="-0.0003 0 -0.0345" rpy="0 1.57079632679 0" />
       <geometry>
-        <cylinder radius="0.0325" length="0.065" />
+        <cylinder radius="0.038" length="0.065" />
         </geometry>
       </collision>
     </link>
@@ -308,9 +308,9 @@
         </geometry>
       </collision>
     <collision name="wrist_link3_side_plate">
-      <origin xyz="-0.00 -0.050 -0.02" rpy="0 0 0" />
+      <origin xyz="-0.00 -0.048 -0.02" rpy="0 0 0" />
       <geometry>
-        <box size="0.06 0.010 0.068" />
+        <box size="0.06 0.020 0.068" />
         </geometry>
       </collision>
     <collision name="wrist_link3_sensor1_block">
