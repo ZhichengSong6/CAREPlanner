@@ -122,6 +122,7 @@ for CASE_ID in "${CASES[@]}"; do
       grep -F "[HOTSPOT_MAP_PACKET]" "${CONTROL_LOG}"         > "${TRIAL_DIR}/hotspot_map_packets.log" || true
       grep -F "[HOTSPOT_MAP_HIT]" "${CONTROL_LOG}"         > "${TRIAL_DIR}/hotspot_map_hits.log" || true
       grep -F "[EXECUTION_GCDF_OCCUPIED_BLOCKER]" "${CONTROL_LOG}"         > "${TRIAL_DIR}/execution_blockers.log" || true
+      grep -E "\\[RUNTIME_SELF_HIT_DIAG(_FREEZE)?\\]" "${CONTROL_LOG}"         > "${TRIAL_DIR}/runtime_self_hit_diag.log" || true
     fi
 
     if [[ -d "${RUN_ROOT}/run" ]]; then
@@ -133,12 +134,14 @@ for CASE_ID in "${CASES[@]}"; do
     TOF_COUNT=0
     MAP_PACKET_COUNT=0
     MAP_HIT_COUNT=0
+    RUNTIME_DIAG_COUNT=0
     [[ -f "${TRIAL_DIR}/tof_hotspot_hits.log" ]] &&       TOF_COUNT="$(wc -l < "${TRIAL_DIR}/tof_hotspot_hits.log")"
     [[ -f "${TRIAL_DIR}/hotspot_map_packets.log" ]] &&       MAP_PACKET_COUNT="$(wc -l < "${TRIAL_DIR}/hotspot_map_packets.log")"
     [[ -f "${TRIAL_DIR}/hotspot_map_hits.log" ]] &&       MAP_HIT_COUNT="$(wc -l < "${TRIAL_DIR}/hotspot_map_hits.log")"
+    [[ -f "${TRIAL_DIR}/runtime_self_hit_diag.log" ]] &&       RUNTIME_DIAG_COUNT="$(wc -l < "${TRIAL_DIR}/runtime_self_hit_diag.log")"
 
     {
-      echo "case=${CASE_ID} trial=${TRIAL} rc=${RC} captured=$([[ -n "${BLOCKER_LINE}" ]] && echo 1 || echo 0) tof_hotspot_hits=${TOF_COUNT} map_packets=${MAP_PACKET_COUNT} map_hits=${MAP_HIT_COUNT}"
+      echo "case=${CASE_ID} trial=${TRIAL} rc=${RC} captured=$([[ -n "${BLOCKER_LINE}" ]] && echo 1 || echo 0) tof_hotspot_hits=${TOF_COUNT} map_packets=${MAP_PACKET_COUNT} map_hits=${MAP_HIT_COUNT} runtime_diag_lines=${RUNTIME_DIAG_COUNT}"
       [[ -n "${BLOCKER_LINE}" ]] && echo "${BLOCKER_LINE}"
       echo ""
     } >> "${SUMMARY}"
