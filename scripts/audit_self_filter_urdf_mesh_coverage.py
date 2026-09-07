@@ -1,36 +1,47 @@
 #!/usr/bin/env python3
 """
-Offline coverage audit for CAREPlanner's dedicated self-filter URDF.
+Audit whether the dedicated CAREPlanner self-filter geometry contains the
+visual geometry of the ACTUAL Gazebo robot.
 
-Question answered:
-    Does the union of each link's dedicated self-filter collision primitives
-    completely contain that link's visual mesh surface?
+Reference visual geometry:
+    src/arm_description/urdf/Arm.urdf
 
-This script intentionally does NOT use body_samples.yaml.  It audits the
-geometry that tof_fusion_self_filter_node.cpp now uses directly:
+Self-filter geometry:
     src/arm_description/urdf/Arm_with_self_filter_collision.urdf
 
-For each visual STL triangle, the surface is sampled at approximately
---surface-spacing (default 2 mm), including vertices, edges, and triangle
-interiors.  Every sample is transformed by the URDF visual origin/scale and
-evaluated against the exact union of that same link's collision
-box/cylinder/sphere primitives.
+This distinction matters because Arm.urdf contains auxiliary fixed sensor,
+camera, ToF and EE visual links that are intentionally stripped from the
+dedicated self-filter URDF.  For every visual link in Arm.urdf, this script
+walks upward through fixed joints to the nearest ancestor that has dedicated
+self-filter collision primitives, transforms that visual mesh into the
+ancestor frame, and evaluates it against the exact union of those primitives.
+
+Thus the audit answers the actual runtime question:
+    Is every rendered robot visual surface that can be seen by Gazebo depth
+    cameras inside the dedicated self-filter envelope?
+
+Surface audit:
+  * binary or ASCII STL supported without trimesh;
+  * triangle vertices, edges and interiors are sampled on a barycentric lattice;
+  * default surface spacing = 2 mm;
+  * exact signed distance to box/cylinder/sphere primitives;
+  * no runtime padding is assumed.
 
 Signed-distance convention:
-    d <= 0 : covered by at least one self-filter primitive
-    d >  0 : visual surface lies outside the self-filter union
+    d <= 0 : covered by dedicated self-filter geometry
+    d >  0 : rendered visual surface lies outside the self-filter union
 
 Outputs:
     self_filter_mesh_coverage.csv
     self_filter_mesh_coverage.json
     self_filter_mesh_coverage_worst_points.csv
+    self_filter_mesh_unmapped_visual_links.csv
 """
 
 import argparse
 import csv
 import json
 import math
-import os
 import struct
 import sys
 import xml.etree.ElementTree as ET
@@ -55,8 +66,7 @@ def rpy_to_matrix(rpy):
     cr, sr = math.cos(r), math.sin(r)
     cp, sp = math.cos(p), math.sin(p)
     cy, sy = math.cos(y), math.sin(y)
-
-    # URDF fixed-axis RPY: Rz(yaw) * Ry(pitch) * Rx(roll).
+    # URDF fixed-axis RPY = Rz(yaw) Ry(pitch) Rx(roll).
     return np.asarray([
         [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
         [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
@@ -73,6 +83,18 @@ def origin_transform(elem):
     )
 
 
+def compose(T_ab, T_bc):
+    """Return T_ac for p_a = T_ab(T_bc(p_c))."""
+    Ra, ta = T_ab
+    Rb, tb = T_bc
+    return Ra @ Rb, Ra @ tb + ta
+
+
+def apply_transform(points, T):
+    R, t = T
+    return points @ R.T + t
+
+
 def resolve_package_uri(uri, repo_root):
     prefix = "package://"
     if not uri.startswith(prefix):
@@ -85,23 +107,21 @@ def resolve_package_uri(uri, repo_root):
     if candidate.exists():
         return candidate
 
-    # Defensive fallback for nested workspaces.
     matches = list((repo_root / "src").glob(f"**/{package}/{rel}"))
     if len(matches) == 1:
         return matches[0]
-    raise FileNotFoundError(f"cannot resolve {uri} from repo root {repo_root}")
+    raise FileNotFoundError(f"cannot resolve {uri} from {repo_root}")
 
 
 def load_stl_triangles(path):
     data = Path(path).read_bytes()
+
     if len(data) >= 84:
         n = struct.unpack_from("<I", data, 80)[0]
-        expected = 84 + 50 * n
-        if expected == len(data):
+        if 84 + 50 * n == len(data):
             tri = np.empty((n, 3, 3), dtype=np.float64)
             off = 84
             for i in range(n):
-                # normal(12 bytes), vertices(36), attr(2)
                 vals = struct.unpack_from("<12fH", data, off)
                 tri[i, 0, :] = vals[3:6]
                 tri[i, 1, :] = vals[6:9]
@@ -109,16 +129,16 @@ def load_stl_triangles(path):
                 off += 50
             return tri
 
-    # ASCII STL fallback.
     verts = []
     for raw in data.decode("utf-8", errors="ignore").splitlines():
         s = raw.strip()
-        if not s.lower().startswith("vertex "):
-            continue
-        toks = s.split()
-        if len(toks) >= 4:
-            verts.append([float(toks[1]), float(toks[2]), float(toks[3])])
-    if len(verts) % 3 != 0 or not verts:
+        if s.lower().startswith("vertex "):
+            toks = s.split()
+            if len(toks) >= 4:
+                verts.append(
+                    [float(toks[1]), float(toks[2]), float(toks[3])])
+
+    if not verts or len(verts) % 3 != 0:
         raise ValueError(f"unsupported/corrupt STL: {path}")
     return np.asarray(verts, dtype=np.float64).reshape(-1, 3, 3)
 
@@ -132,19 +152,22 @@ def triangle_surface_samples(tri, spacing):
     )
     n = max(1, int(math.ceil(max_edge / spacing)))
 
-    # Uniform barycentric lattice over the full triangle.
-    out = []
+    out = np.empty(((n + 1) * (n + 2) // 2, 3), dtype=np.float64)
+    k = 0
     inv = 1.0 / n
     for i in range(n + 1):
         for j in range(n + 1 - i):
             u = i * inv
             v = j * inv
-            out.append(a + u * (b - a) + v * (c - a))
-    return np.asarray(out, dtype=np.float64)
+            out[k] = a + u * (b - a) + v * (c - a)
+            k += 1
+    return out
 
 
 class Primitive:
-    def __init__(self, link, name, kind, R, t, size=None, radius=None, length=None):
+    def __init__(
+            self, link, name, kind, R, t,
+            size=None, radius=None, length=None):
         self.link = link
         self.name = name
         self.kind = kind
@@ -154,9 +177,11 @@ class Primitive:
         self.radius = radius
         self.length = length
 
-    def signed_distance(self, points_link):
-        # Row-vector equivalent of p_local = R^T (p_link - t).
-        q = (points_link - self.t) @ self.R
+    def signed_distance(self, points_anchor):
+        # Primitive origin T_anchor_primitive.
+        # Row-vector local coordinates:
+        # p_primitive = (p_anchor - t) @ R.
+        q = (points_anchor - self.t) @ self.R
 
         if self.kind == "box":
             d = np.abs(q) - 0.5 * self.size
@@ -167,7 +192,9 @@ class Primitive:
         if self.kind == "cylinder":
             radial = np.linalg.norm(q[:, :2], axis=1) - self.radius
             axial = np.abs(q[:, 2]) - 0.5 * self.length
-            outside = np.hypot(np.maximum(radial, 0.0), np.maximum(axial, 0.0))
+            outside = np.hypot(
+                np.maximum(radial, 0.0),
+                np.maximum(axial, 0.0))
             inside = np.minimum(np.maximum(radial, axial), 0.0)
             return outside + inside
 
@@ -177,157 +204,248 @@ class Primitive:
         raise RuntimeError(self.kind)
 
 
-def parse_urdf(urdf_path):
-    root = ET.parse(urdf_path).getroot()
-    links = {}
+def parse_self_filter_collisions(path):
+    root = ET.parse(path).getroot()
+    collisions_by_link = {}
 
     for link in root.findall("link"):
-        name = link.attrib.get("name", "")
-        visuals = []
-        collisions = []
-
-        for vi, visual in enumerate(link.findall("visual")):
-            geom = visual.find("geometry")
-            mesh = geom.find("mesh") if geom is not None else None
-            if mesh is None:
-                continue
-            R, t = origin_transform(visual.find("origin"))
-            scale = parse_vec(mesh.attrib.get("scale"), default=[1.0, 1.0, 1.0])
-            visuals.append({
-                "name": visual.attrib.get("name", f"visual_{vi}"),
-                "filename": mesh.attrib["filename"],
-                "scale": scale,
-                "R": R,
-                "t": t,
-            })
+        link_name = link.attrib.get("name", "")
+        prims = []
 
         for ci, collision in enumerate(link.findall("collision")):
             geom = collision.find("geometry")
             if geom is None:
                 continue
+
             R, t = origin_transform(collision.find("origin"))
             cname = collision.attrib.get("name", f"collision_{ci}")
 
             box = geom.find("box")
             cyl = geom.find("cylinder")
             sph = geom.find("sphere")
+
             if box is not None:
-                collisions.append(Primitive(
-                    name, cname, "box", R, t,
+                prims.append(Primitive(
+                    link_name, cname, "box", R, t,
                     size=parse_vec(box.attrib["size"])))
             elif cyl is not None:
-                collisions.append(Primitive(
-                    name, cname, "cylinder", R, t,
+                prims.append(Primitive(
+                    link_name, cname, "cylinder", R, t,
                     radius=float(cyl.attrib["radius"]),
                     length=float(cyl.attrib["length"])))
             elif sph is not None:
-                collisions.append(Primitive(
-                    name, cname, "sphere", R, t,
+                prims.append(Primitive(
+                    link_name, cname, "sphere", R, t,
                     radius=float(sph.attrib["radius"])))
             else:
                 raise RuntimeError(
-                    f"{name}/{cname}: audit supports only box/cylinder/sphere")
+                    f"{link_name}/{cname}: dedicated self-filter URDF "
+                    "contains unsupported non-primitive collision geometry")
 
-        if visuals or collisions:
-            links[name] = {"visuals": visuals, "collisions": collisions}
+        if prims:
+            collisions_by_link[link_name] = prims
 
-    return links
+    return collisions_by_link
 
 
-def audit_link(link_name, data, repo_root, spacing, tolerance, top_k):
-    primitives = data["collisions"]
-    visuals = data["visuals"]
-    if not visuals:
-        return None
-    if not primitives:
-        return {
-            "link": link_name,
-            "visual_count": len(visuals),
-            "primitive_count": 0,
-            "surface_samples": 0,
-            "outside_samples": 0,
-            "outside_fraction": float("nan"),
-            "max_outside_m": float("inf"),
-            "p95_outside_m": float("inf"),
-            "mean_outside_m": float("inf"),
-            "contained": False,
-            "reason": "visual mesh present but no collision primitive",
-            "worst": [],
+def parse_reference_robot(path):
+    root = ET.parse(path).getroot()
+
+    visuals_by_link = {}
+    for link in root.findall("link"):
+        link_name = link.attrib.get("name", "")
+        visuals = []
+
+        for vi, visual in enumerate(link.findall("visual")):
+            geom = visual.find("geometry")
+            mesh = geom.find("mesh") if geom is not None else None
+            if mesh is None:
+                continue
+
+            visuals.append({
+                "name": visual.attrib.get("name", f"visual_{vi}"),
+                "filename": mesh.attrib["filename"],
+                "scale": parse_vec(
+                    mesh.attrib.get("scale"),
+                    default=[1.0, 1.0, 1.0]),
+                "T_link_visual": origin_transform(visual.find("origin")),
+            })
+
+        if visuals:
+            visuals_by_link[link_name] = visuals
+
+    parent_joint = {}
+    for joint in root.findall("joint"):
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+
+        child_name = child.attrib["link"]
+        parent_joint[child_name] = {
+            "name": joint.attrib.get("name", ""),
+            "type": joint.attrib.get("type", ""),
+            "parent": parent.attrib["link"],
+            "T_parent_child": origin_transform(joint.find("origin")),
         }
 
+    return visuals_by_link, parent_joint
+
+
+def find_self_filter_anchor(
+        source_link,
+        self_filter_links,
+        parent_joint):
+    """
+    Map a rendered reference link into a dedicated self-filter link.
+
+    Only fixed joints may be collapsed.  If a non-fixed joint is encountered
+    before reaching a dedicated collision link, the mapping is invalid.
+    """
+    current = source_link
+    T_current_source = (np.eye(3), np.zeros(3))
+    chain = []
+
+    while True:
+        if current in self_filter_links:
+            return {
+                "ok": True,
+                "anchor": current,
+                "T_anchor_source": T_current_source,
+                "fixed_chain": chain,
+                "reason": "",
+            }
+
+        joint = parent_joint.get(current)
+        if joint is None:
+            return {
+                "ok": False,
+                "anchor": "",
+                "T_anchor_source": None,
+                "fixed_chain": chain,
+                "reason": "no parent joint before self-filter anchor",
+            }
+
+        if joint["type"] != "fixed":
+            return {
+                "ok": False,
+                "anchor": "",
+                "T_anchor_source": None,
+                "fixed_chain": chain,
+                "reason": (
+                    f"encountered non-fixed joint {joint['name']} "
+                    f"type={joint['type']} before self-filter anchor"),
+            }
+
+        # T_parent_source = T_parent_current * T_current_source.
+        T_current_source = compose(
+            joint["T_parent_child"],
+            T_current_source)
+        chain.append(joint["name"])
+        current = joint["parent"]
+
+
+def audit_visual_link(
+        source_link,
+        visuals,
+        mapping,
+        primitives,
+        repo_root,
+        spacing,
+        tolerance,
+        top_k):
     total = 0
     outside = 0
-    outside_d = []
+    outside_distances = []
     worst = []
+
+    T_anchor_source = mapping["T_anchor_source"]
 
     for vis in visuals:
         mesh_path = resolve_package_uri(vis["filename"], repo_root)
         triangles = load_stl_triangles(mesh_path)
-        scale = vis["scale"]
-        Rv, tv = vis["R"], vis["t"]
+
+        # Full mesh -> visual origin -> source link -> fixed-chain anchor.
+        T_anchor_visual = compose(
+            T_anchor_source,
+            vis["T_link_visual"])
 
         for tri_idx, tri_mesh in enumerate(triangles):
-            samples = triangle_surface_samples(tri_mesh * scale, spacing)
-            samples_link = samples @ Rv.T + tv
+            tri_scaled = tri_mesh * vis["scale"]
+            samples_visual = triangle_surface_samples(
+                tri_scaled,
+                spacing)
+            samples_anchor = apply_transform(
+                samples_visual,
+                T_anchor_visual)
 
-            d_union = np.full(samples_link.shape[0], np.inf, dtype=np.float64)
-            nearest_idx = np.full(samples_link.shape[0], -1, dtype=np.int32)
+            d_union = np.full(
+                samples_anchor.shape[0],
+                np.inf,
+                dtype=np.float64)
+            nearest_idx = np.full(
+                samples_anchor.shape[0],
+                -1,
+                dtype=np.int32)
+
             for pi, prim in enumerate(primitives):
-                d = prim.signed_distance(samples_link)
+                d = prim.signed_distance(samples_anchor)
                 better = d < d_union
                 d_union[better] = d[better]
                 nearest_idx[better] = pi
 
             total += len(d_union)
             mask = d_union > tolerance
-            if np.any(mask):
-                idxs = np.flatnonzero(mask)
-                outside += len(idxs)
-                vals = d_union[idxs]
-                outside_d.extend(vals.tolist())
+            if not np.any(mask):
+                continue
 
-                for local_i, d in zip(idxs, vals):
-                    p = samples_link[local_i]
-                    prim = primitives[int(nearest_idx[local_i])]
-                    rec = {
-                        "link": link_name,
-                        "visual": vis["name"],
-                        "mesh": str(mesh_path),
-                        "triangle": int(tri_idx),
-                        "x": float(p[0]),
-                        "y": float(p[1]),
-                        "z": float(p[2]),
-                        "outside_m": float(d),
-                        "nearest_primitive": prim.name,
-                        "nearest_type": prim.kind,
-                    }
-                    worst.append(rec)
+            idxs = np.flatnonzero(mask)
+            vals = d_union[idxs]
+            outside += len(idxs)
+            outside_distances.extend(vals.tolist())
+
+            for local_i, d in zip(idxs, vals):
+                p = samples_anchor[local_i]
+                prim = primitives[int(nearest_idx[local_i])]
+                worst.append({
+                    "source_link": source_link,
+                    "anchor_link": mapping["anchor"],
+                    "visual": vis["name"],
+                    "mesh": str(mesh_path),
+                    "triangle": int(tri_idx),
+                    "x_anchor": float(p[0]),
+                    "y_anchor": float(p[1]),
+                    "z_anchor": float(p[2]),
+                    "outside_m": float(d),
+                    "nearest_primitive": prim.name,
+                    "nearest_type": prim.kind,
+                    "fixed_chain": ";".join(mapping["fixed_chain"]),
+                })
 
     worst.sort(key=lambda r: r["outside_m"], reverse=True)
     worst = worst[:top_k]
 
-    if outside_d:
-        arr = np.asarray(outside_d, dtype=np.float64)
+    if outside_distances:
+        arr = np.asarray(outside_distances, dtype=np.float64)
         max_out = float(np.max(arr))
         p95_out = float(np.percentile(arr, 95))
         mean_out = float(np.mean(arr))
     else:
-        max_out = 0.0
-        p95_out = 0.0
-        mean_out = 0.0
+        max_out = p95_out = mean_out = 0.0
 
     return {
-        "link": link_name,
+        "source_link": source_link,
+        "anchor_link": mapping["anchor"],
+        "fixed_chain": ";".join(mapping["fixed_chain"]),
         "visual_count": len(visuals),
         "primitive_count": len(primitives),
         "surface_samples": int(total),
         "outside_samples": int(outside),
-        "outside_fraction": (outside / total) if total else float("nan"),
+        "outside_fraction": outside / total if total else float("nan"),
         "max_outside_m": max_out,
         "p95_outside_m": p95_out,
         "mean_outside_m": mean_out,
         "contained": bool(outside == 0),
-        "reason": "",
         "worst": worst,
     }
 
@@ -338,18 +456,24 @@ def main():
         "--repo-root",
         default="/home/zhicheng/Project/CAREPlanner")
     ap.add_argument(
-        "--urdf",
-        default="src/arm_description/urdf/Arm_with_self_filter_collision.urdf")
+        "--reference-urdf",
+        default="src/arm_description/urdf/Arm.urdf",
+        help="actual Gazebo/rendered robot visual geometry")
+    ap.add_argument(
+        "--self-filter-urdf",
+        default=(
+            "src/arm_description/urdf/"
+            "Arm_with_self_filter_collision.urdf"))
     ap.add_argument(
         "--surface-spacing",
         type=float,
         default=0.002,
-        help="approximate mesh-surface sampling spacing in meters")
+        help="approximate visual-mesh surface sampling spacing in meters")
     ap.add_argument(
         "--containment-tolerance",
         type=float,
         default=1e-4,
-        help="positive signed distance <= this is treated as numerical boundary")
+        help="d <= tolerance is treated as contained (default 0.1 mm)")
     ap.add_argument("--top-k", type=int, default=50)
     ap.add_argument(
         "--output-dir",
@@ -357,44 +481,69 @@ def main():
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root).resolve()
-    urdf_path = Path(args.urdf)
-    if not urdf_path.is_absolute():
-        urdf_path = repo_root / urdf_path
+
+    reference_urdf = Path(args.reference_urdf)
+    if not reference_urdf.is_absolute():
+        reference_urdf = repo_root / reference_urdf
+
+    self_filter_urdf = Path(args.self_filter_urdf)
+    if not self_filter_urdf.is_absolute():
+        self_filter_urdf = repo_root / self_filter_urdf
+
+    out_dir = Path(args.output_dir)
+    if not out_dir.is_absolute():
+        out_dir = repo_root / out_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.surface_spacing <= 0:
         raise SystemExit("--surface-spacing must be positive")
     if args.containment_tolerance < 0:
         raise SystemExit("--containment-tolerance must be nonnegative")
 
-    links = parse_urdf(urdf_path)
-    out_dir = Path(args.output_dir)
-    if not out_dir.is_absolute():
-        out_dir = repo_root / out_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
+    collisions = parse_self_filter_collisions(self_filter_urdf)
+    visuals, parent_joint = parse_reference_robot(reference_urdf)
 
     results = []
     worst_rows = []
-    for link_name in sorted(links):
-        result = audit_link(
-            link_name,
-            links[link_name],
+    unmapped = []
+
+    for source_link in sorted(visuals):
+        mapping = find_self_filter_anchor(
+            source_link,
+            set(collisions),
+            parent_joint)
+
+        if not mapping["ok"]:
+            unmapped.append({
+                "source_link": source_link,
+                "reason": mapping["reason"],
+                "fixed_chain": ";".join(mapping["fixed_chain"]),
+            })
+            continue
+
+        result = audit_visual_link(
+            source_link,
+            visuals[source_link],
+            mapping,
+            collisions[mapping["anchor"]],
             repo_root,
             args.surface_spacing,
             args.containment_tolerance,
             args.top_k)
-        if result is None:
-            continue
         results.append(result)
         worst_rows.extend(result["worst"])
 
     csv_path = out_dir / "self_filter_mesh_coverage.csv"
     json_path = out_dir / "self_filter_mesh_coverage.json"
     worst_path = out_dir / "self_filter_mesh_coverage_worst_points.csv"
+    unmapped_path = out_dir / "self_filter_mesh_unmapped_visual_links.csv"
 
     fields = [
-        "link", "visual_count", "primitive_count", "surface_samples",
-        "outside_samples", "outside_fraction", "max_outside_m",
-        "p95_outside_m", "mean_outside_m", "contained", "reason",
+        "source_link", "anchor_link", "fixed_chain",
+        "visual_count", "primitive_count",
+        "surface_samples", "outside_samples", "outside_fraction",
+        "max_outside_m", "p95_outside_m", "mean_outside_m",
+        "contained",
     ]
     with csv_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
@@ -402,56 +551,103 @@ def main():
         for r in results:
             w.writerow({k: r[k] for k in fields})
 
-    payload = {
-        "urdf": str(urdf_path),
-        "surface_spacing_m": args.surface_spacing,
-        "containment_tolerance_m": args.containment_tolerance,
-        "all_contained": all(r["contained"] for r in results),
-        "results": results,
-    }
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
     worst_fields = [
-        "link", "visual", "mesh", "triangle", "x", "y", "z",
-        "outside_m", "nearest_primitive", "nearest_type",
+        "source_link", "anchor_link", "visual", "mesh", "triangle",
+        "x_anchor", "y_anchor", "z_anchor",
+        "outside_m", "nearest_primitive", "nearest_type", "fixed_chain",
     ]
     with worst_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=worst_fields)
         w.writeheader()
         w.writerows(worst_rows)
 
-    print("=" * 96)
-    print("SELF-FILTER URDF VISUAL-MESH COVERAGE AUDIT")
-    print(f"URDF: {urdf_path}")
-    print(f"surface spacing: {args.surface_spacing * 1000.0:.2f} mm")
-    print(f"containment tolerance: {args.containment_tolerance * 1000.0:.3f} mm")
-    print("-" * 96)
+    with unmapped_path.open("w", newline="") as f:
+        fields_u = ["source_link", "reason", "fixed_chain"]
+        w = csv.DictWriter(f, fieldnames=fields_u)
+        w.writeheader()
+        w.writerows(unmapped)
+
+    all_mapped = len(unmapped) == 0
+    all_contained = all(r["contained"] for r in results)
+    payload = {
+        "reference_urdf": str(reference_urdf),
+        "self_filter_urdf": str(self_filter_urdf),
+        "surface_spacing_m": args.surface_spacing,
+        "containment_tolerance_m": args.containment_tolerance,
+        "reference_visual_link_count": len(visuals),
+        "self_filter_collision_link_count": len(collisions),
+        "mapped_visual_link_count": len(results),
+        "unmapped_visual_link_count": len(unmapped),
+        "all_visual_links_mapped": all_mapped,
+        "all_mapped_visual_surfaces_contained": all_contained,
+        "strict_whole_robot_pass": bool(all_mapped and all_contained),
+        "results": results,
+        "unmapped": unmapped,
+    }
+    json_path.write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8")
+
+    print("=" * 112)
+    print("DEDICATED SELF-FILTER VS ACTUAL GAZEBO VISUAL-MESH AUDIT")
+    print(f"reference robot : {reference_urdf}")
+    print(f"self-filter URDF: {self_filter_urdf}")
+    print(f"surface spacing : {args.surface_spacing*1000.0:.2f} mm")
     print(
-        f"{'link':18s} {'samples':>10s} {'outside':>10s} "
-        f"{'outside%':>10s} {'max_out(mm)':>12s} {'contained':>10s}")
+        f"tolerance       : "
+        f"{args.containment_tolerance*1000.0:.3f} mm")
+    print("-" * 112)
+    print(
+        f"{'source visual link':30s} {'anchor':15s} "
+        f"{'samples':>10s} {'outside':>10s} "
+        f"{'out%':>9s} {'max(mm)':>10s} {'contained':>10s}")
+
     for r in results:
-        frac = 100.0 * r["outside_fraction"] if math.isfinite(r["outside_fraction"]) else float("nan")
+        frac = (
+            100.0 * r["outside_fraction"]
+            if math.isfinite(r["outside_fraction"])
+            else float("nan"))
         print(
-            f"{r['link']:18s} {r['surface_samples']:10d} "
-            f"{r['outside_samples']:10d} {frac:10.5f} "
-            f"{1000.0*r['max_outside_m']:12.4f} "
+            f"{r['source_link']:30s} "
+            f"{r['anchor_link']:15s} "
+            f"{r['surface_samples']:10d} "
+            f"{r['outside_samples']:10d} "
+            f"{frac:9.5f} "
+            f"{1000.0*r['max_outside_m']:10.4f} "
             f"{str(r['contained']):>10s}")
 
-    print("-" * 96)
-    print(f"all_contained={payload['all_contained']}")
-    print(f"CSV:   {csv_path}")
-    print(f"JSON:  {json_path}")
-    print(f"WORST: {worst_path}")
+    print("-" * 112)
+    print(f"unmapped_visual_links={len(unmapped)}")
+    for r in unmapped:
+        print(
+            f"  UNMAPPED {r['source_link']}: {r['reason']} "
+            f"chain={r['fixed_chain']}")
+
+    print(
+        "all_mapped_visual_surfaces_contained="
+        f"{all_contained}")
+    print(f"strict_whole_robot_pass={payload['strict_whole_robot_pass']}")
+    print(f"CSV:      {csv_path}")
+    print(f"JSON:     {json_path}")
+    print(f"WORST:    {worst_path}")
+    print(f"UNMAPPED: {unmapped_path}")
 
     if worst_rows:
-        print("\nTop outside samples:")
-        for r in sorted(worst_rows, key=lambda x: x["outside_m"], reverse=True)[:10]:
+        print("\nTop outside visual-surface samples:")
+        for r in sorted(
+                worst_rows,
+                key=lambda x: x["outside_m"],
+                reverse=True)[:15]:
             print(
-                f"  {r['link']} p=[{r['x']:.6f},{r['y']:.6f},{r['z']:.6f}] "
+                f"  source={r['source_link']} "
+                f"anchor={r['anchor_link']} "
+                f"p=[{r['x_anchor']:.6f},"
+                f"{r['y_anchor']:.6f},"
+                f"{r['z_anchor']:.6f}] "
                 f"outside={1000.0*r['outside_m']:.3f} mm "
                 f"nearest={r['nearest_primitive']}")
 
-    return 0 if payload["all_contained"] else 1
+    return 0 if payload["strict_whole_robot_pass"] else 1
 
 
 if __name__ == "__main__":
