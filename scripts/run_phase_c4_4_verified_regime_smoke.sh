@@ -586,7 +586,6 @@ record_topic() {
 }
 if [ "${RECORDING_PROFILE}" = "self_filter_perf" ]; then
   echo "[RECORDING] profile=self_filter_perf (lean perception/safety set)"
-  record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
   if [ "${TOF_FUSION_ENABLED}" = "true" ]; then
     record_topic /care_planner/perception/tof_fusion_summary "${OUT}/tof_fusion_summary.csv"
     record_topic /care_planner/confidence_map/e3_summary "${OUT}/e3_summary.csv"
@@ -595,10 +594,9 @@ if [ "${RECORDING_PROFILE}" = "self_filter_perf" ]; then
     record_topic /care_planner/execution_gcdf/safety_summary "${OUT}/execution_gcdf_safety_summary.csv"
     record_topic /care_planner/execution_gcdf/hard_hold "${OUT}/execution_gcdf_hard_hold.csv"
   fi
-  if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
-    record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
-  fi
-  record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+  # Keep joint states only so an intermittent occupied blocker can still be
+  # reconstructed at its exact robot pose. Regime/local-planner/tracker logs
+  # are intentionally omitted from this perception performance profile.
   record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
 else
   echo "[RECORDING] profile=full"
