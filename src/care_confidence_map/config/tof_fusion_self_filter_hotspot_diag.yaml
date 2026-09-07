@@ -35,7 +35,7 @@ debug_occupancy_watch_z: 0.45
 debug_occupancy_watch_half_extent: 0.025
 
 # Disabled in production. The hotspot diagnostic config enables this.
-debug_hotspot_watch_enabled: true
+debug_hotspot_watch_enabled: false
 debug_hotspot_x_min: -0.025
 debug_hotspot_x_max:  0.075
 debug_hotspot_y_min:  0.025
