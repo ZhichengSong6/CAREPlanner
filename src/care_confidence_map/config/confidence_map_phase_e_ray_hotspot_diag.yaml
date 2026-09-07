@@ -1,0 +1,165 @@
+confidence_map:
+  frame: base_link
+
+  x_min: -0.95
+  x_max:  0.95
+  y_min: -0.95
+  y_max:  0.95
+  z_min:  0.0
+  z_max:  1.15
+
+  resolution: 0.05
+
+  update_rate: 30.0
+  publish_rate: 10.0
+
+  # Temporal memory of observed / initially trusted-clear space.
+  # If a voxel is not currently visible, confidence decays as:
+  # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
+  # 100 s is intentionally very slow for current active-sensing debugging,
+  # so previously observed space is effectively remembered over a normal run.
+  temporal_decay_time: 100.0
+
+  # Phase E3 semantics: real ToF ray integration. The frozen C5.41 baseline
+  # remains in confidence_map.yaml with observation_mode: ideal_fov.
+  observation_mode: tof_ray
+
+  # Phase E3 real depth-ray integration. E2 publishes one coarse ray sample
+  # per organized depth-image stride, including hit/no-hit provenance.
+  ray_observation_topic: /care_planner/perception/tof_ray_observations
+  e3_summary_topic: /care_planner/confidence_map/e3_summary
+  ray_observation_timeout: 0.25
+  ray_free_start_range: 0.0
+  ray_endpoint_guard_distance: 0.025
+  ray_step: 0.025
+  ray_min_valid_range: 0.05
+  ray_max_valid_range: 1.50
+
+  # TEMPORARY legacy/static-world latch retained for this provenance run so
+  # occupancy semantics stay identical while we trace the ghost voxel source.
+  # This is not the desired final dynamic-obstacle policy.
+  ray_persistent_occupied: true
+
+  # Diagnostic-only occupancy provenance watch. No mapping/planning semantics
+  # are changed. We are tracing the empty-world ghost voxel that triggered
+  # final/execution GCDF in phase_e_goal_000.
+  debug_occupancy_watch_enabled: false
+  debug_occupancy_watch_x: 0.20
+  debug_occupancy_watch_y: -0.05
+  debug_occupancy_watch_z: 0.45
+
+  # Diagnostic-only 3x3x3 snapshot for the current empty-world UNKNOWN blocker.
+  # Triggered only when a confidence-query request actually touches this voxel.
+  debug_neighborhood_watch_enabled: false
+  debug_neighborhood_watch_x: 0.00
+  debug_neighborhood_watch_y: -0.10
+  debug_neighborhood_watch_z: 0.15
+  debug_neighborhood_watch_period_s: 1.0
+
+  # Diagnostic-only hotspot provenance. Records packet-level HIT/FREE evidence
+  # for the suspended occupied cluster; does not change occupancy semantics.
+  debug_hotspot_watch_enabled: true
+  debug_hotspot_x_min: -0.025
+  debug_hotspot_x_max:  0.075
+  debug_hotspot_y_min:  0.025
+  debug_hotspot_y_max:  0.125
+  debug_hotspot_z_min:  0.225
+  debug_hotspot_z_max:  0.425
+
+  marker_topic: /care_planner/confidence_map/markers
+  pointcloud_topic: /care_planner/confidence_map/points
+  fov_marker_topic: /care_planner/confidence_map/fov_markers
+  query_service: /care_planner/confidence_map/query
+
+# Legacy parameter namespace kept for compatibility. Semantically this is now
+# an INITIAL trusted-free bootstrap around the robot's starting configuration.
+# It must be written exactly once and must never follow the moving robot.
+current_body_prior:
+  enabled: true
+
+  # This file is set by confidence_map.launch so that $(find ...) works.
+  body_samples_file: ""
+
+  # Cold-start trusted envelope around the INITIAL robot body only.
+  #
+  # For links that actually participate in local hard-GCDF (link2 and distal),
+  # the extra radius is:
+  #
+  #   startup_extra(link)
+  #     = 50-ms MAX Cartesian center motion
+  #       + GCDF body-proxy inflation
+  #       + local forbidden-voxel selector proximity band
+  #     = rho_motion(link) + 0.015 + 0.025 m.
+  #
+  # The 0.015 m term is the GCDF body-sphere inflation used by formal Phase-E.
+  # The 0.025 m term is NOT another collision margin: it is the local selector
+  # band used to retrieve nearby UNKNOWN/OCCUPIED voxel centers. Adding both
+  # here prevents the cold-start confidence layer from being geometrically
+  # smaller than the GCDF query footprint at q0.
+  #
+  # 50-ms MAX motion values from analyze_link_kinematic_motion_envelope.py:
+  #   link2       0.0187 m  -> startup extra 0.0587 m
+  #   link3       0.0533 m  -> startup extra 0.0933 m
+  #   link4       0.1021 m  -> startup extra 0.1421 m
+  #   wrist1      0.1406 m  -> startup extra 0.1806 m
+  #   wrist2      0.1412 m  -> startup extra 0.1812 m
+  #   wrist3      0.1700 m  -> startup extra 0.2100 m
+  #
+  # base_link and link1 are ignored by trajectory_risk/local hard-GCDF, so they
+  # do not receive this +0.040 m GCDF-query-footprint term. link1 retains only
+  # its measured 50-ms motion envelope.
+  #
+  # This is NOT a permanent FREE-space privilege. It belongs to the separate
+  # bootstrap-confidence provenance layer and can be removed before subsequent
+  # goals without erasing real ToF observations.
+  inflation_radius: 0.0
+  link_inflation_radius:
+    base_link: 0.0
+    link1: 0.0041
+    link2: 0.0587
+    link3: 0.0933
+    link4: 0.1421
+    wrist_link1: 0.1806
+    wrist_link2: 0.1812
+    wrist_link3: 0.2100
+
+  # IMPORTANT: disabled here. initialize_body_prior_once.py waits until all
+  # required body TFs are available, performs one complete refresh, then locks.
+  refresh_on_startup: false
+
+  # Safety invariant: the trusted-clear body prior belongs only to q_start.
+  # Once the initializer gets a complete-TF refresh, reject every later
+  # request that would move this free-space bubble with the robot.
+  lock_after_complete_refresh: true
+
+  # false = include all body samples, including base if present.
+  # true  = only include samples marked include_for_risk in body_samples.yaml.
+  risk_samples_only: false
+
+  tf_timeout: 0.05
+  refresh_service: /care_planner/confidence_map/refresh_body_prior
+  # Multi-goal/session orchestrators should call this before goal 2 (or after an
+  # explicit map/session reset policy decides the cold-start phase is over).
+  deactivate_service: /care_planner/confidence_map/deactivate_body_prior
+  marker_topic: /care_planner/confidence_map/current_body_prior_markers
+
+sensor_model:
+  forward_axis: z
+
+  tof_min_range: 0.15
+  tof_max_range: 0.75
+
+  horizontal_fov_deg: 55.0
+  vertical_fov_deg: 72.0
+
+  local_resolution: 0.05
+
+  sensors:
+    - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
+    - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
+    - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
+    - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
+    - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
+    - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
+    - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
+    - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}
