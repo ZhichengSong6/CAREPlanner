@@ -85,6 +85,11 @@ struct SensorState
 
   ros::Time cloud_stamp;
   ros::Time received;
+  ros::Time next_processing_stamp;
+
+  std::size_t callbacks_received = 0;
+  std::size_t callbacks_processed = 0;
+  std::size_t callbacks_throttled = 0;
 
   std::size_t raw_points = 0;
   std::size_t voxel_points = 0;
@@ -214,6 +219,14 @@ public:
     pnh_.param("sensor_timeout", sensor_timeout_, 0.25);
     pnh_.param("tf_timeout", tf_timeout_, 0.03);
     pnh_.param("publish_rate", publish_rate_, 15.0);
+    pnh_.param(
+        "per_sensor_processing_rate",
+        per_sensor_processing_rate_,
+        15.0);
+    pnh_.param(
+        "processing_schedule_tolerance_s",
+        processing_schedule_tolerance_s_,
+        0.001);
     pnh_.param("ray_pixel_stride", ray_pixel_stride_, 8);
     pnh_.param("ray_horizontal_fov_deg", ray_horizontal_fov_deg_, 55.0);
     pnh_.param("ray_vertical_fov_deg", ray_vertical_fov_deg_, 72.0);
@@ -287,6 +300,8 @@ public:
         sensor_timeout_ <= 0.0 ||
         tf_timeout_ < 0.0 ||
         publish_rate_ <= 0.0 ||
+        per_sensor_processing_rate_ <= 0.0 ||
+        processing_schedule_tolerance_s_ < 0.0 ||
         ray_pixel_stride_ < 1 ||
         ray_horizontal_fov_deg_ <= 0.0 ||
         ray_vertical_fov_deg_ <= 0.0 ||
@@ -336,7 +351,9 @@ public:
         << " primitives=" << primitive_count_
         << " runtime_padding_m=0"
         << " timestamp_geometry=cloud_stamp"
-        << " target_publish_hz=" << publish_rate_);
+        << " target_publish_hz=" << publish_rate_
+        << " target_processing_hz_per_sensor="
+        << per_sensor_processing_rate_);
 
     for (std::size_t i = 0; i < input_topics_.size(); ++i)
     {
@@ -699,6 +716,47 @@ private:
       return;
     }
 
+    // Raw simulated ToF clouds arrive at 30 Hz per sensor, while the fused
+    // perception product is intentionally 15 Hz.  Throttle each sensor before
+    // PointCloud2->PCL conversion so skipped frames cost only a tiny callback.
+    // The deadline schedule is stamp-based rather than "every other message",
+    // which remains well-behaved if an upstream frame is occasionally dropped.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      SensorState& state = sensor_states_[sensor_index];
+      ++state.callbacks_received;
+
+      const double period_s = 1.0 / per_sensor_processing_rate_;
+      const ros::Duration period(period_s);
+      const ros::Duration tolerance(processing_schedule_tolerance_s_);
+
+      if (state.next_processing_stamp.isZero())
+      {
+        state.next_processing_stamp = msg->header.stamp;
+      }
+
+      if (!msg->header.stamp.isZero() &&
+          msg->header.stamp + tolerance < state.next_processing_stamp)
+      {
+        ++state.callbacks_throttled;
+        return;
+      }
+
+      ++state.callbacks_processed;
+
+      if (!msg->header.stamp.isZero())
+      {
+        // Advance the ideal deadline until it lies strictly after the current
+        // processed stamp (with a tiny numerical tolerance).
+        do
+        {
+          state.next_processing_stamp += period;
+        }
+        while (state.next_processing_stamp <=
+               msg->header.stamp + tolerance);
+      }
+    }
+
     const ros::WallTime callback_start = ros::WallTime::now();
 
     pcl::PointCloud<pcl::PointXYZ>::Ptr raw(
@@ -1019,6 +1077,9 @@ private:
 
     std::size_t active_sensors = 0;
     std::size_t stale_sensors = 0;
+    std::size_t callbacks_received = 0;
+    std::size_t callbacks_processed = 0;
+    std::size_t callbacks_throttled = 0;
     std::size_t raw_points = 0;
     std::size_t voxel_points = 0;
     std::size_t self_removed = 0;
@@ -1044,6 +1105,9 @@ private:
 
     for (const auto& state : states)
     {
+      callbacks_received += state.callbacks_received;
+      callbacks_processed += state.callbacks_processed;
+      callbacks_throttled += state.callbacks_throttled;
       tf_failures += state.tf_failures;
       body_tf_failures += state.body_tf_failures;
       dropped_for_body_tf += state.dropped_for_body_tf;
@@ -1265,6 +1329,16 @@ private:
         << " configured_sensors=" << input_topics_.size()
         << " active_sensors=" << active_sensors
         << " stale_sensors=" << stale_sensors
+        << " target_processing_hz_per_sensor="
+        << per_sensor_processing_rate_
+        << " callbacks_received=" << callbacks_received
+        << " callbacks_processed=" << callbacks_processed
+        << " callbacks_throttled=" << callbacks_throttled
+        << " processing_keep_ratio="
+        << (callbacks_received > 0
+                ? static_cast<double>(callbacks_processed) /
+                      static_cast<double>(callbacks_received)
+                : std::numeric_limits<double>::quiet_NaN())
         << " raw_points=" << raw_points
         << " input_voxel_points=" << voxel_points
         << " self_removed=" << self_removed
@@ -1315,6 +1389,8 @@ private:
   double sensor_timeout_ = 0.25;
   double tf_timeout_ = 0.03;
   double publish_rate_ = 15.0;
+  double per_sensor_processing_rate_ = 15.0;
+  double processing_schedule_tolerance_s_ = 0.001;
 
   int ray_pixel_stride_ = 8;
   double ray_horizontal_fov_deg_ = 55.0;
