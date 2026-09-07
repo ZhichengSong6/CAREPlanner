@@ -93,7 +93,7 @@ for CASE_ID in "${CASES[@]}"; do
     echo "${RC}" > "${DST}/runner_rc.txt"
 
     if [[ -d "${RUN_ROOT}/run" ]]; then
-      for name in         tof_fusion_summary.csv         e3_summary.csv         execution_gcdf_safety_summary.csv         execution_gcdf_hard_hold.csv         regime_summary.csv         local_planner_summary.csv         tracker_summary.csv         joint_states.csv; do
+      for name in         tof_fusion_summary.csv         e3_summary.csv         execution_gcdf_safety_summary.csv         execution_gcdf_hard_hold.csv         joint_states.csv; do
         [[ -f "${RUN_ROOT}/run/${name}" ]] &&           cp -f "${RUN_ROOT}/run/${name}" "${DST}/${name}"
       done
     fi
@@ -132,26 +132,36 @@ def parse_summary(path):
     rows = []
     if not os.path.isfile(path):
         return rows
-    with open(path, newline="", errors="replace") as f:
-        rd = csv.reader(f)
-        h = next(rd, [])
-        if not h:
-            return rows
-        di = h.index("field.data") if "field.data" in h else 1
-        for row in rd:
-            if len(row) <= di:
+    with open(path, errors="replace") as f:
+        f.readline()
+        for raw in f:
+            raw = raw.rstrip("\n")
+            if not raw or "," not in raw:
                 continue
-            rows.append(dict(TOK.findall(",".join(row[di:]))))
+            ts_s, data = raw.split(",", 1)
+            try:
+                # rostopic echo -p emits ROS-time nanoseconds.
+                ts_ros_s = float(ts_s) / 1e9
+            except Exception:
+                ts_ros_s = math.nan
+            rows.append((ts_ros_s, dict(TOK.findall(data))))
     return rows
 
 def vals(rows, key):
     out = []
     steady = rows[10:] if len(rows) > 20 else rows
-    for r in steady:
+    for _, r in steady:
         v = fnum(r.get(key))
         if math.isfinite(v):
             out.append(v)
     return out
+
+def sim_topic_hz(rows):
+    steady = rows[10:] if len(rows) > 20 else rows
+    ts = [t for t, _ in steady if math.isfinite(t)]
+    if len(ts) < 2 or ts[-1] <= ts[0]:
+        return math.nan
+    return (len(ts) - 1) / (ts[-1] - ts[0])
 
 records = []
 for trial_dir in sorted(glob.glob(os.path.join(art, "*", "trial_*"))):
@@ -170,7 +180,7 @@ for trial_dir in sorted(glob.glob(os.path.join(art, "*", "trial_*"))):
 
     hard_events = 0
     occupied_hard = 0
-    for r in safety:
+    for _, r in safety:
         try:
             hard_events = max(hard_events, int(float(r.get("hard_event_count", 0))))
         except Exception:
@@ -178,11 +188,12 @@ for trial_dir in sorted(glob.glob(os.path.join(art, "*", "trial_*"))):
         if r.get("state") == "HARD_HOLD" and r.get("min_source") == "occupied":
             occupied_hard = 1
 
-    last = tof[-1] if tof else {}
+    last = tof[-1][1] if tof else {}
     rec = {
         "case_id": case_id,
         "trial": trial,
         "tof_samples": len(tof),
+        "sim_topic_hz": sim_topic_hz(tof),
         "median_wall_publish_hz": statistics.median(hz) if hz else math.nan,
         "p10_wall_publish_hz": (
             sorted(hz)[max(0, int(0.10*(len(hz)-1)))] if hz else math.nan),
@@ -207,7 +218,7 @@ for trial_dir in sorted(glob.glob(os.path.join(art, "*", "trial_*"))):
 
 fields = [
     "case_id", "trial", "tof_samples",
-    "median_wall_publish_hz", "p10_wall_publish_hz",
+    "sim_topic_hz", "median_wall_publish_hz", "p10_wall_publish_hz",
     "median_publish_callback_ms", "median_cloud_callback_ms",
     "median_self_filter_ms", "median_body_tf_ms",
     "body_tf_failures", "dropped_for_body_tf",
@@ -224,7 +235,8 @@ with open(txt_out, "w") as f:
     f.write("Wall-clock 15 Hz pass threshold: median >= 14.5 Hz.\n\n")
     for r in records:
         f.write(
-            "{case_id} {trial}: wall_hz={median_wall_publish_hz:.3f}, "
+            "{case_id} {trial}: sim_hz={sim_topic_hz:.3f}, "
+            "wall_hz={median_wall_publish_hz:.3f}, "
             "p10_hz={p10_wall_publish_hz:.3f}, "
             "self_filter={median_self_filter_ms:.3f} ms, "
             "cloud_cb={median_cloud_callback_ms:.3f} ms, "
