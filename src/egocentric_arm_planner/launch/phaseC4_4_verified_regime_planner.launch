@@ -498,6 +498,10 @@
     <param name="sensor_name" value="$(arg runtime_self_hit_sensor_name)" />
     <param name="self_filter_urdf"
            value="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+    <param name="reference_urdf"
+           value="$(find arm_description)/urdf/Arm.urdf" />
+    <param name="gazebo_link_states_topic" value="/gazebo/link_states" />
+    <param name="gazebo_model_name" value="care_arm" />
     <param name="hard_hold_topic"
            value="$(arg execution_gcdf_hard_hold_topic)" />
     <param name="joint_topic" value="/care_arm/joint_states" />
