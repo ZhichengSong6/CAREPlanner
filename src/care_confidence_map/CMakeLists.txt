@@ -10,6 +10,7 @@ find_package(catkin REQUIRED COMPONENTS
   std_srvs
   sensor_msgs
   geometry_msgs
+  gazebo_msgs
   trajectory_msgs
   visualization_msgs
   tf2
@@ -46,6 +47,7 @@ catkin_package(
     std_srvs
     sensor_msgs
     geometry_msgs
+    gazebo_msgs
     trajectory_msgs
     visualization_msgs
     tf2
