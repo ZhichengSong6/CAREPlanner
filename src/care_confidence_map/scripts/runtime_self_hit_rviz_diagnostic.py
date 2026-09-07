@@ -37,6 +37,7 @@ import tf.transformations as tft
 import tf2_ros
 
 from geometry_msgs.msg import Point
+from gazebo_msgs.msg import LinkStates
 from sensor_msgs.msg import JointState, PointCloud2
 from std_msgs.msg import Bool, ColorRGBA
 from visualization_msgs.msg import Marker, MarkerArray
@@ -168,6 +169,10 @@ class RuntimeSelfHitDiag:
         self.sensor_id = int(rospy.get_param("~sensor_id", 5))
         self.sensor_name = rospy.get_param("~sensor_name", "link4_sensor2")
         self.urdf_path = rospy.get_param("~self_filter_urdf")
+        self.reference_urdf = rospy.get_param("~reference_urdf")
+        self.gazebo_link_states_topic = rospy.get_param(
+            "~gazebo_link_states_topic", "/gazebo/link_states")
+        self.gazebo_model_name = rospy.get_param("~gazebo_model_name", "care_arm")
         self.marker_topic = rospy.get_param(
             "~marker_topic", "/care_planner/debug/markers")
         self.hard_hold_topic = rospy.get_param(
@@ -200,6 +205,9 @@ class RuntimeSelfHitDiag:
 
         self.primitives = self.load_primitives(self.urdf_path)
         self.link_names = sorted({p["link"] for p in self.primitives})
+        self.visual_meshes = self.load_visual_meshes(
+            self.reference_urdf,
+            ["link1", "link2", "link3", "link4"])
 
         self.tfbuf = tf2_ros.Buffer(cache_time=rospy.Duration(5.0))
         self.tfl = tf2_ros.TransformListener(self.tfbuf)
@@ -212,9 +220,15 @@ class RuntimeSelfHitDiag:
         self.latest_markers = None
         self.latest_summary = ""
         self.frozen = False
+        self.latest_gz_links = {}
+        self.latest_gz_receipt = rospy.Time(0)
+        self.last_tf_links = {}
 
         rospy.Subscriber(self.joint_topic, JointState, self.on_joint, queue_size=1)
         rospy.Subscriber(self.hard_hold_topic, Bool, self.on_hold, queue_size=1)
+        rospy.Subscriber(
+            self.gazebo_link_states_topic, LinkStates,
+            self.on_link_states, queue_size=1)
         self.cloud_sub = rospy.Subscriber(
             self.raw_topic, PointCloud2, self.on_cloud, queue_size=1)
         self.timer = rospy.Timer(rospy.Duration(0.2), self.on_timer)
@@ -228,6 +242,26 @@ class RuntimeSelfHitDiag:
         idx = {n: i for i, n in enumerate(msg.name)}
         if all(n in idx for n in self.q_names):
             self.latest_q = [float(msg.position[idx[n]]) for n in self.q_names]
+
+    def on_link_states(self, msg):
+        poses = {}
+        for name, pose in zip(msg.name, msg.pose):
+            short = name.split("::")[-1]
+            if self.gazebo_model_name and "::" in name:
+                model = name.split("::", 1)[0]
+                if model != self.gazebo_model_name:
+                    continue
+            q = pose.orientation
+            T = tft.quaternion_matrix([q.x, q.y, q.z, q.w])
+            T[:3, 3] = [pose.position.x, pose.position.y, pose.position.z]
+            poses[short] = T
+        if "base_link" in poses:
+            T_base_world = np.linalg.inv(poses["base_link"])
+            self.latest_gz_links = {
+                name: T_base_world.dot(T)
+                for name, T in poses.items()
+            }
+            self.latest_gz_receipt = rospy.Time.now()
 
     def on_hold(self, msg):
         if msg.data and not self.frozen:
@@ -279,6 +313,36 @@ class RuntimeSelfHitDiag:
             raise RuntimeError("no supported primitives in " + path)
         return out
 
+    def load_visual_meshes(self, path, links):
+        if not os.path.isfile(path):
+            raise RuntimeError("missing reference URDF: " + path)
+        root = ET.parse(path).getroot()
+        wanted = set(links)
+        out = {}
+        for link in root.findall("link"):
+            lname = link.attrib.get("name", "")
+            if lname not in wanted:
+                continue
+            entries = []
+            for vis in link.findall("visual"):
+                geom = vis.find("geometry")
+                mesh = geom.find("mesh") if geom is not None else None
+                if mesh is None:
+                    continue
+                org = vis.find("origin")
+                xyz = vec(org.attrib.get("xyz")) if org is not None else vec(None)
+                rpy = vec(org.attrib.get("rpy")) if org is not None else vec(None)
+                scale = vec(mesh.attrib.get("scale"), (1.0, 1.0, 1.0))
+                entries.append({
+                    "uri": mesh.attrib.get("filename", ""),
+                    "T_link_visual": T_xyz_rpy(xyz, rpy),
+                    "scale": scale,
+                })
+            if entries:
+                out[lname] = entries
+        return out
+
+
     def timed_primitives(self, stamp):
         link_T = {}
         for lname in self.link_names:
@@ -292,6 +356,7 @@ class RuntimeSelfHitDiag:
                 return None
             link_T[lname] = T_from_tf(tfm)
 
+        self.last_tf_links = link_T
         timed = []
         for p in self.primitives:
             q = dict(p)
@@ -314,13 +379,14 @@ class RuntimeSelfHitDiag:
             best_i[m] = i
         return best, best_i
 
-    def first_ray_self_intersection(self, origin, endpoint, timed):
+    def first_ray_self_intersection(
+            self, origin, endpoint, timed, start_distance=0.0):
         delta = endpoint - origin
         measured = float(np.linalg.norm(delta))
-        if measured <= self.near_clip + 1e-6:
+        start = max(0.0, float(start_distance))
+        if measured <= start + 1e-6:
             return None
         dbase = delta / measured
-        start = self.near_clip
         ostart = origin + dbase * start
         seg_len = measured - start
 
@@ -359,10 +425,40 @@ class RuntimeSelfHitDiag:
         arr.markers.append(m)
         return m
 
-    def make_markers(self, stamp, Tbs, timed, self_pts, suspects, ray_hits,
-                     nearest_labels, nearest_d, pixels):
+    def make_markers(
+            self, stamp, Tbs, timed, self_pts, suspects,
+            ray_hits_full, ray_hits_after_near,
+            nearest_labels, nearest_d, pixels):
         arr = MarkerArray()
         mid = 0
+
+        # Purple ghost meshes use Gazebo's actual simulated link poses.
+        # RobotModel in RViz is TF/FK-based. Visible separation between the two
+        # directly exposes Gazebo-physics pose vs TF pose disagreement.
+        gz_age = (
+            (rospy.Time.now() - self.latest_gz_receipt).to_sec()
+            if not self.latest_gz_receipt.is_zero() else float("inf"))
+        if gz_age < 0.20:
+            for lname, entries in self.visual_meshes.items():
+                Tgz = self.latest_gz_links.get(lname)
+                if Tgz is None:
+                    continue
+                for entry in entries:
+                    T = Tgz.dot(entry["T_link_visual"])
+                    q = tft.quaternion_from_matrix(T)
+                    m = self.add_marker(
+                        arr, "gazebo_actual_visual", mid,
+                        Marker.MESH_RESOURCE, stamp)
+                    mid += 1
+                    m.mesh_resource = entry["uri"]
+                    m.mesh_use_embedded_materials = False
+                    m.pose.position = point(T[:3, 3])
+                    m.pose.orientation.x = q[0]
+                    m.pose.orientation.y = q[1]
+                    m.pose.orientation.z = q[2]
+                    m.pose.orientation.w = q[3]
+                    m.scale.x, m.scale.y, m.scale.z = map(float, entry["scale"])
+                    m.color = rgba(0.75, 0.2, 1.0, 0.18)
 
         # Exact self-filter primitive union at the cloud stamp.
         for p in timed:
@@ -421,6 +517,20 @@ class RuntimeSelfHitDiag:
         for i in range(4):
             fr.points.extend([point(far[i]), point(far[(i + 1) % 4])])
 
+        near = [
+            tfp([-self.near_clip * hx, -self.near_clip * hy, self.near_clip]),
+            tfp([ self.near_clip * hx, -self.near_clip * hy, self.near_clip]),
+            tfp([ self.near_clip * hx,  self.near_clip * hy, self.near_clip]),
+            tfp([-self.near_clip * hx,  self.near_clip * hy, self.near_clip]),
+        ]
+        nr = self.add_marker(
+            arr, "runtime_sensor_near_plane", mid, Marker.LINE_LIST, stamp)
+        mid += 1
+        nr.scale.x = 0.006
+        nr.color = rgba(1.0, 0.45, 0.0, 1.0)
+        for i in range(4):
+            nr.points.extend([point(near[i]), point(near[(i + 1) % 4])])
+
         if len(self_pts):
             m = self.add_marker(arr, "runtime_self_hits", mid, Marker.POINTS, stamp)
             mid += 1
@@ -435,22 +545,43 @@ class RuntimeSelfHitDiag:
             m.color = rgba(1.0, 0.05, 0.05, 1.0)
             m.points = [point(x) for x in suspects]
 
-            rays = self.add_marker(arr, "runtime_suspect_rays", mid,
-                                   Marker.LINE_LIST, stamp)
+            rays_cross = self.add_marker(
+                arr, "runtime_suspect_rays_cross_self", mid,
+                Marker.LINE_LIST, stamp)
             mid += 1
-            rays.scale.x = 0.003
-            rays.color = rgba(1.0, 0.0, 1.0, 0.85)
-            for p in suspects:
-                rays.points.extend([point(origin), point(p)])
+            rays_cross.scale.x = 0.003
+            rays_cross.color = rgba(1.0, 0.0, 1.0, 0.85)
 
-            ints = [r[2] for r in ray_hits if r is not None]
-            if ints:
-                m = self.add_marker(arr, "runtime_first_self_intersection", mid,
-                                    Marker.POINTS, stamp)
+            rays_clear = self.add_marker(
+                arr, "runtime_suspect_rays_no_self_cross", mid,
+                Marker.LINE_LIST, stamp)
+            mid += 1
+            rays_clear.scale.x = 0.003
+            rays_clear.color = rgba(1.0, 0.15, 0.15, 0.95)
+
+            for p, hit in zip(suspects, ray_hits_full):
+                target = rays_cross if hit is not None else rays_clear
+                target.points.extend([point(origin), point(p)])
+
+            ints_full = [r[2] for r in ray_hits_full if r is not None]
+            if ints_full:
+                m = self.add_marker(
+                    arr, "runtime_first_self_intersection_full", mid,
+                    Marker.POINTS, stamp)
                 mid += 1
-                m.scale.x = m.scale.y = 0.012
+                m.scale.x = m.scale.y = 0.013
                 m.color = rgba(0.1, 0.45, 1.0, 1.0)
-                m.points = [point(x) for x in ints]
+                m.points = [point(x) for x in ints_full]
+
+            ints_near = [r[2] for r in ray_hits_after_near if r is not None]
+            if ints_near:
+                m = self.add_marker(
+                    arr, "runtime_first_self_intersection_after_near", mid,
+                    Marker.POINTS, stamp)
+                mid += 1
+                m.scale.x = m.scale.y = 0.009
+                m.color = rgba(0.2, 1.0, 1.0, 1.0)
+                m.points = [point(x) for x in ints_near]
 
             voxels = {}
             for p in suspects:
@@ -468,7 +599,27 @@ class RuntimeSelfHitDiag:
         qtxt = "q=unavailable"
         if self.latest_q is not None:
             qtxt = "q=[" + ",".join("%.3f" % x for x in self.latest_q) + "]"
-        cross = sum(1 for r in ray_hits if r is not None)
+        cross_full = sum(1 for r in ray_hits_full if r is not None)
+        cross_near = sum(
+            1 for r in ray_hits_after_near if r is not None)
+
+        pose_parts = []
+        if gz_age < 0.20:
+            for lname in ("link1", "link2", "link3", "link4"):
+                Ttf = self.last_tf_links.get(lname)
+                Tgz = self.latest_gz_links.get(lname)
+                if Ttf is None or Tgz is None:
+                    continue
+                dp = 1000.0 * float(np.linalg.norm(
+                    Ttf[:3, 3] - Tgz[:3, 3]))
+                R = Ttf[:3, :3].T.dot(Tgz[:3, :3])
+                ca = max(-1.0, min(
+                    1.0, (float(np.trace(R)) - 1.0) * 0.5))
+                da = math.degrees(math.acos(ca))
+                pose_parts.append("%s %.1fmm/%.2fdeg" % (lname, dp, da))
+        pose_txt = "gz-vs-tf: " + (
+            "  ".join(pose_parts) if pose_parts else "unavailable")
+
         txt = self.add_marker(arr, "runtime_self_hit_text", mid,
                               Marker.TEXT_VIEW_FACING, stamp)
         txt.pose.position = point(origin + np.asarray([0.0, 0.0, 0.08]))
@@ -477,9 +628,12 @@ class RuntimeSelfHitDiag:
         txt.text = (
             "sensor %d: %s\n"
             "stamp=%.3f  hotspot self=%d suspect=%d\n"
-            "ray_crosses_self=%d/%d\n%s" %
+            "ray_cross_full=%d/%d  after_near=%.2fm: %d/%d\n"
+            "%s\n%s" %
             (self.sensor_id, self.sensor_name, stamp.to_sec(),
-             len(self_pts), len(suspects), cross, len(suspects), qtxt))
+             len(self_pts), len(suspects),
+             cross_full, len(suspects), self.near_clip,
+             cross_near, len(suspects), qtxt, pose_txt))
 
         if len(suspects):
             k = int(np.argmax(nearest_d))
@@ -553,7 +707,8 @@ class RuntimeSelfHitDiag:
         nearest_labels = []
         nearest_d = []
         pixels = []
-        ray_hits = []
+        ray_hits_full = []
+        ray_hits_after_near = []
         origin = Tbs[:3, 3]
         suspect_indices = np.flatnonzero(suspect_mask)
         for j in suspect_indices:
@@ -562,35 +717,72 @@ class RuntimeSelfHitDiag:
                 "%s/%s" % (timed[pi]["link"], timed[pi]["name"]))
             nearest_d.append(float(best[j]))
             pixels.append(uvh[j])
-            ray_hits.append(
-                self.first_ray_self_intersection(origin, P[j], timed))
+            ray_hits_full.append(
+                self.first_ray_self_intersection(
+                    origin, P[j], timed, start_distance=0.0))
+            ray_hits_after_near.append(
+                self.first_ray_self_intersection(
+                    origin, P[j], timed, start_distance=self.near_clip))
 
         nearest_d = np.asarray(nearest_d, dtype=np.float64)
         self.latest_markers = self.make_markers(
-            stamp, Tbs, timed, self_pts, suspects, ray_hits,
+            stamp, Tbs, timed, self_pts, suspects,
+            ray_hits_full, ray_hits_after_near,
             nearest_labels, nearest_d, pixels)
 
         if len(suspects):
-            cross = sum(r is not None for r in ray_hits)
+            cross_full = sum(r is not None for r in ray_hits_full)
+            cross_near = sum(
+                r is not None for r in ray_hits_after_near)
             k = int(np.argmax(nearest_d))
-            r = ray_hits[k]
-            rtxt = "none"
-            if r is not None:
+            rfull = ray_hits_full[k]
+            rnear = ray_hits_after_near[k]
+
+            def ray_text(r):
+                if r is None:
+                    return "none"
                 p = timed[r[1]]
                 measured = float(np.linalg.norm(suspects[k] - origin))
-                rtxt = "%s/%s entry=%.3fm overshoot=%.1fmm" % (
+                return "%s/%s entry=%.3fm overshoot=%.1fmm" % (
                     p["link"], p["name"], r[0],
                     1000.0 * (measured - r[0]))
+
+            pose_parts = []
+            gz_age = (
+                (rospy.Time.now() - self.latest_gz_receipt).to_sec()
+                if not self.latest_gz_receipt.is_zero()
+                else float("inf"))
+            if gz_age < 0.20:
+                for lname in ("link1", "link2", "link3", "link4"):
+                    Ttf = self.last_tf_links.get(lname)
+                    Tgz = self.latest_gz_links.get(lname)
+                    if Ttf is None or Tgz is None:
+                        continue
+                    dp = 1000.0 * float(np.linalg.norm(
+                        Ttf[:3, 3] - Tgz[:3, 3]))
+                    R = Ttf[:3, :3].T.dot(Tgz[:3, :3])
+                    ca = max(-1.0, min(
+                        1.0, (float(np.trace(R)) - 1.0) * 0.5))
+                    da = math.degrees(math.acos(ca))
+                    pose_parts.append(
+                        "%s=%.2fmm/%.3fdeg" % (lname, dp, da))
+            pose_diag = ",".join(pose_parts) if pose_parts else "unavailable"
+
             self.latest_summary = (
                 "stamp=%.3f sensor=%d:%s q=%s suspect=%d self=%d "
-                "ray_cross_self=%d/%d worst_pixel=%s worst_endpoint=%s "
-                "nearest=%s outside=%.2fmm ray_first=%s" %
+                "ray_cross_full=%d/%d ray_cross_after_near=%d/%d "
+                "worst_pixel=%s worst_endpoint=%s "
+                "nearest=%s outside=%.2fmm ray_full=%s "
+                "ray_after_near=%s gz_tf_pose={%s}" %
                 (stamp.to_sec(), self.sensor_id, self.sensor_name,
                  ("[" + ",".join("%.5f" % x for x in self.latest_q) + "]")
                  if self.latest_q is not None else "unavailable",
-                 len(suspects), len(self_pts), cross, len(suspects),
+                 len(suspects), len(self_pts),
+                 cross_full, len(suspects),
+                 cross_near, len(suspects),
                  pixels[k], np.array2string(suspects[k], precision=5),
-                 nearest_labels[k], 1000.0 * nearest_d[k], rtxt))
+                 nearest_labels[k], 1000.0 * nearest_d[k],
+                 ray_text(rfull), ray_text(rnear), pose_diag))
             rospy.logwarn_throttle(
                 1.0, "[RUNTIME_SELF_HIT_DIAG] " + self.latest_summary)
 
