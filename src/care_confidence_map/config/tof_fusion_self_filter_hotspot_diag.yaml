@@ -20,6 +20,12 @@ tf_timeout: 0.03
 sensor_timeout: 0.25
 publish_rate: 15.0
 
+# Raw Gazebo ToF clouds arrive at 30 Hz. The fused/ray product is 15 Hz, so
+# process each sensor on a 15 Hz stamp deadline and discard intermediate raw
+# callbacks before PointCloud2->PCL conversion.
+per_sensor_processing_rate: 15.0
+processing_schedule_tolerance_s: 0.001
+
 # Phase E3 ray transport. We sample the organized 240x335 depth image rather
 # than publishing every pixel into the dense 5-cm map.
 ray_pixel_stride: 8
