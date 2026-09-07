@@ -11,6 +11,13 @@
   <arg name="tof_fusion_config_file"
        default="$(find care_confidence_map)/config/tof_fusion_self_filter.yaml" />
   <arg name="tof_fusion_enabled" default="false" />
+  <!-- Diagnostic-only runtime self-hit visualization. No perception/planning
+       semantics are changed when enabled. -->
+  <arg name="runtime_self_hit_rviz_diag_enabled" default="false" />
+  <arg name="runtime_self_hit_sensor_id" default="5" />
+  <arg name="runtime_self_hit_sensor_name" default="link4_sensor2" />
+  <arg name="runtime_self_hit_raw_topic" default="/link4_sensor2/tof/cloud" />
+  <arg name="runtime_self_hit_sensor_frame" default="link4_sensor2_tof_link" />
 
   <arg name="waypoint_weight" default="3000.0" />
   <arg name="waypoint_timeout" default="0.20" />
@@ -475,6 +482,39 @@
     <arg name="config_file" value="$(arg confidence_map_config_file)" />
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
+
+  <!-- Diagnostic-only: reproduce endpoint containment for the selected raw
+       ToF, compute exact ray/self-primitive intersections, and publish a
+       frozen RViz snapshot when execution GCDF enters HARD_HOLD. -->
+  <node if="$(arg runtime_self_hit_rviz_diag_enabled)"
+        pkg="care_confidence_map"
+        type="runtime_self_hit_rviz_diagnostic.py"
+        name="runtime_self_hit_rviz_diagnostic"
+        output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="raw_topic" value="$(arg runtime_self_hit_raw_topic)" />
+    <param name="sensor_frame" value="$(arg runtime_self_hit_sensor_frame)" />
+    <param name="sensor_id" value="$(arg runtime_self_hit_sensor_id)" />
+    <param name="sensor_name" value="$(arg runtime_self_hit_sensor_name)" />
+    <param name="self_filter_urdf"
+           value="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+    <param name="hard_hold_topic"
+           value="$(arg execution_gcdf_hard_hold_topic)" />
+    <param name="joint_topic" value="/care_arm/joint_states" />
+    <param name="marker_topic" value="/care_planner/debug/markers" />
+    <param name="pixel_stride" value="8" />
+    <param name="near_clip" value="0.15" />
+    <param name="far_clip" value="0.75" />
+    <param name="horizontal_fov_deg" value="55.0" />
+    <param name="vertical_fov_deg" value="72.0" />
+    <param name="hotspot_x_min" value="-0.025" />
+    <param name="hotspot_x_max" value="0.075" />
+    <param name="hotspot_y_min" value="-0.025" />
+    <param name="hotspot_y_max" value="0.125" />
+    <param name="hotspot_z_min" value="0.20" />
+    <param name="hotspot_z_max" value="0.425" />
+    <param name="map_resolution" value="0.05" />
+  </node>
 
 
   <!-- C5.4 inner-loop geometry query. This second risk instance is isolated
