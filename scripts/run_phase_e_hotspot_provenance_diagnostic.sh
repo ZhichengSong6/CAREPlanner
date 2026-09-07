@@ -22,7 +22,8 @@ MAX_TRIALS_PER_CASE="${MAX_TRIALS_PER_CASE:-5}"
 GAZEBO_GUI="${GAZEBO_GUI:-false}"
 USE_RVIZ="${USE_RVIZ:-false}"
 RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED:-true}"
-CASES=(phase_e_goal_004 phase_e_goal_015 phase_e_goal_022)
+CASES_CSV="${CASES_CSV:-phase_e_goal_004,phase_e_goal_015,phase_e_goal_022}"
+IFS=',' read -r -a CASES <<< "${CASES_CSV}"
 
 cd "${REPO}"
 
