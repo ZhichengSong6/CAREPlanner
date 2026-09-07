@@ -1,4 +1,3 @@
-#!/usr/bin/env cpp
 #include <ros/ros.h>
 
 #include <sensor_msgs/PointCloud2.h>
@@ -533,6 +532,21 @@ private:
       return false;
     }
 
+    // Gazebo publishes the eight ToF clouds with a common simulation stamp.
+    // Reuse the exact-stamp link transforms across those callbacks so the
+    // dedicated-URDF filter does not multiply TF lookup cost by eight.
+    if (!geometry_cache_stamp_.isZero() &&
+        stamp == geometry_cache_stamp_ &&
+        geometry_cache_.size() == link_geometries_.size())
+    {
+      *timed = geometry_cache_;
+      if (failure_count)
+      {
+        *failure_count = 0;
+      }
+      return true;
+    }
+
     timed->clear();
     timed->reserve(link_geometries_.size());
 
@@ -564,7 +578,14 @@ private:
     // Fail closed for mapping: if the self model is incomplete at this cloud
     // timestamp, do not publish environmental occupied endpoints from that
     // cloud. A partial self model can turn robot returns into false obstacles.
-    return failures == 0 && timed->size() == link_geometries_.size();
+    const bool complete =
+        failures == 0 && timed->size() == link_geometries_.size();
+    if (complete)
+    {
+      geometry_cache_stamp_ = stamp;
+      geometry_cache_ = *timed;
+    }
+    return complete;
   }
 
   double primitiveSignedDistance(
@@ -621,6 +642,10 @@ private:
 
         if (d <= 0.0)
         {
+          if (!nearest)
+          {
+            return true;
+          }
           is_self = true;
         }
       }
@@ -1312,6 +1337,8 @@ private:
 
   std::vector<LinkGeometry> link_geometries_;
   std::size_t primitive_count_ = 0;
+  ros::Time geometry_cache_stamp_;
+  std::vector<TimedLinkGeometry> geometry_cache_;
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
