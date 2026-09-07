@@ -55,6 +55,30 @@ def load_primitives(urdf_path):
     return out
 
 
+def load_visual_meshes(urdf_path):
+    root = ET.parse(urdf_path).getroot()
+    out = {}
+    for link in root.findall("link"):
+        lname = link.attrib.get("name", "")
+        visuals = []
+        for i, vis in enumerate(link.findall("visual")):
+            geom = vis.find("geometry")
+            mesh = geom.find("mesh") if geom is not None else None
+            if mesh is None:
+                continue
+            origin = vis.find("origin")
+            xyz = parse_vec(origin.attrib.get("xyz")) if origin is not None else (0,0,0)
+            rpy = parse_vec(origin.attrib.get("rpy")) if origin is not None else (0,0,0)
+            scale = parse_vec(mesh.attrib.get("scale"), (1.0,1.0,1.0))
+            visuals.append((
+                vis.attrib.get("name", f"visual_{i}"),
+                mesh.attrib.get("filename", ""),
+                xyz, rpy, scale))
+        if visuals:
+            out[lname] = visuals
+    return out
+
+
 def load_worst_points(csv_path, selected_links, max_per_link, min_outside_mm):
     rows = []
     with open(csv_path, newline="", errors="replace") as f:
@@ -106,6 +130,9 @@ def main():
         "~self_filter_urdf",
         "/home/zhicheng/Project/CAREPlanner/src/arm_description/urdf/"
         "Arm_with_self_filter_collision.urdf")
+    reference_urdf = rospy.get_param(
+        "~reference_urdf",
+        "/home/zhicheng/Project/CAREPlanner/src/arm_description/urdf/Arm.urdf")
     selected = rospy.get_param("~links", "link2,link1,link3,link4,wrist_link1,wrist_link3")
     selected_links = {x.strip() for x in selected.split(",") if x.strip()}
     max_per_link = int(rospy.get_param("~max_points_per_link", 30))
@@ -119,16 +146,54 @@ def main():
         raise RuntimeError("coverage CSV missing: " + csv_path)
     if not os.path.isfile(urdf_path):
         raise RuntimeError("self-filter URDF missing: " + urdf_path)
+    if not os.path.isfile(reference_urdf):
+        raise RuntimeError("reference URDF missing: " + reference_urdf)
 
     grouped = load_worst_points(
         csv_path, selected_links, max_per_link, min_outside_mm)
     primitives = load_primitives(urdf_path)
+    visual_meshes = load_visual_meshes(reference_urdf)
 
     pub = rospy.Publisher(topic, MarkerArray, queue_size=1, latch=True)
     rospy.sleep(0.5)
 
     arr = MarkerArray()
     marker_id = 0
+
+    # Clear stale namespaces from earlier link selections.  Without DELETEALL,
+    # RViz keeps old wrist/link markers when this publisher is relaunched with
+    # a different links:= selection.
+    clear = Marker()
+    clear.action = Marker.DELETEALL
+    arr.markers.append(clear)
+
+    # Explicitly overlay the selected ACTUAL visual mesh(es) in yellow so the
+    # user never has to infer which part of the full RobotModel is being
+    # audited.
+    for source in sorted(selected_links):
+        for _, mesh_uri, xyz, rpy, scale in visual_meshes.get(source, []):
+            if not mesh_uri:
+                continue
+            m = Marker()
+            m.header.frame_id = source
+            m.header.stamp = rospy.Time(0)
+            m.frame_locked = True
+            m.ns = "selected_visual_mesh"
+            m.id = marker_id
+            marker_id += 1
+            m.action = Marker.ADD
+            m.type = Marker.MESH_RESOURCE
+            m.mesh_resource = mesh_uri
+            m.mesh_use_embedded_materials = False
+            m.pose.position.x, m.pose.position.y, m.pose.position.z = xyz
+            q = rpy_to_quat(rpy)
+            m.pose.orientation.x = q[0]
+            m.pose.orientation.y = q[1]
+            m.pose.orientation.z = q[2]
+            m.pose.orientation.w = q[3]
+            m.scale.x, m.scale.y, m.scale.z = scale
+            m.color = make_color(1.0, 0.75, 0.0, 0.55)
+            arr.markers.append(m)
 
     # Dedicated self-filter primitives: translucent cyan.
     if show_geometry:
@@ -234,8 +299,9 @@ def main():
         "links=%s",
         len(arr.markers), topic, ",".join(sorted(grouped.keys())))
     rospy.loginfo(
-        "[self_filter_coverage_marker] cyan=dedicated filter primitives, "
-        "red=outside visual samples, magenta=worst sample")
+        "[self_filter_coverage_marker] yellow=selected actual visual mesh, "
+        "cyan=dedicated filter primitives, red=outside visual samples, "
+        "magenta=worst sample")
 
     rospy.spin()
 
