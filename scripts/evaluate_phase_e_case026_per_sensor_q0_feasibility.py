@@ -31,6 +31,31 @@ from urdf_parser_py.urdf import URDF
 
 
 REPO_DEFAULT = "/home/zhicheng/Project/CAREPlanner"
+
+CASE026_TARGET = np.asarray([
+    0.10000000149011612,
+    0.05000000074505806,
+    0.15000000596046448,
+], dtype=np.float64)
+CASE026_MEASURED_SEED_Q = np.asarray([
+    -0.23993935822373746,
+    0.7577102185084499,
+    -0.301829051647589,
+    -1.626700836259844,
+    0.19068393720573518,
+    -0.18052088294007795,
+    -0.3808012222262862,
+], dtype=np.float64)
+CASE026_BLOCKED_Q_VIS = np.asarray([
+    -0.26947852969169617,
+    0.750813901424408,
+    -0.2667731046676636,
+    -1.8708069324493408,
+    0.1902204304933548,
+    -0.1728929728269577,
+    -0.3792421519756317,
+], dtype=np.float64)
+
 VIS_SCRIPT_DIR = Path(__file__).resolve().parent.parent / "src" / "care_visibility_cdf" / "scripts"
 if str(VIS_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(VIS_SCRIPT_DIR))
@@ -180,7 +205,13 @@ def motion_metrics(q, ref):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default=REPO_DEFAULT)
-    ap.add_argument("--trace", required=True)
+    ap.add_argument(
+        "--trace",
+        default="",
+        help=(
+            "Optional obligation-7 projector trace. If omitted, use the exact "
+            "Case-026 obligation-7 target/measured-seed/q_vis frozen in this script."
+        ))
     ap.add_argument(
         "--data",
         default="src/care_visibility_cdf/data/"
@@ -221,8 +252,17 @@ def main():
         args.self_filter_urdf if os.path.isabs(args.self_filter_urdf)
         else os.path.join(repo, args.self_filter_urdf))
 
-    trace, target, seed_q, blocked_q_vis = load_trace(args.trace)
+    if args.trace:
+        trace, target, seed_q, blocked_q_vis = load_trace(args.trace)
+        trace_source = os.path.abspath(args.trace)
+    else:
+        trace = {}
+        target = CASE026_TARGET.copy()
+        seed_q = CASE026_MEASURED_SEED_Q.copy()
+        blocked_q_vis = CASE026_BLOCKED_Q_VIS.copy()
+        trace_source = "builtin_case026_obligation7_exact_values"
 
+    print(f"[case] source {trace_source}", flush=True)
     print(f"[data] opening {data_path}", flush=True)
     with np.load(data_path, allow_pickle=True) as d:
         # Keep the very large q library in its stored float32 form.  Only the
@@ -392,7 +432,7 @@ def main():
 
     report = {
         "diagnostic": "phase_e_case026_per_sensor_q0_feasibility",
-        "trace": os.path.abspath(args.trace),
+        "trace": trace_source,
         "target": [float(v) for v in target],
         "measured_seed_q": [float(v) for v in seed_q],
         "blocked_q_vis": [float(v) for v in blocked_q_vis],
