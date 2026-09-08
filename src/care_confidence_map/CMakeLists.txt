@@ -252,6 +252,7 @@ catkin_install_python(PROGRAMS
   scripts/body_sample_marker_publisher.py
   scripts/self_filter_coverage_marker_publisher.py
   scripts/runtime_self_hit_rviz_diagnostic.py
+  scripts/phase_e_case026_exact_self_occlusion_rviz.py
   scripts/diagnose_gazebo_tf_frame_delta.py
   scripts/initialize_body_prior_once.py
   scripts/executed_vbc_logger_node.py
