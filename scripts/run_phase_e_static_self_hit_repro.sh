@@ -35,7 +35,6 @@ mkdir -p "${ROOT}"
 GAZEBO_PID=""
 FILTER_PID=""
 DIAG_PID=""
-FRAME_DIAG_PID=""
 REC_PIDS=()
 
 kill_group() {
@@ -58,7 +57,6 @@ cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   for p in "${REC_PIDS[@]:-}"; do kill_group "${p}"; done
-  kill_group "${FRAME_DIAG_PID}"
   kill_group "${DIAG_PID}"
   kill_group "${FILTER_PID}"
   kill_group "${GAZEBO_PID}"
@@ -151,6 +149,18 @@ for _ in $(seq 1 120); do
 done
 timeout 20 rostopic echo -n 1 /link4_sensor2/tof/cloud >/dev/null
 
+echo "[SNAPSHOT] Gazebo actual link/render poses vs ROS TF"
+python3 src/care_confidence_map/scripts/capture_static_gazebo_tf_snapshot.py \
+  --output "${ROOT}/static_gazebo_tf_snapshot.json" \
+  --base-frame base_link \
+  --model-name care_arm \
+  --raw-topic /link4_sensor2/tof/cloud \
+  --samples 8 \
+  --period 0.20 \
+  --max-clouds 8 \
+  > "${ROOT}/static_gazebo_tf_snapshot.log" 2>&1
+cat "${ROOT}/static_gazebo_tf_snapshot.log"
+
 setsid rosrun care_confidence_map runtime_self_hit_rviz_diagnostic.py \
   _base_frame:=base_link \
   _raw_topic:=/link4_sensor2/tof/cloud \
@@ -175,17 +185,6 @@ setsid rosrun care_confidence_map runtime_self_hit_rviz_diagnostic.py \
   _hotspot_z_max:=0.425 \
   > "${ROOT}/runtime_diag.log" 2>&1 &
 DIAG_PID=$!
-
-# Independently compare Gazebo's actual render-link pose against ROS TF.
-# This addresses the remaining static failure hypothesis directly.
-setsid python3 src/care_confidence_map/scripts/diagnose_gazebo_tf_frame_delta.py \
-  _base_frame:=base_link \
-  _model_name:=care_arm \
-  _raw_topic:=/link4_sensor2/tof/cloud \
-  _optical_frame:=link4_sensor2_tof_link \
-  _render_frame:=link4_sensor2_tof_gz_link \
-  > "${ROOT}/gazebo_tf_frame_delta.log" 2>&1 &
-FRAME_DIAG_PID=$!
 
 # Capture the exact URDF->SDF conversion used by Gazebo Classic when possible.
 # This lets us inspect whether converted link / visual / sensor frames carry
@@ -269,5 +268,7 @@ PY
 
 echo ""
 cat "${ROOT}/summary.txt"
+echo "[POSE SNAPSHOT]"
+grep -E "dxyz_mm|cloud stamp" "${ROOT}/static_gazebo_tf_snapshot.log" | tail -n 20 || true
 echo "[UPLOAD] ${ZIP}"
 ls -lh "${ZIP}"
