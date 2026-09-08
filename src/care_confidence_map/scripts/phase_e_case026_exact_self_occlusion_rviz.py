@@ -11,6 +11,7 @@ primitive test:
   - primitive hit + exact STL clear -> primitive approximation is too conservative
 """
 
+import json
 import math
 import os
 import struct
@@ -363,6 +364,8 @@ def main():
         reference_robot, visual_entries, q_map, repo, ray_start, ray_end)
 
     exact_occluded = exact_hit is not None
+    exact_distance_from_sensor = (
+        0.03 + exact_hit["distance_m"] if exact_hit is not None else None)
     if primitive_occluded and exact_occluded:
         classification = "EXACT_MESH_SELF_OCCLUSION_CONFIRMED"
     elif primitive_occluded and not exact_occluded:
@@ -387,12 +390,47 @@ def main():
         rospy.logwarn("EXACT_MESH_OCCLUDED=0")
     else:
         rospy.logwarn(
-            "EXACT_MESH_OCCLUDED=1 link=%s dist_from_30mm_start=%.6f m "
-            "point=%s triangle=%d",
-            exact_hit["link"], exact_hit["distance_m"],
+            "EXACT_MESH_OCCLUDED=1 link=%s dist_from_sensor=%.6f m "
+            "dist_from_30mm_start=%.6f m point=%s triangle=%d",
+            exact_hit["link"], exact_distance_from_sensor,
+            exact_hit["distance_m"],
             np.array2string(exact_hit["point_base"], precision=6),
             exact_hit["triangle_index"])
     rospy.logwarn("CLASSIFICATION=%s", classification)
+
+    output_json = rospy.get_param(
+        "~output_json",
+        os.path.join(
+            repo, "outputs/phase_e_case026_exact_self_occlusion",
+            "case026_exact_self_occlusion.json"))
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+    report = {
+        "case_id": "phase_e_goal_026",
+        "obligation_id": 7,
+        "q_vis": [float(v) for v in q],
+        "sensor_frame": sensor_frame,
+        "sensor_origin_base": [float(v) for v in sensor_origin],
+        "target_base": [float(v) for v in target],
+        "target_sensor": [float(v) for v in p_sensor],
+        "nominal_fov_margin_m": float(nominal_margin),
+        "primitive_occluded": bool(primitive_occluded),
+        "primitive_hit": primitive_hit,
+        "exact_mesh_occluded": bool(exact_occluded),
+        "exact_mesh_hit": (
+            None if exact_hit is None else {
+                "link": exact_hit["link"],
+                "mesh_uri": exact_hit["uri"],
+                "distance_from_sensor_m": float(exact_distance_from_sensor),
+                "distance_from_30mm_start_m": float(exact_hit["distance_m"]),
+                "point_base": [float(v) for v in exact_hit["point_base"]],
+                "triangle_index": int(exact_hit["triangle_index"]),
+            }),
+        "mesh_tests": mesh_details,
+        "classification": classification,
+    }
+    with open(output_json, "w") as out:
+        json.dump(report, out, indent=2)
+    rospy.logwarn("OUTPUT_JSON=%s", output_json)
     rospy.logwarn("============================================================")
 
     pub_markers = rospy.Publisher(marker_topic, MarkerArray, queue_size=1, latch=True)
@@ -499,7 +537,7 @@ def main():
     txt.color = rgba(1.0, 1.0, 1.0, 1.0)
     exact_desc = (
         "none" if exact_hit is None
-        else "%s @ %.3fm" % (exact_hit["link"], exact_hit["distance_m"]))
+        else "%s @ %.3fm" % (exact_hit["link"], exact_distance_from_sensor))
     prim_desc = (
         "none" if primitive_hit is None
         else "%s/%s @ %.3fm" % (
