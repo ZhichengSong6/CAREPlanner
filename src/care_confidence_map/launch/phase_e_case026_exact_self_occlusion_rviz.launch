@@ -1,0 +1,60 @@
+<launch>
+  <!-- Frozen Case-026 q_vis geometry diagnostic. No Gazebo/planner/perception. -->
+  <arg name="repo" default="$(env HOME)/Project/CAREPlanner" />
+  <arg name="use_rviz" default="true" />
+  <arg name="rviz_config" default="$(find arm_description)/rviz/care_arm_phase1.rviz" />
+
+  <param name="use_sim_time" value="false" />
+
+  <include file="$(find arm_description)/launch/load_robot_description.launch">
+    <arg name="robot_urdf" value="$(find arm_description)/urdf/Arm.urdf" />
+  </include>
+
+  <node pkg="robot_state_publisher"
+        type="robot_state_publisher"
+        name="robot_state_publisher"
+        output="screen" />
+
+  <node pkg="care_confidence_map"
+        type="phase_e_case026_exact_self_occlusion_rviz.py"
+        name="phase_e_case026_exact_self_occlusion_rviz"
+        output="screen">
+    <param name="repo" value="$(arg repo)" />
+    <param name="reference_urdf"
+           value="$(find arm_description)/urdf/Arm.urdf" />
+    <param name="self_filter_urdf"
+           value="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+
+    <!-- Frozen reproducer from phase_e_goal_026 obligation 7. -->
+    <param name="q1" value="-0.26948" />
+    <param name="q2" value="0.75081" />
+    <param name="q3" value="-0.26677" />
+    <param name="q4" value="-1.87081" />
+    <param name="q5" value="0.19022" />
+    <param name="q6" value="-0.17289" />
+    <param name="q7" value="-0.37924" />
+
+    <param name="target_x" value="0.10" />
+    <param name="target_y" value="0.05" />
+    <param name="target_z" value="0.15" />
+
+    <param name="sensor_frame" value="link4_sensor1_tof_link" />
+    <param name="horizontal_fov_deg" value="55.0" />
+    <param name="vertical_fov_deg" value="72.0" />
+    <param name="z_min" value="0.15" />
+    <param name="z_max" value="0.75" />
+
+    <!-- Exact STL test uses only robot body visual meshes, not conservative
+         self-filter primitives and not ToF housings. -->
+    <param name="exact_visual_links"
+           value="base_link,link1,link2,link3,link4,wrist_link1,wrist_link2,wrist_link3" />
+    <param name="marker_topic" value="/care_planner/debug/markers" />
+  </node>
+
+  <node if="$(arg use_rviz)"
+        pkg="rviz"
+        type="rviz"
+        name="rviz"
+        args="-d $(arg rviz_config)"
+        output="screen" />
+</launch>
