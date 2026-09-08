@@ -30,6 +30,11 @@
   <arg name="initial_wrist_joint2" default="0.0" />
   <arg name="initial_wrist_joint3" default="0.0" />
 
+  <!-- Keep historical behavior by default.  Diagnostics may disable all
+       spawn_model -J arguments to test whether Gazebo's SetModelConfiguration
+       startup path is responsible for render/TF pose divergence. -->
+  <arg name="apply_initial_joint_overrides" default="true" />
+
   <include file="$(find arm_description)/launch/load_robot_description.launch">
     <arg name="robot_urdf" value="$(arg robot_urdf)" />
   </include>
@@ -42,7 +47,10 @@
     <arg name="verbose" value="$(arg verbose)" />
   </include>
 
-  <node pkg="gazebo_ros"
+  <!-- Historical path: spawn_model receives explicit -J values and therefore
+       invokes Gazebo's SetModelConfiguration startup path. -->
+  <node if="$(arg apply_initial_joint_overrides)"
+        pkg="gazebo_ros"
         type="spawn_model"
         name="spawn_care_arm"
         output="screen"
@@ -62,6 +70,24 @@
               -J wrist_joint1 $(arg initial_wrist_joint1)
               -J wrist_joint2 $(arg initial_wrist_joint2)
               -J wrist_joint3 $(arg initial_wrist_joint3)" />
+
+  <!-- Diagnostic / zero-home path: omit -J completely.  This avoids
+       spawn_model's SetModelConfiguration call and lets Gazebo use the URDF
+       model's natural q=0 configuration. -->
+  <node unless="$(arg apply_initial_joint_overrides)"
+        pkg="gazebo_ros"
+        type="spawn_model"
+        name="spawn_care_arm"
+        output="screen"
+        args="-urdf
+              -param robot_description
+              -model $(arg model_name)
+              -x 0.0
+              -y 0.0
+              -z 0.0
+              -R 0.0
+              -P 0.0
+              -Y 0.0" />
 
   <rosparam file="$(find arm_description)/config/controllers.yaml" command="load" />
 
