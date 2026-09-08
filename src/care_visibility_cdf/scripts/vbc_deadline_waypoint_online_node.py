@@ -26,6 +26,7 @@ from vbc_deadline_waypoint_rolling_persistent_impl import PersistentRollingVbcDe
 from vbc_deadline_waypoint_sequential_impl import DeadlineSequentialRollingVbcWaypointNode
 from vbc_multi_deadline_obligation_impl import AccumulatedMultiDeadlineWaypointNode
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
+from vbc_fixed_visibility_diagnostic_impl import FixedVisibilityDiagnosticWaypointNode
 from vbc_blocker_aware_acquisition_impl import BlockerAwareVisibilityAcquisitionWaypointNode
 
 
@@ -166,6 +167,13 @@ class OnlineVisibilityAcquisitionWaypointNode(_OnlineRuntimeMixin, VisibilityAcq
         return OnlineAccumulatedMultiDeadlineWaypointNode._process_new_active_set(self)
 
 
+class OnlineFixedVisibilityDiagnosticWaypointNode(
+        _OnlineRuntimeMixin, FixedVisibilityDiagnosticWaypointNode):
+    def __init__(self):
+        super().__init__()
+        self._run_model_warmup()
+
+
 class OnlineBlockerAwareAcquisitionWaypointNode(
         _OnlineRuntimeMixin, BlockerAwareVisibilityAcquisitionWaypointNode):
     def __init__(self):
@@ -193,7 +201,11 @@ def _configure_runtime_mode(mode: str) -> None:
                     "/care_planner/active_sensing/visibility_waypoint_schedule")
     rospy.set_param(mpc_prefix + "/max_repair_waypoints", 8)
 
-    acquisition = mode in ("visibility_acquisition", "blocker_aware_acquisition")
+    acquisition = mode in (
+        "visibility_acquisition",
+        "blocker_aware_acquisition",
+        "fixed_visibility_diagnostic",
+    )
     manager_prefix = "/c4_4_verified_regime_manager"
     rospy.set_param(manager_prefix + "/repair_completion_gate_enabled", bool(acquisition))
     rospy.set_param(manager_prefix + "/repair_completion_topic",
@@ -228,8 +240,14 @@ def main():
         rospy.set_param("~use_active_set", True)
     mode = str(rospy.get_param(
         "~region_schedule_mode", "accumulated_multi_deadline")).strip().lower()
-    valid = ("blocker_aware_acquisition", "visibility_acquisition",
-             "accumulated_multi_deadline", "deadline_sequential", "shared_persistent")
+    valid = (
+        "blocker_aware_acquisition",
+        "visibility_acquisition",
+        "fixed_visibility_diagnostic",
+        "accumulated_multi_deadline",
+        "deadline_sequential",
+        "shared_persistent",
+    )
     if mode not in valid:
         raise ValueError("~region_schedule_mode must be one of: " + ", ".join(valid))
     _configure_runtime_mode(mode)
@@ -237,6 +255,11 @@ def main():
     if mode == "blocker_aware_acquisition":
         rospy.logwarn("[vbc_waypoint_online] C4.9 region_schedule_mode=blocker_aware_acquisition")
         OnlineBlockerAwareAcquisitionWaypointNode()
+    elif mode == "fixed_visibility_diagnostic":
+        rospy.logwarn(
+            "[vbc_waypoint_online] DIAGNOSTIC region_schedule_mode="
+            "fixed_visibility_diagnostic")
+        OnlineFixedVisibilityDiagnosticWaypointNode()
     elif mode == "visibility_acquisition":
         rospy.logwarn("[vbc_waypoint_online] C4.7/C4.8 region_schedule_mode=visibility_acquisition")
         OnlineVisibilityAcquisitionWaypointNode()
