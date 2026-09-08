@@ -35,6 +35,7 @@ mkdir -p "${ROOT}"
 GAZEBO_PID=""
 FILTER_PID=""
 DIAG_PID=""
+FRAME_DIAG_PID=""
 REC_PIDS=()
 
 kill_group() {
@@ -57,6 +58,7 @@ cleanup() {
   local rc=$?
   trap - EXIT INT TERM
   for p in "${REC_PIDS[@]:-}"; do kill_group "${p}"; done
+  kill_group "${FRAME_DIAG_PID}"
   kill_group "${DIAG_PID}"
   kill_group "${FILTER_PID}"
   kill_group "${GAZEBO_PID}"
@@ -173,6 +175,26 @@ setsid rosrun care_confidence_map runtime_self_hit_rviz_diagnostic.py \
   _hotspot_z_max:=0.425 \
   > "${ROOT}/runtime_diag.log" 2>&1 &
 DIAG_PID=$!
+
+# Independently compare Gazebo's actual render-link pose against ROS TF.
+# This addresses the remaining static failure hypothesis directly.
+setsid python3 src/care_confidence_map/scripts/diagnose_gazebo_tf_frame_delta.py \
+  _base_frame:=base_link \
+  _model_name:=care_arm \
+  _raw_topic:=/link4_sensor2/tof/cloud \
+  _optical_frame:=link4_sensor2_tof_link \
+  _render_frame:=link4_sensor2_tof_gz_link \
+  > "${ROOT}/gazebo_tf_frame_delta.log" 2>&1 &
+FRAME_DIAG_PID=$!
+
+# Capture the exact URDF->SDF conversion used by Gazebo Classic when possible.
+# This lets us inspect whether converted link / visual / sensor frames carry
+# compensating offsets that are invisible in the URDF.
+if command -v gz >/dev/null 2>&1; then
+  gz sdf -p "${REPO}/src/arm_description/urdf/Arm.urdf" \
+    > "${ROOT}/Arm.generated.sdf" \
+    2> "${ROOT}/gz_sdf.stderr" || true
+fi
 
 # Record measured q and ToF performance while the arm is deliberately static.
 setsid rostopic echo -p /care_arm/joint_states > "${ROOT}/joint_states.csv" 2>/dev/null &
