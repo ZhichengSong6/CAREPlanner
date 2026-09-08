@@ -2,6 +2,20 @@
 set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+
+# Keep ROS/RViz on the system environment.  A research conda env may override
+# rospy/Qt/libstdc++ even though this diagnostic itself needs no GPU env.
+if [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); then
+  if [[ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/anaconda3/etc/profile.d/conda.sh"
+  elif [[ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]]; then
+    source "${HOME}/miniconda3/etc/profile.d/conda.sh"
+  fi
+  while [[ "${CONDA_SHLVL:-0}" =~ ^[0-9]+$ ]] && (( CONDA_SHLVL > 0 )); do
+    conda deactivate || break
+  done
+fi
+
 cd "${REPO}"
 
 if timeout 2 rosnode list >/dev/null 2>&1; then
