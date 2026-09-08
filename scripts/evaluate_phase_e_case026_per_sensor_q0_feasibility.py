@@ -225,10 +225,12 @@ def main():
 
     print(f"[data] opening {data_path}", flush=True)
     with np.load(data_path, allow_pickle=True) as d:
-        x = d["x"].astype(np.float64)
-        qlib = d["q"].astype(np.float64)
-        valid = d["valid_fov"].astype(np.bool_)
-        sensor_masks = d["sensor_chain_masks"].astype(np.float64)
+        # Keep the very large q library in its stored float32 form.  Only the
+        # small candidate slices selected below are promoted to float64.
+        x = d["x"].astype(np.float32, copy=False)
+        qlib = d["q"].astype(np.float32, copy=False)
+        valid = d["valid_fov"].astype(np.bool_, copy=False)
+        sensor_masks = d["sensor_chain_masks"].astype(np.float32, copy=False)
         if "q_min" in d.files and "q_max" in d.files:
             q_min = d["q_min"].astype(np.float64)
             q_max = d["q_max"].astype(np.float64)
