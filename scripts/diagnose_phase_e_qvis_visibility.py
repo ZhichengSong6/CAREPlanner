@@ -134,8 +134,8 @@ def build_raycast_args(args):
 
 
 def sensor_rows_for_point(
-        point, q, reference_robot, self_filter_robot,
-        reference_sensor_chains, self_filter_sensor_chains,
+        point, q, self_filter_robot,
+        reference_sensor_chains,
         collision_chains, primitives, args):
     q_map = q_row_to_map(DEFAULT_JOINT_NAMES, q)
     ray_args = build_raycast_args(args)
@@ -154,9 +154,13 @@ def sensor_rows_for_point(
             args.conservative_z_min, args.conservative_z_max)
         conservative_g = conservative_margin_raw - args.conservative_delta
 
-        t_occ = fk_transform(self_filter_sensor_chains[sensor_idx], q_map)
+        # The dedicated self-filter URDF intentionally contains body collision
+        # primitives only; it does not duplicate the fixed ToF sensor frames.
+        # Use the sensor pose from the reference Arm.urdf, while each occluding
+        # body primitive is still transformed with the self-filter URDF chain
+        # inside raycast_self_occlusion().
         occluded, hit = raycast_self_occlusion(
-            self_filter_robot, collision_chains, primitives, t_occ,
+            self_filter_robot, collision_chains, primitives, t_ref,
             np.asarray(point, dtype=np.float64), q_map, ray_args)
 
         rows.append({
@@ -295,10 +299,6 @@ def main():
     reference_sensor_chains = [
         find_chain_joints(reference_robot, "base_link", frame)
         for frame in DEFAULT_SENSOR_FRAMES]
-    self_filter_sensor_chains = [
-        find_chain_joints(self_filter_robot, "base_link", frame)
-        for frame in DEFAULT_SENSOR_FRAMES]
-
     primitives = load_collision_primitives(self_filter_robot)
     collision_chains = [
         find_chain_joints(self_filter_robot, "base_link", p["link"])
@@ -307,8 +307,8 @@ def main():
     point_reports = []
     for point_idx, point in enumerate(points):
         sensor_rows = sensor_rows_for_point(
-            point, q_vis, reference_robot, self_filter_robot,
-            reference_sensor_chains, self_filter_sensor_chains,
+            point, q_vis, self_filter_robot,
+            reference_sensor_chains,
             collision_chains, primitives, args)
         p_report = {
             "point_index": point_idx,
