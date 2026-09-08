@@ -40,18 +40,30 @@ REC_PIDS=()
 kill_group() {
   local pid="${1:-}"
   [[ -z "${pid}" ]] && return 0
-  if kill -0 "${pid}" 2>/dev/null; then kill -INT -- "-${pid}" 2>/dev/null || true; sleep 0.25; fi
-  if kill -0 "${pid}" 2>/dev/null; then kill -TERM -- "-${pid}" 2>/dev/null || true; sleep 0.25; fi
-  if kill -0 "${pid}" 2>/dev/null; then kill -KILL -- "-${pid}" 2>/dev/null || true; fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -INT -- "-${pid}" 2>/dev/null || true
+    sleep 0.25
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    sleep 0.25
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL -- "-${pid}" 2>/dev/null || true
+  fi
   wait "${pid}" 2>/dev/null || true
 }
 cleanup() {
-  set +e
+  local rc=$?
+  trap - EXIT INT TERM
   for p in "${REC_PIDS[@]:-}"; do kill_group "${p}"; done
-  kill_group "${DIAG_PID}"; kill_group "${FILTER_PID}"; kill_group "${GAZEBO_PID}"
+  kill_group "${DIAG_PID}"
+  kill_group "${FILTER_PID}"
+  kill_group "${GAZEBO_PID}"
   for n in gzclient gzserver rviz rosmaster roscore roslaunch; do
     pkill -TERM -x "${n}" 2>/dev/null || true
   done
+  return "${rc}"
 }
 trap cleanup EXIT INT TERM
 cleanup
@@ -81,18 +93,29 @@ setsid roslaunch arm_description gazebo_velocity_control.launch \
   world_file:="${WORLD_FILE}" \
   gazebo_gui:="${GAZEBO_GUI}" \
   use_rviz:="${USE_RVIZ}" \
-  initial_joint1:="${Q1}" \
-  initial_joint2:="${Q2}" \
-  initial_joint3:="${Q3}" \
-  initial_joint4:="${Q4}" \
-  initial_wrist_joint1:="${Q5}" \
-  initial_wrist_joint2:="${Q6}" \
-  initial_wrist_joint3:="${Q7}" \
   > "${ROOT}/gazebo.log" 2>&1 &
 GAZEBO_PID=$!
 
-echo "[WAIT] joint states"
-timeout 30 rostopic echo -n 1 /care_arm/joint_states >/dev/null
+echo "[WAIT] ROS master + joint states"
+for _ in $(seq 1 300); do
+  if rostopic echo -n 1 /care_arm/joint_states >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.1
+done
+timeout 10 rostopic echo -n 1 /care_arm/joint_states >/dev/null
+
+echo "[STATIC SETUP] stop the velocity controller before setting q"
+timeout 10 rosservice call /care_arm/controller_manager/switch_controller \
+  "{start_controllers: [], stop_controllers: ['arm_group_velocity_controller'], strictness: 2, start_asap: false, timeout: 0.0}" \
+  > "${ROOT}/stop_velocity_controller.txt"
+
+echo "[STATIC SETUP] set exact Gazebo joint configuration after controller startup"
+timeout 10 rosservice call /gazebo/set_model_configuration \
+  "{model_name: 'care_arm', urdf_param_name: 'robot_description', joint_names: ['joint1','joint2','joint3','joint4','wrist_joint1','wrist_joint2','wrist_joint3'], joint_positions: [${Q1},${Q2},${Q3},${Q4},${Q5},${Q6},${Q7}]}" \
+  > "${ROOT}/set_model_configuration.txt"
+
+sleep 0.5
 
 echo "[VERIFY] static replay q"
 python3 - "${Q1}" "${Q2}" "${Q3}" "${Q4}" "${Q5}" "${Q6}" "${Q7}" <<'PY'
@@ -111,7 +134,7 @@ print('[STATIC Q] target  =',target)
 print('[STATIC Q] err_inf = %.6f rad' % err)
 print('[STATIC Q] velocity=',v)
 if err > 0.02:
-    raise SystemExit('static replay q mismatch')
+    raise SystemExit('static replay q mismatch: refusing to continue invalid test')
 PY
 
 setsid roslaunch care_confidence_map tof_fusion_self_filter.launch \
@@ -152,9 +175,9 @@ setsid rosrun care_confidence_map runtime_self_hit_rviz_diagnostic.py \
 DIAG_PID=$!
 
 # Record measured q and ToF performance while the arm is deliberately static.
-rostopic echo -p /care_arm/joint_states > "${ROOT}/joint_states.csv" 2>/dev/null &
+setsid rostopic echo -p /care_arm/joint_states > "${ROOT}/joint_states.csv" 2>/dev/null &
 REC_PIDS+=($!)
-rostopic echo -p /care_planner/perception/tof_fusion_summary > "${ROOT}/tof_fusion_summary.csv" 2>/dev/null &
+setsid rostopic echo -p /care_planner/perception/tof_fusion_summary > "${ROOT}/tof_fusion_summary.csv" 2>/dev/null &
 REC_PIDS+=($!)
 
 echo ""
