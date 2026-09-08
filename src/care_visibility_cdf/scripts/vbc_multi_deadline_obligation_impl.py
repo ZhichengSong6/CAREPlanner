@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -76,6 +77,32 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         self._schedule_new_obligations = 0
         self._schedule_matched_obligations = 0
         self._last_safe_verdict_time = math.nan
+
+        # Diagnostic-only q_vis override.  Disabled by default and intentionally
+        # driven by environment variables so existing launch commands/runners do
+        # not change semantics.  The Case-026 A/B wrapper enables it explicitly.
+        self._diag_qvis_override_enabled = str(
+            os.environ.get("CARE_DIAG_QVIS_OVERRIDE_ENABLED", "false")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._diag_qvis_override_obligation_id = int(
+            os.environ.get("CARE_DIAG_QVIS_OVERRIDE_OBLIGATION_ID", "7"))
+        self._diag_qvis_override_target = np.asarray([
+            float(x) for x in os.environ.get(
+                "CARE_DIAG_QVIS_OVERRIDE_TARGET",
+                "0.1,0.05,0.15").split(",")
+        ], dtype=np.float64).reshape(3)
+        self._diag_qvis_override_target_tol_m = float(
+            os.environ.get("CARE_DIAG_QVIS_OVERRIDE_TARGET_TOL_M", "0.03"))
+        self._diag_qvis_override_q = np.asarray([
+            float(x) for x in os.environ.get(
+                "CARE_DIAG_QVIS_OVERRIDE_Q",
+                "-0.8144537806510925,0.5605988502502441,1.0171856880187988,"
+                "-2.180335760116577,0.12358028441667557,-1.7687498331069946,"
+                "1.1331826448440552").split(",")
+        ], dtype=np.float64).reshape(7)
+        self._diag_qvis_override_label = str(os.environ.get(
+            "CARE_DIAG_QVIS_OVERRIDE_LABEL", "case026_robust_s7"))
+        self._diag_qvis_override_applied_count = 0
 
         super().__init__()
 
@@ -299,7 +326,54 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                 time.perf_counter() - t_generate_start)
             self._seed_override = None
 
-        q_vis = np.asarray(result["q_vis"], dtype=np.float64)
+        original_q_vis = np.asarray(result["q_vis"], dtype=np.float64).copy()
+        q_vis = original_q_vis.copy()
+
+        # Narrow diagnostic hook for the Case-026 sensor-branch A/B.  Require
+        # both the expected obligation id and a centroid match so this cannot
+        # silently alter an unrelated obligation if numbering changes.
+        override_applied = False
+        override_target_error_m = math.nan
+        if self._diag_qvis_override_enabled:
+            current_oid = int(self._next_obligation_id)
+            region_centroid = np.asarray(
+                region["centroid"], dtype=np.float64).reshape(3)
+            override_target_error_m = float(np.linalg.norm(
+                region_centroid - self._diag_qvis_override_target))
+            if (
+                current_oid == self._diag_qvis_override_obligation_id
+                and override_target_error_m
+                    <= self._diag_qvis_override_target_tol_m
+            ):
+                q_vis = self._diag_qvis_override_q.copy()
+                result["q_vis"] = q_vis.tolist()
+                result["diagnostic_qvis_override_applied"] = True
+                result["diagnostic_qvis_override_label"] = (
+                    self._diag_qvis_override_label)
+                result["diagnostic_qvis_override_original_q_vis"] = (
+                    original_q_vis.tolist())
+                result["diagnostic_qvis_override_q_vis"] = q_vis.tolist()
+                result["diagnostic_qvis_override_target_error_m"] = (
+                    override_target_error_m)
+                result["shared_solution_mode"] = (
+                    str(result.get("shared_solution_mode", "unknown"))
+                    + "+diagnostic_qvis_override")
+                self._diag_qvis_override_applied_count += 1
+                override_applied = True
+                rospy.logwarn(
+                    "[vbc_multi_deadline][DIAG QVIS OVERRIDE] "
+                    "APPLIED obligation=%d label=%s target_err=%.4fm "
+                    "original=%s override=%s",
+                    current_oid, self._diag_qvis_override_label,
+                    override_target_error_m,
+                    _fmt(original_q_vis, 5), _fmt(q_vis, 5))
+            elif current_oid == self._diag_qvis_override_obligation_id:
+                rospy.logwarn(
+                    "[vbc_multi_deadline][DIAG QVIS OVERRIDE] "
+                    "NOT applied obligation=%d target_err=%.4fm > tol=%.4fm",
+                    current_oid, override_target_error_m,
+                    self._diag_qvis_override_target_tol_m)
+
         deadline_abs = float(result["deadline_absolute_ros_s"])
         now_s = rospy.Time.now().to_sec()
         min_hit = self._rest_min_hit_time(measured, q_vis)
@@ -359,6 +433,12 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "refinement_partition_anchor":
                 refinement_partition_anchor.copy(),
             "q_vis": q_vis,
+            "diagnostic_qvis_override_applied": bool(override_applied),
+            "diagnostic_qvis_override_label": (
+                self._diag_qvis_override_label if override_applied else "none"),
+            "diagnostic_qvis_override_original_q_vis": original_q_vis.copy(),
+            "diagnostic_qvis_override_target_error_m": float(
+                override_target_error_m),
             "q_zero": np.asarray(result["q_zero"], dtype=np.float64),
             "deadline_abs_s": deadline_abs,
             "discovered_sweep_time_s": float(sweep_time_s),
@@ -386,6 +466,16 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_reachable_before_discovered_deadline_lower_bound": ob[
                 "reachable_before_discovered_deadline_lower_bound"],
             "c4_6_q_vis_generation_ms": float(q_vis_generation_ms),
+            "c4_6_diagnostic_qvis_override_enabled": bool(
+                self._diag_qvis_override_enabled),
+            "c4_6_diagnostic_qvis_override_applied": bool(override_applied),
+            "c4_6_diagnostic_qvis_override_label": (
+                self._diag_qvis_override_label if override_applied else "none"),
+            "c4_6_diagnostic_qvis_override_original_q_vis":
+                original_q_vis.tolist(),
+            "c4_6_diagnostic_qvis_override_final_q_vis": q_vis.tolist(),
+            "c4_6_diagnostic_qvis_override_target_error_m": float(
+                override_target_error_m),
             "c4_6_q_vis_source_centroid": source_centroid.tolist(),
             "c4_6_q_vis_source_xyz_min": source_xyz_min.tolist(),
             "c4_6_q_vis_source_xyz_max": source_xyz_max.tolist(),
