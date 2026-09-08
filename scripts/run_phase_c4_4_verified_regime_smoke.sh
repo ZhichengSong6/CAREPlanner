@@ -196,6 +196,29 @@ PY
 fi
 echo "[INITIAL Q] [${IQ1}, ${IQ2}, ${IQ3}, ${IQ4}, ${IQ5}, ${IQ6}, ${IQ7}]"
 
+# Gazebo Classic's spawn_model -J path calls SetModelConfiguration after spawn.
+# Controlled A/B testing showed that this path can nondeterministically leave
+# Gazebo child-link / preserved ToF render poses offset from ROS TF by exactly
+# the joint-origin translations (link2 ~=37.7 mm, link4/render ~=45 mm).
+#
+# For the exact zero/home configuration there is no reason to invoke -J at all:
+# let the URDF spawn naturally at q=0.  Keep an explicit env override for
+# diagnostics / legacy nonzero-q experiments.
+APPLY_INITIAL_JOINT_OVERRIDES="${APPLY_INITIAL_JOINT_OVERRIDES:-auto}"
+if [[ "${APPLY_INITIAL_JOINT_OVERRIDES}" == "auto" ]]; then
+  if python3 - "${IQ1}" "${IQ2}" "${IQ3}" "${IQ4}" "${IQ5}" "${IQ6}" "${IQ7}" <<'PY'
+import sys
+q=[float(x) for x in sys.argv[1:]]
+raise SystemExit(0 if max(abs(x) for x in q) <= 1e-10 else 1)
+PY
+  then
+    APPLY_INITIAL_JOINT_OVERRIDES="false"
+  else
+    APPLY_INITIAL_JOINT_OVERRIDES="true"
+  fi
+fi
+echo "[INITIAL Q] apply_initial_joint_overrides=${APPLY_INITIAL_JOINT_OVERRIDES}"
+
 GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
 REC_PIDS=()
 kill_group() {
@@ -220,6 +243,7 @@ echo "[VIS] gazebo_gui=${GAZEBO_GUI} use_rviz=${USE_RVIZ} world_file=${WORLD_FIL
 setsid roslaunch arm_description gazebo_velocity_control.launch \
   world_file:="${WORLD_FILE}" \
   gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" \
+  apply_initial_joint_overrides:="${APPLY_INITIAL_JOINT_OVERRIDES}" \
   initial_joint1:="${IQ1}" \
   initial_joint2:="${IQ2}" \
   initial_joint3:="${IQ3}" \
@@ -306,6 +330,47 @@ PY
 then
   echo "[ERROR] Gazebo did not settle at requested initial_q before planner startup"
   tail -n 220 "${LOG}/gazebo.log" 2>/dev/null || true
+  exit 1
+fi
+
+echo "[WAIT] validating Gazebo actual link/render poses against ROS TF"
+POSE_AUDIT_JSON="${OUT}/startup_gazebo_tf_snapshot.json"
+if ! python3 src/care_confidence_map/scripts/capture_static_gazebo_tf_snapshot.py \
+  --output "${POSE_AUDIT_JSON}" \
+  --base-frame base_link \
+  --model-name care_arm \
+  --raw-topic /link4_sensor2/tof/cloud \
+  --samples 3 \
+  --period 0.10 \
+  --max-clouds 1 \
+  > "${LOG}/startup_gazebo_tf_snapshot.log" 2>&1
+then
+  echo "[ERROR] startup Gazebo-vs-TF pose snapshot failed"
+  cat "${LOG}/startup_gazebo_tf_snapshot.log" 2>/dev/null || true
+  exit 1
+fi
+if ! python3 - "${POSE_AUDIT_JSON}" <<'PY'
+import json, statistics, sys
+d=json.load(open(sys.argv[1]))
+watch=['link2','link4','link4_sensor2_tof_gz_link']
+bad=[]
+for name in watch:
+    vals=[]
+    for s in d.get('pose_samples',[]):
+        v=s.get('links',{}).get(name,{})
+        if 'delta_norm_m' in v:
+            vals.append(1000.0*float(v['delta_norm_m']))
+    med=statistics.median(vals) if vals else float('inf')
+    print('[STARTUP POSE] {} median_delta_mm={:.3f}'.format(name,med))
+    if med > 5.0:
+        bad.append((name,med))
+if bad:
+    print('[ERROR] Gazebo/TF startup pose mismatch: {}'.format(bad), file=sys.stderr)
+    raise SystemExit(2)
+PY
+then
+  echo "[ERROR] refusing to start planner with inconsistent Gazebo render geometry"
+  cat "${LOG}/startup_gazebo_tf_snapshot.log" 2>/dev/null || true
   exit 1
 fi
 
