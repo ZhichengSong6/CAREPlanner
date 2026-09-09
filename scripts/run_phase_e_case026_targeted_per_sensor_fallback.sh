@@ -3,7 +3,7 @@ set -euo pipefail
 
 REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
 DEVICE="${DEVICE:-cuda}"
-OUT="${OUT:-${REPO}/outputs/phase_e_case026_targeted_fallback/case026_targeted_per_sensor_fallback.json}"
+OUT="${OUT:-${REPO}/outputs/phase_e_case026_targeted_fallback/case026_targeted_per_sensor_fallback_projection_root_ascent.json}"
 
 cd "${REPO}"
 
@@ -33,7 +33,7 @@ python scripts/test_phase_e_case026_targeted_per_sensor_fallback.py \
   --projection-max-step-norm 0.25 \
   --root-refine-iters 12 \
   --root-tolerance-f 0.002 \
-  --branch-ascent-steps 12 \
+  --branch-ascent-steps 1 \
   --branch-step-size 0.05 \
   --branch-max-step-norm 0.25 \
   --max-branch-attempts 8 \
