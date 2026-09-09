@@ -75,6 +75,7 @@ def _field_value_grad(
     model: torch.nn.Module,
     inp: torch.Tensor,
     mode: str,
+    valid_mask: torch.Tensor | None = None,
 ):
     """Return union value [N] and d(union)/dq [N,7]."""
     q = inp[:, 3:10].detach().clone().requires_grad_(True)
@@ -86,6 +87,13 @@ def _field_value_grad(
     elif mode == "eight":
         if pred.ndim != 2 or pred.shape[1] != 8:
             raise RuntimeError(f"8-head output must be [N,8], got {tuple(pred.shape)}")
+        if valid_mask is None:
+            raise RuntimeError("8-head union requires the per-x sensor availability mask")
+        if valid_mask.shape != pred.shape:
+            raise RuntimeError(
+                f"valid_mask {tuple(valid_mask.shape)} != pred {tuple(pred.shape)}"
+            )
+        pred = torch.where(valid_mask, pred, torch.full_like(pred, -float("inf")))
         value = pred.max(dim=1).values
     else:
         raise ValueError(mode)
@@ -106,6 +114,7 @@ def _pair_value_grad(
     x: torch.Tensor,
     q_pair: torch.Tensor,
     mode: str,
+    sensor_available: torch.Tensor | None = None,
 ):
     """x [Bx,3], q_pair [Bx,Bq,7] -> value [Bx,Bq], grad [Bx,Bq,7]."""
     bx, bq, _ = q_pair.shape
@@ -116,6 +125,10 @@ def _pair_value_grad(
     if mode == "scalar":
         value = pred.reshape(-1)
     else:
+        if sensor_available is None:
+            raise RuntimeError("8-head union requires sensor_available")
+        mask = sensor_available[:, None, :].expand(bx, bq, 8).reshape(bx * bq, 8)
+        pred = torch.where(mask, pred, torch.full_like(pred, -float("inf")))
         value = pred.max(dim=1).values
 
     grad = torch.autograd.grad(
@@ -139,12 +152,20 @@ def _pair_value(
     x: torch.Tensor,
     q_pair: torch.Tensor,
     mode: str,
+    sensor_available: torch.Tensor | None = None,
 ):
     bx, bq, _ = q_pair.shape
     qf = q_pair.reshape(bx * bq, 7)
     xf = x[:, None, :].expand(bx, bq, 3).reshape(bx * bq, 3)
     pred = model(torch.cat([xf, qf], dim=-1))
-    value = pred.reshape(-1) if mode == "scalar" else pred.max(dim=1).values
+    if mode == "scalar":
+        value = pred.reshape(-1)
+    else:
+        if sensor_available is None:
+            raise RuntimeError("8-head union requires sensor_available")
+        mask = sensor_available[:, None, :].expand(bx, bq, 8).reshape(bx * bq, 8)
+        pred = torch.where(mask, pred, torch.full_like(pred, -float("inf")))
+        value = pred.max(dim=1).values
     return value.reshape(bx, bq)
 
 
@@ -180,11 +201,14 @@ def _projection(
     iters,
     damping,
     max_step,
+    sensor_available=None,
 ):
     q = q_init.detach().clone()
     eps = 1e-8
     for _ in range(iters):
-        f, grad = _pair_value_grad(model, x, q, mode)
+        f, grad = _pair_value_grad(
+            model, x, q, mode, sensor_available=sensor_available
+        )
         g2 = (grad * grad).sum(dim=-1, keepdim=True)
         step = f[..., None] * grad / torch.clamp(g2, min=eps)
         sn = torch.linalg.norm(step, dim=-1, keepdim=True)
@@ -206,13 +230,16 @@ def _ascent_snapshots(
     step_size,
     max_step,
     snapshots,
+    sensor_available=None,
 ):
     q = q_start.detach().clone()
     out = {}
     eps = 1e-8
     max_k = max(snapshots)
     for k in range(1, max_k + 1):
-        _, grad = _pair_value_grad(model, x, q, mode)
+        _, grad = _pair_value_grad(
+            model, x, q, mode, sensor_available=sensor_available
+        )
         gn = torch.linalg.norm(grad, dim=-1, keepdim=True)
         direction = grad / torch.clamp(gn, min=eps)
         step = step_size * direction
@@ -371,7 +398,7 @@ def main():
         default=(
             "src/care_visibility_cdf/checkpoints/"
             "per_sensor_e2e_fullbatch_seed0/"
-            "scalar_vs_8head_apples_to_apples_final.json"
+            "scalar_vs_8head_apples_to_apples_masked_final.json"
         ),
     )
     args = ap.parse_args()
@@ -440,7 +467,12 @@ def main():
         tgt_grad = target_grad.reshape(-1, 7)
 
         ps, gs = _field_value_grad(scalar, inp, "scalar")
-        pe, ge = _field_value_grad(eight, inp, "eight")
+        pair_valid_mask = has_s[:, None, :].expand(
+            args.batch_x, args.batch_q, 8
+        ).reshape(-1, 8)
+        pe, ge = _field_value_grad(
+            eight, inp, "eight", valid_mask=pair_valid_mask
+        )
 
         _accumulate_field(field["scalar"], ps, gs, tgt, tgt_grad)
         _accumulate_field(field["eight_union"], pe, ge, tgt, tgt_grad)
@@ -467,9 +499,10 @@ def main():
     print("\n=== PLANNING: SAME STARTS / SAME HYPERPARAMETERS ===")
     snapshots = (1, 3, 5, 10)
     for bi in range(args.planning_batches):
-        x, _, _, _ = dataset.sample_x_batch(
+        x, _, valid_plan, _ = dataset.sample_x_batch(
             args.planning_batch_x, split="val", device=device
         )
+        sensor_available_plan = valid_plan.any(dim=1)
         q_shared = sample_random_q(
             dataset, args.planning_batch_q, device
         )
@@ -483,6 +516,9 @@ def main():
             ("scalar", scalar, "scalar"),
             ("eight_union", eight, "eight"),
         ):
+            sensor_available = (
+                sensor_available_plan if mode == "eight" else None
+            )
             q_proj = _projection(
                 model=model,
                 mode=mode,
@@ -493,8 +529,11 @@ def main():
                 iters=args.projection_iters,
                 damping=args.projection_damping,
                 max_step=args.projection_max_step,
+                sensor_available=sensor_available,
             )
-            f_proj = _pair_value(model, x, q_proj, mode)
+            f_proj = _pair_value(
+                model, x, q_proj, mode, sensor_available=sensor_available
+            )
             g_proj = _oracle_pair_g(oracle, x, q_proj)
 
             q_snaps = _ascent_snapshots(
@@ -507,6 +546,7 @@ def main():
                 step_size=args.ascent_step,
                 max_step=args.ascent_max_step,
                 snapshots=snapshots,
+                sensor_available=sensor_available,
             )
             ascent_g = {
                 k: _oracle_pair_g(oracle, x, qk)
@@ -536,6 +576,9 @@ def main():
         "config": vars(args),
         "scalar_checkpoint_step": int(scalar_ckpt.get("step", -1)),
         "eight_checkpoint_step": int(eight_ckpt.get("step", -1)),
+        "eight_union_sensor_masking": (
+            "per-x q0 availability mask; unavailable heads excluded from max"
+        ),
         "field": field_summary,
         "planning": planning_summary,
     }
