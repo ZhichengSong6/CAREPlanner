@@ -451,6 +451,20 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                 min_hit <= max(0.0, deadline_remaining) + 1e-9),
             "final_f_min": float(result["final_f_min"]),
             "shared_solution_mode": str(result["shared_solution_mode"]),
+            "per_sensor_hybrid_used": bool(
+                result.get("per_sensor_hybrid_used", False)),
+            "per_sensor_selected_sensor_id": int(
+                result.get("per_sensor_selected_sensor_id", -1)),
+            "per_sensor_selected_sensor_frame": str(
+                result.get("per_sensor_selected_sensor_frame", "none")),
+            "per_sensor_selected_rank": int(
+                result.get("per_sensor_selected_rank", -1)),
+            "per_sensor_rejected_sensor_ids": list(
+                result.get("per_sensor_hybrid", {}).get(
+                    "rejected_sensor_ids", [])),
+            "per_sensor_branch_compute_ms": float(
+                result.get("per_sensor_hybrid", {}).get(
+                    "compute_ms", math.nan)),
             "q_vis_generation_ms": float(q_vis_generation_ms),
         }
         self._next_obligation_id += 1
@@ -466,6 +480,18 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "c4_6_reachable_before_discovered_deadline_lower_bound": ob[
                 "reachable_before_discovered_deadline_lower_bound"],
             "c4_6_q_vis_generation_ms": float(q_vis_generation_ms),
+            "c4_6_per_sensor_hybrid_used": bool(
+                ob["per_sensor_hybrid_used"]),
+            "c4_6_per_sensor_selected_sensor_id": int(
+                ob["per_sensor_selected_sensor_id"]),
+            "c4_6_per_sensor_selected_sensor_frame": str(
+                ob["per_sensor_selected_sensor_frame"]),
+            "c4_6_per_sensor_selected_rank": int(
+                ob["per_sensor_selected_rank"]),
+            "c4_6_per_sensor_rejected_sensor_ids": list(
+                ob["per_sensor_rejected_sensor_ids"]),
+            "c4_6_per_sensor_branch_compute_ms": float(
+                ob["per_sensor_branch_compute_ms"]),
             "c4_6_diagnostic_qvis_override_enabled": bool(
                 self._diag_qvis_override_enabled),
             "c4_6_diagnostic_qvis_override_applied": bool(override_applied),
@@ -496,11 +522,15 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         rospy.logwarn(
             "[vbc_multi_deadline] ADD obligation=%d points=%d depth=%d parent=%d "
             "deadline_rem=%.3fs Tmin_rest=%.3fs reachable_lb=%d "
-            "min_f=%+.4f qvis_ms=%.3f q_vis=%s",
+            "min_f=%+.4f qvis_ms=%.3f hybrid=%d sensor=S%d rank=%d "
+            "q_vis=%s",
             ob["id"], len(ob["points"]), refinement_depth,
             parent_obligation_id, deadline_remaining, min_hit,
             int(ob["reachable_before_discovered_deadline_lower_bound"]),
-            ob["final_f_min"], q_vis_generation_ms, _fmt(q_vis, 4))
+            ob["final_f_min"], q_vis_generation_ms,
+            int(ob["per_sensor_hybrid_used"]),
+            int(ob["per_sensor_selected_sensor_id"]),
+            int(ob["per_sensor_selected_rank"]), _fmt(q_vis, 4))
         return ob
 
     # ------------------------------------------------------------------
@@ -634,6 +664,12 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             for ob in obligations
             if math.isfinite(float(ob.get("q_vis_generation_ms", math.nan)))
         ]
+        hybrid_used_count = sum(
+            bool(ob.get("per_sensor_hybrid_used", False))
+            for ob in obligations)
+        earliest_sensor = (
+            int(obligations[0].get("per_sensor_selected_sensor_id", -1))
+            if obligations else -1)
         s = String()
         s.data = (
             "steering_policy=accumulated_multi_deadline"
@@ -650,6 +686,8 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             f"{(qvis_times[-1] if qvis_times else math.nan):.3f}"
             f" q_vis_generation_max_ms="
             f"{(max(qvis_times) if qvis_times else math.nan):.3f}"
+            f" per_sensor_hybrid_used_count={hybrid_used_count}"
+            f" earliest_per_sensor_id={earliest_sensor}"
         )
         self.schedule_summary_pub.publish(s)
 
