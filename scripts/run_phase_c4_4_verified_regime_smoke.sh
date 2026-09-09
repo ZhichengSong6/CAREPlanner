@@ -90,6 +90,18 @@ FRONTIER_STEERING_ENABLED="${FRONTIER_STEERING_ENABLED:-true}"
 VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-false}"
 ENABLE_ORACLE_DIAGNOSTICS="${ENABLE_ORACLE_DIAGNOSTICS:-false}"
 
+# Optional scalar + 8-head hybrid visibility steering.  Disabled by default so
+# historical C4/C5 runs are unchanged.  Phase-E per-sensor experiments opt in.
+PER_SENSOR_HYBRID_ENABLED="${PER_SENSOR_HYBRID_ENABLED:-false}"
+PER_SENSOR_CHECKPOINT="${PER_SENSOR_CHECKPOINT:-${REPO}/src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt}"
+PER_SENSOR_SELF_FILTER_URDF="${PER_SENSOR_SELF_FILTER_URDF:-${REPO}/src/arm_description/urdf/Arm_with_self_filter_collision.urdf}"
+PER_SENSOR_BRANCH_ASCENT_STEPS="${PER_SENSOR_BRANCH_ASCENT_STEPS:-12}"
+PER_SENSOR_BRANCH_STEP_SIZE="${PER_SENSOR_BRANCH_STEP_SIZE:-0.05}"
+PER_SENSOR_BRANCH_MAX_STEP_NORM="${PER_SENSOR_BRANCH_MAX_STEP_NORM:-0.25}"
+PER_SENSOR_MAX_BRANCH_ATTEMPTS="${PER_SENSOR_MAX_BRANCH_ATTEMPTS:-4}"
+PER_SENSOR_MIN_CONSERVATIVE_G="${PER_SENSOR_MIN_CONSERVATIVE_G:-0.0}"
+PER_SENSOR_REQUIRE_PRIMITIVE_LOS="${PER_SENSOR_REQUIRE_PRIMITIVE_LOS:-true}"
+
 # Optional online task-success stop. Defaults off here so historical C4/C5
 # diagnostics retain their fixed-duration semantics. Phase-D enables it.
 EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
@@ -141,6 +153,23 @@ SCHEDULE_SUMMARY_TOPIC="/care_planner/active_sensing/visibility_waypoint_schedul
 
 cd "${REPO}" || exit 1
 source devel/setup.bash
+
+python3 -m py_compile \
+  src/care_visibility_cdf/scripts/per_sensor_visibility_runtime.py \
+  src/care_visibility_cdf/scripts/vbc_deadline_waypoint_rolling_impl.py \
+  src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py
+
+if [[ "${PER_SENSOR_HYBRID_ENABLED}" == "true" || "${PER_SENSOR_HYBRID_ENABLED}" == "1" ]]; then
+  if [[ ! -f "${PER_SENSOR_CHECKPOINT}" ]]; then
+    echo "[ERROR] per-sensor hybrid checkpoint not found: ${PER_SENSOR_CHECKPOINT}" >&2
+    exit 2
+  fi
+  if [[ ! -f "${PER_SENSOR_SELF_FILTER_URDF}" ]]; then
+    echo "[ERROR] per-sensor self-filter URDF not found: ${PER_SENSOR_SELF_FILTER_URDF}" >&2
+    exit 2
+  fi
+fi
+
 rm -rf "${OUT}" "${LOG}"
 mkdir -p "${OUT}/projector_traces" "${LOG}"
 
@@ -382,7 +411,9 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _output_root:='${OUT}/projector_traces'" \
+echo "[PER-SENSOR HYBRID] enabled=${PER_SENSOR_HYBRID_ENABLED} checkpoint=${PER_SENSOR_CHECKPOINT} branch_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS} attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} LOS=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS}"
+
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
