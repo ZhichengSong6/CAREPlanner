@@ -25,7 +25,7 @@ WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.wor
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map_phase_e_ray.yaml}"
 
 PER_SENSOR_CHECKPOINT="${PER_SENSOR_CHECKPOINT:-${REPO}/src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt}"
-PER_SENSOR_BRANCH_ASCENT_STEPS="${PER_SENSOR_BRANCH_ASCENT_STEPS:-12}"
+PER_SENSOR_BRANCH_ASCENT_STEPS="${PER_SENSOR_BRANCH_ASCENT_STEPS:-1}"
 PER_SENSOR_MAX_BRANCH_ATTEMPTS="${PER_SENSOR_MAX_BRANCH_ATTEMPTS:-4}"
 
 cd "${REPO}"
@@ -84,7 +84,7 @@ echo "case              : ${CASE_ID}"
 echo "world             : ${WORLD_FILE}"
 echo "runtime           : ${RUN_SECONDS}s"
 echo "8-head checkpoint : ${PER_SENSOR_CHECKPOINT}"
-echo "branch ascent     : ${PER_SENSOR_BRANCH_ASCENT_STEPS} x 0.05 rad"
+echo "branch solver     : 10-step projection + root refinement + ${PER_SENSOR_BRANCH_ASCENT_STEPS} ascent"
 echo "branch attempts   : ${PER_SENSOR_MAX_BRANCH_ATTEMPTS}"
 echo "acceptance        : conservative per-sensor g >= 0 + primitive LOS clear"
 echo "fallback          : original scalar q_vis if all tested branches reject"
