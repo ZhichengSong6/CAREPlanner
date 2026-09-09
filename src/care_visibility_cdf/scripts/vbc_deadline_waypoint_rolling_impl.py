@@ -45,6 +45,7 @@ from evaluate_direct_vs_projection_ascent import (  # noqa: E402
     learned_projection_step,
     model_value_and_grad_q,
 )
+from per_sensor_visibility_runtime import PerSensorVisibilityRuntime  # noqa: E402
 
 
 class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
@@ -67,6 +68,11 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         self._shared_min_f = math.nan
         self._shared_solution_mode = "single_target"
 
+        # Experimental hybrid runtime.  Scalar VisCDF remains the coarse
+        # projector; the 8-head model is consulted only after scalar q_zero.
+        self.per_sensor_hybrid_enabled = False
+        self._per_sensor_runtime = None
+
         super().__init__()
 
         self.selection_active_topic = str(rospy.get_param(
@@ -86,12 +92,72 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         self.shared_fallback_ascent_steps = int(rospy.get_param(
             "~shared_fallback_ascent_steps", 8))
 
+        self.per_sensor_hybrid_enabled = bool(rospy.get_param(
+            "~per_sensor_hybrid_enabled", False))
+        default_per_sensor_checkpoint = (
+            Path(__file__).resolve().parent.parent
+            / "checkpoints" / "per_sensor_e2e_fullbatch_seed0" / "final.pt")
+        self.per_sensor_checkpoint_path = Path(rospy.get_param(
+            "~per_sensor_checkpoint",
+            str(default_per_sensor_checkpoint))).expanduser().resolve()
+        self.per_sensor_self_filter_urdf = Path(rospy.get_param(
+            "~per_sensor_self_filter_urdf",
+            str(Path(self.urdf_path).with_name(
+                "Arm_with_self_filter_collision.urdf")))).expanduser().resolve()
+        self.per_sensor_branch_ascent_steps = int(rospy.get_param(
+            "~per_sensor_branch_ascent_steps", 12))
+        self.per_sensor_branch_step_size = float(rospy.get_param(
+            "~per_sensor_branch_step_size", 0.05))
+        self.per_sensor_branch_max_step_norm = float(rospy.get_param(
+            "~per_sensor_branch_max_step_norm", 0.25))
+        self.per_sensor_max_branch_attempts = int(rospy.get_param(
+            "~per_sensor_max_branch_attempts", 4))
+        self.per_sensor_min_conservative_g = float(rospy.get_param(
+            "~per_sensor_min_conservative_g", 0.0))
+        self.per_sensor_require_primitive_los = bool(rospy.get_param(
+            "~per_sensor_require_primitive_los", True))
+
         if self.predicted_trajectory_timeout <= 0.0:
             raise ValueError("~predicted_trajectory_timeout must be positive")
         if self.target_cell_resolution <= 0.0:
             raise ValueError("~target_cell_resolution must be positive")
         if self.shared_fallback_ascent_steps < 1:
             raise ValueError("~shared_fallback_ascent_steps must be >= 1")
+
+        if self.per_sensor_hybrid_enabled:
+            if not self.per_sensor_checkpoint_path.is_file():
+                raise FileNotFoundError(
+                    "per-sensor checkpoint not found: {}".format(
+                        self.per_sensor_checkpoint_path))
+            if not self.per_sensor_self_filter_urdf.is_file():
+                raise FileNotFoundError(
+                    "per-sensor self-filter URDF not found: {}".format(
+                        self.per_sensor_self_filter_urdf))
+            self._per_sensor_runtime = PerSensorVisibilityRuntime(
+                checkpoint_path=str(self.per_sensor_checkpoint_path),
+                reference_urdf_path=str(self.urdf_path),
+                self_filter_urdf_path=str(self.per_sensor_self_filter_urdf),
+                device=self.device,
+                q_min=self.q_min_list,
+                q_max=self.q_max_list,
+                branch_ascent_steps=self.per_sensor_branch_ascent_steps,
+                branch_step_size=self.per_sensor_branch_step_size,
+                branch_max_step_norm=self.per_sensor_branch_max_step_norm,
+                max_branch_attempts=self.per_sensor_max_branch_attempts,
+                min_conservative_g=self.per_sensor_min_conservative_g,
+                require_primitive_los=self.per_sensor_require_primitive_los,
+            )
+            rospy.logwarn(
+                "[vbc_waypoint_rolling] PER-SENSOR HYBRID ENABLED "
+                "checkpoint=%s branch_steps=%d attempts=%d primitive_los=%d",
+                self.per_sensor_checkpoint_path,
+                self.per_sensor_branch_ascent_steps,
+                self.per_sensor_max_branch_attempts,
+                int(self.per_sensor_require_primitive_los))
+        else:
+            rospy.loginfo(
+                "[vbc_waypoint_rolling] per-sensor hybrid disabled; "
+                "frozen scalar runtime unchanged")
 
         self.selection_active_sub = rospy.Subscriber(
             self.selection_active_topic, Bool,
@@ -114,6 +180,94 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             self.target_cell_resolution,
             int(self.use_active_set),
             self.active_set_points_topic)
+
+    def _maybe_apply_per_sensor_hybrid(
+            self, points_np: np.ndarray, result: Dict[str, object]):
+        """Post-process scalar q_zero with mode-preserving 8-head fallback.
+
+        The scalar result is always retained as a fail-soft fallback.  A
+        per-sensor candidate replaces q_vis only after conservative per-sensor
+        FOV and zero-padding primitive LOS both pass for every point.
+        """
+        if not self.per_sensor_hybrid_enabled:
+            return result
+        if self._per_sensor_runtime is None:
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_waypoint_rolling] per-sensor hybrid enabled but runtime "
+                "helper is unavailable; preserving scalar q_vis")
+            return result
+
+        q_zero = np.asarray(result["q_zero"], dtype=np.float64).reshape(7)
+        scalar_q_vis = np.asarray(
+            result["q_vis"], dtype=np.float64).reshape(7).copy()
+        try:
+            hybrid = self._per_sensor_runtime.generate(points_np, q_zero)
+        except Exception as exc:
+            rospy.logerr(
+                "[vbc_waypoint_rolling] per-sensor branch generation failed; "
+                "preserving scalar q_vis: %s", exc)
+            result["per_sensor_hybrid"] = {
+                "enabled": True,
+                "accepted": False,
+                "runtime_error": str(exc),
+                "scalar_q_vis_preserved": True,
+            }
+            result["per_sensor_hybrid_used"] = False
+            return result
+
+        result["per_sensor_hybrid"] = hybrid
+        result["per_sensor_hybrid_used"] = bool(hybrid["accepted"])
+        result["per_sensor_scalar_q_vis_before_branch"] = (
+            scalar_q_vis.astype(float).tolist())
+
+        if not hybrid["accepted"]:
+            rospy.logwarn(
+                "[vbc_waypoint_rolling] per-sensor branches all rejected "
+                "(ranking=%s rejected=%s); preserving scalar q_vis",
+                hybrid.get("ranking"), hybrid.get("rejected_sensor_ids"))
+            return result
+
+        q_vis_np = np.asarray(
+            hybrid["selected_q_vis"], dtype=np.float64).reshape(7)
+        x = torch.tensor(
+            np.asarray(points_np, dtype=np.float64).reshape(-1, 3),
+            device=self.device, dtype=torch.float32)
+        q_vis = torch.tensor(
+            q_vis_np.reshape(1, 7),
+            device=self.device, dtype=torch.float32)
+
+        # Keep legacy scalar result fields internally coherent even though the
+        # branch candidate was chosen by the per-sensor model.
+        final_values = self._per_point_values(x, q_vis)
+        result["q_vis"] = q_vis_np.astype(float).tolist()
+        result["final_f_min"] = float(np.min(final_values))
+        result["final_f_mean"] = float(np.mean(final_values))
+        result["final_f_per_point"] = final_values.tolist()
+        result["shared_learned_all_positive"] = bool(
+            result["final_f_min"] >= 0.0)
+        result["final_oracle_diagnostic"] = self._oracle_diag_set(x, q_vis)
+        q_nominal = np.asarray(
+            result["q_deadline_nominal"], dtype=np.float64).reshape(7)
+        result["distance_qvis_from_nominal"] = float(
+            np.linalg.norm(q_vis_np - q_nominal))
+        sid = int(hybrid["selected_sensor_id"])
+        result["per_sensor_selected_sensor_id"] = sid
+        result["per_sensor_selected_sensor_frame"] = str(
+            hybrid["selected_sensor_frame"])
+        result["per_sensor_selected_rank"] = int(hybrid["selected_rank"])
+        result["shared_solution_mode"] = (
+            str(result.get("shared_solution_mode", "scalar"))
+            + "+per_sensor_branch_S{}".format(sid))
+
+        rospy.logwarn(
+            "[vbc_waypoint_rolling] PER-SENSOR BRANCH ACCEPTED S%d rank=%d "
+            "rejected=%s branch_ms=%.2f q_vis=%s",
+            sid, int(hybrid["selected_rank"]),
+            hybrid.get("rejected_sensor_ids"),
+            float(hybrid.get("compute_ms", math.nan)),
+            _fmt(q_vis_np, 5))
+        return result
 
     def _cell_key(self, xyz):
         scaled = np.rint(
@@ -431,7 +585,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         initial_diag = self._oracle_diag_set(x, q0)
         final_diag = self._oracle_diag_set(x, q_vis)
 
-        return {
+        result = {
             "active_set_points_xyz": points_np.tolist(),
             "active_set_size": int(points_np.shape[0]),
             "active_set_centroid_xyz": np.mean(points_np, axis=0).astype(float).tolist(),
@@ -476,6 +630,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 "shared_fallback_ascent_steps": self.shared_fallback_ascent_steps,
             },
         }
+        return self._maybe_apply_per_sensor_hybrid(points_np, result)
 
     def _maybe_generate(self) -> None:
         with self._lock:
