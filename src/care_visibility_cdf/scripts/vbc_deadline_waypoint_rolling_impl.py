@@ -105,7 +105,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             str(Path(self.urdf_path).with_name(
                 "Arm_with_self_filter_collision.urdf")))).expanduser().resolve()
         self.per_sensor_branch_ascent_steps = int(rospy.get_param(
-            "~per_sensor_branch_ascent_steps", 12))
+            "~per_sensor_branch_ascent_steps", self.ascent_steps))
         self.per_sensor_branch_step_size = float(rospy.get_param(
             "~per_sensor_branch_step_size", 0.05))
         self.per_sensor_branch_max_step_norm = float(rospy.get_param(
@@ -140,17 +140,27 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 device=self.device,
                 q_min=self.q_min_list,
                 q_max=self.q_max_list,
+                projection_iters=self.projection_iters,
+                projection_damping=self.projection_damping,
+                projection_epsilon_f=self.projection_epsilon_f,
+                projection_max_step_norm=self.projection_max_step_norm,
+                root_refine_iters=self.root_refine_iters,
+                root_tolerance_f=self.root_tolerance_f,
                 branch_ascent_steps=self.per_sensor_branch_ascent_steps,
                 branch_step_size=self.per_sensor_branch_step_size,
                 branch_max_step_norm=self.per_sensor_branch_max_step_norm,
+                branch_fallback_ascent_steps=self.shared_fallback_ascent_steps,
                 max_branch_attempts=self.per_sensor_max_branch_attempts,
                 min_conservative_g=self.per_sensor_min_conservative_g,
                 require_primitive_los=self.per_sensor_require_primitive_los,
             )
             rospy.logwarn(
                 "[vbc_waypoint_rolling] PER-SENSOR HYBRID ENABLED "
-                "checkpoint=%s branch_steps=%d attempts=%d primitive_los=%d",
+                "checkpoint=%s solver=projection_root_ascent "
+                "proj=%d root=%d ascent=%d attempts=%d primitive_los=%d",
                 self.per_sensor_checkpoint_path,
+                self.projection_iters,
+                self.root_refine_iters,
                 self.per_sensor_branch_ascent_steps,
                 self.per_sensor_max_branch_attempts,
                 int(self.per_sensor_require_primitive_los))
@@ -185,9 +195,11 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             self, points_np: np.ndarray, result: Dict[str, object]):
         """Post-process scalar q_zero with mode-preserving 8-head fallback.
 
-        The scalar result is always retained as a fail-soft fallback.  A
-        per-sensor candidate replaces q_vis only after conservative per-sensor
-        FOV and zero-padding primitive LOS both pass for every point.
+        Ranking is evaluated at scalar q_zero, but every sensor branch is solved
+        independently from q_deadline_nominal using the SAME
+        projection -> root-refinement -> ascent semantics as the frozen scalar
+        VisCDF.  In Phase-E obligation generation q_deadline_nominal is the
+        measured-q seed.  The scalar q_vis remains the fail-soft fallback.
         """
         if not self.per_sensor_hybrid_enabled:
             return result
@@ -199,10 +211,15 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             return result
 
         q_zero = np.asarray(result["q_zero"], dtype=np.float64).reshape(7)
+        branch_seed = np.asarray(
+            result["q_deadline_nominal"], dtype=np.float64).reshape(7)
         scalar_q_vis = np.asarray(
             result["q_vis"], dtype=np.float64).reshape(7).copy()
         try:
-            hybrid = self._per_sensor_runtime.generate(points_np, q_zero)
+            hybrid = self._per_sensor_runtime.generate(
+                points_np,
+                q_zero,
+                branch_seed_row=branch_seed)
         except Exception as exc:
             rospy.logerr(
                 "[vbc_waypoint_rolling] per-sensor branch generation failed; "
