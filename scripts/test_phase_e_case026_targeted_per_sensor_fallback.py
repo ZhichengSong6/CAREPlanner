@@ -299,7 +299,7 @@ def main():
     ap.add_argument("--root-refine-iters", type=int, default=12)
     ap.add_argument("--root-tolerance-f", type=float, default=0.002)
 
-    ap.add_argument("--branch-ascent-steps", type=int, default=12)
+    ap.add_argument("--branch-ascent-steps", type=int, default=1)
     ap.add_argument("--branch-step-size", type=float, default=0.05)
     ap.add_argument("--branch-max-step-norm", type=float, default=0.25)
     ap.add_argument("--max-branch-attempts", type=int, default=8)
@@ -391,9 +391,16 @@ def main():
         device=device,
         q_min=Q_MIN,
         q_max=Q_MAX,
+        projection_iters=args.projection_iters,
+        projection_damping=args.projection_damping,
+        projection_epsilon_f=args.projection_epsilon_f,
+        projection_max_step_norm=args.projection_max_step_norm,
+        root_refine_iters=args.root_refine_iters,
+        root_tolerance_f=args.root_tolerance_f,
         branch_ascent_steps=args.branch_ascent_steps,
         branch_step_size=args.branch_step_size,
         branch_max_step_norm=args.branch_max_step_norm,
+        branch_fallback_ascent_steps=8,
         max_branch_attempts=8,
         min_conservative_g=0.0,
         require_primitive_los=True,
@@ -440,6 +447,8 @@ def main():
         print(f"S{s}: {scores[s]:+.6f}")
     print("learned ranking :", [int(v) for v in learned_order.tolist()])
     print("tested order    :", order[: args.max_branch_attempts])
+    print("branch seed     : measured q (independent solve for every sensor)")
+    print("branch solver   : projection -> root refinement -> ascent")
 
     attempts = []
     selected = None
@@ -450,7 +459,7 @@ def main():
     for rank, sid in enumerate(
         order[: args.max_branch_attempts], start=1
     ):
-        branch = runtime._optimize_branch(points, q_zero, sid)
+        branch = runtime._optimize_branch(points, q_seed, sid)
         geom = runtime._candidate_geometry(
             TARGET.reshape(1, 3), branch["q_candidate"], sid
         )
@@ -465,12 +474,16 @@ def main():
         print("")
         print(
             f"[ATTEMPT rank={rank} S{sid}] "
-            f"score {branch['initial_score']:+.5f}->{branch['best_score']:+.5f} "
+            f"score {branch['initial_score']:+.5f}->{branch['final_score']:+.5f} "
+            f"root={branch['root_source']} "
             f"g={geom['min_conservative_g']:+.5f} "
             f"occ={int(geom['any_primitive_self_occluded'])} "
             f"accepted={int(geom['accepted'])}"
         )
+        print("  q_start    :", fmt(branch["q_start"]))
+        print("  q_zero     :", fmt(branch["q_zero"]))
         print("  q_candidate:", fmt(branch["q_candidate"]))
+        print("  mode       :", branch["solution_mode"])
         print("  reject_reason:", geom["reject_reason"])
         if hit is not None:
             print("  hit:", hit)
@@ -511,7 +524,7 @@ def main():
     )
 
     report = {
-        "diagnostic": "phase_e_case026_targeted_per_sensor_fallback",
+        "diagnostic": "phase_e_case026_targeted_per_sensor_fallback_projection_root_ascent",
         "target_xyz": TARGET.tolist(),
         "measured_seed_q": MEASURED_SEED.tolist(),
         "known_blocked_q_vis": KNOWN_BLOCKED_QVIS.tolist(),
@@ -532,6 +545,8 @@ def main():
             "learned_ranking": [int(v) for v in learned_order.tolist()],
             "tested_order": order[: args.max_branch_attempts],
             "forced_first_sensor": int(args.force_first_sensor),
+            "branch_seed_q": MEASURED_SEED.tolist(),
+            "branch_solver": "projection_root_ascent",
             "attempts": attempts,
             "rejected_sensor_ids": rejected,
             "selected_sensor_id": selected_sid,
