@@ -1345,11 +1345,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
 
         try:
-            x = torch.tensor(points, device=self.device, dtype=torch.float32)
-            q = torch.tensor(
-                q_vis.reshape(1, 7), device=self.device, dtype=torch.float32)
-            values = self._per_point_values(x, q)
-            f_min = float(np.min(values)) if values.size else -math.inf
+            hybrid_used = bool(ob.get("per_sensor_hybrid_used", False))
+            sensor_id = int(ob.get("per_sensor_selected_sensor_id", -1))
+            if (hybrid_used and sensor_id >= 0 and
+                    getattr(self, "_per_sensor_runtime", None) is not None):
+                # Preserve the branch identity that certified this q_vis.
+                # Reusing the scalar union score here would incorrectly reject
+                # a true per-sensor candidate merely because the scalar model
+                # underestimates that mode.
+                f_min = float(
+                    self._per_sensor_runtime.branch_score_numpy(
+                        points, q_vis, sensor_id))
+            else:
+                x = torch.tensor(
+                    points, device=self.device, dtype=torch.float32)
+                q = torch.tensor(
+                    q_vis.reshape(1, 7),
+                    device=self.device, dtype=torch.float32)
+                values = self._per_point_values(x, q)
+                f_min = (
+                    float(np.min(values)) if values.size else -math.inf)
         except Exception as exc:
             self._qvis_match_error_count += 1
             self._qvis_match_reject_count += 1
@@ -1368,7 +1383,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f_min + 1e-9 >= self._obligation_match_qvis_min_f)
         if compatible:
             self._qvis_match_accept_count += 1
-            self._qvis_match_last_reason = "qvis_compatible"
+            self._qvis_match_last_reason = (
+                "per_sensor_qvis_compatible"
+                if bool(ob.get("per_sensor_hybrid_used", False))
+                else "qvis_compatible")
             return True
 
         self._qvis_match_reject_count += 1
