@@ -14,6 +14,7 @@ Modes:
 """
 
 import os
+import math
 import time
 
 import numpy as np
@@ -55,9 +56,18 @@ class _OnlineRuntimeMixin:
                 model_value_and_grad_q(x, q, self.model)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
+        scalar_ms = (time.perf_counter() - tic) * 1000.0
+        branch_ms = math.nan
+        if (getattr(self, "per_sensor_hybrid_enabled", False) and
+                getattr(self, "_per_sensor_runtime", None) is not None):
+            branch_ms = float(self._per_sensor_runtime.warmup())
         rospy.logwarn(
-            "[vbc_waypoint_online] ONLINE WARMUP READY: %.2f ms device=%s batch=8 passes=2",
-            (time.perf_counter() - tic) * 1000.0, str(self.device))
+            "[vbc_waypoint_online] ONLINE WARMUP READY: scalar=%.2f ms "
+            "per_sensor=%s device=%s batch=8 passes=2",
+            scalar_ms,
+            ("{:.2f}ms".format(branch_ms)
+             if math.isfinite(branch_ms) else "disabled"),
+            str(self.device))
 
     def _selection_active_callback(self, msg):
         RollingVbcDeadlineWaypointNode._selection_active_callback(self, msg)
