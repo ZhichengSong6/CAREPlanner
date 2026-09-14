@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 from pathlib import Path
 import time
 
@@ -78,7 +77,8 @@ def run_sensor_batches(model, batches, counts8, weights, args, scaler=None, opti
         stats = torch.zeros((8, len(routed.STAT_NAMES)), dtype=torch.float64, device=device)
         model.train(training)
         for batch in batches:
-            with torch.enable_grad(), amp_context(device, args.amp):
+            precision = args.amp if training else "off"
+            with torch.enable_grad(), amp_context(device, precision):
                 loss, st = routed.loss_for_microbatch(
                     model, *batch, counts8, weights, training=training
                 )
@@ -205,7 +205,6 @@ def main():
         raise RuntimeError("BF16 unsupported")
     scaler = torch.cuda.amp.GradScaler(enabled=args.amp == "fp16", init_scale=1024.)
 
-    # Fixed validation cohort is also used for exact initialization-equivalence proof.
     val_batches, val_counts8, val_counts9, _ = prepare_batch_single(
         api, dataset, oracle, args, device, "val", baseline, obj
     )
