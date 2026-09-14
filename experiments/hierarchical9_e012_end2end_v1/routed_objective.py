@@ -1,11 +1,8 @@
 """Auxiliary objectives for E1/E2 shared routing and E2 hard replay.
 
 The original hierarchical9 global objective remains authoritative and is still
-used for every uniform batch.  These helpers do two narrowly defined things:
-1) provide an unbiased one-sensor estimate of the original *sensor* objective
-   for the shared-early trunk in E1/E2, avoiding simultaneous sensor-sensor
-   gradients on that trunk;
-2) provide asymmetric value-only replay on runtime-mined actual-FOV candidates.
+used for every uniform batch. These helpers only route one sensor objective to
+shared-early parameters and add asymmetric runtime-candidate value supervision.
 """
 from __future__ import annotations
 
@@ -14,6 +11,13 @@ from typing import Mapping
 
 import torch
 from torch.nn import functional as F
+
+
+def _zero_early(model):
+    # Connect every early parameter so autograd.grad(..., allow_unused=False) is
+    # valid even when one microbatch has zero rows for the selected sensor.
+    return sum((p.reshape(-1)[0] * 0.0 for p in model.early.parameters()),
+               torch.zeros((), device=next(model.parameters()).device))
 
 
 def selected_sensor_shared_objective(
@@ -35,11 +39,9 @@ def selected_sensor_shared_objective(
     if not 0 <= sensor_id < 8:
         raise ValueError(sensor_id)
     denom = global_counts9[sensor_id + 1].float()
-    if denom <= 0:
-        return inputs.sum() * 0.0
     valid = sensor_mask[:, sensor_id].bool()
-    if not valid.any():
-        return inputs.sum() * 0.0
+    if denom <= 0 or not valid.any():
+        return _zero_early(model)
 
     q = inputs[:, 3:].detach().float().clone().requires_grad_(True)
     x = inputs[:, :3].detach().float()
@@ -63,15 +65,20 @@ def selected_sensor_shared_objective(
     return weights.sensor_objective * objective
 
 
-def _asymmetric_values(pred: torch.Tensor, labels: torch.Tensor, fn_ratio: float):
+def _asymmetric_values(pred: torch.Tensor, labels: torch.Tensor, fn_ratio: float, margin: float):
     if not math.isfinite(fn_ratio) or fn_ratio < 0:
         raise ValueError("fn_ratio must be finite and nonnegative")
+    if not math.isfinite(margin) or margin <= 0:
+        raise ValueError("margin must be finite and positive")
     outside = labels < 0
     inside = labels > 0
     if torch.any(~(outside | inside)):
         raise ValueError("Replay labels must be +/-1")
-    fp = torch.relu(pred[outside]).square().sum() if outside.any() else pred.sum()*0.0
-    fn = torch.relu(-pred[inside]).square().sum() if inside.any() else pred.sum()*0.0
+    scale = margin * margin
+    fp = (torch.relu(pred[outside] + margin).square().sum()/scale
+          if outside.any() else pred.sum()*0.0)
+    fn = (torch.relu(margin - pred[inside]).square().sum()/scale
+          if inside.any() else pred.sum()*0.0)
     count = max(1, int(len(pred)))
     loss = (fp + fn_ratio*fn) / float(count)
     with torch.no_grad():
@@ -81,7 +88,7 @@ def _asymmetric_values(pred: torch.Tensor, labels: torch.Tensor, fn_ratio: float
     return loss, fp_n, fn_n, int(outside.sum()), int(inside.sum())
 
 
-def replay_private_loss(model, replay_batches: Mapping[int, dict], fn_ratio: float):
+def replay_private_loss(model, replay_batches: Mapping[int, dict], fn_ratio: float, margin: float):
     """Average replay loss across active sensors; block only early parameter grads."""
     losses = []
     stats = {"count": 0, "fp": 0, "fn": 0, "outside": 0, "inside": 0}
@@ -91,21 +98,21 @@ def replay_private_loss(model, replay_batches: Mapping[int, dict], fn_ratio: flo
         if not len(inp):
             continue
         pred = model.forward_sensor(inp, s, freeze_sensor_early=True).float()
-        loss, fp, fn, outside, inside = _asymmetric_values(pred, labels, fn_ratio)
+        loss, fp, fn, outside, inside = _asymmetric_values(pred, labels, fn_ratio, margin)
         losses.append(loss)
         stats["count"] += len(inp); stats["fp"] += fp; stats["fn"] += fn
         stats["outside"] += outside; stats["inside"] += inside
     if not losses:
-        device = next(model.parameters()).device
-        return torch.zeros((), device=device), stats
+        return _zero_early(model).detach(), stats
     return torch.stack(losses).mean(), stats
 
 
-def replay_shared_sensor_loss(model, replay_batches: Mapping[int, dict], sensor_id: int, fn_ratio: float):
+def replay_shared_sensor_loss(model, replay_batches: Mapping[int, dict], sensor_id: int,
+                              fn_ratio: float, margin: float):
     """One-sensor replay objective for shared early params; unbiased across sensors."""
     batch = replay_batches.get(sensor_id)
     if batch is None or not len(batch["inputs"]):
-        return next(model.parameters()).sum() * 0.0
+        return _zero_early(model)
     pred = model.forward_sensor(batch["inputs"], sensor_id, freeze_sensor_early=False).float()
-    loss, *_ = _asymmetric_values(pred, batch["labels"], fn_ratio)
+    loss, *_ = _asymmetric_values(pred, batch["labels"], fn_ratio, margin)
     return loss
