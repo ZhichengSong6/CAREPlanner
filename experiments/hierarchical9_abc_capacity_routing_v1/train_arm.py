@@ -18,6 +18,25 @@ import sensor_objective as routed
 old = proto.old
 
 
+def sample_global_indices_single(dataset, split, global_batch_x, device):
+    """Exact upstream rank-0 index sampling without torch.distributed."""
+    if split == "train":
+        pool = dataset.train_indices_cpu
+    elif split == "val":
+        pool = dataset.val_indices_cpu
+    else:
+        raise ValueError(split)
+    ridx = torch.randint(0, len(pool), (global_batch_x,), dtype=torch.long)
+    return pool[ridx].to(device=device, non_blocking=True)
+
+
+def sample_shared_q_single(dataset, batch_q, device):
+    """Exact upstream rank-0 uniform-q draw without distributed broadcast."""
+    q_min, q_max = dataset.q_limits(device=device)
+    u = torch.rand((batch_q, dataset.J), device=device)
+    return q_min[None, :] + u * (q_max - q_min)[None, :]
+
+
 def prepare_batch_single(api, dataset, oracle, args, device, split, baseline, obj):
     bx = args.global_batch_x if split == "train" else args.val_global_batch_x
     bq = args.batch_q if split == "train" else args.val_batch_q
@@ -27,8 +46,10 @@ def prepare_batch_single(api, dataset, oracle, args, device, split, baseline, ob
         if split == "val":
             baseline.seed_everything(args.seed + 100003)
         with torch.no_grad(), torch.autocast(device_type=device.type, enabled=False):
-            indices = api["sample_global_indices"](dataset, split, bx, device)
-            q = api["sample_shared_q"](dataset, bq, device)
+            indices = sample_global_indices_single(dataset, split, bx, device)
+            q = sample_shared_q_single(dataset, bq, device)
+            # materialize_local_x does not require a process group. rank=0/world=1
+            # materializes the full Cartesian batch for this independent GPU arm.
             x, qlib, valid = api["materialize_local_x"](dataset, indices, 0, 1, device)
             sensor_masks = dataset.sensor_masks(device=device)
             batches = []
@@ -231,6 +252,8 @@ def main():
     validation = initial
     for step in range(1, args.steps+1):
         started = time.perf_counter()
+        # Arm-specific construction may consume RNG (B's adapter down-projection).
+        # Reseeding HERE guarantees identical train sample streams for A/B/C.
         baseline.seed_everything(proto.abc_seed_for_update(args.seed, step))
         batches, counts8, counts9, identity = prepare_batch_single(
             api, dataset, oracle, args, device, "train", baseline, obj
