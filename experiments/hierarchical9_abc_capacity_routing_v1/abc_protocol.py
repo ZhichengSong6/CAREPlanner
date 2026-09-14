@@ -82,8 +82,6 @@ def load_reference_root(root: Path):
     cache, p0, _p1, refs = p2.load_references(root)
     run = json.loads((root / "P0/run.json").read_text())
     if run.get("status") != "COMPLETE" or run.get("successful_updates", 2000) != 2000:
-        # The original P0 run.json predates successful_updates in some runs; checkpoint
-        # identity below remains authoritative when that field is absent.
         if run.get("args", {}).get("steps") != 2000:
             raise ValueError("P0 is not the completed 2000-update control")
     expected = dict(
@@ -194,8 +192,12 @@ def assert_checkpoint(cp: dict, p0: dict, p0_sha: str, cache_identity: str, *, r
 
 def load_model_from_checkpoint(cp: dict, p0: dict, device: torch.device | str):
     from abc_model import build_arm
+    from eval_compat import legacy_compatible
     base = p0_model(p0, device)
     model = build_arm(base, cp["arm"])
     model.load_state_dict(cp["model_state"], strict=True)
     model.to(device=device, dtype=torch.float32).eval()
-    return model
+    # The legacy planning benchmark assumes one shared feature tensor.  Arm C
+    # intentionally has per-sensor private tails, so present a narrow evaluation
+    # compatibility interface that calls each real forward_sensor branch exactly.
+    return legacy_compatible(model)
