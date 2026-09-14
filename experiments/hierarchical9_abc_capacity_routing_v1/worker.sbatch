@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+: "${ABC_REFERENCE_ROOT:?}" "${ABC_CODE_REPO:?}" "${ABC_CODE_SHA:?}" "${ABC_STAGE:?}"
+cd "$ABC_CODE_REPO"
+[[ "$(git rev-parse HEAD)" == "$ABC_CODE_SHA" ]] || { echo 'Code HEAD changed after submission'; exit 2; }
+git diff --quiet && git diff --cached --quiet || { echo 'Tracked code changed after submission'; exit 2; }
+DIR=experiments/hierarchical9_abc_capacity_routing_v1
+CONDA_SH="${CONDA_SH:-$HOME/miniforge3/etc/profile.d/conda.sh}"
+[[ -f "$CONDA_SH" ]] || { echo 'Set CONDA_SH'; exit 2; }
+set +u
+source "$CONDA_SH"
+conda activate "${CONDA_ENV:-viscdf}"
+set -u
+export PYTHONUNBUFFERED=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4
+python "$DIR/test_abc.py"
+
+MODE="$ABC_STAGE"
+[[ "$MODE" == smoke || "$MODE" == pilot ]] || { echo 'Unknown ABC stage'; exit 2; }
+LOGDIR="$ABC_REFERENCE_ROOT/logs/abc_${MODE}_${SLURM_JOB_ID}"
+mkdir -p "$LOGDIR"
+
+echo "[launch] ABC mode=$MODE root=$ABC_REFERENCE_ROOT code=$ABC_CODE_SHA host=$(hostname)"
+PIDS=()
+ARMS=(A B C)
+for i in 0 1 2; do
+  arm=${ARMS[$i]}
+  echo "[launch-arm] $arm gpu=$i log=$LOGDIR/${arm}.out"
+  CUDA_VISIBLE_DEVICES=$i python "$DIR/train_arm.py" --reference-root "$ABC_REFERENCE_ROOT" --arm "$arm" --mode "$MODE" > "$LOGDIR/${arm}.out" 2>&1 &
+  PIDS+=("$!")
+done
+
+STATUS=0
+for i in 0 1 2; do
+  if ! wait "${PIDS[$i]}"; then
+    echo "[arm-failed] ${ARMS[$i]} log=$LOGDIR/${ARMS[$i]}.out"
+    STATUS=1
+  else
+    echo "[arm-complete] ${ARMS[$i]}"
+  fi
+done
+if [[ "$STATUS" != 0 ]]; then
+  for arm in A B C; do echo "===== $arm tail ====="; tail -n 80 "$LOGDIR/${arm}.out" || true; done
+  exit 1
+fi
+
+for arm in A B C; do
+  echo "===== $arm final tail ====="
+  tail -n 30 "$LOGDIR/${arm}.out"
+done
+
+CUDA_VISIBLE_DEVICES=3 python "$DIR/evaluate_abc.py" --reference-root "$ABC_REFERENCE_ROOT" --mode "$MODE"
+echo "[done] abc_workflow_complete mode=$MODE"
