@@ -64,7 +64,7 @@ def markdown(report,names):
     for n in names:
         fs=report["field_sentinel"][n]; sm=fs["fields"]["sensor_max"]; rk=fs["ranking"]
         lines.append(f"| {n} | {f(sm['mae'])} | {f(sm['sign_accuracy'])} | {f(sm['gradient_cosine_mean'])} | "
-                     f"{f(rk['top1'])} | {f(rk['fallback_success'])} |")
+                     f"{f(rk['winner_top1_accuracy_or_recall'])} | {f(rk['fallback_accuracy_after_gt_winner_removed'])} |")
     lines += ["","## Planning sensor-max","","| Model | projection | ascent1 | ascent10 |","|---|---:|---:|---:|"]
     for n in names:
         p=report["planning_sentinel"][f"{n}/sensor_max"]
@@ -100,7 +100,6 @@ def main():
     artifact=Path(p0["args"]["artifact_root"])
     v1,_=old.load_v1(artifact/old.V1_REL,device); models["V1"]=v1
     models["P0"]=proto.p0_model(p0,device).eval().requires_grad_(False)
-    # Keep the strongest frozen-backbone diagnostics visible when formal ABC exists.
     if args.mode=="pilot":
         for arm in ("B","C"):
             try:
