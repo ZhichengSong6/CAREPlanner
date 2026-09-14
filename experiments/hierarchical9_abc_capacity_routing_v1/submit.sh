@@ -40,10 +40,10 @@ fi
 mkdir -p "$ROOT/logs"
 LOCK="$ROOT/.abc_${STAGE}_submission"
 
-# Reclaim an earlier failed workflow safely.  A/B/C create their arm directories
-# before model construction, so a pre-update crash can leave partial output trees.
-# Never delete them: archive lock + partial outputs only when Slurm proves the
-# recorded job terminal-failed and no completed arm/evaluation is present.
+# Reclaim an earlier failed workflow safely.  Smoke is a disposable plumbing gate:
+# even if its 2-update A/B/C arms completed, a failed unified evaluation means the
+# smoke workflow is incomplete and may be archived as a whole.  Formal pilot arms,
+# however, are never auto-archived once COMPLETE.
 if [[ -e "$LOCK" ]]; then
   OLD_JOB=""
   [[ -s "$LOCK/job_id" ]] && OLD_JOB=$(cat "$LOCK/job_id")
@@ -53,30 +53,31 @@ if [[ -e "$LOCK" ]]; then
   fi
   case "$STATE" in
     FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL)
-      python3 - "$ROOT/$TRAIN_DIR" "$ROOT/$EVAL_DIR" <<'PY'
+      python3 - "$ROOT/$TRAIN_DIR" "$ROOT/$EVAL_DIR" "$STAGE" <<'PY'
 import json,sys
 from pathlib import Path
-train,ev=map(Path,sys.argv[1:])
-for arm in ('A','B','C'):
-    run=train/arm/'run.json'
-    if run.is_file():
-        try: data=json.loads(run.read_text())
-        except Exception: data={}
-        if data.get('status')=='COMPLETE':
-            raise SystemExit(f'Refusing reclaim: completed arm exists: {run}')
+train,ev=map(Path,sys.argv[1:3]); stage=sys.argv[3]
 manifest=ev/'manifest.json'
 if manifest.is_file():
     try: data=json.loads(manifest.read_text())
     except Exception: data={}
     if data.get('status')=='COMPLETE':
         raise SystemExit(f'Refusing reclaim: completed evaluation exists: {manifest}')
+if stage != 'smoke':
+    for arm in ('A','B','C'):
+        run=train/arm/'run.json'
+        if run.is_file():
+            try: data=json.loads(run.read_text())
+            except Exception: data={}
+            if data.get('status')=='COMPLETE':
+                raise SystemExit(f'Refusing formal-pilot reclaim: completed arm exists: {run}')
 PY
       ARCHIVE="$ROOT/.abc_${STAGE}_failed_${OLD_JOB}_$(date +%Y%m%d_%H%M%S)"
       mkdir "$ARCHIVE"
       mv "$LOCK" "$ARCHIVE/submission_lock"
       [[ -e "$ROOT/$TRAIN_DIR" ]] && mv "$ROOT/$TRAIN_DIR" "$ARCHIVE/$TRAIN_DIR"
       [[ -e "$ROOT/$EVAL_DIR" ]] && mv "$ROOT/$EVAL_DIR" "$ARCHIVE/$EVAL_DIR"
-      echo "[reclaim] archived failed job=$OLD_JOB state=$STATE partial outputs to $ARCHIVE"
+      echo "[reclaim] archived failed job=$OLD_JOB state=$STATE incomplete workflow to $ARCHIVE"
       ;;
     *)
       echo "ABC stage already reserved${OLD_JOB:+ by job $OLD_JOB}${STATE:+ state=$STATE}; not reclaiming"
