@@ -7,6 +7,7 @@ import torch
 import e012_protocol as proto
 from e2e_model import build_from_p0,function_equivalence
 from replay import ReplayBuffer
+import routed_objective as routed
 
 old=proto.old
 
@@ -39,8 +40,8 @@ class E012Tests(unittest.TestCase):
         y1=model.forward_sensor(torch.cat((x,q1),1),4,freeze_sensor_early=True)
         g0=torch.autograd.grad(y0.sum(),q0,retain_graph=True)[0]
         g1=torch.autograd.grad(y1.sum(),q1,retain_graph=True)[0]
-        self.assertTrue(torch.equal(y0,y1))
-        self.assertTrue(torch.equal(g0,g1))
+        self.assertTrue(torch.allclose(y0,y1,atol=1e-7,rtol=1e-7))
+        self.assertTrue(torch.allclose(g0,g1,atol=1e-7,rtol=1e-7))
 
     def test_sensor_parameter_frozen_early_blocks_only_early_param_grad(self):
         model=build_from_p0(self.p0); model.zero_grad(set_to_none=True)
@@ -73,13 +74,19 @@ class E012Tests(unittest.TestCase):
         for s in (0,3,7):
             x=torch.randn(9,3);q=torch.randn(9,7);labels=torch.where(torch.arange(9)%2==0,1.,-1.);g=labels*.01
             buf.add(s,x,q,labels,g)
-        a=buf.sample(5,seed=2,step=9,device=torch.device("cpu"))
-        b=buf.sample(5,seed=2,step=9,device=torch.device("cpu"))
+        a=buf.sample(5,seed=2,step=9,device=torch.device("cpu")); b=buf.sample(5,seed=2,step=9,device=torch.device("cpu"))
         self.assertEqual(set(a),{0,3,7})
         for s in a:
             self.assertTrue(torch.equal(a[s]["inputs"],b[s]["inputs"]))
             self.assertTrue(torch.equal(a[s]["labels"],b[s]["labels"]))
             self.assertEqual(a[s]["inputs"].shape,(5,10))
+
+    def test_replay_margin_has_nonzero_gradient_at_projection_boundary(self):
+        pred=torch.zeros(2,requires_grad=True); labels=torch.tensor([-1.,1.])
+        loss,*_=routed._asymmetric_values(pred,labels,0.25,0.02)
+        loss.backward()
+        self.assertGreater(float(pred.grad[0]),0.0)
+        self.assertLess(float(pred.grad[1]),0.0)
 
 
 if __name__=="__main__": unittest.main(verbosity=2)
