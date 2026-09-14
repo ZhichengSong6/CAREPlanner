@@ -42,11 +42,11 @@ E1 + runtime-aligned projection replay。
 
 每 20 updates（smoke 中每步）从训练 x 和随机 q 产生 actual-outside starts，用现有 `_projection` 生成当前网络 candidate，再用 analytic conservative FOV oracle 标注 candidate。候选按 sensor 存入 4096 容量 replay buffer。
 
-Replay loss 只做 value sign correction：
-- actual outside: `relu(f_s)^2`
-- actual inside: `0.25 * relu(-f_s)^2`
+Replay 使用 0.02 model-field margin，并除以 `margin^2` 做归一化，因此 projection candidate 即使落在 `f≈0` 仍有有效梯度：
+- actual outside: `relu(0.02 + f_s)^2 / 0.02^2`
+- actual inside: `0.25 * relu(0.02 - f_s)^2 / 0.02^2`
 
-权重前 500 updates 从 0 线性 warmup 到 1。private branch 每步使用所有 replay sensor；shared early 仍只接受当步 round-robin sensor 的 replay gradient，保持 E1 的冲突控制原则。
+Replay 总权重前 500 updates 从 0 线性 warmup 到 `0.02`。private branch 每步使用所有 replay sensor；shared early 仍只接受当步 round-robin sensor 的 replay gradient，保持 E1 的冲突控制原则。
 
 注意：这只是 projection-aligned hard-example mining，不声称复现完整 Sparse-SCP/VBC/GCDF runtime。
 
@@ -88,8 +88,4 @@ bash experiments/hierarchical9_e012_end2end_v1/submit.sh pilot
 bash experiments/hierarchical9_e012_end2end_v1/submit.sh pack
 ```
 
-生成：
-
-```text
-$E012_REFERENCE_ROOT/e012_end2end_reports.zip
-```
+生成 `$E012_REFERENCE_ROOT/e012_end2end_reports.zip`。
