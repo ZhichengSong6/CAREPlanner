@@ -10,11 +10,15 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   sensor_msgs
+  care_confidence_map
 )
 
 add_message_files(
   FILES
   CollisionCDFConstraintBatch.msg
+  CollisionCDFWitnessRequest.msg
+  CollisionCDFWitnessResponse.msg
+  CollisionCDFRejectionFeedback.msg
 )
 
 add_service_files(
@@ -30,7 +34,7 @@ generate_messages(
 )
 
 catkin_package(
-  CATKIN_DEPENDS geometry_msgs message_runtime roscpp rospy std_msgs sensor_msgs
+  CATKIN_DEPENDS geometry_msgs message_runtime roscpp rospy std_msgs sensor_msgs care_confidence_map
 )
 
 include_directories(
@@ -50,9 +54,15 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(DIRECTORY config launch checkpoints
+install(DIRECTORY config launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
+# Preserve historical packaging unless the deployment build explicitly opts out.
+# Release acceptance supplies an external, SHA-bound checkpoint instead.
+option(CARE_INSTALL_CHECKPOINTS "Bundle collision checkpoints in install space" ON)
+if(CARE_INSTALL_CHECKPOINTS)
+  install(DIRECTORY checkpoints DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+endif()
 
 
 add_executable(cpp_forbidden_voxel_gpu_shadow_node
@@ -67,6 +77,13 @@ add_dependencies(cpp_forbidden_voxel_gpu_shadow_node
 target_link_libraries(cpp_forbidden_voxel_gpu_shadow_node
   ${catkin_LIBRARIES}
 )
+
+if(CATKIN_ENABLE_TESTING AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_phase_e_gcdf_primitives.cpp")
+  find_package(pinocchio REQUIRED)
+  add_executable(test_gcdf_primitives ../../scripts/test_phase_e_gcdf_primitives.cpp)
+  add_dependencies(test_gcdf_primitives ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_gcdf_primitives ${catkin_LIBRARIES} pinocchio::pinocchio)
+endif()
 
 install(TARGETS
   cpp_forbidden_voxel_gpu_shadow_node

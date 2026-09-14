@@ -34,11 +34,13 @@ public:
                          const Eigen::VectorXd& dq_current,
                          const Eigen::VectorXd& ddq_current,
                          const geometry_msgs::PoseStamped& target_pose_msg,
-                         arm_trajectory::JointTrajectory& tau_task);
+                         arm_trajectory::JointTrajectory& tau_task,
+                         const Eigen::VectorXd* ik_seed = nullptr);
 
   const TaskTrajectoryGeneratorConfig& config() const;
 
   Eigen::VectorXd lastGoalQ() const;
+  const arm_model::IKResult& lastIKResult() const { return last_ik_result_; }
   PlannerStatus lastStatus() const;
   std::string lastStatusString() const;
 
@@ -67,6 +69,7 @@ private:
   std::shared_ptr<arm_model::RobotModel> robot_model_;
 
   Eigen::VectorXd last_goal_q_;
+  arm_model::IKResult last_ik_result_;
   PlannerStatus last_status_ = PlannerStatus::NOT_INITIALIZED;
 };
 

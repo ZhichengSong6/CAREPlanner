@@ -1,0 +1,18 @@
+<launch>
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+  <arg name="input_trajectory_topic" />
+  <arg name="output_topic" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="body_inflation_m" default="0.0" />
+  <arg name="max_eval_timesteps" default="50" />
+  <node pkg="care_confidence_map" type="gcdf_primitive_anchor_node" name="gcdf_primitive_anchors" output="screen">
+    <param name="robot_urdf_file" value="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+    <param name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="output_topic" value="$(arg output_topic)" />
+    <param name="body_inflation_m" value="$(arg body_inflation_m)" />
+    <param name="max_eval_timesteps" value="$(arg max_eval_timesteps)" />
+    <rosparam param="ignored_risk_links">[base_link, link1]</rosparam>
+  </node>
+</launch>

@@ -42,6 +42,8 @@ import os
 import re
 import threading
 import time
+import uuid
+from observation_identity import observation_token
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -173,6 +175,12 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         if q.shape != (7,) or not np.all(np.isfinite(q)):
             return
         self._latest_measured_q = q
+        self._trace_measured = (q.copy(), msg.header.stamp.to_sec())
+
+    def _trace_observation(self, stage, **fields):
+        # Optional instrumentation hook; the mainline does not write debug
+        # traces. Target identities below remain part of runtime validation.
+        return None
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         if msg is None:
@@ -316,11 +324,21 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             raise RuntimeError("measured_joint_state_not_ready")
 
         self._seed_override = measured
+        generation_id = uuid.uuid4().hex
         t_generate_start = time.perf_counter()
+        self._trace_observation("generation_started", generation_event_id=generation_id,
+            obligation_id=int(self._next_obligation_id), measured_seed_q=measured.tolist(),
+            points=np.asarray(region["points"]).tolist(),
+            source_trajectory_stamp_ns=int(trajectory.header.stamp.to_nsec()),
+            trajectory_source=str(trajectory_source))
         try:
             result = RollingVbcDeadlineWaypointNode._generate_active_set_waypoint(
                 self, region["points"], trajectory, sweep_time_s,
                 trajectory_received)
+        except Exception as exc:
+            self._trace_observation("generation_failed", generation_event_id=generation_id,
+                error=str(exc), compute_ms=1000.0*(time.perf_counter()-t_generate_start))
+            raise
         finally:
             q_vis_generation_ms = 1000.0 * (
                 time.perf_counter() - t_generate_start)
@@ -406,6 +424,7 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             dtype=np.float64).reshape(3)
 
         ob = {
+            "generation_event_id": generation_id,
             "id": int(self._next_obligation_id),
             "points": source_points.copy(),
             "keys": source_keys,
@@ -468,10 +487,19 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "q_vis_generation_ms": float(q_vis_generation_ms),
         }
         self._next_obligation_id += 1
+        self._trace_observation("generated", generation_event_id=generation_id,
+            observation_token=observation_token(ob), obligation_id=int(ob["id"]),
+            q_vis=q_vis.tolist(), points=source_points.tolist(),
+            compute_ms=float(q_vis_generation_ms),
+            per_sensor_hybrid=result.get("per_sensor_hybrid", {"enabled": False}),
+            scalar_final_f=float(result["final_f_min"]),
+            oracle=result.get("final_oracle_diagnostic"))
 
         # Save a compact per-obligation trace alongside existing projector traces.
         trace = dict(result)
         trace.update({
+            "generation_event_id": generation_id,
+            "observation_token": observation_token(ob),
             "c4_6_obligation_id": ob["id"],
             "c4_6_seed_source": "measured_joint_state",
             "c4_6_measured_seed_q": measured.tolist(),

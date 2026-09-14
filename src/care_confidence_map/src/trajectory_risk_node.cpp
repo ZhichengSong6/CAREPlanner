@@ -1,5 +1,9 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
+#include <care_confidence_map/body_geometry_params.hpp>
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/gcdf_primitive_anchors.hpp>
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/confidence_query_validation.hpp>
 
 #include <std_srvs/Trigger.h>
 
@@ -43,7 +47,7 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!evaluator_.initialize(
+    if (!care_confidence_map::initializeBodyGeometry(evaluator_, pnh_, "trajectory_risk",
             robot_urdf_file_,
             body_samples_file_,
             base_frame_,
@@ -52,6 +56,13 @@ public:
       ROS_ERROR_STREAM("[trajectory_risk_node] Failed to initialize evaluator: "
                        << error_msg);
       return false;
+    }
+
+    if(evaluator_.usesPrimitives() && forbidden_space_pair_publish_enabled_) {
+      std::string path;pnh_.getParam("trajectory_risk/primitive_urdf_file",path);
+      if(!primitive_export_model_.load(path,ignored_risk_links_,&error_msg)) {
+        ROS_ERROR_STREAM(error_msg);return false;
+      }
     }
 
     confidence_query_client_ =
@@ -863,6 +874,7 @@ private:
       return false;
     }
 
+    if(evaluator_.usesPrimitives() && !care_confidence_map::validConfidenceResponse(*srv))return false;
     const std::size_t n = srv->request.points.size();
 
     if (srv->response.confidence.size() != n ||
@@ -1677,9 +1689,10 @@ private:
     marker.pose.orientation.w = 1.0;
 
     const double scale_multiplier = is_worst_marker ? 2.4 : 2.0;
-    marker.scale.x = scale_multiplier * sample.radius;
-    marker.scale.y = scale_multiplier * sample.radius;
-    marker.scale.z = scale_multiplier * sample.radius;
+    const double display_radius=evaluator_.usesPrimitives()?.006:sample.radius;
+    marker.scale.x = scale_multiplier * display_radius;
+    marker.scale.y = scale_multiplier * display_radius;
+    marker.scale.z = scale_multiplier * display_radius;
 
     setColorForConfidence(
         confidence,
@@ -1718,9 +1731,10 @@ private:
     marker.pose.orientation.w = 1.0;
 
     const double scale_multiplier = is_topk_marker ? 3.0 : 2.5;
-    marker.scale.x = scale_multiplier * item.radius;
-    marker.scale.y = scale_multiplier * item.radius;
-    marker.scale.z = scale_multiplier * item.radius;
+    const double display_radius=evaluator_.usesPrimitives()?.006:item.radius;
+    marker.scale.x = scale_multiplier * display_radius;
+    marker.scale.y = scale_multiplier * display_radius;
+    marker.scale.z = scale_multiplier * display_radius;
 
     if (is_topk_marker)
     {
@@ -1766,9 +1780,10 @@ private:
     marker.action = visualization_msgs::Marker::ADD;
     marker.pose.position = toPointMsg(item.center_base);
     marker.pose.orientation.w = 1.0;
-    marker.scale.x = scale_multiplier * item.radius;
-    marker.scale.y = scale_multiplier * item.radius;
-    marker.scale.z = scale_multiplier * item.radius;
+    const double display_radius=evaluator_.usesPrimitives()?.006:item.radius;
+    marker.scale.x = scale_multiplier * display_radius;
+    marker.scale.y = scale_multiplier * display_radius;
+    marker.scale.z = scale_multiplier * display_radius;
     marker.color.r = r;
     marker.color.g = g;
     marker.color.b = b;
@@ -1931,6 +1946,7 @@ private:
     std::ostringstream oss;
 
     oss << "trajectory_risk: "
+        << "geometry_backend=" << evaluator_.geometryBackend() << ", support=discrete_diagnostic_points, "
         << "success=" << result.success
         << ", message=" << result.message
         << ", score=" << result.score
@@ -2364,6 +2380,28 @@ private:
   {
     if (!forbidden_space_pair_publish_enabled_)
     {
+      return;
+    }
+
+    if(evaluator_.usesPrimitives()) {
+      try {
+        std::vector<Eigen::VectorXd> q;
+        for(const auto& f:sample_result.frames)q.push_back(f.q);
+        std::vector<care_confidence_map::VbcPrimitiveFrame> frames;std::string error;
+        if(!primitive_export_model_.computeTrajectory(evaluator_,q,&frames,&error))throw std::runtime_error(error);
+        std::vector<care_confidence_map::GcdfPrimitiveAnchor> anchors;
+        for(std::size_t k=0;k<frames.size();++k) {
+          if(q[k].size()!=7)throw std::runtime_error("primitive anchor requires q7");
+          for(const auto& p:frames[k].primitives) {
+            care_confidence_map::GcdfPrimitiveAnchor a;a.shape=p;a.eval_timestep=k;
+            a.original_timestep=risk_result.eval_to_original_index.at(k);
+            a.inflation=forbidden_space_body_inflation_m_;
+            for(int j=0;j<7;++j)a.q[j]=q[k][j];anchors.push_back(std::move(a));
+          }
+        }
+        std_msgs::Header header;header.frame_id=base_frame_;header.stamp=source_trajectory_stamp;
+        forbidden_space_pair_pub_.publish(care_confidence_map::encodePrimitiveAnchors(header,anchors));
+      } catch(const std::exception& e) {ROS_ERROR_STREAM_THROTTLE(1.,"Primitive anchor export rejected: "<<e.what());}
       return;
     }
 
@@ -3308,6 +3346,7 @@ private:
   ros::Timer eval_timer_;
 
   care_confidence_map::TrajectoryRiskEvaluator evaluator_;
+  care_confidence_map::VbcPrimitiveModel primitive_export_model_;
 
   std::mutex latest_traj_mutex_;
   trajectory_msgs::JointTrajectory latest_traj_;

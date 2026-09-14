@@ -210,6 +210,7 @@ catkin_install_python(PROGRAMS
   scripts/c4_3_planner_regime_handoff_node.py
   scripts/c4_4_verified_regime_manager_node.py
   scripts/optimized_trajectory_continuity_node.py
+  scripts/gcdf_rejection_feedback.py
   scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
   scripts/execution_gcdf_measured_state_trajectory_node.py
@@ -226,3 +227,14 @@ catkin_install_python(PROGRAMS
   scripts/compare_phase_b2_ab_runs.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+install(TARGETS egocentric_arm_planner receding_horizon_planner_node
+  trajectory_visualizer_node trajectory_execution_manager_node
+  velocity_qp_mpc_node velocity_qp_mpc_waypoint_node local_sparse_scp_planner_node
+  frozen_snapshot_repair_diagnostic_node ee_interactive_marker_node
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
+install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

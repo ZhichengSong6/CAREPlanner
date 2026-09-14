@@ -114,6 +114,11 @@ class PhaseB2ControlledTrialNode:
 
         self._startup_time = rospy.Time.now()
         self._goal_sent = False
+        # Offline benchmark only; absent in normal/legacy launches. This delays
+        # goal dispatch but cannot replace any prior or execution safety gate.
+        import os
+        self._benchmark_arm_token = os.environ.get("CARE_BENCHMARK_ARM_TOKEN", "")
+        self._benchmark_armed = not bool(self._benchmark_arm_token)
         self._legacy_replan_goal_sent = False
         self._replan_count = 0
 
@@ -137,6 +142,10 @@ class PhaseB2ControlledTrialNode:
 
         self.goal_pub = rospy.Publisher(
             self.goal_topic, PoseStamped, queue_size=1, latch=True)
+        if self._benchmark_arm_token:
+            self._benchmark_arm_sub = rospy.Subscriber(
+                "/care_planner/benchmark/arm", String,
+                self._benchmark_arm_callback, queue_size=1)
         self.target_pub = rospy.Publisher(
             self.target_topic, PointStamped, queue_size=1)
         self.sweep_pub = rospy.Publisher(
@@ -355,9 +364,16 @@ class PhaseB2ControlledTrialNode:
             rospy.logwarn(
                 "[phase_b2_trial] initial trusted-free prior READY")
 
+    def _benchmark_arm_callback(self, msg):
+        with self._lock:
+            if self._benchmark_arm_token and msg.data == self._benchmark_arm_token:
+                self._benchmark_armed = True
+
     def _goal_timer_callback(self, _event):
         with self._lock:
             if self._goal_sent:
+                return
+            if not self._benchmark_armed:
                 return
             if not self._initial_prior_ready:
                 rospy.logwarn_throttle(

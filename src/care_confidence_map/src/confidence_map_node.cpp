@@ -1,9 +1,15 @@
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/gcdf_primitive_anchors.hpp>
 #include <ros/ros.h>
+#include <ros/callback_queue.h>
+#include <mutex>
+#include <memory>
 
 #include <XmlRpcValue.h>
 
 #include <care_confidence_map/QueryConfidence.h>
 #include <care_confidence_map/body_sample_model.hpp>
+#include <care_confidence_map/legacy_body_backend.hpp>
 
 #include <std_srvs/Trigger.h>
 #include <std_msgs/String.h>
@@ -75,9 +81,18 @@ public:
   ConfidenceMapNode()
     : nh_()
     , pnh_("~")
+    , query_nh_(nh_)
     , tf_buffer_()
     , tf_listener_(tf_buffer_)
   {
+  }
+
+  ~ConfidenceMapNode()
+  {
+    // Stop the reader before grid/member destruction, including on shutdown
+    // with a request in flight. The default ROS queue remains single-threaded.
+    query_service_.shutdown();
+    if (query_spinner_) query_spinner_->stop();
   }
 
   bool initialize()
@@ -132,8 +147,11 @@ public:
               this);
     }
 
+    bool dedicated_queries = true;
+    pnh_.param("confidence_map/query_dedicated_queue", dedicated_queries, true);
+    if (dedicated_queries) query_nh_.setCallbackQueue(&query_queue_);
     query_service_ =
-        nh_.advertiseService(query_service_name_,
+        query_nh_.advertiseService(query_service_name_,
                              &ConfidenceMapNode::handleQueryConfidence,
                              this);
 
@@ -167,11 +185,18 @@ public:
                       << refresh_msg);
     }
 
+    // All initialization (including optional prior refresh) precedes readers.
+    if (dedicated_queries) {
+      query_spinner_.reset(new ros::AsyncSpinner(1, &query_queue_));
+      query_spinner_->start();
+    }
+    ROS_INFO_STREAM("[confidence_map_node] query_dedicated_queue=" << dedicated_queries);
     printSummary();
     return true;
   }
 
 private:
+  friend struct ColdStartPrimitiveTest;
   bool loadConfidenceMapParams()
   {
     ros::NodeHandle& nh = pnh_;
@@ -401,6 +426,13 @@ private:
   {
     ros::NodeHandle& nh = pnh_;
 
+    nh.param<std::string>("current_body_prior/geometry_backend", current_body_prior_geometry_backend_, "samples");
+    if (current_body_prior_geometry_backend_ != "samples" && current_body_prior_geometry_backend_ != "primitive")
+    {
+      ROS_ERROR("[confidence_map_node] Unknown body prior geometry_backend (no fallback).");
+      return false;
+    }
+
     nh.param("current_body_prior/enabled",
              current_body_prior_enabled_,
              true);
@@ -492,11 +524,49 @@ private:
       return true;
     }
 
-    if (current_body_prior_inflation_radius_ < 0.0)
+    if (!std::isfinite(current_body_prior_inflation_radius_) || current_body_prior_inflation_radius_ < 0.0 ||
+        !std::isfinite(current_body_prior_tf_timeout_) || current_body_prior_tf_timeout_ < 0.0)
     {
       ROS_ERROR_STREAM("[confidence_map_node] Invalid current_body_prior/inflation_radius: "
                        << current_body_prior_inflation_radius_);
       return false;
+    }
+
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      std::string urdf_file, error;
+      nh.param<std::string>("current_body_prior/primitive_urdf_file", urdf_file, "");
+      // Do not silently reinterpret arbitrary YAML risk flags as URDF link roles.
+      // Explicit exclusions are required only for the optional risk-only mode.
+      std::vector<std::string> ignored;
+      if (current_body_prior_risk_samples_only_ &&
+          !nh.getParam("current_body_prior/primitive_risk_excluded_links", ignored))
+      {
+        ROS_ERROR("[confidence_map_node] primitive risk-only mode requires explicit primitive_risk_excluded_links.");
+        return false;
+      }
+      if (!current_body_primitive_model_.load(urdf_file, ignored, &error))
+      {
+        ROS_ERROR_STREAM("[confidence_map_node] Cannot load primitive prior: " << error);
+        return false;
+      }
+      if (!ignored.empty())
+      {
+        care_confidence_map::VbcPrimitiveModel all_links;
+        if (!all_links.load(urdf_file, {}, &error)) return false;
+        std::set<std::string> seen;
+        for (const auto& link : ignored)
+          if (std::find(all_links.frames().begin(), all_links.frames().end(), link) == all_links.frames().end() ||
+              !seen.insert(link).second)
+          {
+            ROS_ERROR_STREAM("[confidence_map_node] Unknown/duplicate primitive risk exclusion: " << link);
+            return false;
+          }
+      }
+      ROS_INFO_STREAM("[confidence_map_node] primitive prior: "
+                      << current_body_primitive_model_.primitives().size()
+                      << " solids; no body_samples.yaml loaded; URDF=" << urdf_file);
+      return true;
     }
 
     if (current_body_prior_body_samples_file_.empty())
@@ -506,7 +576,7 @@ private:
     }
 
     std::string error_msg;
-    if (!current_body_sample_model_.loadFromYaml(
+    if (!care_confidence_map::loadLegacyBodySamples(&current_body_sample_model_,
             current_body_prior_body_samples_file_, &error_msg))
     {
       ROS_ERROR_STREAM("[confidence_map_node] Failed to load body samples for current_body_prior: "
@@ -775,6 +845,23 @@ private:
     }
   }
 
+  void markPrimitiveAsKnownClear(const care_confidence_map::VbcPrimitive& primitive, double inflation)
+  {
+    GridPoint* const grid = grid_points_.data();
+    const int ny = ny_, nz = nz_;
+    care_confidence_map::visitPrimitiveProximity(primitive, inflation, 0.0,
+        Eigen::Vector3d(x_min_, y_min_, z_min_), Eigen::Vector3i(nx_, ny_, nz_), resolution_,
+        [&](int x, int y, int z, float) {
+          // Same provenance-only write as the legacy sphere path.
+          grid[(x*ny+y)*nz+z].bootstrap_confidence = 1.0f;
+          ++last_body_prior_updated_cells_;
+        }, [&](int x, int y, int z) {
+          // Union membership is already proven by a previous solid. Avoid
+          // another exact SDF evaluation; never skip an unclassified cell.
+          return grid[(x*ny+y)*nz+z].bootstrap_confidence == 0.0f;
+        });
+  }
+
   bool refreshCurrentBodyPrior(
       const ros::Time& now,
       const std::string& reason,
@@ -811,6 +898,71 @@ private:
       return true;
     }
 
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      // All TFs/geometry must validate BEFORE any primitive becomes effective.
+      // Cache one latest transform per link, retaining the existing TF policy.
+      std::map<std::string, tf2::Transform> transforms;
+      for (const auto& frame : current_body_primitive_model_.frames())
+      {
+        try
+        {
+          const auto msg = tf_buffer_.lookupTransform(map_frame_, frame, ros::Time(0),
+              ros::Duration(current_body_prior_tf_timeout_));
+          transforms.emplace(frame, transformMsgToTf2(msg));
+        }
+        catch (const tf2::TransformException& ex)
+        {
+          ROS_WARN_STREAM_THROTTLE(2.0, "[confidence_map_node] primitive prior missing TF: " << ex.what());
+        }
+      }
+      std::vector<care_confidence_map::GcdfPrimitiveAnchor> pending;
+      pending.reserve(current_body_primitive_model_.primitives().size());
+      try
+      {
+        for (const auto& local : current_body_primitive_model_.primitives())
+        {
+          const auto it = transforms.find(local.link_name);
+          if (it == transforms.end()) { ++last_body_prior_skipped_samples_; continue; }
+          care_confidence_map::GcdfPrimitiveAnchor a;
+          a.eval_timestep = a.original_timestep = 0;
+          a.shape = local;
+          const auto& tf = it->second;
+          const auto c = tf * tf2::Vector3(local.center.x(), local.center.y(), local.center.z());
+          a.shape.center = Eigen::Vector3d(c.x(), c.y(), c.z());
+          // Same R_map_link * R_link_collision, without Eigen expression
+          // temporaries in the workspace's unoptimized build.
+          double* rotation = a.shape.rotation.data();
+          const double* local_rotation = local.rotation.data();
+          for (int r=0; r<3; ++r) for (int s=0; s<3; ++s)
+            rotation[3*s+r] = tf.getBasis()[r][0]*local_rotation[3*s] +
+                tf.getBasis()[r][1]*local_rotation[3*s+1] + tf.getBasis()[r][2]*local_rotation[3*s+2];
+          a.inflation = currentBodyPriorInflationForLink(local.link_name);
+          care_confidence_map::validatePrimitiveAnchor(a);
+          pending.push_back(std::move(a));
+          ++last_body_prior_transformed_samples_;
+        }
+        if (last_body_prior_skipped_samples_ == 0 && !pending.empty())
+        {
+          // Large startup envelopes first: overlapping cells need an exact
+          // containment test only until one solid proves union membership.
+          // This changes neither coverage nor confidence provenance.
+          std::stable_sort(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
+            return a.inflation > b.inflation;
+          });
+          for (const auto& a : pending) markPrimitiveAsKnownClear(a.shape, a.inflation);
+        }
+      }
+      catch (const std::exception& ex)
+      {
+        clearBootstrapConfidenceLayer();
+        last_body_prior_updated_cells_ = 0;
+        if (message) *message = std::string("primitive prior rejected: ") + ex.what();
+        return false;
+      }
+    }
+    else
+    {
     if (current_body_sample_model_.size() == 0)
     {
       if (message)
@@ -868,9 +1020,11 @@ private:
 
       ++last_body_prior_transformed_samples_;
     }
+    }
 
     std::ostringstream oss;
     oss << "reason=" << reason
+        << ", geometry_backend=" << current_body_prior_geometry_backend_
         << ", transformed_samples=" << last_body_prior_transformed_samples_
         << ", skipped_samples=" << last_body_prior_skipped_samples_
         << ", updated_cells=" << last_body_prior_updated_cells_
@@ -1074,6 +1228,7 @@ private:
   void rayObservationCallback(
       const sensor_msgs::PointCloud2ConstPtr& msg)
   {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
     if (!msg || observation_mode_ != "tof_ray")
     {
       return;
@@ -1606,6 +1761,7 @@ private:
     std_msgs::String msg;
     std::ostringstream oss;
     oss << "phase=E3"
+        << " body_prior_geometry_backend=" << current_body_prior_geometry_backend_
         << " observation_mode=" << observation_mode_
         << " ray_packet_count=" << ray_packet_count_
         << " ray_decode_failure_count=" << ray_decode_failure_count_
@@ -1636,6 +1792,8 @@ private:
       care_confidence_map::QueryConfidence::Request& req,
       care_confidence_map::QueryConfidence::Response& res)
   {
+    // One current, coherent map version per response; no cached SAFE answer.
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
     res.confidence.clear();
     res.current_visibility.clear();
     res.inside_map.clear();
@@ -1819,6 +1977,7 @@ private:
       std_srvs::Trigger::Request&,
       std_srvs::Trigger::Response& res)
   {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
     std::string message;
     const bool ok = refreshCurrentBodyPrior(
         ros::Time::now(), "service", &message);
@@ -1832,6 +1991,7 @@ private:
       std_srvs::Trigger::Request&,
       std_srvs::Trigger::Response& res)
   {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
     std::size_t cleared_cells = 0;
     std::size_t preserved_sensor_cells = 0;
     for (auto& gp : grid_points_)
@@ -2262,10 +2422,11 @@ private:
 
     std::ostringstream oss;
     oss << "cold-start body bootstrap"
+        << "\nbackend=" << current_body_prior_geometry_backend_
         << "\nper-link kinematic inflation (fallback="
         << current_body_prior_inflation_radius_ << " m)"
-        << "\nbootstrap confidence=1, visibility=0"
-        << "\nsamples=" << last_body_prior_transformed_samples_
+        << "\nbootstrap confidence=1; sensor visibility preserved"
+        << "\ngeometry elements=" << last_body_prior_transformed_samples_
         << ", cells=" << last_body_prior_updated_cells_;
 
     marker.text = oss.str();
@@ -2289,6 +2450,23 @@ private:
     }
 
     int marker_id = 0;
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      // Show exactly the trusted grid centres, not axis-expanded boxes/cylinders
+      // that would misrepresent rounded Minkowski dilation as extra FREE space.
+      visualization_msgs::Marker m;
+      m.header = delete_marker.header;
+      m.ns = "current_body_prior_grid_centres"; m.id = marker_id++;
+      m.type = visualization_msgs::Marker::POINTS; m.action = visualization_msgs::Marker::ADD;
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = resolution_ * 0.25;
+      m.color.g = 1.0; m.color.b = 0.7; m.color.a = 0.6;
+      for (const auto& gp : grid_points_) if (gp.bootstrap_confidence > 0.5f)
+      {
+        geometry_msgs::Point p; p.x=gp.x; p.y=gp.y; p.z=gp.z; m.points.push_back(p);
+      }
+      array.markers.push_back(std::move(m));
+    }
     for (const auto& sphere : last_body_prior_spheres_)
     {
       array.markers.push_back(
@@ -2369,6 +2547,7 @@ private:
 
   void updateTimerCallback(const ros::TimerEvent&)
   {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
     const ros::Time now = ros::Time::now();
 
     if (observation_mode_ == "ideal_fov")
@@ -2395,6 +2574,10 @@ private:
 
   void publishTimerCallback(const ros::TimerEvent&)
   {
+    // This callback and all writers still use the same single default queue.
+    // It only READS map state, so can run alongside the dedicated query reader.
+    // In particular, marker TF waits and cloud publication never hold the map
+    // write/query mutex. No publication or map update is skipped.
     visualization_msgs::MarkerArray marker_array;
     std::vector<tf2::Transform> T_map_sensors_unused;
     getSensorTransforms(T_map_sensors_unused, &marker_array);
@@ -2441,6 +2624,7 @@ private:
 
     ROS_INFO_STREAM("");
     ROS_INFO_STREAM("current_body_prior:");
+    ROS_INFO_STREAM("  geometry_backend: " << current_body_prior_geometry_backend_);
     ROS_INFO_STREAM("  enabled: " << current_body_prior_enabled_);
     ROS_INFO_STREAM("  body_samples_file: " << current_body_prior_body_samples_file_);
     ROS_INFO_STREAM("  fallback_inflation_radius: " << current_body_prior_inflation_radius_);
@@ -2484,6 +2668,10 @@ private:
 private:
   ros::NodeHandle nh_;
   ros::NodeHandle pnh_;
+  ros::NodeHandle query_nh_;
+  ros::CallbackQueue query_queue_;
+  std::unique_ptr<ros::AsyncSpinner> query_spinner_;
+  std::mutex map_query_mutex_;
 
   tf2_ros::Buffer tf_buffer_;
   tf2_ros::TransformListener tf_listener_;
@@ -2586,6 +2774,8 @@ private:
   std::string current_body_prior_marker_topic_ =
       "/care_planner/confidence_map/current_body_prior_markers";
   care_confidence_map::BodySampleModel current_body_sample_model_;
+  std::string current_body_prior_geometry_backend_ = "samples";
+  care_confidence_map::VbcPrimitiveModel current_body_primitive_model_;
   std::vector<CurrentBodyPriorSphere> last_body_prior_spheres_;
   ros::Time last_body_prior_refresh_time_;
   int last_body_prior_updated_cells_ = 0;

@@ -2,7 +2,8 @@
 """Executed visibility-before-contact diagnostic logger.
 
 For one frozen target x*, measure from the actually executed robot motion:
-  d_body(t) = min_i ||c_i(q_measured(t)) - x*|| - r_i
+  primitive: minimum signed distance to the transformed URDF solids;
+  legacy samples: min_i ||c_i(q_measured(t)) - x*|| - r_i.
 The first d_body <= sweep_extra_margin is executed sweep. The first
 current_visibility >= visibility_threshold is executed sensor-seen.
 The executed VBC margin is t_sweep_exec - t_see_exec.
@@ -18,6 +19,7 @@ import csv
 import json
 import math
 import re
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -26,10 +28,12 @@ from typing import Dict, List, Optional, Tuple
 import rospy
 import tf2_geometry_msgs
 import tf2_ros
-import yaml
 from care_confidence_map.srv import QueryConfidence, QueryConfidenceRequest
 from geometry_msgs.msg import PointStamped
 from std_msgs.msg import Float32, String
+# Source path under catkin's devel relay; installed scripts share this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from primitive_point_geometry import load_primitives, target_in_link
 
 
 def _sanitize(text: str) -> str:
@@ -48,15 +52,18 @@ class ExecutedVBCLogger:
         "closest_sample", "sweep_latched", "sweep_delay_s", "seen_latched",
         "see_delay_s", "executed_vbc_margin_s", "confidence",
         "current_visibility", "inside_map",
+        "geometry_backend", "closest_primitive_index",
     ]
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self.geometry_backend = str(rospy.get_param("~geometry_backend", "samples"))
+        if self.geometry_backend not in ("samples", "primitive"):
+            raise ValueError("Unknown geometry_backend (no fallback)")
+        self.primitive_urdf_file = str(rospy.get_param("~primitive_urdf_file", ""))
         self.base_frame = str(rospy.get_param("~base_frame", "base_link"))
         self.target_topic = str(rospy.get_param(
             "~target_topic", "/care_planner/active_sensing/target_point"))
-        self.body_samples_file = Path(
-            rospy.get_param("~body_samples_file", "")).expanduser()
         self.query_service = str(rospy.get_param(
             "~confidence_query_service", "/care_planner/confidence_map/query"))
         self.rate = float(rospy.get_param("~rate", 50.0))
@@ -76,12 +83,17 @@ class ExecutedVBCLogger:
             raise ValueError("invalid rate/timeout")
         if not 0.0 <= self.visibility_threshold <= 1.0:
             raise ValueError("~visibility_threshold must be in [0,1]")
-        if not self.body_samples_file.is_file():
-            raise ValueError(f"~body_samples_file does not exist: {self.body_samples_file}")
-
-        self.samples_by_frame = self._load_samples(self.body_samples_file)
-        if not self.samples_by_frame:
-            raise ValueError("no executable risk body samples loaded")
+        self.samples_by_frame, self.primitives_by_frame = {}, {}
+        if self.geometry_backend == "primitive":
+            self.primitives_by_frame = load_primitives(self.primitive_urdf_file, self.ignored_links)
+        else:
+            self.body_samples_file = Path(
+                rospy.get_param("~body_samples_file", "")).expanduser()
+            if not self.body_samples_file.is_file():
+                raise ValueError(f"~body_samples_file does not exist: {self.body_samples_file}")
+            self.samples_by_frame = self._load_samples(self.body_samples_file)
+            if not self.samples_by_frame:
+                raise ValueError("no executable risk body samples loaded")
 
         self.output_root.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -97,6 +109,7 @@ class ExecutedVBCLogger:
         self.query_client = rospy.ServiceProxy(self.query_service, QueryConfidence, persistent=False)
 
         self._target: Optional[PointStamped] = None
+        self._target_epoch = 0
         self._target_xyz: Optional[Tuple[float, float, float]] = None
         self._target_time: Optional[float] = None
         self._sweep_time: Optional[float] = None
@@ -105,6 +118,7 @@ class ExecutedVBCLogger:
         self._latest_clearance = math.nan
         self._latest_closest_link = "none"
         self._latest_closest_sample = -1
+        self._latest_closest_primitive = -1
         self._latest_confidence = math.nan
         self._latest_current_visibility = math.nan
         self._latest_inside_map = 0
@@ -126,6 +140,7 @@ class ExecutedVBCLogger:
             self.target_topic, self.csv_path, self.json_path)
 
     def _load_samples(self, path: Path) -> Dict[str, List[Tuple[str, int, Tuple[float, float, float], float]]]:
+        import yaml  # Legacy-only dependency; primitive uses URDF geometry.
         data = yaml.safe_load(path.read_text())
         out: Dict[str, List[Tuple[str, int, Tuple[float, float, float], float]]] = {}
         for link in data.get("body_sampling", {}).get("links", []):
@@ -160,8 +175,10 @@ class ExecutedVBCLogger:
             return
         now = rospy.Time.now().to_sec()
         with self._lock:
-            changed = self._target_xyz is None or self._distance(xyz, self._target_xyz) > self.target_change_tolerance
+            changed = (self._target_xyz is None or self._distance(xyz, self._target_xyz) > self.target_change_tolerance
+                       or self._target.header.frame_id != msg.header.frame_id)
             if changed:
+                self._target_epoch += 1
                 self._target_time = now
                 self._sweep_time = None
                 self._see_time = None
@@ -190,6 +207,22 @@ class ExecutedVBCLogger:
     def _compute_min_clearance(self, target_base: PointStamped) -> Optional[Tuple[float, str, int]]:
         target_xyz = self._xyz(target_base)
         best, best_link, best_sample = math.inf, "none", -1
+        if self.geometry_backend == "primitive":
+            for frame, primitives in self.primitives_by_frame.items():
+                try:
+                    transform = self.tf_buffer.lookup_transform(
+                        self.base_frame, frame, rospy.Time(0), rospy.Duration(self.tf_timeout))
+                    point = target_in_link(target_xyz, transform.transform)
+                except Exception as exc:
+                    rospy.logwarn_throttle(1.0, "[executed_vbc] primitive TF invalid: %s", exc)
+                    return None
+                for primitive in primitives:
+                    clearance = primitive.distance(point)
+                    if not math.isfinite(clearance):
+                        return None
+                    if clearance < best:
+                        best, best_link, best_sample = clearance, frame, primitive.collision_index
+            return None if not math.isfinite(best) else (best, best_link, best_sample)
         for frame, samples in self.samples_by_frame.items():
             try:
                 tf_msg = self.tf_buffer.lookup_transform(
@@ -219,7 +252,11 @@ class ExecutedVBCLogger:
             return None
         if len(res.confidence) != 1 or len(res.current_visibility) != 1 or len(res.inside_map) != 1:
             return None
-        return float(res.confidence[0]), float(res.current_visibility[0]), int(res.inside_map[0])
+        confidence, visibility, inside = float(res.confidence[0]), float(res.current_visibility[0]), int(res.inside_map[0])
+        if not (math.isfinite(confidence) and math.isfinite(visibility) and
+                0. <= confidence <= 1. and 0. <= visibility <= 1. and inside in (0, 1)):
+            return None
+        return confidence, visibility, inside
 
     def _summary_payload(self) -> Dict[str, object]:
         target_time = self._target_time
@@ -227,6 +264,9 @@ class ExecutedVBCLogger:
         see_delay = None if self._see_time is None or target_time is None else self._see_time - target_time
         margin = None if self._sweep_time is None or self._see_time is None else self._sweep_time - self._see_time
         return {
+            "geometry_backend": self.geometry_backend,
+            "diagnostic_only": True,
+            "latest_closest_primitive_index": self._latest_closest_primitive,
             "trial_label": self.trial_label,
             "lambda_vis": self.lambda_vis,
             "target_xyz": None if self._target_xyz is None else list(self._target_xyz),
@@ -254,7 +294,7 @@ class ExecutedVBCLogger:
 
     def _timer_callback(self, _event) -> None:
         with self._lock:
-            target, target_time = self._target, self._target_time
+            target, target_time, epoch = self._target, self._target_time, self._target_epoch
         if target is None or target_time is None:
             return
         target_base = self._target_in_base(target)
@@ -269,10 +309,16 @@ class ExecutedVBCLogger:
         clearance, closest_link, closest_sample = clearance_info
         confidence, current_visibility, inside_map = vis_info
         with self._lock:
+            if epoch != self._target_epoch:
+                return  # An in-flight query cannot latch events into a new target epoch.
+            closest_primitive = closest_sample if self.geometry_backend == "primitive" else -1
+            if self.geometry_backend == "primitive":
+                closest_sample = -1
             self._sequence += 1
             self._latest_clearance = clearance
             self._latest_closest_link = closest_link
             self._latest_closest_sample = closest_sample
+            self._latest_closest_primitive = closest_primitive
             self._latest_confidence = confidence
             self._latest_current_visibility = current_visibility
             self._latest_inside_map = inside_map
@@ -294,6 +340,8 @@ class ExecutedVBCLogger:
             margin = math.nan if self._sweep_time is None or self._see_time is None else self._sweep_time - self._see_time
 
             self._writer.writerow({
+                "geometry_backend": self.geometry_backend,
+                "closest_primitive_index": closest_primitive,
                 "ros_time": now,
                 "t_from_target_s": now - target_time,
                 "target_x": target_base.point.x,
@@ -317,6 +365,7 @@ class ExecutedVBCLogger:
 
             msg = String()
             msg.data = (
+                f"geometry_backend={self.geometry_backend} diagnostic_only=1 closest_primitive_index={closest_primitive} "
                 f"seq={self._sequence} elapsed={now-target_time:.9f} "
                 f"min_clearance={clearance:.9f} min_clearance_all={self._min_clearance_all:.9f} "
                 f"closest_link={closest_link} closest_sample={closest_sample} "

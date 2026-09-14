@@ -1,4 +1,6 @@
 <launch>
+  <arg name="geometry_backend" default="samples" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <arg name="body_samples_file"
        default="$(find care_confidence_map)/config/body_samples.yaml" />
 
@@ -10,7 +12,7 @@
   <arg name="alpha" default="0.35" />
   <arg name="scale_multiplier" default="1.0" />
 
-  <node pkg="care_confidence_map"
+  <node if="$(eval arg('geometry_backend') == 'samples')" pkg="care_confidence_map"
         type="body_sample_marker_publisher.py"
         name="body_sample_marker_publisher"
         output="screen">
@@ -20,5 +22,16 @@
     <param name="show_non_risk" value="$(arg show_non_risk)" />
     <param name="alpha" value="$(arg alpha)" />
     <param name="scale_multiplier" value="$(arg scale_multiplier)" />
+  </node>
+  <node unless="$(eval arg('geometry_backend') == 'samples')" pkg="care_confidence_map"
+        type="body_sample_model_node" name="body_primitive_marker_publisher" output="screen">
+    <param name="body_sample_model/geometry_backend" value="$(arg geometry_backend)" />
+    <param name="body_sample_model/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param name="body_sample_model/marker_topic" value="$(arg marker_topic)" />
+    <param name="body_sample_model/publish_rate" value="$(arg publish_rate)" />
+    <param name="body_sample_model/show_non_risk_samples" value="$(arg show_non_risk)" />
+    <param name="body_sample_model/marker_alpha" value="$(arg alpha)" />
+    <param name="body_sample_model/primitive_display_scale" value="$(arg scale_multiplier)" />
+    <!-- Primitive markers show exact URDF solids; no sphere scale multiplier. -->
   </node>
 </launch>

@@ -66,7 +66,7 @@ include_directories(
 )
 
 add_library(body_sample_model
-  src/body_sample_model.cpp
+  legacy/src/body_sample_model.cpp
 )
 
 add_dependencies(body_sample_model
@@ -81,6 +81,8 @@ target_link_libraries(body_sample_model
 
 add_library(trajectory_risk_evaluator
   src/trajectory_risk_evaluator.cpp
+  src/vbc_primitive_model.cpp
+  src/legacy_body_backend.cpp
 )
 
 add_dependencies(trajectory_risk_evaluator
@@ -89,15 +91,39 @@ add_dependencies(trajectory_risk_evaluator
 )
 
 target_link_libraries(trajectory_risk_evaluator
-  body_sample_model
+  ${CMAKE_DL_LIBS}
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
 )
 
+if(CATKIN_ENABLE_TESTING
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_phase_e_diagnostic_primitives.cpp"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_phase_e_cold_start_primitives.cpp"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/test_phase_e_vbc_primitives.cpp"
+   AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/benchmark_phase_e_vbc_real_trajectories.cpp")
+  add_executable(test_diagnostic_primitives ../../scripts/test_phase_e_diagnostic_primitives.cpp)
+  add_dependencies(test_diagnostic_primitives ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_diagnostic_primitives trajectory_risk_evaluator ${catkin_LIBRARIES} pinocchio::pinocchio)
+  add_executable(test_cold_start_primitives ../../scripts/test_phase_e_cold_start_primitives.cpp)
+  add_dependencies(test_cold_start_primitives ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_cold_start_primitives trajectory_risk_evaluator ${catkin_LIBRARIES} pinocchio::pinocchio yaml-cpp)
+  add_executable(test_vbc_primitives ../../scripts/test_phase_e_vbc_primitives.cpp)
+  add_dependencies(test_vbc_primitives ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(test_vbc_primitives trajectory_risk_evaluator ${catkin_LIBRARIES} pinocchio::pinocchio)
+  add_executable(benchmark_vbc_real_trajectories ../../scripts/benchmark_phase_e_vbc_real_trajectories.cpp)
+  add_dependencies(benchmark_vbc_real_trajectories ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+  target_link_libraries(benchmark_vbc_real_trajectories trajectory_risk_evaluator ${catkin_LIBRARIES} pinocchio::pinocchio)
+endif()
+
 add_executable(confidence_map_node
   src/confidence_map_node.cpp
 )
+
+add_executable(gcdf_primitive_anchor_node src/gcdf_primitive_anchor_node.cpp)
+add_dependencies(gcdf_primitive_anchor_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(gcdf_primitive_anchor_node trajectory_risk_evaluator ${catkin_LIBRARIES} pinocchio::pinocchio)
+install(TARGETS gcdf_primitive_anchor_node RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 add_dependencies(confidence_map_node
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
@@ -105,7 +131,8 @@ add_dependencies(confidence_map_node
 )
 
 target_link_libraries(confidence_map_node
-  body_sample_model
+  trajectory_risk_evaluator
+  pinocchio::pinocchio
   ${catkin_LIBRARIES}
   yaml-cpp
 )
@@ -133,7 +160,8 @@ add_dependencies(body_sample_model_node
 )
 
 target_link_libraries(body_sample_model_node
-  body_sample_model
+  trajectory_risk_evaluator
+  pinocchio::pinocchio
   ${catkin_LIBRARIES}
   yaml-cpp
 )
@@ -148,7 +176,8 @@ add_dependencies(body_observability_node
 )
 
 target_link_libraries(body_observability_node
-  body_sample_model
+  trajectory_risk_evaluator
+  pinocchio::pinocchio
   ${catkin_LIBRARIES}
   yaml-cpp
 )
@@ -164,7 +193,6 @@ add_dependencies(trajectory_risk_node
 
 target_link_libraries(trajectory_risk_node
   trajectory_risk_evaluator
-  body_sample_model
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
@@ -182,7 +210,6 @@ add_dependencies(trajectory_vbc_selector_node
 
 target_link_libraries(trajectory_vbc_selector_node
   trajectory_risk_evaluator
-  body_sample_model
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
@@ -203,7 +230,6 @@ add_dependencies(trajectory_vbc_selector_temporal_cluster_node
 
 target_link_libraries(trajectory_vbc_selector_temporal_cluster_node
   trajectory_risk_evaluator
-  body_sample_model
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
@@ -223,7 +249,6 @@ add_dependencies(trajectory_vbc_selector_legacy_node
 
 target_link_libraries(trajectory_vbc_selector_legacy_node
   trajectory_risk_evaluator
-  body_sample_model
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
@@ -240,7 +265,6 @@ add_dependencies(predicted_vbc_auditor_node
 
 target_link_libraries(predicted_vbc_auditor_node
   trajectory_risk_evaluator
-  body_sample_model
   ${catkin_LIBRARIES}
   yaml-cpp
   pinocchio::pinocchio
@@ -248,8 +272,6 @@ target_link_libraries(predicted_vbc_auditor_node
 
 catkin_install_python(PROGRAMS
   scripts/test_query_confidence.py
-  scripts/generate_body_samples.py
-  scripts/body_sample_marker_publisher.py
   scripts/self_filter_coverage_marker_publisher.py
   scripts/runtime_self_hit_rviz_diagnostic.py
   scripts/phase_e_case026_exact_self_occlusion_rviz.py
@@ -258,6 +280,23 @@ catkin_install_python(PROGRAMS
   scripts/executed_vbc_logger_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
+
+# Legacy-only implementations, with unchanged rosrun executable basenames.
+# Install the real files, not the source compatibility symlinks: those links
+# are relative to the source package layout, not lib/<package>.
+catkin_install_python(PROGRAMS
+  legacy/scripts/generate_body_samples.py
+  legacy/scripts/body_sample_marker_publisher.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+# config/body_samples.yaml is a relative alias to this canonical asset.
+install(DIRECTORY legacy/config
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/legacy)
+
+# Importable helper, not a catkin executable relay (relays do not export module symbols).
+install(FILES scripts/primitive_point_geometry.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 install(TARGETS
   body_sample_model
@@ -282,3 +321,6 @@ install(DIRECTORY
   srv
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
+
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})

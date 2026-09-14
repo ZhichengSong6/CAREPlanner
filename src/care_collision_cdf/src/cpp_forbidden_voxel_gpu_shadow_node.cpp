@@ -1,6 +1,9 @@
 #include <ros/ros.h>
 
 #include <care_collision_cdf/CollisionCDFConstraintBatch.h>
+#include <care_collision_cdf/CollisionCDFWitnessRequest.h>
+#include <care_collision_cdf/CollisionCDFWitnessResponse.h>
+#include <care_confidence_map/gcdf_primitive_anchors.hpp>
 
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
@@ -16,6 +19,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -47,9 +51,12 @@ struct Anchor {
   float radius = 0.0f;
   int eval_timestep = -1;
   int original_timestep = -1;
+  std::shared_ptr<const care_confidence_map::GcdfPrimitiveAnchor> primitive;
 };
 
 struct MapIndex {
+  std::string frame_id;
+  std::vector<uint8_t> present;
   // low now means hard-forbidden: UNKNOWN(low confidence) OR OCCUPIED.
   std::vector<uint8_t> low;
   std::vector<uint8_t> source_type;
@@ -149,6 +156,7 @@ Stats simpleStats(const std::vector<float>& values) {
 }  // namespace
 
 class CppForbiddenVoxelGpuShadow {
+  friend struct GcdfPrimitiveTest;
  public:
   enum class Channel {
     LOCAL = 0,
@@ -158,6 +166,9 @@ class CppForbiddenVoxelGpuShadow {
 
   CppForbiddenVoxelGpuShadow()
       : nh_(), pnh_("~") {
+    pnh_.param<std::string>("geometry_backend", geometry_backend_, "samples");
+    if (geometry_backend_!="samples" && geometry_backend_!="primitive")
+      throw std::runtime_error("geometry_backend must be samples or primitive; no fallback");
     pnh_.param<std::string>(
         "anchor_topic",
         anchor_topic_,
@@ -209,6 +220,7 @@ class CppForbiddenVoxelGpuShadow {
 
     pnh_.param("rate", rate_hz_, 20.0);
     pnh_.param("process_on_input_callback", process_on_input_callback_, false);
+    pnh_.param("local_witness_requests_required", local_witness_requests_required_, false);
     pnh_.param("anchor_stale_s", anchor_stale_s_, 0.25);
     pnh_.param("map_stale_s", map_stale_s_, 0.50);
     pnh_.param("confidence_threshold", confidence_threshold_, 0.50);
@@ -277,6 +289,11 @@ class CppForbiddenVoxelGpuShadow {
     constraint_batch_pub_ =
         nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
             constraint_batch_topic_, 2);
+    witness_response_pub_ = nh_.advertise<CollisionCDFWitnessResponse>(
+        constraint_batch_topic_ + "/witness_response", 2);
+    witness_diagnostic_pub_ = nh_.advertise<std_msgs::String>(summary_topic_ + "/witness", 100);
+    witness_request_sub_ = nh_.subscribe(constraint_batch_topic_ + "/witness_request", 2,
+        &CppForbiddenVoxelGpuShadow::witnessRequestCallback, this);
     final_constraint_batch_pub_ =
         nh_.advertise<care_collision_cdf::CollisionCDFConstraintBatch>(
             final_constraint_batch_topic_, 2);
@@ -373,6 +390,17 @@ class CppForbiddenVoxelGpuShadow {
     processPendingNow();
   }
 
+  void witnessRequestCallback(const CollisionCDFWitnessRequestConstPtr& msg) {
+    if (!msg) return;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      // One bounded pending slot; late requests cannot replace newer work.
+      if (latest_witness_request_ && msg->header.stamp <= latest_witness_request_->header.stamp) return;
+      latest_witness_request_ = msg;
+    }
+    processPendingNow();
+  }
+
   void finalAnchorCallback(const sensor_msgs::PointCloud2ConstPtr& msg) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -395,6 +423,7 @@ class CppForbiddenVoxelGpuShadow {
     const auto t0 = Clock::now();
 
     auto index = std::make_shared<MapIndex>();
+    index->present.assign(grid_size_, 0);
     index->low.assign(grid_size_, 0);
     index->source_type.assign(
         grid_size_,
@@ -403,6 +432,7 @@ class CppForbiddenVoxelGpuShadow {
     index->current_visibility.assign(grid_size_, 0.0f);
     index->occupancy.assign(grid_size_, 0.0f);
     index->stamp = msg->header.stamp;
+    index->frame_id = msg->header.frame_id;
     index->received = ros::Time::now();
 
     try {
@@ -439,6 +469,7 @@ class CppForbiddenVoxelGpuShadow {
 
         const int linear = linearIndex(ix, iy, iz);
         const std::size_t ulinear = static_cast<std::size_t>(linear);
+        index->present[ulinear] = 1;
         index->confidence[ulinear] = conf;
         index->current_visibility[ulinear] = vis;
         index->occupancy[ulinear] = occ;
@@ -489,6 +520,24 @@ class CppForbiddenVoxelGpuShadow {
   std::vector<Anchor> decodeAnchors(
       const sensor_msgs::PointCloud2& cloud) const {
     std::vector<Anchor> anchors;
+    if (geometry_backend_=="primitive") {
+      try {
+        const auto decoded=care_confidence_map::decodePrimitiveAnchors(cloud);
+        std::map<int,std::pair<int,std::array<float,7>>> identities;
+        for (const auto& p:decoded) {
+          const auto key=std::make_pair(p.eval_timestep,p.q);
+          const auto found=identities.emplace(p.original_timestep,key);
+          if (!found.second && found.first->second!=key)
+            throw std::invalid_argument("Primitive knot has inconsistent q/eval identity");
+          Anchor a;a.q=p.q;a.eval_timestep=p.eval_timestep;a.original_timestep=p.original_timestep;
+          a.primitive=std::make_shared<care_confidence_map::GcdfPrimitiveAnchor>(p);
+          anchors.push_back(std::move(a));
+        }
+      } catch (const std::exception& e) {
+        ROS_ERROR_STREAM("Primitive anchor decode failed (no fallback): "<<e.what());anchors.clear();
+      }
+      return anchors;
+    }
     anchors.reserve(cloud.width);
 
     try {
@@ -585,6 +634,22 @@ class CppForbiddenVoxelGpuShadow {
 
       for (const Anchor* anchor_ptr : it->second) {
         const Anchor& anchor = *anchor_ptr;
+        if (anchor.primitive) {
+          const auto& a=*anchor.primitive;
+          care_confidence_map::visitPrimitiveProximity(a.shape,a.inflation,proximity_margin,
+              Eigen::Vector3d(x_min_,y_min_,z_min_),Eigen::Vector3i(nx_,ny_,nz_),resolution_,
+              [&](int x,int y,int z,float clearance) {
+                const int index=linearIndex(x,y,z);
+                float& best=best_clearance_[index];
+                if (!std::isfinite(best)) {best=clearance;touched.push_back(index);}
+                else if (clearance<best) best=clearance;
+              },[&](int x,int y,int z) {
+                const int i=linearIndex(x,y,z);
+                return map.low[i] && (channel!=Channel::EXECUTION ||
+                    map.source_type[i]==CollisionCDFConstraintBatch::SOURCE_OCCUPIED);
+              });
+          continue;
+        }
         const double search_radius =
             static_cast<double>(anchor.radius) + proximity_margin;
         const int n = static_cast<int>(
@@ -726,6 +791,134 @@ class CppForbiddenVoxelGpuShadow {
       *active_step_count = active_steps;
     }
     return pairs;
+  }
+
+  void failWitnessResponse(const std::string& reason) {
+    if (!active_witness_response_) return;
+    for (auto& status : active_witness_response_->status) status = "error_" + reason;
+    active_witness_response_->batch.header = active_witness_response_->request.header;
+    active_witness_response_->batch.dof = 7;
+    publishWitnessResponse();
+  }
+
+  void publishWitnessResponse() {
+    if (!active_witness_response_) return;
+    const auto& req = active_witness_response_->request;
+    for (std::size_t i = 0; i < active_witness_response_->status.size(); ++i) {
+      std::ostringstream s;
+      s << std::setprecision(17) << "C5_WITNESS event=witness_reevaluation"
+        << " query_stamp_ns=" << req.header.stamp.toNSec()
+        << " map_stamp_ns=" << active_witness_response_->map_stamp.toNSec()
+        << " plan_seq=" << req.plan_sequence << " mode_epoch=" << req.mode_epoch
+        << " target_revision=" << req.target_revision << " progress_epoch=" << req.progress_epoch
+        << " witness_index=" << i << " timestep=" << req.original_timestep[i]
+        << " status=" << active_witness_response_->status[i];
+      if (req.point_flat.size() >= 3*i+3)
+        s << " point=[" << req.point_flat[3*i] << ',' << req.point_flat[3*i+1] << ',' << req.point_flat[3*i+2] << ']';
+      if (req.q_flat.size() >= 7*i+7) {
+        s << " q_requested=[";
+        for (int j=0;j<7;++j) { if(j) s << ','; s << req.q_flat[7*i+j]; }
+        s << ']';
+      }
+      const auto& b=active_witness_response_->batch;
+      for (std::size_t p=0;p<b.distance.size();++p) {
+        if (b.original_timestep[p]!=req.original_timestep[i] || req.point_flat.size()<3*i+3) continue;
+        bool match=true;
+        for (int j=0;j<3;++j) match=match && std::fabs(b.point_flat[3*p+j]-req.point_flat[3*i+j])<=1e-5;
+        if (!match) continue;
+        s << " batch_pair=" << p << " distance=" << b.distance[p] << " q_linearization=[";
+        for (int j=0;j<7;++j) { if(j) s << ','; s << b.q_linearization_flat[7*p+j]; }
+        s << "] gradient=[";
+        for (int j=0;j<7;++j) { if(j) s << ','; s << b.gradient_flat[7*p+j]; }
+        s << ']'; break;
+      }
+      std_msgs::String msg; msg.data = s.str(); witness_diagnostic_pub_.publish(msg);
+      ROS_INFO_STREAM(msg.data);
+    }
+    witness_response_pub_.publish(*active_witness_response_);
+  }
+
+  bool mergeWitnessPairs(const std::vector<Anchor>& anchors, const MapIndex& map,
+                         std::vector<PairMeta>* pairs) {
+    if (!active_witness_response_) return true;
+    const auto& req = active_witness_response_->request;
+    const std::size_t n = req.original_timestep.size();
+    if (req.dof != 7 || n > 32 || req.point_flat.size() != 3*n || req.q_flat.size() != 7*n) {
+      failWitnessResponse("request_dimension"); return false;
+    }
+    bool valid = true;
+    for (std::size_t i = 0; i < n; ++i) {
+      auto& status = active_witness_response_->status[i];
+      const int k = req.original_timestep[i];
+      bool finite = k >= 1;
+      for (int j = 0; j < 3; ++j) finite = finite && std::isfinite(req.point_flat[3*i+j]);
+      for (int j = 0; j < 7; ++j) finite = finite && std::isfinite(req.q_flat[7*i+j]);
+      if (!finite) { status="error_invalid_point_q_or_step"; valid=false; continue; }
+      if (req.point_flat[3*i]<x_min_-1e-5 || req.point_flat[3*i]>x_max_+1e-5 ||
+          req.point_flat[3*i+1]<y_min_-1e-5 || req.point_flat[3*i+1]>y_max_+1e-5 ||
+          req.point_flat[3*i+2]<z_min_-1e-5 || req.point_flat[3*i+2]>z_max_+1e-5) {
+        status="error_point_outside_map"; valid=false; continue;
+      }
+      const int ix=coordToIndex(req.point_flat[3*i],x_min_,nx_);
+      const int iy=coordToIndex(req.point_flat[3*i+1],y_min_,ny_);
+      const int iz=coordToIndex(req.point_flat[3*i+2],z_min_,nz_);
+      if (!validIndex(ix,iy,iz)) { status="error_point_outside_map"; valid=false; continue; }
+      const int index=linearIndex(ix,iy,iz);
+      const auto point=pointForIndex(index);
+      bool grid_match=true;
+      for (int j=0;j<3;++j) grid_match = grid_match && std::fabs(point[j]-req.point_flat[3*i+j])<=1e-5;
+      if (!grid_match || !map.present[index]) {
+        status = grid_match ? "error_map_voxel_unavailable" : "error_point_off_grid";
+        valid=false; continue;
+      }
+      const Anchor* first=nullptr;
+      float clearance=std::numeric_limits<float>::infinity();
+      bool q_match=true;
+      for (const auto& a : anchors) {
+        if (a.original_timestep != k) continue;
+        first=&a;
+        double squared=0.0;
+        for (int j=0;j<3;++j) squared+=(point[j]-a.center[j])*(point[j]-a.center[j]);
+        const double d=a.primitive ? a.primitive->shape.signedDistance(
+            Eigen::Vector3d(point[0],point[1],point[2]))-a.primitive->inflation : std::sqrt(squared)-a.radius;
+        clearance=std::min(clearance,static_cast<float>(d));
+        for (int j=0;j<7;++j) q_match=q_match && std::fabs(a.q[j]-req.q_flat[7*i+j])<=1e-4;
+      }
+      if (!first || !q_match) {
+        status=first ? "error_anchor_q_mismatch" : "error_anchor_step_missing";
+        valid=false; continue;
+      }
+      if (!map.low[index]) { status="resolved_free"; continue; }
+      status = map.source_type[index] == CollisionCDFConstraintBatch::SOURCE_OCCUPIED
+          ? "evaluated_occupied" : "evaluated_unknown";
+      // Natural pairs are kept in full. Re-evaluation only adds missing
+      // identities; it does not enlarge/truncate the existing pair budgets.
+      bool found=false;
+      std::size_t step_count=0;
+      for (const auto& p : *pairs) {
+        if (p.original_timestep != k) continue;
+        ++step_count;
+        if (p.point == point) found=true;
+      }
+      if (found) continue;
+      if (pairs->size() >= static_cast<std::size_t>(max_pairs_) ||
+          step_count >= static_cast<std::size_t>(max_pairs_per_step_)) {
+        status="error_pair_budget_exceeded"; valid=false; continue;
+      }
+      PairMeta p;
+      p.point=point; p.q=first->q; p.original_timestep=k; p.eval_timestep=first->eval_timestep;
+      p.confidence=map.confidence[index]; p.current_visibility=map.current_visibility[index];
+      p.source_type=map.source_type[index]; p.approx_body_clearance_m=clearance;
+      pairs->push_back(p);
+    }
+    if (!valid) {
+      for (auto& status : active_witness_response_->status)
+        if (status == "evaluated_unknown" || status == "evaluated_occupied") status="error_query_aborted";
+      active_witness_response_->batch.header=req.header;
+      active_witness_response_->batch.dof=7;
+      publishWitnessResponse();
+    }
+    return valid;
   }
 
   bool connectGpuSocket() {
@@ -1109,6 +1302,10 @@ class CppForbiddenVoxelGpuShadow {
     msg.online_pipeline_ms = pipeline_ms;
 
     batchPublisher(channel).publish(msg);
+    if (channel == Channel::LOCAL && active_witness_response_) {
+      active_witness_response_->batch = msg;
+      publishWitnessResponse();
+    }
     ++batchPublishCount(channel);
   }
 
@@ -1141,6 +1338,7 @@ class CppForbiddenVoxelGpuShadow {
         << " gpu_d2h_ms=" << gpu.d2h_ms
         << " pipeline_ms=" << pipeline_ms
         << " map_index_ms=" << map_index_ms
+        << " geometry_backend=" << geometry_backend_
         << " channel=" << channelName(channel)
         << " batch_topic=" << batchTopic(channel)
         << " batch_subscribers=" << batchPublisher(channel).getNumSubscribers()
@@ -1152,6 +1350,7 @@ class CppForbiddenVoxelGpuShadow {
   }
 
   void timerCallback(const ros::TimerEvent&) {
+    active_witness_response_.reset();
     const auto pipeline_t0 = Clock::now();
     const ros::Time now = ros::Time::now();
 
@@ -1189,15 +1388,32 @@ class CppForbiddenVoxelGpuShadow {
       } else if (
           latest_anchor_cloud_ &&
           latest_anchor_cloud_->header.stamp != last_processed_anchor_stamp_ &&
-          (now - latest_anchor_received_).toSec() <= anchor_stale_s_) {
+          (now - latest_anchor_received_).toSec() <= anchor_stale_s_ &&
+          (!local_witness_requests_required_ || (latest_witness_request_ &&
+           latest_witness_request_->header.stamp == latest_anchor_cloud_->header.stamp))) {
         channel = Channel::LOCAL;
         anchor_cloud = latest_anchor_cloud_;
         anchor_received = latest_anchor_received_;
         last_processed_anchor_stamp_ = anchor_cloud->header.stamp;
+        if (latest_witness_request_ && latest_witness_request_->header.stamp == anchor_cloud->header.stamp) {
+          active_witness_response_.reset(new CollisionCDFWitnessResponse);
+          active_witness_response_->request = *latest_witness_request_;
+          active_witness_response_->map_stamp = map->stamp;
+          active_witness_response_->status.assign(latest_witness_request_->original_timestep.size(), "error_unprocessed");
+          if (latest_witness_request_->header.frame_id != anchor_cloud->header.frame_id) {
+            failWitnessResponse("frame_mismatch"); return;
+          }
+        }
       }
     }
 
     if (!anchor_cloud || !map) {
+      return;
+    }
+    if (geometry_backend_=="primitive" && (anchor_cloud->header.frame_id.empty() ||
+        anchor_cloud->header.frame_id!=map->frame_id)) {
+      failWitnessResponse("map_frame_mismatch");
+      ROS_ERROR("Primitive anchor/map frame mismatch; no safety batch emitted");
       return;
     }
     if ((now - anchor_received).toSec() > anchor_stale_s_) {
@@ -1208,6 +1424,7 @@ class CppForbiddenVoxelGpuShadow {
     std::vector<Anchor> anchors = decodeAnchors(*anchor_cloud);
     const auto decode_t1 = Clock::now();
     if (anchors.empty()) {
+      failWitnessResponse("anchor_decode");
       ROS_WARN_STREAM_THROTTLE(
           1.0,
           "[C5.8 C++] empty anchor decode channel="
@@ -1225,6 +1442,7 @@ class CppForbiddenVoxelGpuShadow {
     std::vector<PairMeta> pairs = buildPairs(
         anchors, *map, channel, pair_margin,
         &raw_pair_count, &active_step_count);
+    if (!mergeWitnessPairs(anchors, *map, &pairs)) return;
     const auto selection_t1 = Clock::now();
 
     // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
@@ -1286,6 +1504,14 @@ class CppForbiddenVoxelGpuShadow {
           1.0,
           "[C5.8 C++] GPU query failed channel="
               << channelName(channel));
+      failWitnessResponse("gpu_query_failed");
+      return;
+    }
+
+    if (active_witness_response_ &&
+        (!std::all_of(distance.begin(), distance.end(), finiteFloat) ||
+         !std::all_of(gradient.begin(), gradient.end(), finiteFloat))) {
+      failWitnessResponse("nonfinite_gpu_output");
       return;
     }
 
@@ -1370,6 +1596,7 @@ class CppForbiddenVoxelGpuShadow {
   ros::NodeHandle pnh_;
 
   std::string anchor_topic_;
+  std::string geometry_backend_;
   std::string final_anchor_topic_;
   std::string execution_anchor_topic_;
   std::string map_topic_;
@@ -1384,6 +1611,7 @@ class CppForbiddenVoxelGpuShadow {
 
   double rate_hz_ = 20.0;
   bool process_on_input_callback_ = false;
+  bool local_witness_requests_required_ = false;
   double anchor_stale_s_ = 0.25;
   double map_stale_s_ = 0.50;
   double confidence_threshold_ = 0.50;
@@ -1406,6 +1634,11 @@ class CppForbiddenVoxelGpuShadow {
   std::size_t grid_size_ = 0;
 
   ros::Subscriber anchor_sub_;
+  ros::Subscriber witness_request_sub_;
+  ros::Publisher witness_response_pub_;
+  ros::Publisher witness_diagnostic_pub_;
+  CollisionCDFWitnessRequestConstPtr latest_witness_request_;
+  std::unique_ptr<CollisionCDFWitnessResponse> active_witness_response_;
   ros::Subscriber final_anchor_sub_;
   ros::Subscriber execution_anchor_sub_;
   ros::Subscriber map_sub_;

@@ -99,6 +99,7 @@ def _fmt(values: Sequence[float], precision: int = 5) -> str:
 class VbcDeadlineWaypointNode:
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._stopping = False
 
         self.target_topic = str(rospy.get_param(
             "~target_topic", "/care_planner/active_sensing/target_point"))
@@ -200,7 +201,8 @@ class VbcDeadlineWaypointNode:
         self.trajectory_sub = rospy.Subscriber(
             self.trajectory_topic, JointTrajectory, self._trajectory_callback, queue_size=1)
 
-        self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate), self._timer_callback)
+        self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate), self._run_timer_callback)
+        rospy.on_shutdown(self._on_shutdown)
         rospy.logwarn(
             "[vbc_waypoint] explicit projection + root refinement + %d ascent step(s); diagnostic-only oracle=%d",
             self.ascent_steps, int(self.enable_oracle_diagnostics))
@@ -643,6 +645,24 @@ class VbcDeadlineWaypointNode:
         )
         self.summary_pub.publish(msg)
         rospy.loginfo_throttle(0.5, "[vbc_waypoint] %s", msg.data)
+
+    def _on_shutdown(self) -> None:
+        self._stopping = True
+        self.timer.shutdown()
+
+    def _shutdown_requested(self) -> bool:
+        return self._stopping or rospy.core.is_shutdown_requested() or rospy.is_shutdown()
+
+    def _run_timer_callback(self, event) -> None:
+        if self._shutdown_requested():
+            return
+        try:
+            self._timer_callback(event)
+        except rospy.ROSException:
+            # Stop future ticks without joining model/service work. Tolerate
+            # only ROS teardown races in an already-running callback.
+            if not self._shutdown_requested():
+                raise
 
     def _timer_callback(self, _event) -> None:
         self._maybe_generate()

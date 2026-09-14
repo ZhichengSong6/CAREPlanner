@@ -1,4 +1,7 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
+#include <care_confidence_map/legacy_body_backend.hpp>
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/primitive_probe_grid.hpp>
 
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/algorithm/frames.hpp>
@@ -13,20 +16,22 @@
 namespace care_confidence_map
 {
 
-bool TrajectoryRiskEvaluator::initialize(
+bool TrajectoryRiskEvaluator::initializeKinematics(
     const std::string& robot_urdf_file,
-    const std::string& body_samples_file,
     const std::string& base_frame,
     std::string* error_msg)
 {
   initialized_ = false;
+  primitive_backend_ = false;
+  primitive_local_.clear();
   fast_audit_prepared_ = false;
   fast_audit_sensor_frame_ids_.clear();
   fast_audit_body_frames_.clear();
   fast_audit_body_sample_count_ = 0;
 
   robot_urdf_file_ = robot_urdf_file;
-  body_samples_file_ = body_samples_file;
+  body_samples_file_.clear();
+  legacy_body_samples_.reset();
   base_frame_ = base_frame;
 
   if (!buildPinocchioModel(robot_urdf_file_, error_msg))
@@ -34,8 +39,29 @@ bool TrajectoryRiskEvaluator::initialize(
     return false;
   }
 
+  if (!model_.existFrame(base_frame_))
+  {
+    if (error_msg) *error_msg = "Missing base frame: " + base_frame_;
+    return false;
+  }
+  extractActiveJointNames();
+  initialized_ = true;
+  return true;
+}
+
+bool TrajectoryRiskEvaluator::initialize(
+    const std::string& robot_urdf_file,
+    const std::string& body_samples_file,
+    const std::string& base_frame,
+    std::string* error_msg)
+{
+  if (!initializeKinematics(robot_urdf_file, base_frame, error_msg)) return false;
+  initialized_ = false;
+  body_samples_file_ = body_samples_file;
+
   std::string body_error;
-  if (!body_sample_model_.loadFromYaml(body_samples_file_, &body_error))
+  auto legacy = std::make_shared<BodySampleModel>();
+  if (!loadLegacyBodySamples(legacy.get(), body_samples_file_, &body_error))
   {
     if (error_msg)
     {
@@ -44,6 +70,7 @@ bool TrajectoryRiskEvaluator::initialize(
     return false;
   }
 
+  legacy_body_samples_ = std::move(legacy);
   if (!validateBodySampleFrames(error_msg))
   {
     return false;
@@ -53,6 +80,25 @@ bool TrajectoryRiskEvaluator::initialize(
 
   initialized_ = true;
   return true;
+}
+
+bool TrajectoryRiskEvaluator::initializePrimitives(const std::string& urdf,
+    const std::string& collision_urdf,const std::string& base,double resolution,
+    const Eigen::Vector3d& origin,std::string* error) {
+  if(!initializeKinematics(urdf,base,error))return false;
+  initialized_=false;
+  if(!std::isfinite(resolution) || resolution<=0 || !origin.allFinite()) {
+    if(error)*error="Invalid primitive diagnostic grid";return false;
+  }
+  VbcPrimitiveModel geometry;
+  // Match existing YAML risk semantics: base excluded, link1 included. Consumers
+  // still apply their original ignored_risk_links (normally base + link1).
+  if(!geometry.load(collision_urdf,{"base_link"},error))return false;
+  for(const auto& frame:geometry.frames()) if(!model_.existFrame(frame)) {
+    if(error)*error="Missing primitive frame: "+frame;return false;
+  }
+  primitive_local_=geometry.primitives();primitive_probe_resolution_=resolution;
+  primitive_probe_origin_=origin;primitive_backend_=true;initialized_=true;return true;
 }
 
 bool TrajectoryRiskEvaluator::buildPinocchioModel(
@@ -96,7 +142,7 @@ bool TrajectoryRiskEvaluator::validateBodySampleFrames(
 {
   std::unordered_set<std::string> missing_frames;
 
-  for (const auto& frame : body_sample_model_.frames())
+  for (const auto& frame : bodySampleModel().frames())
   {
     if (!model_.existFrame(frame))
     {
@@ -131,12 +177,12 @@ bool TrajectoryRiskEvaluator::checkConfigurationSize(
     const Eigen::VectorXd& q,
     std::string* error_msg) const
 {
-  if (q.size() != model_.nq)
+  if (q.size() != model_.nq || !q.allFinite())
   {
     if (error_msg)
     {
       std::ostringstream oss;
-      oss << "Invalid q size. Expected model.nq="
+      oss << "Invalid q (size or nonfinite). Expected model.nq="
           << model_.nq
           << ", got "
           << q.size();
@@ -154,7 +200,7 @@ bool TrajectoryRiskEvaluator::computeSamplesForConfiguration(
     TrajectoryFrameSamples* out,
     std::string* error_msg) const
 {
-  if (!initialized_)
+  if (!initialized_ || (!primitive_backend_ && legacyRiskSampleCount(bodySampleModel()) == 0))
   {
     if (error_msg)
     {
@@ -180,7 +226,7 @@ bool TrajectoryRiskEvaluator::computeSamplesForConfiguration(
   out->timestep_index = timestep_index;
   out->q = q;
   out->samples.clear();
-  out->samples.reserve(body_sample_model_.riskSampleCount());
+  if (!primitive_backend_) out->samples.reserve(legacyRiskSampleCount(bodySampleModel()));
 
   pinocchio::forwardKinematics(model_, data_, q);
   pinocchio::updateFramePlacements(model_, data_);
@@ -189,7 +235,32 @@ bool TrajectoryRiskEvaluator::computeSamplesForConfiguration(
   const pinocchio::SE3& T_world_base = data_.oMf[base_fid];
   const pinocchio::SE3 T_base_world = T_world_base.inverse();
 
-  for (const auto& sample : body_sample_model_.samples())
+  if(primitive_backend_) {
+    try {
+      std::vector<VbcPrimitive> world;world.reserve(primitive_local_.size());
+      pinocchio::SE3 pose;
+      std::size_t previous_frame=std::numeric_limits<std::size_t>::max();
+      for(const auto& local:primitive_local_) {
+        if(local.frame_index!=previous_frame) {
+          pose=T_base_world*data_.oMf[model_.getFrameId(local.link_name)];previous_frame=local.frame_index;
+        }
+        auto p=local;p.center=pose.act(local.center);
+        const double* a=pose.rotation().data();const double* b=local.rotation.data();double* r=p.rotation.data();
+        for(int i=0;i<3;++i)for(int j=0;j<3;++j)
+          r[3*j+i]=a[i]*b[3*j]+a[3+i]*b[3*j+1]+a[6+i]*b[3*j+2];
+        world.push_back(std::move(p));
+      }
+      for(const auto& probe:primitiveProbeGrid(world,primitive_probe_resolution_,primitive_probe_origin_)) {
+        TrajectoryBodySample p;p.timestep_index=timestep_index;p.link_name=p.frame_name=probe.link_name;
+        p.center_base=probe.point;p.radius=0.;p.source_type=probe.source_type;
+        p.source_collision_index=probe.collision_index;p.sample_index_in_link=-1;
+        out->samples.push_back(std::move(p));
+      }
+      return true;
+    } catch(const std::exception& e) {out->samples.clear();if(error_msg)*error_msg=e.what();return false;}
+  }
+
+  for (const auto& sample : bodySampleModel().samples())
   {
     if (!sample.include_for_risk)
     {
@@ -308,6 +379,13 @@ bool TrajectoryRiskEvaluator::computeAuditGeometryForConfiguration(
     ConfigurationAuditGeometry* out,
     std::string* error_msg) const
 {
+  if(primitive_backend_) {
+    if(!out){if(error_msg)*error_msg="Null primitive audit output";return false;}
+    out->body_samples.clear();out->frame_poses.clear();TrajectoryFrameSamples probes;
+    if(!computeSamplesForConfiguration(q,timestep_index,&probes,error_msg) ||
+       !computeFramePosesForConfiguration(q,frame_names,&out->frame_poses,error_msg))return false;
+    out->timestep_index=timestep_index;out->body_samples=std::move(probes.samples);return true;
+  }
   if (!initialized_)
   {
     if (error_msg)
@@ -351,11 +429,11 @@ bool TrajectoryRiskEvaluator::computeAuditGeometryForConfiguration(
 
   out->timestep_index = timestep_index;
   out->body_samples.clear();
-  out->body_samples.reserve(body_sample_model_.riskSampleCount());
+  out->body_samples.reserve(legacyRiskSampleCount(bodySampleModel()));
   out->frame_poses.clear();
   out->frame_poses.reserve(frame_names.size());
 
-  for (const auto& sample : body_sample_model_.samples())
+  for (const auto& sample : bodySampleModel().samples())
   {
     if (!sample.include_for_risk || !model_.existFrame(sample.frame_name))
     {
@@ -443,7 +521,19 @@ bool TrajectoryRiskEvaluator::prepareFastAudit(
   const std::unordered_set<std::string> ignored(
       ignored_risk_links.begin(), ignored_risk_links.end());
 
-  for (const auto& sample : body_sample_model_.samples())
+  if(primitive_backend_) for(const auto& p:primitive_local_) {
+    if(ignored.count(p.link_name))continue;
+    const auto fid=model_.getFrameId(p.link_name);
+    auto it=std::find_if(fast_audit_body_frames_.begin(),fast_audit_body_frames_.end(),
+        [&](const auto& f){return f.frame_id==fid;});
+    if(it==fast_audit_body_frames_.end()) {
+      CachedAuditBodyFrame f;f.frame_id=fid;fast_audit_body_frames_.push_back(std::move(f));
+      it=fast_audit_body_frames_.end()-1;
+    }
+    it->primitives.push_back(p);++fast_audit_body_sample_count_;
+  }
+
+  for (const auto& sample : bodySampleModel().samples())
   {
     if (!sample.include_for_risk || ignored.count(sample.link_name) != 0)
     {
@@ -554,6 +644,10 @@ bool TrajectoryRiskEvaluator::evaluateFastAuditForConfiguration(
     // that link share the transform.  This replaces one frame lookup and one
     // world/base composition per body sample in the previous implementation.
     const pinocchio::SE3 T_base_link = T_base_world * data_.oMf[frame.frame_id];
+    if(!frame.primitives.empty()) {
+      const Eigen::Vector3d target_link=T_base_link.actInv(target_base);
+      for(const auto& p:frame.primitives)best=std::min(best,p.signedDistance(target_link));
+    }
     for (const auto& sample : frame.samples)
     {
       const Eigen::Vector3d center_base = T_base_link.act(sample.center_link);

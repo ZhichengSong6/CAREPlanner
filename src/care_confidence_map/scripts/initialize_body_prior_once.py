@@ -11,7 +11,7 @@ from std_srvs.srv import Trigger
 class InitialBodyPriorInitializer:
     """Initialize the trusted-free body prior exactly once.
 
-    The confidence-map service still performs the geometric body-sphere marking,
+    The confidence-map service performs samples/primitive geometry marking,
     but this coordinator owns *when* it is allowed to happen:
 
       1. wait until the confidence-map service exists;
@@ -26,6 +26,8 @@ class InitialBodyPriorInitializer:
     the bootstrap while preserving all genuine sensor-derived observations.
     """
 
+    # Legacy Trigger keys count geometry elements (spheres or primitives).
+    # Keep the ready protocol unchanged for both backends.
     _TRANSFORMED_RE = re.compile(r"transformed_samples=(\d+)")
     _SKIPPED_RE = re.compile(r"skipped_samples=(\d+)")
     _UPDATED_RE = re.compile(r"updated_cells=(\d+)")

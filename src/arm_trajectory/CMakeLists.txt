@@ -34,3 +34,9 @@ add_dependencies(arm_trajectory
 target_link_libraries(arm_trajectory
   ${catkin_LIBRARIES}
 )
+
+install(TARGETS arm_trajectory
+  ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+  LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})

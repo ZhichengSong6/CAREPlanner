@@ -1,7 +1,13 @@
 <launch>
+  <arg name="geometry_backend" default="samples" />
+  <arg name="body_samples_file" default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <!-- C5.3a exact VBC auditor for the constrained shadow trajectory only.
        All steering outputs are isolated so this node cannot affect planner state. -->
   <arg name="base_frame" default="base_link" />
+  <arg name="event_driven_eval" default="false" />
+  <arg name="tcp_nodelay" default="false" />
+  <arg name="confidence_query_persistent" default="false" />
   <arg name="shadow_prediction_topic"
        default="/care_planner/mpc/cdf_shadow_predicted_trajectory" />
   <arg name="shadow_vbc_summary_topic"
@@ -15,10 +21,18 @@
     <remap from="/care_planner/trajectory_risk/vbc_summary"
            to="$(arg shadow_vbc_summary_topic)" />
     <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg name="geometry_backend" value="$(arg geometry_backend)" />
+      <arg if="$(eval arg('geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic" value="$(arg shadow_prediction_topic)" />
       <arg name="predicted_trajectory_topic" value="$(arg shadow_prediction_topic)" />
       <arg name="prefer_predicted_trajectory" value="true" />
+      <arg name="event_driven_eval" value="$(arg event_driven_eval)" />
+      <arg name="tcp_nodelay" value="$(arg tcp_nodelay)" />
+      <arg name="confidence_query_persistent" value="$(arg confidence_query_persistent)" />
+      <!-- Arrival checks supplement, never replace, the original 20Hz audit. -->
+      <arg name="preserve_periodic_eval" value="true" />
       <arg name="predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
       <arg name="output_target_topic"
            value="/care_planner/cdf_shadow_vbc/unused_target" />

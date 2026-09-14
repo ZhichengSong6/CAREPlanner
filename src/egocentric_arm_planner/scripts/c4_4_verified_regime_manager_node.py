@@ -25,6 +25,7 @@ is diagnostic only.
 import math
 import re
 import threading
+import time
 
 import rospy
 from std_msgs.msg import Bool, Float64, String
@@ -210,6 +211,7 @@ class C44VerifiedRegimeManager:
         self.last_tracker_complete_seq = 0
         self.last_tracker_complete_stamp_ns = 0
         self.repair_safe_commit_count = 0
+        self.repair_final_vbc_hold = False
 
         self.repair_entry_count = 0
         self.probe_entry_count = 0
@@ -247,6 +249,10 @@ class C44VerifiedRegimeManager:
         self.blocker_rediscovery_count = 0
         self.blocker_rediscovery_vbc_unsafe_count = 0
         self.blocker_rediscovery_vbc_safe_count = 0
+        self.task_stall_stamp_ns = 0
+        self.task_stall_deadline = None
+        self.task_stall_confirmed = False
+        self.task_stall_outcome = "none"
 
         self.clear_until = None
         self.probe_ignore_until = None
@@ -302,6 +308,12 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.task_uncertified_topic, Bool, self._task_uncertified_cb,
             queue_size=10)
+        rospy.Subscriber(
+            "/care_planner/local_planner/task_stall", String,
+            self._task_stall_cb, queue_size=10)
+        rospy.Subscriber(str(rospy.get_param("~local_planner_summary_topic",
+            "/care_planner/local_planner/summary")), String,
+            self._repair_final_vbc_feedback_cb, queue_size=20)
         rospy.Subscriber(
             self.visibility_waypoint_active_topic, Bool,
             self._visibility_waypoint_active_cb, queue_size=1)
@@ -492,6 +504,59 @@ class C44VerifiedRegimeManager:
                     self.execution_ready_time,
                     replay=True)
 
+    def _repair_final_vbc_feedback_cb(self, msg):
+        fields = _tokens(msg.data)
+        hold = _as_bool(fields.get("final_vbc_hold"))
+        if hold is None:
+            return
+        with self._lock:
+            self.repair_final_vbc_hold = hold
+            if hold and self.state == self.REPAIR:
+                self.last_transition_reason = "repair_final_vbc_no_progress_hold"
+
+    def _finish_task_stall_locked(self, outcome):
+        self.task_stall_outcome = outcome
+        self.task_stall_deadline = None
+        if self.blocker_rediscovery_origin == "task_qp_no_progress":
+            self.blocker_rediscovery_pending = False
+            self.blocker_rediscovery_origin = "none"
+            self.blocker_rediscovery_force_bootstrap = False
+            self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+        self.last_transition_reason = outcome
+
+    def _task_stall_cb(self, msg):
+        if msg is None:
+            return
+        f = _tokens(msg.data)
+        with self._lock:
+            if f.get("status") == "retry":
+                if self.task_stall_stamp_ns or self.state not in (self.NORMAL, self.PROBE_NORMAL):
+                    return
+                if not self.execution_ready:
+                    self.task_uncertified_pending = self.state == self.NORMAL
+                    return
+                if self.state == self.PROBE_NORMAL and self._probe_single_flight_busy_locked():
+                    return
+                self.last_transition_reason = "local_qp_primal_infeasible_unattributed_retry"
+                self.replan_request_pub.publish(Bool(data=True))
+                return
+            if f.get("status") == "reset":
+                if self.task_stall_stamp_ns:
+                    self._finish_task_stall_locked("qp_stall_reset_" + f.get("reason", "unknown"))
+                self.task_stall_stamp_ns = 0
+                self.task_stall_confirmed = False
+                return
+            stamp = _as_int(f.get("query_stamp_ns"), 0)
+            if (f.get("status") != "stalled" or stamp <= 0 or
+                    stamp == self.task_stall_stamp_ns or
+                    self.state not in (self.NORMAL, self.PROBE_NORMAL)):
+                return
+            self.task_stall_stamp_ns = stamp
+            self.task_stall_confirmed = False
+            self.task_stall_deadline = time.monotonic() + 5.0
+            self.task_stall_outcome = "qp_no_progress_wait_exact_blocker"
+            self._begin_blocker_rediscovery_locked("task_qp_no_progress")
+
     def _begin_blocker_rediscovery_locked(
             self, origin, force_bootstrap=True):
         """Fail closed until a real visibility obligation exists.
@@ -521,12 +586,18 @@ class C44VerifiedRegimeManager:
         now = rospy.Time.now()
         with self._lock:
             self.visibility_waypoint_active = value
+            if (self.blocker_rediscovery_origin == "task_qp_no_progress" and
+                    not self.task_stall_confirmed):
+                return  # An old waypoint cannot certify this stalled query.
             if (not value or not self.blocker_rediscovery_pending or
                     not self.execution_ready or
                     self.state not in (self.NORMAL, self.PROBE_NORMAL)):
                 return
 
             origin = self.blocker_rediscovery_origin
+            if origin == "task_qp_no_progress":
+                self.task_stall_outcome = "qp_stall_exact_blocker_obligation_ready"
+                self.task_stall_deadline = None
             force_bootstrap = self.blocker_rediscovery_force_bootstrap
             self.blocker_rediscovery_pending = False
             self.blocker_rediscovery_origin = "none"
@@ -561,6 +632,22 @@ class C44VerifiedRegimeManager:
             if (not self.blocker_rediscovery_pending or
                     not self.blocker_rediscovery_force_bootstrap or
                     self.state not in (self.NORMAL, self.PROBE_NORMAL)):
+                return
+
+            if self.blocker_rediscovery_origin == "task_qp_no_progress":
+                if (_as_int(f.get("trajectory_stamp_ns"), 0) != self.task_stall_stamp_ns or
+                        not _as_bool(f.get("success"))):
+                    return
+                if not has_violation:
+                    self.blocker_rediscovery_vbc_safe_count += 1
+                    self._finish_task_stall_locked("QP_NO_PROGRESS_NO_VBC_BLOCKER")
+                    return  # VBC SAFE is not a hard-QP feasibility certificate.
+                self.task_stall_confirmed = True
+                self.blocker_rediscovery_vbc_unsafe_count += 1
+                self.task_stall_outcome = "qp_stall_exact_blocker_wait_obligation"
+                if self.visibility_waypoint_active and self.execution_ready:
+                    self._finish_task_stall_locked("qp_stall_exact_blocker_obligation_ready")
+                    self._transition_locked(self.REPAIR, self.task_stall_outcome, rospy.Time.now())
                 return
 
             if has_violation:
@@ -708,6 +795,8 @@ class C44VerifiedRegimeManager:
             return
         now = rospy.Time.now()
         with self._lock:
+            if self.task_stall_stamp_ns:
+                return  # Late numerical failure must not restart stalled work.
             # "Uncertified" is deliberately distinct from mathematical
             # infeasibility. It means PIQP exhausted its iteration budget and
             # therefore did not provide a hard-GCDF-certified task candidate.
@@ -900,6 +989,9 @@ class C44VerifiedRegimeManager:
 
             if self.state == self.REPAIR:
                 if result == "unsafe":
+                    if getattr(self, 'repair_final_vbc_hold', False):
+                        self.last_transition_reason = "repair_final_vbc_no_progress_hold"
+                        return
                     # Final executable GCDF/VBC rejection means no trajectory
                     # was committed, so there will be no tracker-complete event
                     # to drive another REPAIR plan. Stay in REPAIR and explicitly
@@ -1128,6 +1220,11 @@ class C44VerifiedRegimeManager:
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         with self._lock:
+            if (self.task_stall_deadline is not None and
+                    time.monotonic() >= self.task_stall_deadline):
+                self._finish_task_stall_locked(
+                    "QP_NO_PROGRESS_OBLIGATION_TIMEOUT" if self.task_stall_confirmed
+                    else "QP_NO_PROGRESS_EXACT_DIAGNOSTIC_TIMEOUT")
             trigger = self.execution_ready and self.state == self.REPAIR
             probe_active = self.execution_ready and self.state == self.PROBE_NORMAL
             clear = (
@@ -1270,6 +1367,8 @@ class C44VerifiedRegimeManager:
                     self.repair_completion_event_count),
                 "visibility_waypoint_active={}".format(
                     int(self.visibility_waypoint_active)),
+                "task_stall_outcome={}".format(self.task_stall_outcome),
+                "task_stall_stamp_ns={}".format(self.task_stall_stamp_ns),
                 "blocker_rediscovery_pending={}".format(
                     int(self.blocker_rediscovery_pending)),
                 "blocker_rediscovery_origin={}".format(

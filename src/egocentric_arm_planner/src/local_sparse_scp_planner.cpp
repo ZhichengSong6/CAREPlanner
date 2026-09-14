@@ -1,4 +1,9 @@
 #include "egocentric_arm_planner/local_sparse_scp_planner.hpp"
+#include "egocentric_arm_planner/visibility_objective_step.hpp"
+#include "egocentric_arm_planner/measured_braking_seed.hpp"
+#include "egocentric_arm_planner/qp_box_conflict.hpp"
+#include "egocentric_arm_planner/candidate_audit_context.hpp"
+#include <iomanip>
 
 #include <piqp/piqp.hpp>
 
@@ -83,6 +88,9 @@ bool LocalSparseSCPPlanner::initialize(
   reference_sub_ = nh_.subscribe(
       reference_topic_, 1,
       &LocalSparseSCPPlanner::referenceCallback, this);
+  task_reference_status_sub_ = nh_.subscribe(
+      "/care_planner/task_reference_status", 10,
+      &LocalSparseSCPPlanner::taskReferenceStatusCallback, this);
   waypoint_schedule_sub_ = nh_.subscribe(
       waypoint_schedule_topic_, 1,
       &LocalSparseSCPPlanner::waypointScheduleCallback, this);
@@ -116,6 +124,10 @@ bool LocalSparseSCPPlanner::initialize(
   cdf_batch_sub_ = nh_.subscribe(
       cdf_batch_topic_, 2,
       &LocalSparseSCPPlanner::cdfConstraintBatchCallback, this);
+  witness_request_pub_ = nh_.advertise<care_collision_cdf::CollisionCDFWitnessRequest>(
+      cdf_batch_topic_ + "/witness_request", 2);
+  witness_response_sub_ = nh_.subscribe(cdf_batch_topic_ + "/witness_response", 2,
+      &LocalSparseSCPPlanner::witnessResponseCallback, this);
 
   query_trajectory_pub_ =
       nh_.advertise<trajectory_msgs::JointTrajectory>(
@@ -123,14 +135,30 @@ bool LocalSparseSCPPlanner::initialize(
   candidate_trajectory_pub_ =
       nh_.advertise<trajectory_msgs::JointTrajectory>(
           candidate_trajectory_topic_, 1);
+  observation_identity_pub_ = nh_.advertise<std_msgs::String>(
+      "/care_planner/local_planner/observation_candidate_identity", 100);
+  std::string final_outcome_topic;
+  pnh_.param<std::string>("local_planner/verification_outcome_topic", final_outcome_topic,
+                         "/care_planner/verification_outcome");
+  final_verification_sub_ = nh_.subscribe(final_outcome_topic, 100,
+      &LocalSparseSCPPlanner::finalVerificationCallback, this);
+  gcdf_rejection_feedback_sub_ = nh_.subscribe(
+      candidate_trajectory_topic_ + "/gcdf_rejection_feedback", 4,
+      &LocalSparseSCPPlanner::gcdfRejectionFeedbackCallback, this);
+  pnh_.param("local_planner/rejection_snapshots_enabled", rejection_snapshots_enabled_, false);
+  candidate_audit_context_pub_ = nh_.advertise<std_msgs::String>(
+      candidate_trajectory_topic_ + "/audit_context", 4);
   summary_pub_ =
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
+  witness_diagnostic_pub_ = nh_.advertise<std_msgs::String>(summary_topic_ + "/witness", 100);
   task_infeasible_pub_ =
       nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
   task_obstacle_blocked_pub_ =
       nh_.advertise<std_msgs::Bool>(task_obstacle_blocked_topic_, 10, false);
   task_uncertified_pub_ =
       nh_.advertise<std_msgs::Bool>(task_uncertified_topic_, 10, false);
+  task_stall_pub_ = nh_.advertise<std_msgs::String>(
+      "/care_planner/local_planner/task_stall", 10, true);
   force_vbc_bootstrap_pub_ =
       nh_.advertise<std_msgs::Bool>(force_vbc_bootstrap_topic_, 1, true);
   gcdf_recovery_trajectory_pub_ =
@@ -433,15 +461,74 @@ void LocalSparseSCPPlanner::jointStateCallback(
   latest_joint_state_ = *msg;
   latest_joint_state_received_ = ros::Time::now();
   has_joint_state_ = true;
+  Eigen::VectorXd measured;
+  if (extractMeasuredQ(*msg, measured)) {
+    const bool vbc_was_blocked = final_vbc_no_progress_.progress.blocked();
+    if (final_vbc_no_progress_.progress.observe(measured) && vbc_was_blocked && repair_mode_)
+      requestPlanLocked("measured_progress_after_final_vbc_stall");
+    const bool repair_was_blocked = repair_no_progress_.blocked();
+    if (repair_no_progress_.observe(measured) && repair_was_blocked && repair_mode_)
+      requestPlanLocked("measured_progress_after_repair_qp_stall");
+    const bool was_blocked = task_no_progress_.blocked();
+    if (task_no_progress_.observe(measured) && was_blocked) {
+      std_msgs::String status; status.data = "status=reset reason=measured_progress";
+      task_stall_pub_.publish(status);
+      requestPlanLocked("measured_progress_after_qp_stall");
+    }
+  }
+}
+
+void LocalSparseSCPPlanner::taskReferenceStatusCallback(
+    const std_msgs::StringConstPtr& msg) {
+  if (!msg) return;
+  unsigned long long id = 0, stamp = 0;
+  if (!parseUnsignedToken(msg->data, "request_id", &id) ||
+      !parseUnsignedToken(msg->data, "request_ros_ns", &stamp)) return;
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool exhausted = msg->data.find("status=exhausted") != std::string::npos;
+  if (!task_reference_receipt_.status(id, stamp, exhausted)) return;
+  // Different ROS topics may be delivered out of order: do not invalidate a
+  // fresh reference just because its earlier 'pending' status arrives later.
+  if (!task_reference_receipt_.pending && !task_reference_receipt_.failed &&
+      latest_reference_.header.stamp.toNSec() >= stamp && !latest_reference_.points.empty()) {
+    const bool reference_was_unavailable = !has_reference_;
+    has_reference_ = true;
+    if (reference_was_unavailable ||
+        (normal_reference_refresh_pending_ && !probe_mode_ && !repair_mode_)) {
+      normal_reference_refresh_pending_ = false;
+      last_normal_completed_execution_stamp_ns_ = latest_execution_stamp_ns_;
+      requestPlanLocked("fresh_reference_status_after_reference");
+    }
+    return;
+  }
+  normal_reference_refresh_pending_ = !exhausted;
+  has_reference_ = false;
+  plan_requested_ = false;
+  ++mode_epoch_;  // in-flight candidates based on the old reference are stale
+  plan_request_reason_ = exhausted ? "normal_task_reference_retry_exhausted"
+                                   : "waiting_fresh_normal_task_reference";
+  ROS_WARN_STREAM("[LocalSparseSCPPlanner] " << plan_request_reason_ << " " << msg->data);
 }
 
 void LocalSparseSCPPlanner::referenceCallback(
     const trajectory_msgs::JointTrajectoryConstPtr& msg) {
   if (!msg || msg->points.empty()) return;
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!task_reference_receipt_.reference(msg->header.stamp.toNSec())) {
+    if (msg->header.stamp.toNSec() >= task_reference_receipt_.min_stamp) {
+      // Buffer only; an exhausted request cannot authorize planning. A newer
+      // request's status may arrive after its reference on the other topic.
+      latest_reference_ = *msg;
+      latest_reference_received_ = ros::Time::now();
+    }
+    return;
+  }
   latest_reference_ = *msg;
   latest_reference_received_ = ros::Time::now();
   has_reference_ = true;
+  task_no_progress_.reset();
+  std_msgs::String reset; reset.data = "status=reset reason=fresh_reference";
+  task_stall_pub_.publish(reset);
 
   if (normal_reference_refresh_pending_) {
     // C5.33: the first fresh /task_trajectory after PROBE->NORMAL is the
@@ -494,6 +581,7 @@ void LocalSparseSCPPlanner::waypointScheduleCallback(
     }
   }
   latest_schedule_ = incoming;
+  if (changed) selectRepairTargetLocked();
   if (changed && repair_mode_ && visibility_waypoint_weight_ > 0.0)
     requestPlanLocked("visibility_schedule_changed");
 }
@@ -552,6 +640,7 @@ void LocalSparseSCPPlanner::singleWaypointActiveCallback(
   if (latest_single_waypoint_active_ == msg->data) return;
 
   latest_single_waypoint_active_ = msg->data;
+  selectRepairTargetLocked();
   if (repair_mode_ && visibility_waypoint_weight_ > 0.0) {
     requestPlanLocked(
         msg->data
@@ -580,10 +669,20 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
       (q - latest_single_waypoint_q_)
               .lpNorm<Eigen::Infinity>() > 1e-5;
 
+  const std::string previous_token = latest_observation_token_;
   latest_single_waypoint_q_ = q;
+  latest_observation_token_ = "none";
+  if (!msg->layout.dim.empty() &&
+      msg->layout.dim.front().label.find("care_obs_v1_") == 0 &&
+      msg->layout.dim.front().label.find_first_not_of(
+          "abcdefghijklmnopqrstuvwxyz0123456789_") == std::string::npos)
+    latest_observation_token_ = msg->layout.dim.front().label;
   has_single_waypoint_q_ = true;
+  if (changed || previous_token != latest_observation_token_)
+    selectRepairTargetLocked();
 
-  if (changed && repair_mode_ && visibility_waypoint_weight_ > 0.0) {
+  if ((changed || previous_token != latest_observation_token_) &&
+      repair_mode_ && visibility_waypoint_weight_ > 0.0) {
     requestPlanLocked("single_visibility_waypoint_q_changed");
   }
 }
@@ -598,6 +697,9 @@ void LocalSparseSCPPlanner::recoveryCallback(
       repair_mode_ = msg->data;
       ++mode_epoch_;
       if (repair_mode_) {
+        task_no_progress_.reset();
+        std_msgs::String reset; reset.data = "status=reset reason=real_repair_transition";
+        task_stall_pub_.publish(reset);
         // C5.32: the execution that was already active/completed before REPAIR
         // is not a REPAIR completion event. Baseline the stamp here so a
         // repeated latched complete=1 from the previous mode cannot trigger a
@@ -631,6 +733,7 @@ void LocalSparseSCPPlanner::probeActiveCallback(
   ++mode_epoch_;
 
   if (probe_mode_) {
+    probe_reference_request_id_ = task_reference_receipt_.id;
     normal_reference_refresh_pending_ = false;
     requestPlanLocked("enter_probe_normal");
     return;
@@ -647,7 +750,13 @@ void LocalSparseSCPPlanner::probeActiveCallback(
   // C5.33 PROBE->NORMAL: do NOT immediately plan against the stale one-shot
   // task trajectory. Wait for the regime-manager pulse -> repeated EE goal ->
   // fresh measured-state /task_trajectory callback.
-  normal_reference_refresh_pending_ = true;
+  if (has_reference_ && task_reference_receipt_.id > probe_reference_request_id_ &&
+      !task_reference_receipt_.pending && !task_reference_receipt_.failed) {
+    normal_reference_refresh_pending_ = false;
+    requestPlanLocked("fresh_reference_before_normal_transition");
+    return;
+  }
+  normal_reference_refresh_pending_ = !task_reference_receipt_.failed;
   plan_requested_ = false;
   plan_request_reason_ = "waiting_fresh_normal_task_reference";
 }
@@ -813,18 +922,34 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
 
 void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
     const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg) {
+  acceptCdfBatch(msg, nullptr);
+}
+
+void LocalSparseSCPPlanner::witnessResponseCallback(
+    const care_collision_cdf::CollisionCDFWitnessResponseConstPtr& msg) {
+  if (!msg) return;
+  acceptCdfBatch(boost::make_shared<care_collision_cdf::CollisionCDFConstraintBatch>(msg->batch), msg.get());
+}
+
+void LocalSparseSCPPlanner::acceptCdfBatch(
+    const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg,
+    const care_collision_cdf::CollisionCDFWitnessResponse* response) {
   if (!msg) return;
 
   bool accepted = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // A legacy batch cannot stand in for an explicit witness acknowledgement.
+    // Empty requests keep the legacy batch path (NORMAL/PROBE included).
+    if (witness_response_required_ != static_cast<bool>(response)) return;
     ++cdf_batch_received_;
 
     if (!plan_running_ || !waiting_for_cdf_) return;
 
-    const double dt =
-        std::fabs((msg->header.stamp - current_query_stamp_).toSec());
-    if (dt > cdf_stamp_tolerance_s_) {
+    // Stamp is a request identity, not a noisy measurement timestamp. In
+    // simulation adjacent requests may differ by only 1 ns; a tolerance
+    // would allow a delayed previous (possibly empty) batch into a new solve.
+    if (msg->header.stamp != current_query_stamp_) {
       ++cdf_stamp_miss_;
       return;
     }
@@ -839,7 +964,46 @@ void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
         std::max(plan_cdf_roundtrip_max_ms_, roundtrip_ms);
     ++plan_cdf_roundtrip_count_;
 
+    bool response_error = false;
+    if (response) {
+      const auto& a = response->request;
+      const auto& b = current_witness_request_;
+      if (a.header.stamp != b.header.stamp || a.header.frame_id != b.header.frame_id ||
+          a.plan_sequence != b.plan_sequence || a.mode_epoch != b.mode_epoch ||
+          a.target_revision != b.target_revision || a.progress_epoch != b.progress_epoch ||
+          a.dof != b.dof || a.original_timestep != b.original_timestep ||
+          a.point_flat != b.point_flat || a.q_flat != b.q_flat) {
+        publishWitnessDiagnosticLocked(-1, -1, Eigen::Vector3d::Zero(), "response_identity_mismatch");
+        return;
+      }
+      response_error = response->status.size() != b.original_timestep.size();
+      if (response_error)
+        publishWitnessDiagnosticLocked(-1, -1, Eigen::Vector3d::Zero(), "response_dimension_error");
+      // Only a fresh map disposition in this exact query may retire a point.
+      // A missing pair in a plain batch is never a free-space certificate.
+      if (!response_error && plan_mode_epoch_ == mode_epoch_ &&
+          repair_no_progress_.current(plan_repair_ticket_)) {
+        for (std::size_t i = 0; i < response->status.size(); ++i) {
+          const Eigen::Vector3d p(b.point_flat[3*i], b.point_flat[3*i+1], b.point_flat[3*i+2]);
+          const auto& status = response->status[i];
+          publishWitnessDiagnosticLocked(static_cast<int>(i), b.original_timestep[i], p, "upstream_"+status);
+          if (status == "resolved_free") {
+            repair_unknown_witnesses_.erase(std::remove_if(repair_unknown_witnesses_.begin(),
+                repair_unknown_witnesses_.end(), [&](const RepairWitness& w) {
+                  return w.timestep == b.original_timestep[i] &&
+                      (w.point-p).lpNorm<Eigen::Infinity>() <= 1e-5;
+                }), repair_unknown_witnesses_.end());
+          } else if (status != "evaluated_unknown" && status != "evaluated_occupied") {
+            response_error = true;
+          }
+        }
+      }
+    }
     pending_batch_ = msg;
+    if (plan_repair_mode_ && repair_mode_ && plan_mode_epoch_ == mode_epoch_ &&
+        repair_no_progress_.current(plan_repair_ticket_))
+      updateRepairWitnessesLocked(*msg);
+    if (response_error) repair_witness_requires_reobserve_ = true;
     waiting_for_cdf_ = false;
     accepted = true;
   }
@@ -849,6 +1013,126 @@ void LocalSparseSCPPlanner::cdfConstraintBatchCallback(
     // benchmark still tells us that timestamp matching and ROS transport worked.
     publishSummary("cdf_batch_accepted");
     worker_cv_.notify_one();
+  }
+}
+
+void LocalSparseSCPPlanner::publishWitnessDiagnosticLocked(
+    int index, int timestep, const Eigen::Vector3d& point,
+    const std::string& reason, int pair, double q_error) {
+  std::ostringstream s;
+  s << std::setprecision(17) << "C5_4_WITNESS event=repair_witness_check"
+    << " query_stamp_ns=" << current_query_stamp_.toNSec()
+    << " plan_seq=" << plan_sequence_ << " mode_epoch=" << plan_mode_epoch_
+    << " target_revision=" << plan_repair_ticket_.revision
+    << " progress_epoch=" << plan_repair_ticket_.progress
+    << " phase=" << (plan_repair_observation_phase_ ? "observation" : "retreat")
+    << " witness_index=" << index << " timestep=" << timestep
+    << " point=[" << point[0] << ',' << point[1] << ',' << point[2] << ']'
+    << " reason=" << reason << " batch_pair=" << pair << " q_error_inf=" << q_error;
+  if (timestep >= 1 && timestep < plan_q_bar_.cols()) {
+    s << " q_expected=[";
+    for (int j = 0; j < dof_; ++j) { if (j) s << ','; s << plan_q_bar_(j,timestep); }
+    s << ']';
+  }
+  std_msgs::String msg; msg.data = s.str(); witness_diagnostic_pub_.publish(msg);
+  // Unthrottled evidence with exact identities also survives CSV packet loss.
+  ROS_INFO_STREAM(msg.data);
+}
+
+void LocalSparseSCPPlanner::updateRepairWitnessesLocked(
+    const care_collision_cdf::CollisionCDFConstraintBatch& batch) {
+  // Identity only is retained. Every accepted query must supply its own finite
+  // distance and full 7D gradient at the current (point, timestep, q_bar).
+  // This runs in BOTH phases, and freshness is recomputed, never latched.
+  repair_witness_requires_reobserve_ = true;
+  const std::size_t n = batch.distance.size();
+  if (batch.num_pairs < 0 || n != static_cast<std::size_t>(batch.num_pairs) ||
+      batch.dof != dof_ || batch.original_timestep.size() != n ||
+      (!batch.source_type.empty() && batch.source_type.size() != n) ||
+      batch.point_flat.size() != n * 3 ||
+      batch.gradient_flat.size() != n * dof_ ||
+      batch.q_linearization_flat.size() != n * dof_) {
+    publishWitnessDiagnosticLocked(-1, -1, Eigen::Vector3d::Zero(), "batch_dimension_error");
+    for (std::size_t i = 0; i < repair_unknown_witnesses_.size(); ++i)
+      publishWitnessDiagnosticLocked(i, repair_unknown_witnesses_[i].timestep,
+          repair_unknown_witnesses_[i].point, "batch_dimension_error");
+    return;
+  }
+
+  std::vector<RepairWitness> fresh;
+  std::vector<std::string> reasons(n, "outside_safety_horizon");
+  std::vector<double> q_errors(n, 0.0);
+  bool valid_batch = true;
+  auto same = [](const RepairWitness& a, const RepairWitness& b) {
+    return a.timestep == b.timestep &&
+        (a.point - b.point).lpNorm<Eigen::Infinity>() <= 1e-5;
+  };
+  for (std::size_t i = 0; i < n; ++i) {
+    const int k = batch.original_timestep[i];
+    if (k < 1 || k > std::min(num_intervals_, cdf_constraint_horizon_steps_)) continue;
+    RepairWitness w{Eigen::Vector3d(batch.point_flat[3*i],
+        batch.point_flat[3*i+1], batch.point_flat[3*i+2]), k};
+    std::string reason = "fresh";
+    if (!w.point.allFinite()) reason = "nonfinite_point";
+    else if (!std::isfinite(batch.distance[i])) reason = "nonfinite_distance";
+    double gradient_l1 = 0.0;
+    for (int j = 0; j < dof_; ++j) {
+      const double q = batch.q_linearization_flat[i*dof_+j];
+      const double g = batch.gradient_flat[i*dof_+j];
+      if (!std::isfinite(q)) reason = "nonfinite_q";
+      else if (!std::isfinite(g)) reason = "nonfinite_gradient";
+      else {
+        q_errors[i] = std::max(q_errors[i], std::fabs(q-plan_q_bar_(j,k)));
+        if (q_errors[i] > cdf_linearization_tolerance_inf_ && reason == "fresh")
+          reason = "q_linearization_mismatch";
+      }
+      gradient_l1 += std::fabs(g);
+    }
+    const uint8_t source = batch.source_type.empty()
+        ? static_cast<uint8_t>(care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN) : batch.source_type[i];
+    if (source != care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN &&
+        source != care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED)
+      reason = "invalid_source";
+    reasons[i] = reason;
+    if (reason != "fresh") {
+      valid_batch = false;
+      publishWitnessDiagnosticLocked(-1, k, w.point, reason, i, q_errors[i]);
+      continue;
+    }
+    fresh.push_back(w);
+    if (source == care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN &&
+        batch.distance[i] - trust_radius_ * gradient_l1 < cdf_safety_margin_ &&
+        std::none_of(repair_unknown_witnesses_.begin(), repair_unknown_witnesses_.end(),
+                     [&](const RepairWitness& old) { return same(old, w); })) {
+      if (repair_unknown_witnesses_.size() < 32) repair_unknown_witnesses_.push_back(w);
+      else {
+        repair_witness_overflow_ = true;
+        publishWitnessDiagnosticLocked(-1, k, w.point, "witness_capacity_exceeded", i);
+      }
+    }
+  }
+  const bool all_seen = std::all_of(repair_unknown_witnesses_.begin(), repair_unknown_witnesses_.end(),
+      [&](const RepairWitness& old) {
+        return std::any_of(fresh.begin(), fresh.end(),
+                          [&](const RepairWitness& w) { return same(old, w); });
+      });
+  repair_witness_requires_reobserve_ = repair_witness_overflow_ || !valid_batch || !all_seen;
+  for (std::size_t wi = 0; wi < repair_unknown_witnesses_.size(); ++wi) {
+    const auto& w = repair_unknown_witnesses_[wi];
+    int matched = -1;
+    std::string reason = "missing_point";
+    for (std::size_t i = 0; i < n; ++i) {
+      const Eigen::Vector3d p(batch.point_flat[3*i], batch.point_flat[3*i+1], batch.point_flat[3*i+2]);
+      if (!p.allFinite() || (p-w.point).lpNorm<Eigen::Infinity>() > 1e-5) continue;
+      if (batch.original_timestep[i] != w.timestep) {
+        if (matched < 0) reason = "wrong_timestep";
+        continue;
+      }
+      matched = static_cast<int>(i); reason = reasons[i];
+      if (reason == "fresh") break;
+    }
+    publishWitnessDiagnosticLocked(wi, w.timestep, w.point, reason, matched,
+        matched >= 0 ? q_errors[matched] : 0.0);
   }
 }
 
@@ -1034,8 +1318,140 @@ bool LocalSparseSCPPlanner::buildReferenceHorizon(
          finiteMatrix(u_ref) && finiteMatrix(u_init);
 }
 
+std::string LocalSparseSCPPlanner::repairTargetKeyLocked() const {
+  // Deadlines may be refreshed without changing the actual observation goal.
+  std::ostringstream s;
+  s << std::setprecision(17);
+  if (!latest_schedule_.empty()) {
+    s << "schedule";
+    for (const auto& wp : latest_schedule_) {
+      s << ':' << wp.id;
+      for (int j = 0; j < wp.q.size(); ++j) s << ':' << wp.q[j];
+    }
+  } else if (latest_single_waypoint_active_ && has_single_waypoint_q_) {
+    s << latest_observation_token_;
+    for (int j = 0; j < latest_single_waypoint_q_.size(); ++j)
+      s << ':' << latest_single_waypoint_q_[j];
+  }
+  return s.str();
+}
+
+void LocalSparseSCPPlanner::selectRepairTargetLocked() {
+  const auto key = repairTargetKeyLocked();
+  repair_no_progress_.select(key);
+  final_vbc_no_progress_.progress.select(key);
+}
+
+void LocalSparseSCPPlanner::finalVerificationCallback(const std_msgs::StringConstPtr& msg) {
+  if (!msg) return;
+  // Exact field tokens, not substring/nearest-time matching. No malformed or
+  // positive outcome can become a final VBC failure.
+  std::map<std::string, std::string> fields;
+  std::istringstream input(msg->data);
+  std::string word;
+  while (input >> word) {
+    const auto eq = word.find('=');
+    if (eq != std::string::npos && !fields.emplace(word.substr(0,eq),word.substr(eq+1)).second) return;
+  }
+  if (fields["result"] != "unsafe" || fields["safety_gate"] != "vbc" || fields["committed"] != "0") return;
+  unsigned long long raw = 0, audited = 0;
+  try {
+    for (const auto& key : {"raw_candidate_stamp_ns", "audited_trajectory_stamp_ns"}) {
+      const auto& value = fields[key];
+      if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) return;
+    }
+    raw = std::stoull(fields["raw_candidate_stamp_ns"]);
+    audited = std::stoull(fields["audited_trajectory_stamp_ns"]);
+  } catch (...) { return; }
+  if (!raw || !audited) return;
+  std::string event;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!repair_mode_ || probe_mode_) return;
+    const auto outcome = final_vbc_no_progress_.reject(raw, mode_epoch_);
+    if (outcome == RepairNoProgress::Failure::Stale) return;
+    event = outcome == RepairNoProgress::Failure::Exhausted
+        ? "repair_final_vbc_no_progress_hold" : "repair_final_vbc_retry";
+    if (outcome == RepairNoProgress::Failure::Exhausted) {
+      // Invalidate an already-started solve as well as future Bool replan
+      // pulses. Never cancel/commandeer a trajectory owned by the tracker.
+      ++plan_sequence_;
+      plan_running_ = false;
+      waiting_for_cdf_ = false;
+      pending_batch_.reset();
+    }
+    requestPlanLocked(event);
+    ROS_WARN_STREAM("[LocalSparseSCPPlanner] " << event << " raw_candidate_stamp_ns=" << raw
+        << " audited_trajectory_stamp_ns=" << audited
+        << " failures=" << final_vbc_no_progress_.progress.failures());
+  }
+  publishSummary(event);
+}
+
+void LocalSparseSCPPlanner::gcdfRejectionFeedbackCallback(
+    const care_collision_cdf::CollisionCDFRejectionFeedbackConstPtr& msg) {
+  if (!msg || msg->header.stamp.isZero() || msg->raw_candidate_stamp.isZero() ||
+      msg->point_flat.size() % 3 || msg->point_flat.size() > 96 ||
+      (!msg->overflow && msg->point_flat.empty()) ||
+      !std::all_of(msg->point_flat.begin(), msg->point_flat.end(),
+                   [](double v) { return std::isfinite(v); })) return;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = gcdf_feedback_pending_.find(msg->raw_candidate_stamp.toNSec());
+    if (it == gcdf_feedback_pending_.end() || !repair_mode_ || probe_mode_ ||
+        msg->header.frame_id != current_frame_id_ || it->second.mode_epoch != mode_epoch_ ||
+        !repair_no_progress_.current(it->second.ticket)) return;
+    gcdf_feedback_pending_.erase(it);  // one feedback per exact raw candidate
+    repair_witness_overflow_ = repair_witness_overflow_ || msg->overflow;
+    // Carry only point identity. A handoff/braking knot has no general
+    // one-to-one QP index: explicitly re-query every EXISTING hard-prefix
+    // knot at its new q. Never reuse the executable's distance or gradient.
+    for (std::size_t i = 0; i < msg->point_flat.size(); i += 3) {
+      const Eigen::Vector3d p(msg->point_flat[i], msg->point_flat[i+1], msg->point_flat[i+2]);
+      for (int k = 1; k <= std::min(num_intervals_, cdf_constraint_horizon_steps_); ++k) {
+        const bool present = std::any_of(repair_unknown_witnesses_.begin(), repair_unknown_witnesses_.end(),
+            [&](const RepairWitness& w) { return w.timestep == k &&
+                (w.point-p).lpNorm<Eigen::Infinity>() <= 1e-5; });
+        if (present) continue;
+        if (repair_unknown_witnesses_.size() >= 32) {
+          repair_witness_overflow_ = true;
+          break;
+        }
+        repair_unknown_witnesses_.push_back(RepairWitness{p, k});
+      }
+    }
+    repair_witness_requires_reobserve_ = true;
+    // Invalidate any solve started without the newly discovered identities.
+    ++plan_sequence_;
+    plan_running_ = false;
+    waiting_for_cdf_ = false;
+    pending_batch_.reset();
+    requestPlanLocked("repair_final_gcdf_witness_requery");
+    ROS_WARN_STREAM("[LocalSparseSCPPlanner] repair_final_gcdf_witness_requery raw_stamp_ns="
+        << msg->raw_candidate_stamp.toNSec() << " audited_stamp_ns=" << msg->header.stamp.toNSec()
+        << " witnesses=" << repair_unknown_witnesses_.size()
+        << " overflow=" << repair_witness_overflow_);
+  }
+  publishSummary("repair_final_gcdf_witness_requery");
+}
+
 void LocalSparseSCPPlanner::requestPlanLocked(
     const std::string& reason) {
+  if (repair_mode_ && final_vbc_no_progress_.progress.blocked()) {
+    plan_requested_ = false;
+    plan_request_reason_ = "repair_final_vbc_no_progress_hold";
+    return;
+  }
+  if (repair_mode_ && repair_no_progress_.blocked()) {
+    plan_requested_ = false;
+    plan_request_reason_ = "repair_qp_no_progress_hold";
+    return;
+  }
+  if (!repair_mode_ && task_no_progress_.blocked()) {
+    plan_requested_ = false;
+    plan_request_reason_ = "qp_no_progress_hold";
+    return;
+  }
   plan_requested_ = true;
   plan_request_reason_ = reason;
 }
@@ -1050,12 +1466,18 @@ bool LocalSparseSCPPlanner::startPlan() {
   Eigen::VectorXd previous_command;
   FrontierObjective frontier;
   bool repair = false;
+  bool observation_phase = true;
   bool probe = false;
   std::string reason;
+  unsigned long long start_mode_epoch = 0;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (plan_running_ || !plan_requested_) return false;
+    if (repair_mode_ && (repair_no_progress_.blocked() || final_vbc_no_progress_.progress.blocked())) {
+      plan_requested_ = false;
+      return false;
+    }
     if (!has_joint_state_ || !has_reference_) {
       ROS_WARN_THROTTLE(
           1.0,
@@ -1069,12 +1491,33 @@ bool LocalSparseSCPPlanner::startPlan() {
     single_waypoint_active = latest_single_waypoint_active_;
     has_single_waypoint_q = has_single_waypoint_q_;
     single_waypoint_q = latest_single_waypoint_q_;
+    plan_observation_token_ = repair_mode_ && schedule.empty() &&
+        single_waypoint_active && has_single_waypoint_q
+        ? latest_observation_token_ : "none";
     previous_command = latest_executed_command_;
     if (previous_command.size() != dof_)
       previous_command = Eigen::VectorXd::Zero(dof_);
     frontier = latest_frontier_;
     repair = repair_mode_;
     probe = probe_mode_;
+    start_mode_epoch = mode_epoch_;
+    plan_repair_ticket_ = repair_no_progress_.active;
+    if (repair && (repair_witness_mode_epoch_ != start_mode_epoch ||
+                   repair_witness_ticket_.target != plan_repair_ticket_.target ||
+                   repair_witness_ticket_.revision != plan_repair_ticket_.revision)) {
+      repair_unknown_witnesses_.clear();
+      repair_witness_overflow_ = false;
+      repair_witness_requires_reobserve_ = false;
+      repair_observation_phase_ = true;
+      repair_witness_ticket_ = plan_repair_ticket_;
+      repair_witness_mode_epoch_ = start_mode_epoch;
+    }
+    plan_repair_mode_ = repair;
+    plan_repair_observation_phase_ = repair_observation_phase_;
+    observation_phase = plan_repair_observation_phase_;
+    if (repair && !observation_phase) plan_observation_token_ = "none";
+    plan_probe_mode_ = probe;
+    plan_mode_epoch_ = start_mode_epoch;
     reason = plan_request_reason_;
 
     plan_requested_ = false;
@@ -1089,7 +1532,7 @@ bool LocalSparseSCPPlanner::startPlan() {
   // topics; its multi-deadline schedule topic stays empty.  The C5.4 local
   // planner accepts both interfaces. In REPAIR, fall back to a synthetic
   // terminal-horizon obligation for that active q_vis.
-  if (!repair) {
+  if (!repair || !observation_phase) {
     schedule.clear();
     frontier.active = false;
     frontier.frontier_weight_scale = 0.0;
@@ -1100,8 +1543,7 @@ bool LocalSparseSCPPlanner::startPlan() {
              single_waypoint_q.size() == dof_) {
     DeadlineWaypoint wp;
     wp.id = -1;
-    wp.deadline_abs_s =
-        ros::Time::now().toSec() + horizon_duration_;
+    wp.terminal_objective = true;
     wp.q = single_waypoint_q;
     schedule.push_back(std::move(wp));
   }
@@ -1112,7 +1554,7 @@ bool LocalSparseSCPPlanner::startPlan() {
   // selector from falling back to the task trajectory to discover the next
   // blocker. Treat this as a normal waiting state instead: request an immediate
   // task-trajectory bootstrap and publish no candidate until q_vis arrives.
-  if (repair && schedule.empty()) {
+  if (repair && observation_phase && schedule.empty()) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       plan_running_ = false;
@@ -1161,15 +1603,22 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
     u_init.setZero();
     initialization_mode = "repair_hold";
+    if (!observation_phase) initialization_mode = "repair_safety_retreat_hold";
   }
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (start_mode_epoch != mode_epoch_ ||
+        (repair && !repair_no_progress_.targetCurrent(plan_repair_ticket_))) {
+      plan_running_ = false;
+      return false;
+    }
     plan_q_current_ = q_current;
     plan_previous_command_ = previous_command;
     plan_q_ref_ = q_ref;
     plan_u_ref_ = u_ref;
     plan_q_bar_ = q_init;
+    plan_normal_reseed_used_ = false;
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
     plan_frontier_ = frontier;
@@ -1212,15 +1661,48 @@ bool LocalSparseSCPPlanner::startPlan() {
 }
 
 void LocalSparseSCPPlanner::abortPlan(const std::string& reason) {
+  SparseSolveResult trace;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    trace.trace_plan_sequence = plan_sequence_;
+    trace.trace_observation_token = plan_observation_token_;
+    trace.trace_repair = plan_repair_mode_;
+    trace.trace_repair_observation_phase = plan_repair_observation_phase_;
+    trace.trace_repair_witnesses = static_cast<int>(repair_unknown_witnesses_.size());
+    trace.trace_repair_witnesses_fresh = !repair_witness_requires_reobserve_;
+    trace.trace_probe = plan_probe_mode_;
+    trace.trace_repair_ticket = plan_repair_ticket_;
+    trace.status = reason;
+    if (witness_response_required_ && reason == "cdf_wait_timeout") {
+      for (std::size_t i = 0; i < repair_unknown_witnesses_.size(); ++i)
+        publishWitnessDiagnosticLocked(i, repair_unknown_witnesses_[i].timestep,
+            repair_unknown_witnesses_[i].point, "witness_response_timeout");
+    }
     plan_running_ = false;
     waiting_for_cdf_ = false;
     pending_batch_.reset();
     last_plan_finish_time_ = ros::Time::now();
     ++solve_failure_count_;
+    if (repair_mode_ && plan_repair_mode_ && plan_mode_epoch_ == mode_epoch_ &&
+        repair_no_progress_.targetCurrent(plan_repair_ticket_)) {
+      const auto outcome = repair_no_progress_.fail(plan_repair_ticket_);
+      trace.repair_failures = repair_no_progress_.failures();
+      trace.repair_feedback = outcome == RepairNoProgress::Failure::Exhausted
+          ? "repair_plan_exhausted" : "repair_plan_retry_scheduled";
+      requestPlanLocked(trace.repair_feedback);
+    }
   }
-  publishSummary("aborted_" + reason);
+  publishSummary("aborted_" + reason, &trace);
+  if (reason == "cdf_wait_timeout" && !trace.trace_repair && !trace.trace_probe) {
+    // Transport failure is not evidence of collision or geometric infeasibility.
+    // Remain fail-closed; no unbounded automatic retry of the same reference.
+    std_msgs::Bool uncertified; uncertified.data = true;
+    task_uncertified_pub_.publish(uncertified);
+    std_msgs::String status;
+    status.data = "status=uncertified reason=cdf_wait_timeout action=hold_wait_external_replan";
+    task_stall_pub_.publish(status);
+  }
+  if (!trace.repair_feedback.empty()) publishSummary(trace.repair_feedback, &trace);
   ROS_WARN_STREAM(
       "[LocalSparseSCPPlanner] plan aborted: " << reason);
 }
@@ -1255,6 +1737,13 @@ void LocalSparseSCPPlanner::workerLoop() {
     double trust = 0.0;
     double slack_linear_weight = 0.0;
     int iteration = 0;
+    unsigned long long solve_mode_epoch = 0;
+    unsigned long long solve_plan_sequence = 0;
+    bool observation_phase = true;
+    bool witnesses_fresh = true;
+    int witness_count = 0;
+    std::string solve_observation_token;
+    RepairNoProgress::Ticket solve_repair_ticket;
     ros::Time expected_stamp;
 
     {
@@ -1270,8 +1759,15 @@ void LocalSparseSCPPlanner::workerLoop() {
       batch = pending_batch_;
       pending_batch_.reset();
       if (!batch || !plan_running_) continue;
+      solve_mode_epoch = plan_mode_epoch_;
+      solve_plan_sequence = plan_sequence_;
+      solve_observation_token = plan_observation_token_;
+      solve_repair_ticket = plan_repair_ticket_;
 
       repair = plan_repair_mode_;
+      observation_phase = plan_repair_observation_phase_;
+      witnesses_fresh = !repair_witness_requires_reobserve_;
+      witness_count = static_cast<int>(repair_unknown_witnesses_.size());
       probe = plan_probe_mode_;
       const bool executable_prefix_mode = repair || probe;
 
@@ -1318,16 +1814,19 @@ void LocalSparseSCPPlanner::workerLoop() {
       expected_stamp = current_query_stamp_;
     }
 
-    if (std::fabs(
-            (batch->header.stamp - expected_stamp).toSec()) >
-        cdf_stamp_tolerance_s_) {
+    if (batch->header.stamp != expected_stamp) {
       continue;
     }
 
     publishSummary("sparse_qp_started");
 
-    SparseSolveResult result =
-        solveSparseSubproblem(
+    SparseSolveResult result;
+    if (repair && !witnesses_fresh) {
+      result.status = "repair_witness_missing_or_invalid";
+    } else if (repair && !observation_phase && cdf_slack_enabled_) {
+      result.status = "repair_retreat_requires_hard_gcdf";
+    } else {
+      result = solveSparseSubproblem(
             *batch,
             q_bar,
             u_bar,
@@ -1340,6 +1839,10 @@ void LocalSparseSCPPlanner::workerLoop() {
             probe,
             trust,
             slack_linear_weight);
+    }
+    result.trace_repair_observation_phase = observation_phase;
+    result.trace_repair_witnesses = witness_count;
+    result.trace_repair_witnesses_fresh = witnesses_fresh;
 
     // C5.25: compute the existing soft diagnostic before deciding whether a
     // failed PROBE plan is terminal. The soft solve is NON-EXECUTABLE; when
@@ -1366,15 +1869,38 @@ void LocalSparseSCPPlanner::workerLoop() {
       diagnostic_ran = true;
     }
 
+    result.trace_plan_sequence = solve_plan_sequence;
+    result.trace_observation_token = solve_observation_token;
+    result.trace_repair = repair;
+    result.trace_probe = probe;
+    result.trace_repair_ticket = solve_repair_ticket;
+    diagnostic.trace_plan_sequence = solve_plan_sequence;
+    diagnostic.trace_observation_token = solve_observation_token;
+    diagnostic.trace_repair = repair;
+    diagnostic.trace_probe = probe;
     bool publish_candidate = false;
     bool publish_next_query = false;
     bool restoration_applied = false;
+    bool normal_reseed_applied = false;
     Eigen::MatrixXd q_next, u_next;
     std::string frame;
     double total_ms = 0.0;
 
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      // Failure evidence/restoration is as request-sensitive as candidates.
+      // An old worker result must not clear a newer plan's running state.
+      if (solve_plan_sequence != plan_sequence_) continue;
+      if (solve_mode_epoch != mode_epoch_ || repair != repair_mode_ ||
+          probe != probe_mode_ ||
+          (repair && !repair_no_progress_.current(solve_repair_ticket))) {
+        plan_running_ = false;
+        waiting_for_cdf_ = false;
+        if (repair && repair_mode_ && solve_mode_epoch == mode_epoch_ &&
+            repair_no_progress_.targetCurrent(solve_repair_ticket))
+          requestPlanLocked("repair_stale_measured_progress");
+        continue;
+      }
       ++solve_count_;
       if (!result.solved) {
         ++solve_failure_count_;
@@ -1387,7 +1913,24 @@ void LocalSparseSCPPlanner::workerLoop() {
             plan_probe_feasibility_restore_attempts_ <
                 probe_feasibility_restoration_max_attempts_;
 
-        if (restoration_available) {
+        // One bounded NORMAL relinearization only after an independently
+        // proven row/box conflict. Preserve the task objective, measured q_0,
+        // trust radius, PIQP settings and total SCP budget. This seed is never
+        // published as an executable candidate; fresh GCDF + hard QP required.
+        if (!repair && !probe && result.box_conflicting_cdf_rows > 0 &&
+            !plan_normal_reseed_used_ && scp_iteration_ + 1 < max_scp_iterations_ &&
+            measuredBrakingSeed(q_bar.col(0), previous_command, acceleration_limits_,
+                                num_intervals_, dt_, q_next, u_next)) {
+          plan_normal_reseed_used_ = true;
+          ++scp_iteration_;  // failed solve consumes an iteration too
+          plan_q_bar_ = q_next;
+          plan_u_bar_ = u_next;
+          previous_query_min_distance_ = std::numeric_limits<double>::quiet_NaN();
+          plan_initialization_mode_ = "normal_conflict_measured_reseed";
+          normal_reseed_applied = true;
+          publish_next_query = true;
+          frame = current_frame_id_;
+        } else if (restoration_available) {
           // The soft trajectory stays internal. Re-query GCDF at this iterate,
           // then require a hard-QP solve before any candidate publication.
           plan_q_bar_ = diagnostic.q;
@@ -1407,6 +1950,20 @@ void LocalSparseSCPPlanner::workerLoop() {
           waiting_for_cdf_ = false;
           plan_probe_restore_pending_hard_recheck_ = false;
           last_plan_finish_time_ = ros::Time::now();
+          if (repair) {
+            if (observation_phase && (result.selected_unknown_cdf_rows > 0 || !witnesses_fresh)) {
+              repair_witness_requires_reobserve_ = true;
+              repair_observation_phase_ = false;
+            }
+            const auto outcome = repair_no_progress_.fail(solve_repair_ticket);
+            result.repair_failures = repair_no_progress_.failures();
+            result.repair_feedback = outcome == RepairNoProgress::Failure::Exhausted
+                ? "repair_qp_exhausted" : outcome == RepairNoProgress::Failure::Retry
+                ? "repair_qp_retry_scheduled" : "repair_qp_stale_progress_retry";
+            // A fresh GCDF query and hard solve are required for every retry.
+            // Measured motion during this solve belongs to a new episode.
+            requestPlanLocked(result.repair_feedback);
+          }
         }
       } else {
         if (probe && plan_probe_restore_pending_hard_recheck_) {
@@ -1440,6 +1997,12 @@ void LocalSparseSCPPlanner::workerLoop() {
         }
 
         if (converged || exhausted) {
+          if (repair && !observation_phase) {
+            // The active plan remains retreat through publication. Only the
+            // NEXT plan regains visibility objectives, after this complete
+            // hard solve with fresh witness coverage. UNKNOWN rows may remain.
+            repair_observation_phase_ = true;
+          }
           publish_candidate = true;
           plan_running_ = false;
           waiting_for_cdf_ = false;
@@ -1482,6 +2045,14 @@ void LocalSparseSCPPlanner::workerLoop() {
             << " soft_primal=" << diagnostic.primal_residual);
       }
 
+      if (normal_reseed_applied) {
+        ROS_WARN_STREAM("[LocalSparseSCPPlanner] NORMAL_BOX_RESEED conflicts="
+                        << result.box_conflicting_cdf_rows << " used_iteration=" << iteration+1
+                        << " fresh_gcdf_hard_qp_required=1");
+        publishQueryTrajectory(q_next, u_next, frame);
+        continue;
+      }
+
       if (restoration_applied) {
         publishSummary(
             "probe_feasibility_restore_applied",
@@ -1496,53 +2067,50 @@ void LocalSparseSCPPlanner::workerLoop() {
         continue;
       }
 
+      if (repair) {
+        publishSummary(result.repair_feedback, &result, total_ms);
+      }
       if (!repair) {
+        bool stalled = false;
+        int failures = 0;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (solve_mode_epoch != mode_epoch_ || solve_plan_sequence != plan_sequence_ || repair != repair_mode_ ||
+              probe != probe_mode_) continue;
+          Eigen::VectorXd measured;
+          if (!extractMeasuredQ(latest_joint_state_, measured)) measured = q_bar.col(0);
+          stalled = task_no_progress_.fail(measured);
+          failures = task_no_progress_.failures;
+          if (stalled) plan_requested_ = false;
+        }
+        if (stalled) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (solve_mode_epoch != mode_epoch_ || solve_plan_sequence != plan_sequence_ ||
+              !task_no_progress_.blocked()) continue;
+          std_msgs::String msg;
+          std::ostringstream s;
+          s << "status=stalled classification=QP_NO_PROGRESS_UNCERTIFIED"
+            << " failures=" << failures << " query_stamp_ns=" << batch->header.stamp.toNSec()
+            << " snapshot=disabled";
+          msg.data = s.str(); task_stall_pub_.publish(msg);
+          ROS_ERROR_STREAM("[LocalSparseSCPPlanner] " << msg.data);
+          // No infeasibility claim or soft candidate. The regime manager
+          // requests same-query exact VBC; row presence is not blocker evidence.
+          continue;
+        }
         if (result.status.find("primal infeasible") != std::string::npos) {
-          std_msgs::Bool blocked_msg;
-          blocked_msg.data = true;
-
-          // Phase E4 semantics:
-          //   UNKNOWN-only  -> visibility repair
-          //   MIXED         -> visibility repair for UNKNOWN while OCCUPIED
-          //                    remains a hard GCDF constraint
-          //   OCCUPIED-only -> non-sensing collision-free replan
-          //
-          // Presence of any occupied row is NOT sufficient to classify the
-          // failure as obstacle-only. In a mixed batch the UNKNOWN rows may be
-          // the actual cause of infeasibility (and are active constraints).
-          if (result.selected_unknown_cdf_rows > 0) {
-            const bool recovery_published =
-                publishLocalGcdfRecoveryEvidence(
-                    *batch, result, q_bar, u_bar, current_frame_id_);
-            task_infeasible_pub_.publish(blocked_msg);
-            ROS_WARN_STREAM(
-                "[LocalSparseSCPPlanner] task QP "
-                << (result.selected_occupied_cdf_rows > 0
-                        ? "mixed UNKNOWN+OCCUPIED"
-                        : "UNKNOWN-only")
-                << " infeasible in "
-                << (probe ? "PROBE_NORMAL" : "NORMAL")
-                << " unknown_rows=" << result.selected_unknown_cdf_rows
-                << " occupied_rows=" << result.selected_occupied_cdf_rows
-                << " exact_gcdf_recovery_published="
-                << static_cast<int>(recovery_published)
-                << " -> publish visibility-repair signal");
-          } else if (result.selected_occupied_cdf_rows > 0) {
-            task_obstacle_blocked_pub_.publish(blocked_msg);
-            ROS_WARN_STREAM(
-                "[LocalSparseSCPPlanner] task QP OCCUPIED-only blocked in "
-                << (probe ? "PROBE_NORMAL" : "NORMAL")
-                << " occupied_rows=" << result.selected_occupied_cdf_rows
-                << " -> publish non-sensing obstacle replan signal");
-          } else {
-            // Defensive fallback for a hard infeasibility with no semantic
-            // GCDF rows. Preserve the old task-infeasible path rather than
-            // silently stalling.
-            task_infeasible_pub_.publish(blocked_msg);
-            ROS_WARN_STREAM(
-                "[LocalSparseSCPPlanner] task QP infeasible with no semantic "
-                "GCDF rows -> publish task infeasible signal");
-          }
+          // A certificate for this linearized QP does not identify which
+          // UNKNOWN/OCCUPIED rows caused it. Never turn row presence into a
+          // visibility obligation (the final-GCDF rejection path is unchanged).
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (solve_mode_epoch != mode_epoch_ || solve_plan_sequence != plan_sequence_) continue;
+          std_msgs::String msg;
+          msg.data = "status=retry classification=QP_PRIMAL_INFEASIBLE_UNATTRIBUTED";
+          task_stall_pub_.publish(msg);
+          ROS_WARN_STREAM("[LocalSparseSCPPlanner] " << msg.data
+                          << " unknown_rows=" << result.selected_unknown_cdf_rows
+                          << " occupied_rows=" << result.selected_occupied_cdf_rows
+                          << " -> bounded retry; no recovery evidence published");
         } else if (
             result.status.find("max iterations") != std::string::npos ||
             result.status.find("maximum iterations") != std::string::npos) {
@@ -1565,11 +2133,20 @@ void LocalSparseSCPPlanner::workerLoop() {
       {
         std::lock_guard<std::mutex> lock(mutex_);
         mode_stale =
-            plan_mode_epoch_ != mode_epoch_ ||
+            solve_mode_epoch != mode_epoch_ ||
+            solve_plan_sequence != plan_sequence_ ||
             repair != repair_mode_ ||
-            probe != probe_mode_;
+            probe != probe_mode_ ||
+            (repair && !repair_no_progress_.current(solve_repair_ticket));
         if (mode_stale) {
           ++stale_mode_candidate_discard_count_;
+        } else {
+          // Publish under the same identity lock as the check: a callback
+          // cannot replace the target in between validation and publication.
+          publishCandidateTrajectory(
+              result.q, result.u, current_frame_id_, solve_observation_token, *batch, q_bar, u_bar);
+          if (repair && !observation_phase)
+            requestPlanLocked("repair_observation_after_safe_retreat");
         }
       }
       if (mode_stale) {
@@ -1580,8 +2157,6 @@ void LocalSparseSCPPlanner::workerLoop() {
         continue;
       }
 
-      publishCandidateTrajectory(
-          result.q, result.u, current_frame_id_);
       publishSummary("candidate_published", &result, total_ms);
       continue;
     }
@@ -1855,10 +2430,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   const double now_s = ros::Time::now().toSec();
   for (const auto& wp : schedule) {
     if (wp.q.size() != dof_) continue;
-    const double rel = wp.deadline_abs_s - now_s;
-    int k = static_cast<int>(std::ceil(rel / dt_));
-    k = std::max(1, k);
-    if (k > num_intervals_) continue;
+    const int k = visibilityObjectiveStep(wp.terminal_objective,
+        wp.deadline_abs_s, now_s, dt_, num_intervals_);
+    if (k < 1) continue;
+    out.visibility_objective_step = k;
     for (int j = 0; j < dof_; ++j) {
       addQuadraticTarget(
           qIndex(k, j),
@@ -2099,6 +2674,10 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   out.dual_residual = result.info.dual_res;
   out.status = piqp::status_to_string(status);
 
+  if (!force_diagnostic_slack && status != piqp::PIQP_SOLVED) {
+    out.box_conflicting_cdf_rows = lowerBoxConflicts(G, h_l, x_l, x_u, n_acc);
+  }
+
   if (status != piqp::PIQP_SOLVED ||
       result.x.size() != n ||
       !finiteVector(result.x)) {
@@ -2179,34 +2758,103 @@ ros::Time LocalSparseSCPPlanner::publishQueryTrajectory(
     const Eigen::MatrixXd& q,
     const Eigen::MatrixXd& u,
     const std::string& frame_id) {
-  const ros::Time stamp = ros::Time::now();
+  ros::Time stamp;
   bool armed = false;
+  bool invalid_clock = false;
+  care_collision_cdf::CollisionCDFWitnessRequest request;
   {
     // C5.31: arm the expected stamp BEFORE publishing. In the event-driven
     // GCDF path a batch can return within a few milliseconds; publishing first
     // creates a race where the callback sees waiting_for_cdf_=false.
     std::lock_guard<std::mutex> lock(mutex_);
     if (plan_running_) {
-      current_query_stamp_ = stamp;
-      current_query_wall_ = ros::WallTime::now();
-      waiting_for_cdf_ = true;
-      armed = true;
+      const ros::Time now = ros::Time::now();
+      // Keep the existing stamp-correlated wire API while avoiding collisions
+      // when several SCP iterations run during one /clock update. Do not reset
+      // identity between plans. A backward clock must not mint future evidence.
+      invalid_clock = now.isZero() || now < last_query_ros_time_;
+      if (!invalid_clock) {
+        stamp = now;
+        if (stamp <= current_query_stamp_) {
+          stamp = current_query_stamp_ + ros::Duration(0, 1);
+          ++query_stamp_adjustments_;
+        }
+        last_query_ros_time_ = now;
+        current_query_stamp_ = stamp;
+        current_query_wall_ = ros::WallTime::now();
+        waiting_for_cdf_ = true;
+        request.header.stamp = stamp;
+        request.header.frame_id = frame_id;
+        request.dof = dof_;
+        request.plan_sequence = plan_sequence_;
+        request.mode_epoch = plan_mode_epoch_;
+        request.target_revision = plan_repair_ticket_.revision;
+        request.progress_epoch = plan_repair_ticket_.progress;
+        if (plan_repair_mode_) {
+          for (const auto& witness : repair_unknown_witnesses_) {
+            request.original_timestep.push_back(witness.timestep);
+            for (int j = 0; j < 3; ++j) request.point_flat.push_back(witness.point[j]);
+            for (int j = 0; j < dof_; ++j) request.q_flat.push_back(q(j, witness.timestep));
+          }
+        }
+        current_witness_request_ = request;
+        witness_response_required_ = !request.original_timestep.empty();
+        if (witness_response_required_) repair_witness_requires_reobserve_ = true;
+        armed = true;
+      }
     }
   }
   if (armed) {
+    publishSummary("cdf_query_armed");
+    witness_request_pub_.publish(request);
     query_trajectory_pub_.publish(
         makeTrajectoryMessage(q, u, frame_id, stamp));
   }
+  if (invalid_clock) abortPlan("cdf_query_clock_invalid");
   return stamp;
 }
 
 void LocalSparseSCPPlanner::publishCandidateTrajectory(
     const Eigen::MatrixXd& q,
     const Eigen::MatrixXd& u,
-    const std::string& frame_id) {
-  candidate_trajectory_pub_.publish(
-      makeTrajectoryMessage(
-          q, u, frame_id, ros::Time::now()));
+    const std::string& frame_id,
+    const std::string& observation_token,
+    const care_collision_cdf::CollisionCDFConstraintBatch& batch,
+    const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u) {
+  const auto msg = makeTrajectoryMessage(q, u, frame_id, ros::Time::now());
+  if (plan_repair_mode_ && !plan_probe_mode_ &&
+      !final_vbc_no_progress_.remember(msg.header.stamp.toNSec(), mode_epoch_, plan_sequence_)) {
+    ROS_ERROR("[LocalSparseSCPPlanner] duplicate/zero candidate identity; not published");
+    return;
+  }
+  if (plan_repair_mode_ && !plan_probe_mode_) {
+    while (gcdf_feedback_pending_.size() >= FinalVbcNoProgress::max_pending)
+      gcdf_feedback_pending_.erase(gcdf_feedback_pending_.begin());
+    gcdf_feedback_pending_.emplace(msg.header.stamp.toNSec(),
+        FinalVbcNoProgress::Candidate{plan_repair_ticket_, mode_epoch_, plan_sequence_});
+  }
+  if (rejection_snapshots_enabled_) {
+    std::ostringstream out;
+    out << "{\"schema\":1,\"raw_candidate_stamp_ns\":\"" << msg.header.stamp.toNSec()
+        << "\",\"plan_seq\":" << plan_sequence_ << ",\"mode_epoch\":" << mode_epoch_
+        << ",\"target_revision\":" << final_vbc_no_progress_.progress.active.revision
+        << ",\"progress_epoch\":" << final_vbc_no_progress_.progress.active.progress
+        << ",\"observation_token\":";
+    auditString(out,observation_token);
+    out << ",\"query_trajectory\":";
+    auditTrajectory(out,makeTrajectoryMessage(query_q,query_u,frame_id,batch.header.stamp));
+    out << ",\"local_gcdf_batch\":"; auditBatch(out,batch); out << '}';
+    std_msgs::String context; context.data = out.str();
+    if (context.data.size() <= 2*1024*1024) candidate_audit_context_pub_.publish(context);
+    else ROS_WARN("[LocalSparseSCPPlanner] audit context exceeds 2 MiB cap; diagnostic omitted");
+  }
+  std_msgs::String identity;
+  identity.data = "observation_token=" + observation_token +
+      " raw_candidate_stamp_ns=" + std::to_string(msg.header.stamp.toNSec());
+  observation_identity_pub_.publish(identity);
+  ROS_INFO_STREAM("[OBS_CANDIDATE] observation_token=" << observation_token
+                  << " raw_candidate_stamp_ns=" << msg.header.stamp.toNSec());
+  candidate_trajectory_pub_.publish(msg);
 }
 
 
@@ -2337,6 +2985,11 @@ void LocalSparseSCPPlanner::publishSummary(
   bool repair = false;
   bool probe = false;
   int probe_restore_attempts = 0;
+  bool observation_phase = true;
+  int witness_count = 0;
+  bool witnesses_fresh = true;
+  int final_vbc_failures = 0;
+  bool final_vbc_hold = false;
   bool probe_restore_pending_recheck = false;
   unsigned long long probe_restore_total = 0;
   unsigned long long probe_restore_hard_success_total = 0;
@@ -2356,10 +3009,12 @@ void LocalSparseSCPPlanner::publishSummary(
   unsigned long long smooth_handoff_replan_suppressed_busy_count = 0;
   unsigned long long stale_mode_candidate_discard_count = 0;
   double last_cdf_roundtrip_ms = 0.0;
+  unsigned long long query_stamp_ns = 0, query_ros_time_ns = 0, query_stamp_adjustments = 0;
   double plan_cdf_roundtrip_sum_ms = 0.0;
   double plan_cdf_roundtrip_max_ms = 0.0;
   int plan_cdf_roundtrip_count = 0;
   std::string init_mode = "unknown";
+  std::string observation_token;
   bool frontier_active = false;
   double frontier_weight_scale = 0.0;
   double frontier_qvis_weight_scale = 1.0;
@@ -2369,7 +3024,13 @@ void LocalSparseSCPPlanner::publishSummary(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     plan_seq = plan_sequence_;
+    final_vbc_failures = final_vbc_no_progress_.progress.failures();
+    final_vbc_hold = final_vbc_no_progress_.progress.blocked();
+    observation_token = plan_observation_token_;
     batches = cdf_batch_received_;
+    query_stamp_ns = current_query_stamp_.toNSec();
+    query_ros_time_ns = last_query_ros_time_.toNSec();
+    query_stamp_adjustments = query_stamp_adjustments_;
     misses = cdf_stamp_miss_;
     solves = solve_count_;
     failures = solve_failure_count_;
@@ -2378,6 +3039,9 @@ void LocalSparseSCPPlanner::publishSummary(
     running = plan_running_;
     repair = plan_repair_mode_;
     probe = plan_probe_mode_;
+    observation_phase = plan_repair_observation_phase_;
+    witness_count = static_cast<int>(repair_unknown_witnesses_.size());
+    witnesses_fresh = !repair_witness_requires_reobserve_;
     probe_restore_attempts = plan_probe_feasibility_restore_attempts_;
     probe_restore_pending_recheck =
         plan_probe_restore_pending_hard_recheck_;
@@ -2429,11 +3093,29 @@ void LocalSparseSCPPlanner::publishSummary(
   }
 
   std::ostringstream oss;
+  if (result && result->trace_plan_sequence) {
+    plan_seq = result->trace_plan_sequence;
+    observation_token = result->trace_observation_token;
+    repair = result->trace_repair;
+    probe = result->trace_probe;
+    observation_phase = result->trace_repair_observation_phase;
+    witness_count = result->trace_repair_witnesses;
+    witnesses_fresh = result->trace_repair_witnesses_fresh;
+  }
   oss << "C5_4_LOCAL_SCP"
       << " event=" << event
+      << " query_stamp_ns=" << query_stamp_ns
+      << " query_ros_time_ns=" << query_ros_time_ns
+      << " query_stamp_adjustments=" << query_stamp_adjustments
+      << " final_vbc_failures=" << final_vbc_failures
+      << " final_vbc_hold=" << static_cast<int>(final_vbc_hold)
       << " plan_seq=" << plan_seq
+      << " observation_token=" << observation_token
       << " running=" << static_cast<int>(running)
       << " repair=" << static_cast<int>(repair)
+      << " repair_phase=" << (observation_phase ? "observation" : "retreat")
+      << " repair_witness_count=" << witness_count
+      << " repair_witness_fresh=" << static_cast<int>(witnesses_fresh)
       << " probe=" << static_cast<int>(probe)
       << " task_ref_horizon_steps="
       << (probe ? probe_task_horizon_steps_ : num_intervals_)
@@ -2501,6 +3183,12 @@ void LocalSparseSCPPlanner::publishSummary(
 
   if (result) {
     oss << " solved=" << static_cast<int>(result->solved)
+        << " repair_failures=" << result->repair_failures
+        << " repair_max_failures=" << RepairNoProgress::max_failures
+        << " repair_target_revision=" << result->trace_repair_ticket.revision
+        << " repair_progress_epoch=" << result->trace_repair_ticket.progress
+        << " snapshot=disabled"
+        << " visibility_objective_step=" << result->visibility_objective_step
         << " status=" << result->status
         << " piqp_iter=" << result->iterations
         << " solve_ms=" << result->setup_and_solve_ms

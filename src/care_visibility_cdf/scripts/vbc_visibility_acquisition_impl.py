@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 from typing import Dict, List
 
 import numpy as np
@@ -39,6 +40,8 @@ import rospy
 from care_confidence_map.srv import QueryConfidenceRequest
 from geometry_msgs.msg import Point
 from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import MultiArrayDimension
+from observation_identity import observation_token, observation_region_token
 
 from vbc_deadline_waypoint_node import _vector_msg
 from vbc_multi_deadline_obligation_impl import AccumulatedMultiDeadlineWaypointNode
@@ -61,7 +64,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         # q_vis/q_zero/deadline messages from two snapshots cannot interleave.
         self._schedule_publish_lock = threading.RLock()
         self._timer_exception_count = 0
+        self._trace_last_target = None
+        self._trace_published_target = None
+        self._trace_seen_samples = {}
         super().__init__()
+        self._trace_observation("session_started")
 
         self.visibility_check_rate = float(rospy.get_param(
             "~visibility_check_rate", 20.0))
@@ -249,7 +256,9 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             worst_point = points[worst_idx].copy()
 
         q_dist_inf = math.nan
-        measured = self._latest_measured_q
+        measured, measured_stamp = getattr(self, "_trace_measured", (None, math.nan))
+        query_diag["measured_q"] = None if measured is None else measured.copy()
+        query_diag["measured_ros_s"] = measured_stamp
         q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
         if (measured is not None and measured.shape == (7,) and
                 q_vis.shape == (7,) and np.all(np.isfinite(q_vis))):
@@ -312,28 +321,44 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             return
 
         self._acquisition_started = True
-        seen_ids: List[int] = []
+        seen_regions = {}
         diagnostics = []
         for ob in snapshot:
+            # Capture the actual published target, not _ordered_obligations():
+            # the latter may run a new shared solve and return a different q.
+            with self._schedule_publish_lock:
+                published = getattr(self, "_trace_published_target", None)
             (seen, frac, min_conf, mean_conf, max_vis, point_count,
              worst_point, q_dist_inf, query_diag) = self._query_region_seen(ob)
             oid = int(ob["id"])
+            self._record_seen_query(ob, published, seen, frac, query_diag)
+            q_dist_inf = query_diag["q_distance_inf"]
             geometry_diag = self._obligation_geometry_diagnostics(ob)
             diagnostics.append((
                 oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
                 q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy(),
                 query_diag, geometry_diag))
             if seen:
-                seen_ids.append(oid)
+                seen_regions[oid] = observation_region_token(ob)
 
-        if seen_ids:
+        if seen_regions:
             with self._obligation_lock:
                 before = len(self._obligations)
+                # A service response for an old point set cannot clear a newly
+                # refreshed region merely because its integer id is unchanged.
+                seen_ids = [int(ob["id"]) for ob in self._obligations
+                            if seen_regions.get(int(ob["id"])) == observation_region_token(ob)]
                 self._obligations = [
                     ob for ob in self._obligations
                     if int(ob["id"]) not in set(seen_ids)]
                 removed = before - len(self._obligations)
             self._seen_obligation_count += removed
+            for oid in seen_ids:
+                self._trace_seen_samples.pop((oid, "original"), None)
+                self._trace_seen_samples.pop((oid, "published"), None)
+            for oid in seen_regions.keys() - set(seen_ids):
+                self._trace_observation("seen_stale_discarded", obligation_id=oid,
+                    region_token=seen_regions[oid])
             rospy.logwarn(
                 "[vbc_acquisition] ACTUAL VISIBILITY acquired obligations=%s "
                 "removed=%d remaining=%d",
@@ -442,6 +467,10 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             else "none")
         active_q_vis_text = "none"
         if remaining:
+            if active_query_diag.get("q_distance_observation_token") != observation_token(remaining[0]):
+                # A newer shared solve may have replaced the pose since the
+                # query. Do not display an old distance beside the new q_vis.
+                active_q_dist_inf = math.nan
             q_vis = np.asarray(
                 remaining[0].get("q_vis", []), dtype=np.float64).reshape(-1)
             if q_vis.shape == (7,) and np.all(np.isfinite(q_vis)):
@@ -468,6 +497,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" active_mean_confidence={active_mean_conf:.6f}"
             f" active_max_current_visibility={active_max_vis:.6f}"
             f" active_q_distance_inf={active_q_dist_inf:.6f}"
+            f" active_q_distance_token={active_query_diag.get('q_distance_observation_token', 'none')}"
             f" active_worst_point_xyz="
             f"{float(active_worst_point[0]):.4f},"
             f"{float(active_worst_point[1]):.4f},"
@@ -562,12 +592,16 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                     self._shared_solution_mode = "c47_visibility_acquisition"
                     self._summary = "c47_acquisition_goal_ready"
 
-                self.waypoint_pub.publish(_vector_msg(q_vis_snapshot))
+                self.waypoint_pub.publish(self._traced_waypoint(first, q_vis_snapshot))
                 self.zero_pub.publish(_vector_msg(q_zero_snapshot))
                 d = Float64()
                 d.data = deadline_snapshot
                 self.deadline_pub.publish(d)
             else:
+                if self._trace_last_target is not None:
+                    self._trace_observation("unscheduled", observation_token=self._trace_last_target)
+                self._trace_last_target = None
+                self._trace_published_target = None
                 with self._lock:
                     self._q_vis = None
                     self._q_zero = None
@@ -586,10 +620,16 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
 
     def _timer_callback(self, _event) -> None:
         """Fail closed without permanently killing rospy's timer thread."""
+        if self._shutdown_requested():
+            return
         try:
             self._maybe_generate()
+            if self._shutdown_requested():
+                return
             self._publish_state()
         except Exception as exc:
+            if isinstance(exc, rospy.ROSException) and self._shutdown_requested():
+                return
             self._timer_exception_count += 1
             self._acquisition_complete = False
             try:
@@ -622,7 +662,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 q_snapshot = np.asarray(
                     obligations[0]["q_vis"], dtype=np.float64).reshape(7).copy()
                 deadline_snapshot = float(rospy.Time.now().to_sec() + 1.0)
-                self.waypoint_pub.publish(_vector_msg(q_snapshot))
+                self.waypoint_pub.publish(self._traced_waypoint(obligations[0], q_snapshot))
                 # Plumbing timestamp only; not a REPAIR deadline.
                 d = Float64()
                 d.data = deadline_snapshot
@@ -641,3 +681,56 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         )
         self.summary_pub.publish(msg)
         rospy.loginfo_throttle(0.5, "[vbc_acquisition] %s", msg.data)
+
+    def _traced_waypoint(self, ob, q):
+        # Same seven data values and legacy interface. Identity travels in the
+        # SAME message, avoiding cross-topic metadata/q races. Non-aware readers
+        # continue using data, exactly as before.
+        msg = _vector_msg(q)
+        token = observation_token(ob)
+        region = observation_region_token(ob)
+        self._trace_published_target = dict(observation_token=token, region_token=region,
+                                            q_vis=np.asarray(q).copy())
+        msg.layout.dim = [MultiArrayDimension(label=token, size=7, stride=7)]
+        if token != self._trace_last_target:
+            self._trace_last_target = token
+            self._trace_observation("scheduled", observation_token=token,
+                generation_event_id=ob.get("generation_event_id", "legacy"),
+                obligation_id=int(ob["id"]), q_vis=q.tolist(),
+                points=np.asarray(ob["points"]).tolist(), region_token=region,
+                target_source=ob.get("shared_solution_mode", "individual"),
+                target_member_regions=ob.get("target_member_regions", [region]),
+                target_solver_points=ob.get("target_solver_points", np.asarray(ob["points"]).tolist()))
+        return msg
+
+    def _record_seen_query(self, ob, published, seen, fraction, query_diag):
+        """One real query, exact region join; never infer a head caused seen."""
+        region = observation_region_token(ob)
+        targets = [("original", observation_token(ob), np.asarray(ob["q_vis"]))]
+        with self._schedule_publish_lock:
+            current = getattr(self, "_trace_published_target", None)
+            if (published is not None and current is not None and
+                    published["region_token"] == region and
+                    current["observation_token"] == published["observation_token"] and
+                    published["observation_token"] != targets[0][1]):
+                targets.append(("published", published["observation_token"], published["q_vis"]))
+        measured = query_diag.get("measured_q")
+        query_diag["q_distance_observation_token"] = targets[-1][1]
+        query_diag["q_distance_inf"] = (float(np.max(np.abs(measured-targets[-1][2])))
+            if measured is not None and np.all(np.isfinite(measured)) else math.nan)
+        now_wall = time.monotonic()
+        for role, token, q in targets:
+            key = (int(ob["id"]), role)
+            last = self._trace_seen_samples.get(key, (None, False, -math.inf))
+            if token == last[0] and bool(seen) == last[1] and now_wall-last[2] < 1.0:
+                continue
+            self._trace_seen_samples[key] = (token, bool(seen), now_wall)
+            distance = (float(np.max(np.abs(measured-q)))
+                        if measured is not None and np.all(np.isfinite(measured)) else math.nan)
+            self._trace_observation("seen_query", observation_token=token, region_token=region,
+                obligation_id=int(ob["id"]), actual_seen=bool(seen), seen_fraction=float(fraction),
+                query_status=str(query_diag.get("status")), q_distance_inf=distance,
+                measured_q=None if measured is None else measured.tolist(),
+                measured_ros_s=float(query_diag.get("measured_ros_s", math.nan)),
+                evidence_relation="same_exact_region_" + role,
+                causal_head_attribution="unknown")

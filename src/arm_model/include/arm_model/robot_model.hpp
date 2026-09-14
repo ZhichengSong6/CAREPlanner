@@ -1,4 +1,5 @@
 #pragma once
+#include "arm_model/ik_result.hpp"
 
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/model.hpp>
@@ -67,7 +68,12 @@ public:
 
   bool solveIK(const Eigen::Isometry3d& target_pose,
                const Eigen::VectorXd& q_seed,
-               Eigen::VectorXd& q_solution) const;
+              Eigen::VectorXd& q_solution) const;
+
+  // Legacy bool accepts approximate results; task references must use this API.
+  IKResult solveIKDetailed(const Eigen::Isometry3d& target_pose,
+                          const Eigen::VectorXd& q_seed,
+                          Eigen::VectorXd& q_solution) const;
 
   bool poseMsgToEigen(const geometry_msgs::PoseStamped& pose_msg,
                       Eigen::Isometry3d& T) const;

@@ -2,7 +2,8 @@
 """Runtime helper for hybrid scalar + per-sensor Visibility CDF steering.
 
 The frozen scalar VisCDF remains the coarse union/manifold projector.  After the
-scalar q_zero is available, the 8-head model preserves sensor modes:
+scalar q_zero is available, an 8-output sensor view (legacy 8-head, or H9
+output[1:9]) preserves sensor modes:
 
     scalar q_zero
         -> rank the 8 learned sensor heads
@@ -24,8 +25,10 @@ Important runtime semantic:
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -39,6 +42,7 @@ from evaluate_direct_vs_projection_ascent import (
     normalize_checkpoint_args,
     torch_load_checkpoint,
 )
+from hierarchical_visibility_cdf_model import build_from_checkpoint_args
 from validate_visibility_oracle import (
     find_chain_joints,
     fk_transform,
@@ -49,6 +53,142 @@ from check_visibility_self_occlusion import (
     q_row_to_map,
     raycast_self_occlusion,
 )
+
+
+_LEGACY_OUTPUT_SEMANTICS = "per_sensor_signed_visibility_cdf"
+_HIERARCHICAL9_FORMAT = "careplanner_hierarchical9_scratch_v1"
+_HIERARCHICAL9_OUTPUT_SEMANTICS = (
+    "hierarchical_union_plus_per_sensor_signed_visibility_cdf"
+)
+_HIERARCHICAL9_V1_SHA256 = (
+    "979552db20bc7e20775758b273613532921c5dbf11c480b13597127683c4c199"
+)
+_HIERARCHICAL9_V1_ARCHITECTURE = {
+    "shared_layers": "1024,512,256",
+    "branch_layers": "128,128",
+    "nerf": True,
+    "activation": "relu",
+    "dedicated_union_head": True,
+    "sensor_specific_nonlinear_heads": True,
+}
+
+
+class _Hierarchical9SensorView(torch.nn.Module):
+    """Expose only S0--S7 while retaining the complete nine-output model."""
+
+    def __init__(self, full_model: torch.nn.Module) -> None:
+        super().__init__()
+        self.full_model = full_model
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        full_output = self.full_model(inputs)
+        if full_output.ndim != 2 or full_output.shape[1] != 9:
+            raise RuntimeError(
+                "hierarchical9 model returned shape {}".format(
+                    tuple(full_output.shape)
+                )
+            )
+        # output[0] is the dedicated union.  It is not a ninth sensor.
+        return full_output[:, 1:9]
+
+
+def _checkpoint_sha256(checkpoint_path: str) -> str:
+    path = Path(checkpoint_path).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(
+            "per-sensor checkpoint not found: {}".format(path)
+        )
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _require_exact_mapping(mapping, expected, label: str) -> None:
+    if not isinstance(mapping, dict):
+        raise RuntimeError("hierarchical9 checkpoint missing {}".format(label))
+    for key, value in expected.items():
+        if mapping.get(key) != value:
+            raise RuntimeError(
+                "hierarchical9 {} mismatch: {}={!r}, expected {!r}".format(
+                    label, key, mapping.get(key), value
+                )
+            )
+
+
+def _validate_hierarchical9_v1_checkpoint(ckpt, checkpoint_sha256: str):
+    if checkpoint_sha256 != _HIERARCHICAL9_V1_SHA256:
+        raise RuntimeError(
+            "hierarchical9 V1 checkpoint SHA256 mismatch: got {}, expected {}"
+            .format(checkpoint_sha256, _HIERARCHICAL9_V1_SHA256)
+        )
+
+    expected_top_level = {
+        "format": _HIERARCHICAL9_FORMAT,
+        "output_semantics": _HIERARCHICAL9_OUTPUT_SEMANTICS,
+        "step": 50000,
+        "out_dim": 9,
+        "initialization": "random_from_scratch",
+        "frozen_parameters": 0,
+    }
+    for key, value in expected_top_level.items():
+        if ckpt.get(key) != value:
+            raise RuntimeError(
+                "hierarchical9 checkpoint mismatch: {}={!r}, expected {!r}"
+                .format(key, ckpt.get(key), value)
+            )
+
+    _require_exact_mapping(
+        ckpt.get("architecture"),
+        _HIERARCHICAL9_V1_ARCHITECTURE,
+        "architecture",
+    )
+    _require_exact_mapping(
+        ckpt.get("output_layout"),
+        {
+            "union_index": 0,
+            "sensor_slice": [1, 9],
+            "sensor_frames": list(DEFAULT_SENSOR_FRAMES),
+        },
+        "output_layout",
+    )
+    if ckpt.get("joint_names") != list(DEFAULT_JOINT_NAMES):
+        raise RuntimeError(
+            "hierarchical9 checkpoint joint_names/order mismatch"
+        )
+
+    cargs = normalize_checkpoint_args(ckpt.get("args", {}))
+    for key in ("shared_layers", "branch_layers", "nerf"):
+        expected = _HIERARCHICAL9_V1_ARCHITECTURE[key]
+        if cargs.get(key) != expected:
+            raise RuntimeError(
+                "hierarchical9 args/architecture mismatch: {}={!r}, "
+                "expected {!r}".format(key, cargs.get(key), expected)
+            )
+    return cargs
+
+
+def _record_runtime_model_metadata(
+    ckpt, checkpoint_sha256: str, model_type: str
+) -> None:
+    ckpt["runtime_adapter"] = {
+        "model_type": str(model_type),
+        "checkpoint_sha256": str(checkpoint_sha256),
+        "output_semantics": _LEGACY_OUTPUT_SEMANTICS,
+        "num_sensor_outputs": 8,
+    }
+
+
+def _validate_sensor_output(pred: torch.Tensor, rows: int) -> None:
+    if pred.ndim != 2 or tuple(pred.shape) != (int(rows), 8):
+        raise RuntimeError(
+            "per-sensor model returned shape {}, expected ({}, 8)".format(
+                tuple(pred.shape), int(rows)
+            )
+        )
+    if not bool(torch.isfinite(pred).all().item()):
+        raise RuntimeError("per-sensor model returned non-finite output")
 
 
 class _RayArgs:
@@ -79,9 +219,52 @@ def _parse_skips(raw) -> Tuple[int, ...]:
 
 
 def build_per_sensor_model(checkpoint_path: str, device: torch.device):
+    # Hash before unpickling.  H9 V1 is a fixed runtime artifact and must match
+    # the reviewed final.pt byte-for-byte regardless of its filename.
+    checkpoint_sha256 = _checkpoint_sha256(checkpoint_path)
     ckpt = torch_load_checkpoint(checkpoint_path, device)
+    if not isinstance(ckpt, dict) or "model_state" not in ckpt:
+        raise RuntimeError("unsupported per-sensor checkpoint structure")
+
+    checkpoint_format = ckpt.get("format")
     semantics = str(ckpt.get("output_semantics", ""))
-    if semantics and semantics != "per_sensor_signed_visibility_cdf":
+    if checkpoint_format == _HIERARCHICAL9_FORMAT:
+        cargs = _validate_hierarchical9_v1_checkpoint(
+            ckpt, checkpoint_sha256
+        )
+        full_model = build_from_checkpoint_args(cargs).to(
+            device=device, dtype=torch.float32
+        )
+        full_model.load_state_dict(ckpt["model_state"], strict=True)
+        if full_model.parameter_count() != 1133705:
+            raise RuntimeError(
+                "hierarchical9 V1 parameter-count mismatch: {}".format(
+                    full_model.parameter_count()
+                )
+            )
+        full_model.eval().requires_grad_(False)
+        model = _Hierarchical9SensorView(full_model).to(device)
+        model.eval().requires_grad_(False)
+        _record_runtime_model_metadata(
+            ckpt, checkpoint_sha256, "hierarchical9_v1_sensor_view"
+        )
+        return model, ckpt
+
+    # Do not let an H9-looking checkpoint silently fall through to the legacy
+    # constructor because one identifying field is absent or misspelled.
+    if (semantics == _HIERARCHICAL9_OUTPUT_SEMANTICS
+            or ckpt.get("out_dim") == 9
+            or checkpoint_sha256 == _HIERARCHICAL9_V1_SHA256):
+        raise RuntimeError(
+            "inconsistent hierarchical9 checkpoint identity/metadata"
+        )
+    if checkpoint_format not in (None, ""):
+        raise RuntimeError(
+            "unsupported per-sensor checkpoint format: {!r}".format(
+                checkpoint_format
+            )
+        )
+    if semantics and semantics != _LEGACY_OUTPUT_SEMANTICS:
         raise RuntimeError(
             "unexpected per-sensor checkpoint semantics: {!r}".format(semantics)
         )
@@ -95,6 +278,15 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
             )
         )
 
+    sensor_frames = ckpt.get("sensor_frames")
+    if (sensor_frames is not None
+            and sensor_frames != list(DEFAULT_SENSOR_FRAMES)):
+        raise RuntimeError("legacy per-sensor checkpoint sensor order mismatch")
+    joint_names = ckpt.get("joint_names")
+    if (joint_names is not None
+            and joint_names != list(DEFAULT_JOINT_NAMES)):
+        raise RuntimeError("legacy per-sensor checkpoint joint order mismatch")
+
     model = YimingMLP(
         in_dim=10,
         out_dim=8,
@@ -105,9 +297,12 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
         ),
         skips=_parse_skips(cargs.get("skips", "")),
         nerf=bool(cargs.get("nerf", True)),
-    ).to(device)
+    ).to(device=device, dtype=torch.float32)
     model.load_state_dict(ckpt["model_state"], strict=True)
-    model.eval()
+    model.eval().requires_grad_(False)
+    _record_runtime_model_metadata(
+        ckpt, checkpoint_sha256, "legacy_yiming_8head"
+    )
     return model, ckpt
 
 
@@ -201,6 +396,11 @@ class PerSensorVisibilityRuntime:
 
         self.q_min_np = np.asarray(q_min, dtype=np.float64).reshape(7)
         self.q_max_np = np.asarray(q_max, dtype=np.float64).reshape(7)
+        if (not np.all(np.isfinite(self.q_min_np))
+                or not np.all(np.isfinite(self.q_max_np))):
+            raise ValueError("joint limits must be finite")
+        if np.any(self.q_min_np > self.q_max_np):
+            raise ValueError("q_min must not exceed q_max")
         self.q_min = torch.tensor(
             self.q_min_np, device=self.device, dtype=torch.float32
         )
@@ -211,6 +411,7 @@ class PerSensorVisibilityRuntime:
         self.model, self.checkpoint = build_per_sensor_model(
             self.checkpoint_path, self.device
         )
+        self.ray_args = _RayArgs()
 
         # Sensor poses come from the reference robot.  The dedicated self-filter
         # URDF intentionally contains only body collision primitives.
@@ -272,12 +473,15 @@ class PerSensorVisibilityRuntime:
     ) -> torch.Tensor:
         points = points.reshape(-1, 3)
         q = q.reshape(1, 7)
+        if points.shape[0] < 1:
+            raise ValueError("at least one obligation point is required")
+        if not bool(torch.isfinite(points).all().item()):
+            raise ValueError("obligation points must be finite")
+        if not bool(torch.isfinite(q).all().item()):
+            raise ValueError("q must be finite")
         q_batch = q.expand(points.shape[0], -1)
         pred = self.model(torch.cat([points, q_batch], dim=-1))
-        if pred.ndim != 2 or pred.shape[1] != 8:
-            raise RuntimeError(
-                "per-sensor model returned shape {}".format(tuple(pred.shape))
-            )
+        _validate_sensor_output(pred, points.shape[0])
         return pred
 
     @torch.no_grad()
@@ -300,18 +504,33 @@ class PerSensorVisibilityRuntime:
             raise ValueError("sensor_id out of range")
 
         points = points.detach().reshape(-1, 3)
-        q_var = q.detach().clone().reshape(1, 7).requires_grad_(True)
-        q_batch = q_var.expand(points.shape[0], -1)
-        pred = self.model(torch.cat([points, q_batch], dim=-1))[:, sensor_id]
-        value = torch.min(pred)
-        grad = torch.autograd.grad(
-            value,
-            q_var,
-            grad_outputs=torch.ones_like(value),
-            create_graph=False,
-            retain_graph=False,
-            only_inputs=True,
-        )[0]
+        q_input = q.detach().clone().reshape(1, 7)
+        if points.shape[0] < 1:
+            raise ValueError("at least one obligation point is required")
+        if not bool(torch.isfinite(points).all().item()):
+            raise ValueError("obligation points must be finite")
+        if not bool(torch.isfinite(q_input).all().item()):
+            raise ValueError("q must be finite")
+
+        # Parameter freezing must not disable the original seven-dimensional q
+        # autograd path.  enable_grad also makes this safe under a read-only
+        # outer context without caching features from a previous q iterate.
+        with torch.enable_grad():
+            q_var = q_input.requires_grad_(True)
+            q_batch = q_var.expand(points.shape[0], -1)
+            pred_all = self.model(torch.cat([points, q_batch], dim=-1))
+            _validate_sensor_output(pred_all, points.shape[0])
+            value = torch.min(pred_all[:, sensor_id])
+            grad = torch.autograd.grad(
+                value,
+                q_var,
+                grad_outputs=torch.ones_like(value),
+                create_graph=False,
+                retain_graph=False,
+                only_inputs=True,
+            )[0]
+        if not bool(torch.isfinite(grad).all().item()):
+            raise RuntimeError("per-sensor model returned non-finite q gradient")
         # The target gradient for each sensor is chain-masked during training.
         # Enforce the same physical dependency online so approximation noise
         # cannot drive joints downstream of the selected sensor.
@@ -322,7 +541,10 @@ class PerSensorVisibilityRuntime:
     def branch_score(
         self, points: torch.Tensor, q: torch.Tensor, sensor_id: int
     ) -> float:
-        pred = self._head_values(points, q)[:, int(sensor_id)]
+        sensor_id = int(sensor_id)
+        if sensor_id < 0 or sensor_id >= 8:
+            raise ValueError("sensor_id out of range")
+        pred = self._head_values(points, q)[:, sensor_id]
         return float(torch.min(pred).item())
 
     def branch_score_numpy(
@@ -482,6 +704,7 @@ class PerSensorVisibilityRuntime:
         q_zero = None
         f_zero = math.nan
         root_source = "none"
+        root_found = False
         f_current = float(initial_score)
 
         if f_current >= 0.0:
@@ -492,6 +715,7 @@ class PerSensorVisibilityRuntime:
             q_zero = q.clone()
             f_zero = f_current
             root_source = "initial_branch_tolerance"
+            root_found = True
 
         for iteration in range(1, self.projection_iters + 1):
             if q_zero is not None:
@@ -524,12 +748,14 @@ class PerSensorVisibilityRuntime:
                     points, sensor_id, q, f_current, q_next, f_next
                 )
                 root_source = "branch_sign_crossing_bisection"
+                root_found = True
                 break
 
             if abs(f_next) <= self.projection_epsilon_f:
                 q_zero = q_next.detach()
                 f_zero = float(f_next)
                 root_source = "branch_projection_tolerance"
+                root_found = True
                 break
 
             q = q_next.detach()
@@ -613,6 +839,7 @@ class PerSensorVisibilityRuntime:
             "f_zero": float(f_zero),
             "q_candidate": q_vis[0]
                 .detach().cpu().numpy().astype(float).tolist(),
+            "root_found": bool(root_found),
             "root_source": str(root_source),
             "solution_mode": str(solution_mode),
             "projection_history": projection_history,
@@ -625,6 +852,12 @@ class PerSensorVisibilityRuntime:
     ) -> Dict[str, object]:
         points = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
         q = np.asarray(q_row, dtype=np.float64).reshape(7)
+        if points.shape[0] < 1:
+            raise ValueError("at least one obligation point is required")
+        if not np.all(np.isfinite(points)):
+            raise ValueError("obligation points must be finite")
+        if not np.all(np.isfinite(q)):
+            raise ValueError("q must be finite")
         q_map = q_row_to_map(DEFAULT_JOINT_NAMES, q)
         sensor_chain = self.sensor_chains[int(sensor_id)]
         sensor_transform = fk_transform(sensor_chain, q_map)
@@ -663,7 +896,7 @@ class PerSensorVisibilityRuntime:
                     sensor_transform,
                     point,
                     q_map,
-                    _RayArgs(),
+                    self.ray_args,
                 )
 
             min_cons_g = min(min_cons_g, cons_g)
@@ -723,6 +956,14 @@ class PerSensorVisibilityRuntime:
             if branch_seed_row is None
             else np.asarray(branch_seed_row, dtype=np.float64).reshape(7)
         )
+        if points_np.shape[0] < 1:
+            raise ValueError("at least one obligation point is required")
+        if not np.all(np.isfinite(points_np)):
+            raise ValueError("obligation points must be finite")
+        if not np.all(np.isfinite(q_zero_np)):
+            raise ValueError("scalar q_zero must be finite")
+        if not np.all(np.isfinite(branch_seed_np)):
+            raise ValueError("branch seed q must be finite")
 
         points = torch.tensor(
             points_np, device=self.device, dtype=torch.float32
@@ -744,6 +985,7 @@ class PerSensorVisibilityRuntime:
         for rank, sensor_id in enumerate(
             order[: self.max_branch_attempts].tolist(), start=1
         ):
+            branch_tic = time.perf_counter()
             branch = self._optimize_branch(
                 points, branch_seed, int(sensor_id)
             )
@@ -753,6 +995,9 @@ class PerSensorVisibilityRuntime:
             attempt = dict(branch)
             attempt["rank"] = int(rank)
             attempt["geometry"] = geometry
+            # Each branch already materializes tensor values on the CPU.
+            # Include optimization AND FOV/LOS, including rejected branches.
+            attempt["branch_latency_ms"] = 1000.0 * (time.perf_counter() - branch_tic)
             attempts.append(attempt)
             if bool(geometry["accepted"]):
                 selected = attempt
@@ -816,5 +1061,11 @@ class PerSensorVisibilityRuntime:
                 "self_filter_padding_m": 0.0,
                 "checkpoint": self.checkpoint_path,
                 "checkpoint_step": int(self.checkpoint.get("step", -1)),
+                "checkpoint_model_type": self.checkpoint.get(
+                    "runtime_adapter", {}
+                ).get("model_type", "unknown"),
+                "checkpoint_sha256": self.checkpoint.get(
+                    "runtime_adapter", {}
+                ).get("checkpoint_sha256", "unknown"),
             },
         }

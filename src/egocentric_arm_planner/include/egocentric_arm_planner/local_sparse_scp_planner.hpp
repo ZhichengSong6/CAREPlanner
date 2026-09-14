@@ -3,11 +3,18 @@
 #include <ros/ros.h>
 
 #include <care_collision_cdf/CollisionCDFConstraintBatch.h>
+#include <care_collision_cdf/CollisionCDFWitnessRequest.h>
+#include <care_collision_cdf/CollisionCDFWitnessResponse.h>
+#include <care_collision_cdf/CollisionCDFRejectionFeedback.h>
 
 #include <sensor_msgs/JointState.h>
 #include <std_msgs/Bool.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/String.h>
+#include "egocentric_arm_planner/task_reference_retry.hpp"
+#include "egocentric_arm_planner/qp_no_progress.hpp"
+#include "egocentric_arm_planner/repair_no_progress.hpp"
+#include "egocentric_arm_planner/final_vbc_no_progress.hpp"
 #include <trajectory_msgs/JointTrajectory.h>
 
 #include <Eigen/Dense>
@@ -34,6 +41,7 @@ private:
   struct DeadlineWaypoint {
     long long id = 0;
     double deadline_abs_s = 0.0;
+    bool terminal_objective = false;
     Eigen::VectorXd q;
   };
 
@@ -50,6 +58,18 @@ private:
   struct SparseSolveResult {
     bool solved = false;
     std::string status = "not_solved";
+    int box_conflicting_cdf_rows = 0;
+    int visibility_objective_step = -1;
+    unsigned long long trace_plan_sequence = 0;
+    std::string trace_observation_token = "none";
+  bool trace_repair = false;
+    bool trace_repair_observation_phase = true;
+    int trace_repair_witnesses = 0;
+    bool trace_repair_witnesses_fresh = true;
+    bool trace_probe = false;
+    RepairNoProgress::Ticket trace_repair_ticket;
+    int repair_failures = 0;
+    std::string repair_feedback;
     int iterations = 0;
     double primal_residual = 0.0;
     double dual_residual = 0.0;
@@ -78,6 +98,7 @@ private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void referenceCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void taskReferenceStatusCallback(const std_msgs::StringConstPtr& msg);
   void waypointScheduleCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void visibilityFrontierCallback(
@@ -92,8 +113,21 @@ private:
   void executedCommandCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void executionSummaryCallback(const std_msgs::StringConstPtr& msg);
+  void finalVerificationCallback(const std_msgs::StringConstPtr& msg);
   void cdfConstraintBatchCallback(
       const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg);
+  void updateRepairWitnessesLocked(
+      const care_collision_cdf::CollisionCDFConstraintBatch& batch);
+  void gcdfRejectionFeedbackCallback(
+      const care_collision_cdf::CollisionCDFRejectionFeedbackConstPtr& msg);
+  void witnessResponseCallback(
+      const care_collision_cdf::CollisionCDFWitnessResponseConstPtr& msg);
+  void acceptCdfBatch(
+      const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg,
+      const care_collision_cdf::CollisionCDFWitnessResponse* response);
+  void publishWitnessDiagnosticLocked(int index, int timestep,
+      const Eigen::Vector3d& point, const std::string& reason,
+      int pair = -1, double q_error = 0.0);
   void timerCallback(const ros::TimerEvent&);
 
   bool loadConfig();
@@ -119,6 +153,8 @@ private:
       Eigen::MatrixXd& u_init) const;
 
   void requestPlanLocked(const std::string& reason);
+  std::string repairTargetKeyLocked() const;
+  void selectRepairTargetLocked();
   bool startPlan();
   void abortPlan(const std::string& reason);
 
@@ -148,7 +184,10 @@ private:
   void publishCandidateTrajectory(
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
-      const std::string& frame_id);
+      const std::string& frame_id,
+      const std::string& observation_token,
+      const care_collision_cdf::CollisionCDFConstraintBatch& batch,
+      const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u);
   bool publishLocalGcdfRecoveryEvidence(
       const care_collision_cdf::CollisionCDFConstraintBatch& batch,
       const SparseSolveResult& result,
@@ -174,6 +213,7 @@ private:
 
   ros::Subscriber joint_state_sub_;
   ros::Subscriber reference_sub_;
+  ros::Subscriber task_reference_status_sub_;
   ros::Subscriber waypoint_schedule_sub_;
   ros::Subscriber visibility_frontier_sub_;
   ros::Subscriber single_waypoint_active_sub_;
@@ -187,11 +227,27 @@ private:
   ros::Subscriber cdf_batch_sub_;
 
   ros::Publisher query_trajectory_pub_;
+  ros::Publisher witness_request_pub_;
+  ros::Publisher witness_diagnostic_pub_;
+  ros::Subscriber witness_response_sub_;
+  care_collision_cdf::CollisionCDFWitnessRequest current_witness_request_;
+  bool witness_response_required_ = false;
   ros::Publisher candidate_trajectory_pub_;
+  ros::Publisher observation_identity_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher task_infeasible_pub_;
   ros::Publisher task_obstacle_blocked_pub_;
   ros::Publisher task_uncertified_pub_;
+  ros::Publisher task_stall_pub_;
+  QPNoProgress task_no_progress_;
+  RepairNoProgress repair_no_progress_;
+  FinalVbcNoProgress final_vbc_no_progress_;
+  ros::Subscriber final_verification_sub_;
+  ros::Subscriber gcdf_rejection_feedback_sub_;
+  std::map<std::uint64_t, FinalVbcNoProgress::Candidate> gcdf_feedback_pending_;
+  ros::Publisher candidate_audit_context_pub_;
+  bool rejection_snapshots_enabled_ = false;
+  RepairNoProgress::Ticket plan_repair_ticket_;
   ros::Publisher force_vbc_bootstrap_pub_;
   ros::Publisher gcdf_recovery_trajectory_pub_;
   ros::Publisher gcdf_recovery_event_pub_;
@@ -206,6 +262,8 @@ private:
   bool latest_single_waypoint_active_ = false;
   bool has_single_waypoint_q_ = false;
   Eigen::VectorXd latest_single_waypoint_q_;
+  std::string latest_observation_token_ = "none";
+  std::string plan_observation_token_ = "none";
   Eigen::VectorXd latest_executed_command_;
   ros::Time latest_joint_state_received_;
   ros::Time latest_reference_received_;
@@ -227,6 +285,8 @@ private:
   unsigned long long normal_reference_refresh_count_ = 0;
   unsigned long long normal_refresh_blocked_replan_count_ = 0;
   bool normal_reference_refresh_pending_ = false;
+  TaskReferenceReceipt task_reference_receipt_;
+  unsigned long long probe_reference_request_id_ = 0;
 
   // Smooth handoff requests are advisory and mode-aware. PROBE remains owned
   // by the verified single-flight state machine.
@@ -254,6 +314,8 @@ private:
       std::numeric_limits<double>::quiet_NaN();
   double plan_cdf_slack_linear_weight_ = 10.0;
   ros::Time current_query_stamp_;
+  ros::Time last_query_ros_time_;
+  unsigned long long query_stamp_adjustments_ = 0;
   ros::WallTime current_query_wall_;
   ros::WallTime current_plan_start_wall_;
   // C5.31 latency accounting for the event-driven trajectory->GCDF roundtrip.
@@ -268,10 +330,24 @@ private:
   Eigen::MatrixXd plan_q_ref_;
   Eigen::MatrixXd plan_u_ref_;
   Eigen::MatrixXd plan_q_bar_;
+  bool plan_normal_reseed_used_ = false;
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
   FrontierObjective plan_frontier_;
   bool plan_repair_mode_ = false;
+  // REPAIR alternates between safe retreat and visibility observation. A
+  // retreat never carries a q_vis objective back into the hard GCDF solve.
+  bool repair_observation_phase_ = true;
+  bool plan_repair_observation_phase_ = true;
+  struct RepairWitness {
+    Eigen::Vector3d point;
+    int timestep;
+  };
+  std::vector<RepairWitness> repair_unknown_witnesses_;
+  bool repair_witness_requires_reobserve_ = false;
+  bool repair_witness_overflow_ = false;
+  RepairNoProgress::Ticket repair_witness_ticket_;
+  unsigned long long repair_witness_mode_epoch_ = 0;
   bool plan_probe_mode_ = false;
   std::string plan_initialization_mode_ = "task_reference";
   // C5.25: a failed PROBE hard-QP may use one soft solve only as an

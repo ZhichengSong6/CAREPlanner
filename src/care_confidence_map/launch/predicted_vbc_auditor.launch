@@ -1,4 +1,6 @@
 <launch>
+  <arg name="geometry_backend" default="samples" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <!-- C4.1 diagnostic verifier. It subscribes to the already-computed MPC
        predicted trajectory and never publishes control commands. -->
   <arg name="robot_urdf_file"
@@ -27,7 +29,9 @@
 
     <param name="predicted_vbc/robot_urdf_file"
            value="$(arg robot_urdf_file)" />
-    <param name="predicted_vbc/body_samples_file"
+    <param name="predicted_vbc/geometry_backend" value="$(arg geometry_backend)" />
+    <param name="predicted_vbc/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param if="$(eval arg('geometry_backend') == 'samples')" name="predicted_vbc/body_samples_file"
            value="$(arg body_samples_file)" />
     <param name="predicted_vbc/base_frame"
            value="$(arg base_frame)" />

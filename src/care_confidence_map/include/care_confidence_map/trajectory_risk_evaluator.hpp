@@ -1,6 +1,7 @@
 #pragma once
 
 #include <care_confidence_map/body_sample_model.hpp>
+#include <care_confidence_map/primitive_geometry.hpp>
 
 #include <Eigen/Dense>
 
@@ -11,6 +12,7 @@
 #include <cstddef>
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace care_confidence_map
 {
@@ -82,6 +84,11 @@ class TrajectoryRiskEvaluator
 public:
   TrajectoryRiskEvaluator() = default;
 
+  // Frame-only FK for URDF primitive VBC. Does not read body_samples.yaml.
+  bool initializeKinematics(const std::string& robot_urdf_file,
+                            const std::string& base_frame,
+                            std::string* error_msg = nullptr);
+
   bool initialize(const std::string& robot_urdf_file,
                   const std::string& body_samples_file,
                   const std::string& base_frame,
@@ -91,6 +98,14 @@ public:
   {
     return initialized_;
   }
+
+  bool initializePrimitives(const std::string& robot_urdf_file,
+                            const std::string& primitive_urdf_file,
+                            const std::string& base_frame,
+                            double probe_resolution, const Eigen::Vector3d& probe_origin,
+                            std::string* error_msg = nullptr);
+  bool usesPrimitives() const { return primitive_backend_; }
+  const char* geometryBackend() const { return primitive_backend_ ? "primitive" : "samples"; }
 
   int nq() const
   {
@@ -109,8 +124,11 @@ public:
 
   const BodySampleModel& bodySampleModel() const
   {
-    return body_sample_model_;
+    // Legacy source API retained; primary primitive runtime never calls this.
+    static const BodySampleModel empty;
+    return legacy_body_samples_ ? *legacy_body_samples_ : empty;
   }
+  bool hasLegacyBodySamples() const { return static_cast<bool>(legacy_body_samples_); }
 
   TrajectorySampleResult computeTrajectorySamples(
       const std::vector<Eigen::VectorXd>& q_traj) const;
@@ -180,6 +198,7 @@ private:
   {
     pinocchio::FrameIndex frame_id = 0;
     std::vector<CachedAuditBodySample> samples;
+    std::vector<VbcPrimitive> primitives;
   };
 
   bool buildPinocchioModel(const std::string& robot_urdf_file,
@@ -194,12 +213,18 @@ private:
 
 private:
   bool initialized_ = false;
+  bool primitive_backend_ = false;
+  double primitive_probe_resolution_ = .05;
+  Eigen::Vector3d primitive_probe_origin_ = Eigen::Vector3d(-.95,-.95,0.);
+  std::vector<VbcPrimitive> primitive_local_;
 
   std::string robot_urdf_file_;
   std::string body_samples_file_;
   std::string base_frame_ = "base_link";
 
-  BodySampleModel body_sample_model_;
+  // Compatibility data is allocated only by initialize(samples), not by FK or
+  // primitive initialization. Shared ownership preserves evaluator copyability.
+  std::shared_ptr<const BodySampleModel> legacy_body_samples_;
 
   pinocchio::Model model_;
   mutable pinocchio::Data data_;

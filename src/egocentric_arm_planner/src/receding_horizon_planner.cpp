@@ -1,7 +1,9 @@
 #include "egocentric_arm_planner/receding_horizon_planner.hpp"
+#include "egocentric_arm_planner/trajectory_dynamics.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <sstream>
 
 namespace egocentric_arm_planner {
 namespace {
@@ -26,6 +28,12 @@ bool RecedingHorizonPlanner::initialize(const ros::NodeHandle& nh,
   pnh_.param<double>("receding_horizon/mpc_command_timeout",
                      mpc_command_timeout_,
                      mpc_command_timeout_);
+  pnh_.param("receding_horizon/reference_max_attempts", reference_retry_.max_attempts, 3);
+  pnh_.param("receding_horizon/reference_retry_delay_s", reference_retry_.retry_delay_s, 0.5);
+  pnh_.param("receding_horizon/reference_timeout_s", reference_retry_.timeout_s, 5.0);
+  if (reference_retry_.max_attempts < 1 || reference_retry_.max_attempts > 10 ||
+      !std::isfinite(reference_retry_.retry_delay_s) || reference_retry_.retry_delay_s <= 0 ||
+      !std::isfinite(reference_retry_.timeout_s) || reference_retry_.timeout_s <= 0) return false;
 
   pnh_.param<std::string>("topics/joint_states",
                           joint_state_topic_,
@@ -85,6 +93,8 @@ bool RecedingHorizonPlanner::initialize(const ros::NodeHandle& nh,
       task_trajectory_topic_, 1, false);
   command_traj_pub_ = nh_.advertise<trajectory_msgs::JointTrajectory>(
       command_trajectory_topic_, 1, false);
+  reference_status_pub_ = nh_.advertise<std_msgs::String>(
+      "/care_planner/task_reference_status", 10, true);
 
   planning_timer_ = nh_.createTimer(
       ros::Duration(1.0 / planning_rate_),
@@ -99,7 +109,7 @@ bool RecedingHorizonPlanner::initialize(const ros::NodeHandle& nh,
   ROS_INFO_STREAM("[RecedingHorizonPlanner] command_trajectory_topic = " << command_trajectory_topic_);
   ROS_INFO_STREAM("[RecedingHorizonPlanner] mpc_command_topic = " << mpc_command_topic_
                   << ", timeout = " << mpc_command_timeout_ << " s");
-  ROS_INFO("[RecedingHorizonPlanner] One-shot nominal planning enabled: each new EE target is planned once, then an advancing cached suffix is published.");
+  ROS_INFO("[RecedingHorizonPlanner] Nominal reference planning: bounded failed-attempt retries; after success an advancing cached suffix is published.");
   ROS_INFO("[RecedingHorizonPlanner] Retarget boundary uses measured q plus the latest MPC velocity-command history; JointState.velocity is not used for nominal boundary conditions.");
   ROS_WARN("[RecedingHorizonPlanner] Phase I node only publishes trajectory messages. It does NOT directly control Gazebo or robot states.");
 
@@ -156,17 +166,34 @@ void RecedingHorizonPlanner::targetPoseCallback(
   latest_target_pose_ = *msg;
   has_target_pose_ = true;
   new_target_pending_ = true;
+  reference_retry_.start(ros::SteadyTime::now().toSec());
+  reference_ik_seed_.resize(0);
+  reference_request_ros_time_ = ros::Time::now();
+  publishReferenceStatusLocked("pending", "new_target");
 
   // A new high-level target invalidates the old nominal command immediately.
-  // The next timer tick performs exactly one new nominal planning attempt.
+  // Failed attempts retry with measured q and fresh command history, bounded
+  // by this request's attempt count and steady-clock deadline.
   has_persistent_command_ = false;
   persistent_command_.clear();
   persistent_command_start_time_ = ros::Time(0);
 
-  ROS_INFO_STREAM("[RecedingHorizonPlanner] New EE target received. Scheduling one nominal planning attempt. position = ["
+  ROS_INFO_STREAM("[RecedingHorizonPlanner] New EE target received. Scheduling bounded nominal planning. position = ["
                   << msg->pose.position.x << ", "
                   << msg->pose.position.y << ", "
                   << msg->pose.position.z << "]");
+}
+
+void RecedingHorizonPlanner::publishReferenceStatusLocked(
+    const std::string& status, const std::string& reason) {
+  std::ostringstream s;
+  s << "request_id=" << reference_retry_.id
+    << " request_ros_ns=" << reference_request_ros_time_.toNSec()
+    << " attempt=" << reference_retry_.attempts
+    << " max_attempts=" << reference_retry_.max_attempts
+    << " status=" << status << " reason=" << reason;
+  std_msgs::String msg; msg.data = s.str(); reference_status_pub_.publish(msg);
+  ROS_WARN_STREAM("[TaskReference] " << msg.data);
 }
 
 bool RecedingHorizonPlanner::hasValidInputs() const {
@@ -264,17 +291,27 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   geometry_msgs::PoseStamped target_pose;
   Eigen::VectorXd latest_mpc_command;
   Eigen::VectorXd previous_mpc_command;
+  Eigen::VectorXd ik_seed;
   ros::Time latest_mpc_time;
   ros::Time previous_mpc_time;
   bool have_mpc_command = false;
   bool have_previous_mpc_command = false;
   bool should_plan_new_target = false;
+  std::uint64_t request_id = 0;
 
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
+    const double now = ros::SteadyTime::now().toSec();
+    if (reference_retry_.expired(now)) {
+      reference_retry_.active = false;
+      new_target_pending_ = false;
+      publishReferenceStatusLocked("exhausted", "request_timeout");
+    }
     if (!hasValidInputs()) return false;
 
-    if (new_target_pending_) {
+    if (new_target_pending_ && reference_retry_.claim(now)) {
+      request_id = reference_retry_.id;
+      ik_seed = reference_ik_seed_;
       joint_state = latest_joint_state_;
       target_pose = latest_target_pose_;
       latest_mpc_command = latest_mpc_command_;
@@ -285,17 +322,24 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       have_previous_mpc_command = has_previous_mpc_command_;
       should_plan_new_target = true;
 
-      // Claim this target before the expensive one-shot plan. A failed attempt
-      // is not retried at 20 Hz; publishing a new target requests another try.
+      // Claim this attempt; failure schedules a delayed bounded retry.
       new_target_pending_ = false;
     }
   }
 
   if (!should_plan_new_target) return publishPersistentCommand();
 
+  const auto fail = [this, request_id](const std::string& reason) {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    if (request_id != reference_retry_.id) return false;
+    new_target_pending_ = reference_retry_.fail(request_id, ros::SteadyTime::now().toSec());
+    publishReferenceStatusLocked(new_target_pending_ ? "retry_scheduled" : "exhausted", reason);
+    return false;
+  };
+
   if (!robot_model_->updateJointState(joint_state)) {
     ROS_WARN("[RecedingHorizonPlanner] Failed to update RobotModel from JointState.");
-    return false;
+    return fail("joint_state_invalid");
   }
 
   const Eigen::VectorXd q_current = robot_model_->getCurrentQ();
@@ -360,49 +404,39 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
 
   arm_trajectory::JointTrajectory tau_task;
   const PlannerStatus gen_status =
-      task_generator_.generate(q_current, dq_planning, ddq_current, target_pose, tau_task);
+      task_generator_.generate(q_current, dq_planning, ddq_current, target_pose, tau_task,
+                               ik_seed.size() ? &ik_seed : nullptr);
   if (gen_status != PlannerStatus::SUCCESS) {
+    const auto& ik = task_generator_.lastIKResult();
+    if (gen_status == PlannerStatus::IK_APPROXIMATE) {
+      std::lock_guard<std::mutex> lock(data_mutex_);
+      if (request_id != reference_retry_.id) return false;
+      reference_ik_seed_ = task_generator_.lastGoalQ();
+    }
     ROS_WARN_STREAM(
         "[RecedingHorizonPlanner] One-shot task trajectory generation failed: "
             << plannerStatusToString(gen_status)
-            << ". Publish a new target to retry.");
-    return false;
+            << " position_error=" << ik.position_error
+            << " rotation_error=" << ik.rotation_error
+            << ". Bounded request retry policy applies.");
+    std::ostringstream reason;
+    reason << "generation_" << plannerStatusToString(gen_status)
+           << " ik_position_error=" << ik.position_error
+           << " ik_rotation_error=" << ik.rotation_error;
+    return fail(reason.str());
   }
 
   if (task_cfg.enforce_velocity_acceleration_limits) {
-    const double check_dt = std::max(0.005, std::min(task_cfg.trajectory_dt, 0.02));
-    double worst_velocity_ratio = 0.0;
-    double worst_acceleration_ratio = 0.0;
-    Eigen::VectorXd q_s;
-    Eigen::VectorXd dq_s;
-    Eigen::VectorXd ddq_s;
-
-    for (double t = tau_task.startTime();
-         t <= tau_task.endTime() + 1e-9;
-         t += check_dt) {
-      if (!tau_task.sample(std::min(t, tau_task.endTime()), q_s, dq_s, ddq_s)) {
-        continue;
-      }
-      for (int i = 0; i < dq_s.size(); ++i) {
-        const double v_limit = std::max(
-            task_cfg.joint_velocity_limits[static_cast<std::size_t>(i)], 1e-6);
-        const double a_limit = std::max(
-            task_cfg.joint_acceleration_limits[static_cast<std::size_t>(i)], 1e-6);
-        worst_velocity_ratio = std::max(
-            worst_velocity_ratio, std::abs(dq_s[i]) / v_limit);
-        worst_acceleration_ratio = std::max(
-            worst_acceleration_ratio, std::abs(ddq_s[i]) / a_limit);
-      }
-    }
-
-    if (worst_velocity_ratio > 1.001 || worst_acceleration_ratio > 1.001) {
+    const auto dynamics = checkTaskDynamics(tau_task, task_cfg.joint_velocity_limits,
+        task_cfg.joint_acceleration_limits, task_cfg.trajectory_dt);
+    if (!dynamics.accepted()) {
       ROS_ERROR_STREAM(
           "[RecedingHorizonPlanner] Rejecting dynamically invalid one-shot tau_task. "
-              << "worst_velocity_ratio=" << worst_velocity_ratio
-              << ", worst_acceleration_ratio=" << worst_acceleration_ratio
+              << "worst_velocity_ratio=" << dynamics.velocity_ratio
+              << ", worst_acceleration_ratio=" << dynamics.acceleration_ratio
               << ", duration=" << tau_task.duration()
               << ". Publish a new target to retry.");
-      return false;
+      return fail("dynamics_rejected");
     }
   }
 
@@ -414,7 +448,7 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
             << plannerStatusToString(eval_status)
             << ", message: " << eval.message
             << ". Publish a new target to retry.");
-    return false;
+    return fail("evaluation_failed");
   }
 
   arm_trajectory::JointTrajectory tau_cmd;
@@ -425,18 +459,25 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
         "[RecedingHorizonPlanner] One-shot intervention failed: "
             << plannerStatusToString(intervention_status)
             << ". Publish a new target to retry.");
-    return false;
+    return fail("intervention_failed");
   }
 
-  if (publish_task_trajectory_) {
-    trajectory_msgs::JointTrajectory task_msg;
-    if (convertToRosTrajectory(tau_task, robot_model_->baseFrame(), task_msg)) {
-      task_traj_pub_.publish(task_msg);
-    }
-  }
+  trajectory_msgs::JointTrajectory task_msg;
+  if (publish_task_trajectory_ &&
+      !convertToRosTrajectory(tau_task, robot_model_->baseFrame(), task_msg))
+    return fail("reference_not_published");
 
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
+    if (request_id != reference_retry_.id) return false;
+    if (!reference_retry_.succeed(request_id, ros::SteadyTime::now().toSec())) {
+      reference_retry_.active = false;
+      publishReferenceStatusLocked("exhausted", "result_after_timeout");
+      return false;
+    }
+    if (publish_task_trajectory_) task_traj_pub_.publish(task_msg);
+    publishReferenceStatusLocked("succeeded", publish_task_trajectory_
+        ? "reference_published" : "reference_debug_disabled");
     persistent_command_ = tau_cmd;
     persistent_command_start_time_ = ros::Time::now();
     has_persistent_command_ = true;

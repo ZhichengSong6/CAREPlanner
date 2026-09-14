@@ -1,4 +1,7 @@
 <launch>
+  <arg name="geometry_backend" default="samples" />
+  <arg name="body_samples_file" default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <!-- Controlled visibility-before-contact experiments. -->
 
   <arg name="config_file"
@@ -73,10 +76,16 @@
   </include>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="body_prior_geometry_backend" value="$(arg geometry_backend)" />
+    <arg if="$(eval arg('geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="body_prior_primitive_urdf_file" value="$(arg primitive_urdf_file)" />
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
 
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg name="geometry_backend" value="$(arg geometry_backend)" />
+    <arg if="$(eval arg('geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
     <arg name="active_sensing_target_topic" value="$(arg legacy_candidate_target_topic)" />
@@ -86,6 +95,9 @@
   </include>
 
   <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+    <arg name="geometry_backend" value="$(arg geometry_backend)" />
+    <arg if="$(eval arg('geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
     <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
@@ -95,6 +107,9 @@
 
   <include if="$(arg enable_executed_vbc_logger)"
            file="$(find care_confidence_map)/launch/executed_vbc_logger.launch">
+    <arg name="geometry_backend" value="$(arg geometry_backend)" />
+    <arg if="$(eval arg('geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="target_topic" value="$(arg frozen_target_topic)" />
     <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />

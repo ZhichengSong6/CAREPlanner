@@ -1,4 +1,6 @@
 <launch>
+  <arg name="geometry_backend" default="samples" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <arg name="body_samples_file"
        default="$(find care_confidence_map)/config/body_samples.yaml" />
 
@@ -9,7 +11,9 @@
         name="body_sample_model_node"
         output="screen">
 
-    <param name="body_sample_model/body_samples_file"
+    <param name="body_sample_model/geometry_backend" value="$(arg geometry_backend)" />
+    <param name="body_sample_model/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param if="$(eval arg('geometry_backend') == 'samples')" name="body_sample_model/body_samples_file"
            value="$(arg body_samples_file)" />
 
     <param name="body_sample_model/map_frame"

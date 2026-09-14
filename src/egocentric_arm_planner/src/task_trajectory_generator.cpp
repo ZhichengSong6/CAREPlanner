@@ -1,4 +1,5 @@
 #include "egocentric_arm_planner/task_trajectory_generator.hpp"
+#include "egocentric_arm_planner/trajectory_dynamics.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -268,8 +269,11 @@ PlannerStatus TaskTrajectoryGenerator::generate(
     const Eigen::VectorXd& dq_current,
     const Eigen::VectorXd& ddq_current,
     const geometry_msgs::PoseStamped& target_pose_msg,
-    arm_trajectory::JointTrajectory& tau_task) {
+    arm_trajectory::JointTrajectory& tau_task,
+    const Eigen::VectorXd* ik_seed) {
   tau_task.clear();
+  last_goal_q_.resize(0);
+  last_ik_result_ = arm_model::IKResult();
 
   if (!initialized_) {
     last_status_ = PlannerStatus::NOT_INITIALIZED;
@@ -338,11 +342,21 @@ PlannerStatus TaskTrajectoryGenerator::generate(
   }
 
   Eigen::VectorXd q_goal;
-  const bool ik_ok = robot_model_->solveIK(T_base_target, q_current, q_goal);
+  last_ik_result_ = robot_model_->solveIKDetailed(
+      T_base_target, ik_seed ? *ik_seed : q_current, q_goal);
 
-  if (!ik_ok || q_goal.size() != robot_model_->nq() || !q_goal.allFinite()) {
+  if (last_ik_result_.status == arm_model::IKStatus::FAILED ||
+      q_goal.size() != robot_model_->nq() || !q_goal.allFinite()) {
     ROS_WARN("[TaskTrajectoryGenerator] IK failed.");
     last_status_ = PlannerStatus::IK_FAILED;
+    return last_status_;
+  }
+
+  last_goal_q_ = q_goal;
+  if (!last_ik_result_.converged()) {
+    // Solver-only continuation. No approximate trajectory reaches certification
+    // or execution. Retrying uses the same measured boundary and safety checks.
+    last_status_ = PlannerStatus::IK_APPROXIMATE;
     return last_status_;
   }
 
@@ -393,22 +407,15 @@ PlannerStatus TaskTrajectoryGenerator::generate(
       break;
     }
 
-    double scale = 1.0;
-    Eigen::VectorXd q_s, dq_s, ddq_s;
-    const double check_dt = std::max(0.005, std::min(config_.trajectory_dt, 0.02));
-    for (double t = 0.0; t <= duration + 1e-9; t += check_dt) {
-      if (!tau_task.sample(std::min(t, duration), q_s, dq_s, ddq_s)) {
-        continue;
-      }
-      for (int i = 0; i < dq_s.size(); ++i) {
-        const double v_limit = std::max(config_.joint_velocity_limits[static_cast<std::size_t>(i)], 1e-6);
-        const double a_limit = std::max(config_.joint_acceleration_limits[static_cast<std::size_t>(i)], 1e-6);
-        scale = std::max(scale, std::abs(dq_s[i]) / v_limit);
-        scale = std::max(scale, std::sqrt(std::abs(ddq_s[i]) / a_limit));
-      }
+    const auto dynamics = checkTaskDynamics(tau_task, config_.joint_velocity_limits,
+        config_.joint_acceleration_limits, config_.trajectory_dt);
+    if (!dynamics.valid) {
+      tau_task.clear();
+      last_status_ = PlannerStatus::INVALID_TRAJECTORY;
+      return last_status_;
     }
-
-    if (scale <= 1.0 + 1e-3) {
+    const double scale = dynamics.durationScale();
+    if (dynamics.accepted()) {
       break;
     }
 
@@ -417,6 +424,7 @@ PlannerStatus TaskTrajectoryGenerator::generate(
           0.5,
           "[TaskTrajectoryGenerator] Duration limit check reached max iterations. "
               << "remaining_scale=" << scale << ", duration=" << duration);
+      generated = false;
       break;
     }
 
@@ -424,12 +432,14 @@ PlannerStatus TaskTrajectoryGenerator::generate(
                                          std::max(config_.min_plan_duration,
                                                   duration * config_.duration_limit_check_margin * scale));
     if (new_duration <= duration + 1e-6) {
+      generated = false;
       break;
     }
     duration = new_duration;
   }
 
   if (!generated) {
+    tau_task.clear();
     last_status_ = PlannerStatus::INVALID_TRAJECTORY;
     return last_status_;
   }

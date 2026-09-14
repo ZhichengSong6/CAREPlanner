@@ -1,4 +1,5 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
+#include <care_confidence_map/body_geometry_params.hpp>
 
 #include <ros/ros.h>
 
@@ -33,7 +34,7 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!evaluator_.initialize(
+    if (!care_confidence_map::initializeBodyGeometry(evaluator_, pnh_, "predicted_vbc",
             robot_urdf_file_, body_samples_file_, base_frame_, &error_msg))
     {
       ROS_ERROR_STREAM("[predicted_vbc_auditor] evaluator init failed: " << error_msg);
@@ -95,7 +96,8 @@ public:
         "[predicted_vbc_auditor] FAST horizon audit: full MPC prediction (normally 21 q), "
         "one Pinocchio FK per evaluated q, cached sensors="
         << evaluator_.fastAuditSensorCount()
-        << ", cached body samples=" << evaluator_.fastAuditBodySampleCount()
+        << ", geometry_backend=" << evaluator_.geometryBackend()
+        << ", cached body geometry elements=" << evaluator_.fastAuditBodySampleCount()
         << " grouped into " << evaluator_.fastAuditBodyFrameCount()
         << " body frames");
     return true;
@@ -285,6 +287,7 @@ private:
     std_msgs::String summary;
     std::ostringstream oss;
     oss << "enabled=" << static_cast<int>(enabled_)
+        << " geometry_backend=" << evaluator_.geometryBackend() << " diagnostic_only=1"
         << " active=0 status=" << status
         << " violation=0 audit_ms=0 evaluated_q=0";
     summary.data = oss.str();
@@ -455,6 +458,7 @@ private:
     std_msgs::String summary_msg;
     std::ostringstream oss;
     oss << "enabled=1 active=1"
+        << " geometry_backend=" << evaluator_.geometryBackend() << " diagnostic_only=1"
         << " status=" << status
         << " violation=" << static_cast<int>(violation)
         << " predicted_seen=" << static_cast<int>(std::isfinite(first_see_s))
@@ -516,6 +520,7 @@ private:
     std_msgs::String summary_msg;
     std::ostringstream oss;
     oss << "enabled=1 active=1 status=" << status
+        << " geometry_backend=" << evaluator_.geometryBackend() << " diagnostic_only=1"
         << " violation=0 audit_ms=" << audit_ms
         << " evaluated_q=" << evaluated_q;
     summary_msg.data = oss.str();

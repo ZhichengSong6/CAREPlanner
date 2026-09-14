@@ -496,26 +496,36 @@ void RobotModel::clampToPositionLimits(Eigen::VectorXd& q) const {
 bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
                          const Eigen::VectorXd& q_seed,
                          Eigen::VectorXd& q_solution) const {
+  return solveIKDetailed(target_pose, q_seed, q_solution).status != IKStatus::FAILED;
+}
+
+IKResult RobotModel::solveIKDetailed(const Eigen::Isometry3d& target_pose,
+                                    const Eigen::VectorXd& q_seed,
+                                    Eigen::VectorXd& q_solution) const {
+  IKResult result;
+  // q_seed and q_solution may alias in legacy callers; do not clear the seed.
   if (!initialized_) {
     ROS_ERROR("[RobotModel] solveIK called before initialization.");
-    return false;
+    return result;
   }
 
-  if (q_seed.size() != model_.nq) {
+  if (q_seed.size() != model_.nq || !q_seed.allFinite() ||
+      !target_pose.matrix().allFinite()) {
     ROS_ERROR_STREAM("[RobotModel] solveIK q_seed size mismatch. q_seed.size = "
                      << q_seed.size() << ", model.nq = " << model_.nq);
-    return false;
+    return result;
   }
 
   pinocchio::FrameIndex ee_id;
   if (!getFrameId(ee_frame_, ee_id)) {
     ROS_ERROR_STREAM("[RobotModel] EE frame not found: " << ee_frame_);
-    return false;
+    return result;
   }
 
   Eigen::VectorXd q = q_seed;
 
   for (int iter = 0; iter < ik_max_iters_; ++iter) {
+    result.iterations = iter;
     pinocchio::forwardKinematics(model_, data_, q);
     pinocchio::updateFramePlacements(model_, data_);
     pinocchio::computeJointJacobians(model_, data_, q);
@@ -528,7 +538,7 @@ bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
     const Eigen::AngleAxisd aa(R_err);
     Eigen::Vector3d rot_err_local = aa.angle() * aa.axis();
     if (!rot_err_local.allFinite()) {
-      rot_err_local.setZero();
+      return result;
     }
 
     const Eigen::Vector3d rot_err_world = T_current.linear() * rot_err_local;
@@ -538,7 +548,10 @@ bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
 
     if (pos_norm < ik_pos_tol_ && rot_norm < ik_rot_tol_) {
       q_solution = q;
-      return true;
+      result.position_error = pos_norm;
+      result.rotation_error = rot_norm;
+      result.status = IKStatus::CONVERGED;
+      return result;
     }
 
     Eigen::MatrixXd J6(6, model_.nv);
@@ -566,7 +579,7 @@ bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
 
     if (!v.allFinite()) {
       ROS_WARN("[RobotModel] IK produced non-finite velocity update.");
-      return false;
+      return result;
     }
 
     const double max_step = 0.2;
@@ -581,7 +594,7 @@ bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
   q_solution = q;
 
   Eigen::Isometry3d T_final;
-  getEndEffectorPose(q_solution, T_final);
+  if (!q_solution.allFinite() || !getEndEffectorPose(q_solution, T_final)) return result;
 
   const double final_pos_err =
       (target_pose.translation() - T_final.translation()).norm();
@@ -595,13 +608,16 @@ bool RobotModel::solveIK(const Eigen::Isometry3d& target_pose,
     final_rot_err = std::numeric_limits<double>::infinity();
   }
 
-  ROS_WARN_STREAM("[RobotModel] IK did not fully converge. final position error = "
+  result.iterations = ik_max_iters_;
+  result.position_error = final_pos_err;
+  result.rotation_error = final_rot_err;
+  result.status = classifyIK(final_pos_err, final_rot_err, ik_pos_tol_, ik_rot_tol_);
+  if (!result.converged()) ROS_WARN_STREAM("[RobotModel] IK did not fully converge. final position error = "
                   << final_pos_err
                   << ", final rotation error = "
                   << final_rot_err);
 
-  return final_pos_err < 5.0 * ik_pos_tol_
-      && final_rot_err < 5.0 * ik_rot_tol_;
+  return result;
 }
 
 bool RobotModel::poseMsgToEigen(const geometry_msgs::PoseStamped& pose_msg,
@@ -610,7 +626,8 @@ bool RobotModel::poseMsgToEigen(const geometry_msgs::PoseStamped& pose_msg,
   const auto& q_msg = pose_msg.pose.orientation;
 
   Eigen::Quaterniond q(q_msg.w, q_msg.x, q_msg.y, q_msg.z);
-  if (q.norm() < 1e-12) {
+  if (!q.coeffs().allFinite() || !std::isfinite(q.norm()) || q.norm() < 1e-12 ||
+      !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) {
     ROS_ERROR("[RobotModel] Invalid quaternion in poseMsgToEigen.");
     return false;
   }

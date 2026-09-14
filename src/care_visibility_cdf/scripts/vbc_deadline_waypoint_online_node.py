@@ -15,9 +15,20 @@ Modes:
 
 import os
 import math
+import sys
 import time
 
 import numpy as np
+
+# The CUDA-enabled VisCDF conda environment intentionally owns NumPy/Torch,
+# while ROS Noetic's pure-Python dependencies (for example rospkg and
+# catkin_pkg) live in the system dist-packages directory.  Append, rather than
+# prepend, that directory so enabling CUDA does not shadow conda binary wheels.
+_SYSTEM_DIST_PACKAGES = "/usr/lib/python3/dist-packages"
+if (_SYSTEM_DIST_PACKAGES not in sys.path
+        and os.path.isdir(_SYSTEM_DIST_PACKAGES)):
+    sys.path.append(_SYSTEM_DIST_PACKAGES)
+
 import rospy
 import torch
 

@@ -1,5 +1,8 @@
+#include <care_confidence_map/tf_primitive_geometry.hpp>
 #include <care_confidence_map/body_sample_model.hpp>
+#include <care_confidence_map/legacy_body_backend.hpp>
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/confidence_query_validation.hpp>
 
 #include <ros/ros.h>
 
@@ -38,7 +41,20 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!model_.loadFromYaml(body_samples_file_, &error_msg))
+    pnh_.param<std::string>("body_observability/geometry_backend",geometry_backend_,"samples");
+    pnh_.param("body_observability/probe_resolution",probe_resolution_,.05);
+    std::vector<double> origin;
+    if(pnh_.getParam("body_observability/probe_origin",origin)) {
+      if(origin.size()!=3)return false;
+      probe_origin_=Eigen::Vector3d(origin[0],origin[1],origin[2]);
+    }
+    std::string primitive_urdf;pnh_.getParam("body_observability/primitive_urdf_file",primitive_urdf);
+    if(geometry_backend_!="samples" && geometry_backend_!="primitive")return false;
+    if(!std::isfinite(probe_resolution_) || probe_resolution_<=0 || !probe_origin_.allFinite())return false;
+    const bool loaded=geometry_backend_=="primitive" ? primitive_model_.load(primitive_urdf,
+        use_risk_samples_only_?std::vector<std::string>{"base_link"}:std::vector<std::string>{},&error_msg)
+        : care_confidence_map::loadLegacyBodySamples(&model_,body_samples_file_,&error_msg);
+    if (!loaded)
     {
       ROS_ERROR_STREAM("[body_observability_node] Failed to load body samples: "
                        << error_msg);
@@ -188,6 +204,19 @@ private:
   {
     out->clear();
 
+    if(geometry_backend_=="primitive") {
+      try {
+        const auto world=care_confidence_map::transformPrimitiveGeometry(primitive_model_,tf_buffer_,map_frame_);
+        for(const auto& p:care_confidence_map::primitiveProbeGrid(world,probe_resolution_,probe_origin_)) {
+          TransformedSample ts;ts.sample.link_name=ts.sample.frame_name=p.link_name;
+          ts.sample.source_type=p.source_type;ts.sample.source_collision_index=p.collision_index;
+          ts.sample.radius=0.;ts.point_base.x=p.point.x();ts.point_base.y=p.point.y();ts.point_base.z=p.point.z();
+          out->push_back(std::move(ts));
+        }
+        return !out->empty();
+      } catch(const std::exception& e) {out->clear();ROS_WARN_STREAM_THROTTLE(1.,e.what());return false;}
+    }
+
     std::map<std::string, tf2::Transform> T_map_frame;
 
     for (const auto& frame : model_.frames())
@@ -270,6 +299,7 @@ private:
       return false;
     }
 
+    if(geometry_backend_=="primitive" && !care_confidence_map::validConfidenceResponse(*srv))return false;
     const std::size_t n = transformed_samples.size();
 
     if (srv->response.confidence.size() != n ||
@@ -447,6 +477,7 @@ private:
     std::ostringstream oss;
 
     oss << "body_observability: "
+        << "geometry_backend=" << geometry_backend_ << ", support=discrete_diagnostic_points, "
         << "mean_confidence=" << result.mean_confidence
         << ", min_confidence=" << result.min_confidence
         << ", visible_ratio=" << result.visible_ratio
@@ -558,9 +589,8 @@ private:
     marker.pose.position = ts.point_base;
     marker.pose.orientation.w = 1.0;
 
-    marker.scale.x = 2.0 * ts.sample.radius;
-    marker.scale.y = 2.0 * ts.sample.radius;
-    marker.scale.z = 2.0 * ts.sample.radius;
+    const double radius=geometry_backend_=="primitive"?.006:ts.sample.radius;
+    marker.scale.x = marker.scale.y = marker.scale.z = 2.0 * radius;
 
     marker.color = confidenceColor(confidence, inside);
 
@@ -633,6 +663,12 @@ private:
 
     if (!transformBodySamples(&transformed_samples))
     {
+      if(geometry_backend_=="primitive") {
+        std_msgs::String msg;msg.data="geometry_backend=primitive status=invalid_geometry diagnostic_only=1";
+        summary_pub_.publish(msg);score_pub_.publish(makeFloatMsg(0.));min_confidence_pub_.publish(makeFloatMsg(0.));
+        visible_ratio_pub_.publish(makeFloatMsg(0.));
+        visualization_msgs::MarkerArray markers;markers.markers.push_back(makeDeleteAllMarker());marker_pub_.publish(markers);
+      }
       ROS_WARN_THROTTLE(
           2.0,
           "[body_observability_node] No transformed body samples available.");
@@ -642,6 +678,12 @@ private:
     care_confidence_map::QueryConfidence srv;
     if (!queryConfidence(transformed_samples, &srv))
     {
+      if(geometry_backend_=="primitive") {
+        std_msgs::String m;m.data="geometry_backend=primitive status=invalid_confidence diagnostic_only=1";
+        summary_pub_.publish(m);score_pub_.publish(makeFloatMsg(0.));min_confidence_pub_.publish(makeFloatMsg(0.));
+        visible_ratio_pub_.publish(makeFloatMsg(0.));
+        visualization_msgs::MarkerArray a;a.markers.push_back(makeDeleteAllMarker());marker_pub_.publish(a);
+      }
       return;
     }
 
@@ -667,7 +709,7 @@ private:
     ROS_INFO_STREAM("use_risk_samples_only: " << use_risk_samples_only_);
     ROS_INFO_STREAM("publish_markers: " << publish_markers_);
     ROS_INFO_STREAM("samples loaded: " << model_.size());
-    ROS_INFO_STREAM("risk samples loaded: " << model_.riskSampleCount());
+    ROS_INFO_STREAM("risk samples loaded: " << care_confidence_map::legacyRiskSampleCount(model_));
     ROS_INFO_STREAM("frames: " << model_.frames().size());
     for (const auto& frame : model_.frames())
     {
@@ -697,6 +739,10 @@ private:
   care_confidence_map::BodySampleModel model_;
 
   std::string body_samples_file_;
+  std::string geometry_backend_="samples";
+  double probe_resolution_=.05;
+  Eigen::Vector3d probe_origin_=Eigen::Vector3d(-.95,-.95,0.);
+  care_confidence_map::VbcPrimitiveModel primitive_model_;
   std::string map_frame_ = "base_link";
   std::string confidence_query_service_ =
       "/care_planner/confidence_map/query";

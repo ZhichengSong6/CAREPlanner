@@ -67,8 +67,7 @@ confidence_map:
 current_body_prior:
   enabled: true
 
-  # This file is set by confidence_map.launch so that $(find ...) works.
-  body_samples_file: ""
+  # Legacy samples YAML is supplied by launch only for the samples backend.
 
   # Cold-start trusted envelope around the INITIAL robot body only.
   #

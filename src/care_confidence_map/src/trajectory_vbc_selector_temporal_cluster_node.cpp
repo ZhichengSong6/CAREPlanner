@@ -1,5 +1,7 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/vbc_evidence.hpp>
+#include <care_confidence_map/vbc_primitive_model.hpp>
 
 #include <ros/ros.h>
 
@@ -26,9 +28,9 @@
 
 // C4.3 selector with bounded temporal clustering.
 //
-// C5.29 spatial semantics: each robot body sample is a sphere (center+radius).
-// VBC candidates are confidence-map voxel centers swept by the FULL future body
-// sphere volume (plus the same margin used by GCDF), not merely sphere centers.
+// VBC candidates are confidence-map voxel centers inside the configured body
+// geometry at evaluated trajectory knots. Backend defaults to legacy samples;
+// primitive uses exact URDF solids. VBC margin is independent of GCDF inflation.
 // Every low-confidence swept voxel is then evaluated independently with analytic
 // VBC. Steering semantics
 // are coarser: violating candidates are first grouped into ordered temporal
@@ -39,6 +41,8 @@
 // active set.
 class TrajectoryVbcTemporalClusterNode
 {
+  friend struct VbcPrimitiveTest;
+  friend struct VbcPrimitiveReplay;
 public:
   TrajectoryVbcTemporalClusterNode() : nh_(), pnh_("~") {}
 
@@ -47,8 +51,16 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!evaluator_.initialize(
-            robot_urdf_file_, body_samples_file_, base_frame_, &error_msg))
+    if (geometry_backend_ != "samples" && geometry_backend_ != "primitive")
+    {
+      ROS_ERROR_STREAM("Unknown VBC geometry backend: " << geometry_backend_);
+      return false;
+    }
+    const bool geometry_ok = geometry_backend_ == "primitive"
+        ? (evaluator_.initializeKinematics(robot_urdf_file_, base_frame_, &error_msg) &&
+           primitive_model_.load(primitive_urdf_file_, ignored_risk_links_, &error_msg))
+        : evaluator_.initialize(robot_urdf_file_, body_samples_file_, base_frame_, &error_msg);
+    if (!geometry_ok)
     {
       ROS_ERROR_STREAM(
           "[trajectory_vbc_temporal] Failed to initialize evaluator: "
@@ -70,6 +82,10 @@ public:
         temporal_layer_mpc_steps_ < 0 || region_max_diameter_m_ <= 0.0 ||
         tof_min_range_ < 0.0 || tof_max_range_ <= tof_min_range_ ||
         horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0 ||
+        !std::isfinite(swept_volume_margin_m_) || !std::isfinite(map_resolution_) ||
+        !std::isfinite(map_x_min_) || !std::isfinite(map_x_max_) ||
+        !std::isfinite(map_y_min_) || !std::isfinite(map_y_max_) ||
+        !std::isfinite(map_z_min_) || !std::isfinite(map_z_max_) ||
         swept_volume_margin_m_ < 0.0 || map_resolution_ <= 0.0 ||
         map_x_max_ < map_x_min_ || map_y_max_ < map_y_min_ ||
         map_z_max_ < map_z_min_)
@@ -96,21 +112,34 @@ public:
       return false;
     }
 
+    if (geometry_backend_ == "primitive")
+    {
+      std::vector<care_confidence_map::VbcPrimitiveFrame> initial_geometry;
+      if (!primitive_model_.computeTrajectory(evaluator_, {q0}, &initial_geometry, &error_msg))
+      {
+        ROS_ERROR_STREAM("Invalid primitive frame configuration: " << error_msg);
+        return false;
+      }
+    }
+
     confidence_query_client_ =
         nh_.serviceClient<care_confidence_map::QueryConfidence>(
-            confidence_query_service_);
+            confidence_query_service_, confidence_query_persistent_);
 
+    bool tcp_nodelay = false;
+    pnh_.param("trajectory_vbc/tcp_nodelay", tcp_nodelay, false);
+    const auto trajectory_transport = ros::TransportHints().tcpNoDelay(tcp_nodelay);
     trajectory_sub_ = nh_.subscribe(
         input_trajectory_topic_, 1,
-        &TrajectoryVbcTemporalClusterNode::trajectoryCallback, this);
+        &TrajectoryVbcTemporalClusterNode::trajectoryCallback, this, trajectory_transport);
     predicted_trajectory_sub_ = nh_.subscribe(
         predicted_trajectory_topic_, 1,
-        &TrajectoryVbcTemporalClusterNode::predictedTrajectoryCallback, this);
+        &TrajectoryVbcTemporalClusterNode::predictedTrajectoryCallback, this, trajectory_transport);
     if (!rediscovery_trajectory_topic_.empty())
     {
       rediscovery_trajectory_sub_ = nh_.subscribe(
           rediscovery_trajectory_topic_, 1,
-          &TrajectoryVbcTemporalClusterNode::rediscoveryTrajectoryCallback, this);
+          &TrajectoryVbcTemporalClusterNode::rediscoveryTrajectoryCallback, this, trajectory_transport);
     }
     force_bootstrap_sub_ = nh_.subscribe(
         force_bootstrap_topic_, 1,
@@ -153,6 +182,8 @@ private:
     int sample_index_in_link = -1;
     std::string source_type = "unknown";
     int source_collision_index = -1;
+    std::string source_collision_name;
+    double primitive_signed_distance_m = std::numeric_limits<double>::quiet_NaN();
     Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
     double raw_sample_radius_m = 0.0;
     double swept_radius_m = 0.0;
@@ -171,6 +202,8 @@ private:
     int sample_index_in_link = -1;
     std::string source_type = "unknown";
     int source_collision_index = -1;
+    std::string source_collision_name;
+    double primitive_signed_distance_m = std::numeric_limits<double>::quiet_NaN();
     Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
     double raw_sample_radius_m = 0.0;
     double swept_radius_m = 0.0;
@@ -215,6 +248,8 @@ private:
     double body_fk_ms = 0.0;
     double swept_voxel_build_ms = 0.0;
     double confidence_query_ms = 0.0;
+    double confidence_ready_ms = 0.0;
+    double confidence_rpc_ms = 0.0;
     double candidate_filter_ms = 0.0;
     double sensor_fk_ms = 0.0;
     double visibility_scan_ms = 0.0;
@@ -233,9 +268,15 @@ private:
   {
     std::ostringstream oss;
     oss << " trajectory_convert_ms=" << current_eval_timing_.trajectory_convert_ms
+        << " input_wait_ms=" << current_input_wait_ms_
+        << " geometry_backend=" << geometry_backend_
+        << " spatial_semantics=voxel_centers_discrete_knots"
         << " body_fk_ms=" << current_eval_timing_.body_fk_ms
         << " swept_voxel_build_ms=" << current_eval_timing_.swept_voxel_build_ms
         << " confidence_query_ms=" << current_eval_timing_.confidence_query_ms
+        << " confidence_ready_ms=" << current_eval_timing_.confidence_ready_ms
+        << " confidence_rpc_ms=" << current_eval_timing_.confidence_rpc_ms
+        << " confidence_persistent=" << static_cast<int>(confidence_query_persistent_)
         << " candidate_filter_ms=" << current_eval_timing_.candidate_filter_ms
         << " sensor_fk_ms=" << current_eval_timing_.sensor_fk_ms
         << " visibility_scan_ms=" << current_eval_timing_.visibility_scan_ms
@@ -248,10 +289,13 @@ private:
 
   void loadParams()
   {
+    pnh_.param("trajectory_vbc/preserve_periodic_eval", preserve_periodic_eval_, false);
     pnh_.param<std::string>(
         "trajectory_vbc/robot_urdf_file", robot_urdf_file_, "");
     pnh_.param<std::string>(
         "trajectory_vbc/body_samples_file", body_samples_file_, "");
+    pnh_.param<std::string>("trajectory_vbc/geometry_backend", geometry_backend_, "samples");
+    pnh_.param<std::string>("trajectory_vbc/primitive_urdf_file", primitive_urdf_file_, "");
     pnh_.param<std::string>(
         "trajectory_vbc/base_frame", base_frame_, "base_link");
     pnh_.param<std::string>(
@@ -299,6 +343,7 @@ private:
         predicted_periodic_refresh_rate_, 5.0);
     pnh_.param("trajectory_vbc/max_eval_timesteps", max_eval_timesteps_, 50);
     pnh_.param("trajectory_vbc/query_timeout", query_timeout_, 0.10);
+    pnh_.param("trajectory_vbc/confidence_query_persistent", confidence_query_persistent_, false);
     pnh_.param("trajectory_vbc/fallback_dt", fallback_dt_, 0.05);
     pnh_.param(
         "trajectory_vbc/prefer_predicted_trajectory",
@@ -519,9 +564,35 @@ private:
       srv->request.points.push_back(p);
     }
 
-    if (!confidence_query_client_.waitForExistence(ros::Duration(query_timeout_)))
+    const auto ready_begin = ros::WallTime::now();
+    bool ready = true;
+    if (!confidence_query_persistent_)
+      ready = confidence_query_client_.waitForExistence(ros::Duration(query_timeout_));
+    else if (!confidence_query_client_.isValid())
+    {
+      // Reconnect only on a subsequent evaluation; never retry a failed query
+      // or reuse its response as a certificate. Keep the existing ready budget.
+      confidence_query_client_.shutdown();
+      auto probe = nh_.serviceClient<care_confidence_map::QueryConfidence>(confidence_query_service_);
+      ready = probe.waitForExistence(ros::Duration(query_timeout_));
+      if (ready)
+      {
+        confidence_query_client_ = nh_.serviceClient<care_confidence_map::QueryConfidence>(
+            confidence_query_service_, true);
+        ready = confidence_query_client_.isValid();
+      }
+    }
+    current_eval_timing_.confidence_ready_ms = wallMs(ready_begin);
+    if (!ready)
       return false;
-    if (!confidence_query_client_.call(*srv)) return false;
+    const auto rpc_begin = ros::WallTime::now();
+    const bool called = confidence_query_client_.call(*srv);
+    current_eval_timing_.confidence_rpc_ms = wallMs(rpc_begin);
+    if (!called)
+    {
+      if (confidence_query_persistent_) confidence_query_client_.shutdown();
+      return false;
+    }
     const std::size_t n = srv->request.points.size();
     return srv->response.confidence.size() == n &&
            srv->response.current_visibility.size() == n &&
@@ -926,6 +997,10 @@ private:
 
     ++active_set_bundle_seq_;
     std_msgs::Float64MultiArray msg;
+    // Optional diagnostic identity, leaving the legacy numeric layout intact.
+    msg.layout.dim.resize(1);
+    msg.layout.dim[0].label = "care_vbc_v1_" + std::to_string(current_eval_stamp_ns_) +
+        "_" + std::to_string(active_set_bundle_seq_);
     msg.data.reserve(3 + ordered.size() * 3);
     msg.data.push_back(static_cast<double>(active_set_bundle_seq_));
     msg.data.push_back(sweep_time_s);
@@ -963,7 +1038,7 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=0"
-        << " spatial_support=body_sphere_volume"
+        << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=" << reason
@@ -984,6 +1059,9 @@ private:
         << " active_layer_cross_link_region_count=0 active_set_point_count=0"
         << " layer_point_counts=none active_region_sizes=none"
         << " min_required_margin_s=" << min_margin_s_
+        << " vbc_evidence=" << care_confidence_map::vbcEvidence(
+             current_eval_stamp_ns_, active_set_bundle_seq_, min_margin_s_,
+             map_resolution_, std::vector<Candidate>{}, std::vector<TemporalLayer>{}, geometry_backend_)
         << timingFields();
     std_msgs::String msg;
     msg.data = oss.str();
@@ -1066,7 +1144,7 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=1"
-        << " spatial_support=body_sphere_volume"
+        << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " reason=selected_temporal_cluster"
@@ -1109,6 +1187,7 @@ private:
         << " sample_index=" << representative.sample_index_in_link
         << " source_type=" << representative.source_type
         << " source_collision_index=" << representative.source_collision_index
+        << " primitive_signed_distance_m=" << representative.primitive_signed_distance_m
         << " raw_sample_center_xyz=["
         << representative.sample_center_base.x() << ","
         << representative.sample_center_base.y() << ","
@@ -1118,15 +1197,16 @@ private:
         << " blocker_center_distance_m="
         << representative.point_center_distance_m
         << " inside_raw_body_sphere="
-        << static_cast<int>(
+        << (geometry_backend_ == "primitive" ? -1 : static_cast<int>(
              representative.point_center_distance_m <=
-             representative.raw_sample_radius_m + 1e-9)
+             representative.raw_sample_radius_m + 1e-9))
         << " margin_shell_only="
-        << static_cast<int>(
+        << (geometry_backend_ == "primitive" ? static_cast<int>(
+             representative.primitive_signed_distance_m > 1e-9) : static_cast<int>(
              representative.point_center_distance_m >
              representative.raw_sample_radius_m + 1e-9 &&
              representative.point_center_distance_m <=
-             representative.swept_radius_m + 1e-9)
+             representative.swept_radius_m + 1e-9))
         << " sweep_eval_t=" << representative.sweep_eval_timestep
         << " sweep_original_t=" << representative.sweep_original_timestep
         // Keep the legacy guard diagnostic key.  In temporal-cluster mode this
@@ -1140,7 +1220,10 @@ private:
           << " margin_s=" << representative.margin_s;
     else
       oss << " see_time_s=inf margin_s=-inf";
-    oss << timingFields();
+    oss << timingFields()
+        << " vbc_evidence=" << care_confidence_map::vbcEvidence(
+             current_eval_stamp_ns_, active_set_bundle_seq_, min_margin_s_,
+             map_resolution_, candidates, layers, geometry_backend_);
 
     std_msgs::String summary_msg;
     summary_msg.data = oss.str();
@@ -1171,6 +1254,14 @@ private:
   {
     const ros::WallTime eval_begin = ros::WallTime::now();
     current_eval_timing_ = EvalTiming();
+    // Diagnostic only: arrival callback -> evaluation start, independently of
+    // trajectory ROS stamp and geometry/service compute time. No scheduling change.
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      const ros::WallTime received = trajectory_source == "predicted" ? predicted_received_wall_ :
+          trajectory_source == "scp_rediscovery" ? rediscovery_received_wall_ : trajectory_received_wall_;
+      current_input_wait_ms_ = received.isZero() ? 0.0 : wallMs(received, eval_begin);
+    }
 
     ros::Time identity_stamp = traj.header.stamp;
     if (identity_stamp.isZero()) identity_stamp = ros::Time::now();
@@ -1204,20 +1295,44 @@ private:
     current_eval_timing_.trajectory_convert_ms = wallMs(convert_begin);
 
     const ros::WallTime body_fk_begin = ros::WallTime::now();
-    const care_confidence_map::TrajectorySampleResult sample_result =
-        evaluator_.computeTrajectorySamples(q_traj);
+    care_confidence_map::TrajectorySampleResult sample_result;
+    std::vector<care_confidence_map::VbcPrimitiveFrame> primitive_frames;
+    bool body_ok = false;
+    if (geometry_backend_ == "primitive")
+      body_ok = primitive_model_.computeTrajectory(evaluator_, q_traj, &primitive_frames, &error_msg);
+    else
+    {
+      sample_result = evaluator_.computeTrajectorySamples(q_traj);
+      body_ok = sample_result.success;
+      error_msg = sample_result.message;
+    }
     current_eval_timing_.body_fk_ms = wallMs(body_fk_begin);
-    if (!sample_result.success)
+    if (!body_ok)
     {
       ROS_WARN_STREAM_THROTTLE(
           2.0, "[trajectory_vbc_temporal] body-sweep FK failed: "
-                   << sample_result.message);
+                   << error_msg);
       return;
     }
 
     const ros::WallTime swept_begin = ros::WallTime::now();
-    const std::vector<SweepVoxel> swept_voxels =
-        buildSweptVolumeVoxels(sample_result, original_indices, eval_times_s);
+    std::vector<SweepVoxel> swept_voxels;
+    try
+    {
+      if (geometry_backend_ == "primitive")
+        swept_voxels = care_confidence_map::buildPrimitiveSweptVoxels<SweepVoxel>(
+            primitive_frames, original_indices, eval_times_s,
+            {{map_x_min_, map_y_min_, map_z_min_}, {map_x_max_, map_y_max_, map_z_max_},
+             map_resolution_}, swept_volume_margin_m_);
+      else
+        swept_voxels = buildSweptVolumeVoxels(sample_result, original_indices, eval_times_s);
+    }
+    catch (const std::exception& e)
+    {
+      // No safe summary or samples fallback: final verifier must time out closed.
+      ROS_ERROR_STREAM_THROTTLE(2.0, "VBC geometry evaluation failed: " << e.what());
+      return;
+    }
     current_eval_timing_.swept_voxel_build_ms = wallMs(swept_begin);
     last_swept_voxel_query_count_ = swept_voxels.size();
     if (swept_voxels.empty())
@@ -1265,6 +1380,8 @@ private:
         candidate.sample_index_in_link = voxel.sample_index_in_link;
         candidate.source_type = voxel.source_type;
         candidate.source_collision_index = voxel.source_collision_index;
+        candidate.source_collision_name = voxel.source_collision_name;
+        candidate.primitive_signed_distance_m = voxel.primitive_signed_distance_m;
         candidate.sample_center_base = voxel.sample_center_base;
         candidate.raw_sample_radius_m = voxel.raw_sample_radius_m;
         candidate.swept_radius_m = voxel.swept_radius_m;
@@ -1286,6 +1403,8 @@ private:
           it->second.sample_index_in_link = voxel.sample_index_in_link;
           it->second.source_type = voxel.source_type;
           it->second.source_collision_index = voxel.source_collision_index;
+          it->second.source_collision_name = voxel.source_collision_name;
+          it->second.primitive_signed_distance_m = voxel.primitive_signed_distance_m;
           it->second.sample_center_base = voxel.sample_center_base;
           it->second.raw_sample_radius_m = voxel.raw_sample_radius_m;
           it->second.swept_radius_m = voxel.swept_radius_m;
@@ -1395,6 +1514,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_traj_ = *msg;
+      trajectory_received_wall_ = ros::WallTime::now();
       has_traj_ = true;
       evaluate_now =
           event_driven_eval_ && !force_bootstrap_ &&
@@ -1412,6 +1532,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_predicted_traj_ = *msg;
+      predicted_received_wall_ = ros::WallTime::now();
       predicted_traj_received_ = ros::Time::now();
       has_predicted_traj_ = true;
       evaluate_now =
@@ -1437,6 +1558,7 @@ private:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       latest_rediscovery_traj_ = *msg;
+      rediscovery_received_wall_ = ros::WallTime::now();
       rediscovery_traj_received_ = ros::Time::now();
       has_rediscovery_traj_ = true;
       evaluate_now =
@@ -1542,7 +1664,7 @@ private:
           traj = latest_predicted_traj_;
           source = "predicted";
 
-          if (event_driven_eval_)
+          if (event_driven_eval_ && !preserve_periodic_eval_)
           {
             ros::Time stamp = traj.header.stamp;
             const unsigned long long stamp_ns =
@@ -1612,9 +1734,12 @@ private:
     ROS_INFO_STREAM("prefer predicted: " << prefer_predicted_trajectory_
                     << ", timeout=" << predicted_trajectory_timeout_ << " s");
     ROS_INFO_STREAM("candidate resolution: " << candidate_resolution_ << " m");
-    ROS_INFO_STREAM("spatial support: full body-sphere volume, margin="
+    ROS_INFO_STREAM("spatial support: " << geometry_backend_ << " volume, margin="
                     << swept_volume_margin_m_ << " m, map_resolution="
                     << map_resolution_ << " m");
+    ROS_INFO_STREAM("FK URDF: " << robot_urdf_file_ << "; primitive URDF: "
+                    << (geometry_backend_ == "primitive" ? primitive_urdf_file_ : "unused")
+                    << "; semantics: voxel centers at discrete knots");
     ROS_INFO_STREAM("temporal layer maximum span: "
                     << temporal_layer_mpc_steps_ << " MPC steps");
     ROS_INFO_STREAM("spatial region maximum diameter: "
@@ -1672,6 +1797,7 @@ private:
   double predicted_periodic_refresh_rate_ = 5.0;
   int max_eval_timesteps_ = 50;
   double query_timeout_ = 0.10;
+  bool confidence_query_persistent_ = false;
   double fallback_dt_ = 0.05;
   double predicted_trajectory_timeout_ = 0.20;
   double rediscovery_trajectory_timeout_ = 1.0;
@@ -1689,6 +1815,9 @@ private:
   unsigned long long current_eval_stamp_ns_ = 0;
   std::string current_eval_trigger_ = "startup";
   EvalTiming current_eval_timing_;
+  bool preserve_periodic_eval_ = false;
+  ros::WallTime trajectory_received_wall_, predicted_received_wall_, rediscovery_received_wall_;
+  double current_input_wait_ms_ = 0.0;
   unsigned long long last_event_evaluated_predicted_stamp_ns_ = 0;
   ros::WallTime last_predicted_full_eval_wall_;
   unsigned long long predicted_periodic_skip_count_ = 0;
@@ -1699,6 +1828,9 @@ private:
 
   std::string robot_urdf_file_;
   std::string body_samples_file_;
+  std::string geometry_backend_ = "samples";
+  std::string primitive_urdf_file_;
+  care_confidence_map::VbcPrimitiveModel primitive_model_;
   std::string base_frame_ = "base_link";
   std::string input_trajectory_topic_ = "/care_planner/task_trajectory";
   std::string predicted_trajectory_topic_ =

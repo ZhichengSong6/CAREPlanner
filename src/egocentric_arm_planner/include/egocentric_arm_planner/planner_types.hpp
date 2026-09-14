@@ -19,7 +19,8 @@ enum class PlannerStatus {
   EVALUATION_FAILED,
   INTERVENTION_FAILED,
 
-  UNKNOWN_ERROR
+  UNKNOWN_ERROR,
+  IK_APPROXIMATE
 };
 
 inline std::string plannerStatusToString(const PlannerStatus status) {
@@ -36,6 +37,8 @@ inline std::string plannerStatusToString(const PlannerStatus status) {
       return "MISSING_TARGET";
     case PlannerStatus::IK_FAILED:
       return "IK_FAILED";
+    case PlannerStatus::IK_APPROXIMATE:
+      return "IK_APPROXIMATE";
     case PlannerStatus::INVALID_TRAJECTORY:
       return "INVALID_TRAJECTORY";
     case PlannerStatus::EVALUATION_FAILED:

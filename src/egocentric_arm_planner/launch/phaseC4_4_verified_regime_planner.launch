@@ -1,4 +1,13 @@
 <launch>
+  <!-- Optional bounded forensic sink; never changes certification thresholds. -->
+  <arg name="rejection_snapshot_dir" default="" />
+  <!-- Unified default for all geometry consumers; per-path A/B overrides remain supported. -->
+  <arg name="geometry_backend" default="primitive" />
+  <arg name="confidence_query_dedicated_queue" default="true" />
+  <!-- Compatibility input: forwarded only to explicit samples consumers. -->
+  <arg name="body_samples_file" default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+  <arg name="gcdf_geometry_backend" default="$(arg geometry_backend)" />
   <!-- C4.4: verified planner regime transitions with split candidate/execution VBC. -->
   <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
   <arg name="base_frame" default="base_link" />
@@ -53,6 +62,11 @@
   <arg name="candidate_vbc_summary_topic" default="/care_planner/candidate_vbc/summary" />
   <arg name="candidate_outcome_topic" default="/care_planner/verification_outcome" />
   <arg name="execution_vbc_summary_topic" default="/care_planner/execution_vbc/summary" />
+  <!-- Opt-in arrival evaluation for new committed trajectories. Periodic audit
+       remains active; use identical setting for samples/primitive A/B. -->
+  <arg name="execution_vbc_event_driven_eval" default="true" />
+  <arg name="verification_tcp_nodelay" default="true" />
+  <arg name="vbc_confidence_query_persistent" default="true" />
   <arg name="execution_vbc_trajectory_topic"
        default="/care_planner/committed_trajectory" />
   <arg name="regime_summary_topic" default="/care_planner/c4_4/regime_summary" />
@@ -130,6 +144,12 @@
        VBC therefore adds no extra spatial inflation by default. -->
   <arg name="local_scp_proximity_margin" default="0.025" />
   <arg name="vbc_swept_volume_margin_m" default="0.0" />
+  <!-- Stage-one A/B only; both candidate and execution VBC use this backend. -->
+  <arg name="vbc_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="body_prior_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="diagnostic_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="body_prior_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
+  <arg name="vbc_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
 
   <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
   <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
@@ -167,6 +187,7 @@
   <arg name="cdf_selector_max_pairs_per_step" default="250" />
   <arg name="cdf_selector_signed_zero_band" default="0.05" />
   <arg name="cdf_shadow_vbc_audit_enabled" default="false" />
+  <arg name="cdf_shadow_vbc_event_driven_eval" default="true" />
   <arg name="cdf_shadow_vbc_summary_topic"
        default="/care_planner/cdf_shadow_vbc/summary" />
 
@@ -247,6 +268,8 @@
   <!-- Serial executable safety gate and safe-plan commit memory. -->
   <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
         name="optimized_trajectory_continuity" output="screen">
+    <param name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+    <param name="rejection_snapshot_dir" value="$(arg rejection_snapshot_dir)" />
     <!-- C5.20: load joint-position limits so PROBE measured-state rebasing
          cannot translate the certified executable outside configured limits. -->
     <rosparam command="load" file="$(arg config_file)" />
@@ -408,6 +431,9 @@
         name="local_sparse_scp_planner_node"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
+    <param name="local_planner/rejection_snapshots_enabled"
+           value="$(eval arg('rejection_snapshot_dir') != '')" />
+    <param name="local_planner/verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
     <param name="local_planner/reference_trajectory"
            value="/care_planner/task_trajectory" />
     <param name="local_planner/visibility_waypoint_weight"
@@ -444,7 +470,8 @@
        priority; the streams therefore cannot overwrite one another. -->
   <group if="$(arg final_executable_gcdf_enabled)"
          ns="final_executable_gcdf_pair_export">
-    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic"
            value="/care_planner/final_gcdf/query_trajectory" />
@@ -468,6 +495,15 @@
       <arg name="refresh_body_prior_before_query" value="false" />
       <arg name="evaluate_stale_trajectory" value="false" />
     </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="/care_planner/final_gcdf/query_trajectory" />
+      <arg name="output_topic" value="/care_planner/final_gcdf/body_sweep_anchors" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="50" />
+    </include>
   </group>
 
   <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
@@ -479,6 +515,10 @@
   </include>
 
   <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="query_dedicated_queue" value="$(arg confidence_query_dedicated_queue)" />
+    <arg if="$(eval arg('body_prior_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="body_prior_geometry_backend" value="$(arg body_prior_geometry_backend)" />
+    <arg name="body_prior_primitive_urdf_file" value="$(arg body_prior_primitive_urdf_file)" />
     <arg name="config_file" value="$(arg confidence_map_config_file)" />
     <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
   </include>
@@ -525,7 +565,8 @@
        from the main risk diagnostics and only exports body-sweep anchors for
        the current SCP iterate. -->
   <group if="$(arg use_local_sparse_scp)" ns="local_scp_pair_export">
-    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic"
            value="$(arg local_scp_query_trajectory_topic)" />
@@ -548,6 +589,15 @@
       <arg name="refresh_body_prior_before_query" value="false" />
       <arg name="evaluate_stale_trajectory" value="false" />
     </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="output_topic" value="$(arg local_scp_body_anchor_topic)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="50" />
+    </include>
   </group>
 
   <node if="$(arg use_local_sparse_scp)"
@@ -556,6 +606,7 @@
         name="c5_4_local_scp_cdf_selector"
         output="screen">
     <param name="anchor_topic" value="$(arg local_scp_body_anchor_topic)" />
+    <param name="geometry_backend" value="$(arg gcdf_geometry_backend)" />
     <param name="final_anchor_topic"
            value="/care_planner/final_gcdf/body_sweep_anchors" />
     <param name="map_topic" value="/care_planner/confidence_map/points" />
@@ -577,6 +628,7 @@
     <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
     <param name="rate" value="50.0" />
     <param name="process_on_input_callback" value="true" />
+    <param name="local_witness_requests_required" value="true" />
     <param name="confidence_threshold"
            value="$(arg forbidden_space_confidence_threshold)" />
     <param name="map_resolution" value="0.05" />
@@ -606,7 +658,8 @@
       <param name="max_age_s" value="0.15" />
     </node>
 
-    <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic"
            value="$(arg execution_gcdf_measured_trajectory_topic)" />
@@ -629,6 +682,15 @@
       <arg name="max_eval_timesteps" value="1" />
       <arg name="refresh_body_prior_before_query" value="false" />
       <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <arg name="output_topic" value="$(arg execution_gcdf_body_anchor_topic)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="1" />
     </include>
 
     <node pkg="egocentric_arm_planner"
@@ -656,6 +718,9 @@
   </group>
 
   <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg if="$(eval arg('diagnostic_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <arg name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="input_trajectory_topic" value="$(arg trajectory_risk_input_topic)" />
     <arg name="active_sensing_target_topic" value="/care_planner/active_sensing/legacy_target_candidate" />
@@ -683,6 +748,7 @@
         type="cpp_forbidden_voxel_gpu_shadow_node"
         name="c5_3a_cpp_forbidden_voxel_gpu_shadow"
         output="screen">
+    <param name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
     <param name="anchor_topic" value="$(arg forbidden_space_pair_topic)" />
     <param name="map_topic" value="/care_planner/confidence_map/points" />
     <param name="summary_topic"
@@ -707,6 +773,12 @@
        is isolated and cannot feed steering/commit/execution. -->
   <include if="$(arg cdf_shadow_vbc_audit_enabled)"
            file="$(find egocentric_arm_planner)/launch/c5_3a_cdf_shadow_vbc_audit.launch">
+    <arg name="event_driven_eval" value="$(arg cdf_shadow_vbc_event_driven_eval)" />
+    <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+    <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+    <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+    <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="shadow_prediction_topic"
          value="$(arg cdf_shadow_prediction_topic)" />
@@ -723,6 +795,9 @@
     <remap from="/care_planner/trajectory_risk/vbc_summary"
            to="$(arg candidate_vbc_summary_topic)" />
     <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+      <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
       <arg name="predicted_trajectory_topic" value="$(arg verification_trajectory_topic)" />
@@ -731,6 +806,8 @@
       <arg name="event_driven_eval" value="true" />
       <arg name="eval_rate" value="5.0" />
       <arg name="predicted_periodic_refresh_rate" value="5.0" />
+      <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+      <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
       <arg name="rediscovery_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
       <arg name="rediscovery_trajectory_timeout" value="1.0" />
       <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
@@ -746,7 +823,7 @@
     </include>
   </group>
 
-  <!-- Execution auditor: identical full body-sphere swept-volume VBC geometry,
+  <!-- Execution auditor: identical selected swept-volume VBC geometry,
        but it reads only committed execution plans and all steering-side outputs
        are isolated. -->
   <group ns="execution_vbc_audit">
@@ -759,6 +836,14 @@
     <remap from="/care_planner/trajectory_risk/vbc_selected_see_time_s"
            to="/care_planner/execution_vbc/selected_see_time_s" />
     <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg name="event_driven_eval" value="$(arg execution_vbc_event_driven_eval)" />
+      <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+      <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+      <!-- Add arrival checks without reducing the historical 20-Hz audit. -->
+      <arg name="preserve_periodic_eval" value="true" />
+      <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+      <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
       <arg name="base_frame" value="$(arg base_frame)" />
       <arg name="input_trajectory_topic"
            value="$(arg execution_vbc_trajectory_topic)" />
@@ -779,8 +864,11 @@
     </include>
   </group>
 
-  <!-- Keep the single-target analytic auditor as steering diagnostics only. -->
+  <!-- Single-target diagnostic audit; not the candidate/final certificate. -->
   <include file="$(find care_confidence_map)/launch/predicted_vbc_auditor.launch">
+    <arg if="$(eval arg('diagnostic_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <arg name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="prediction_topic" value="$(arg verification_trajectory_topic)" />
     <arg name="target_topic" value="$(arg frozen_target_topic)" />

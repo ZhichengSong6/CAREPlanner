@@ -57,3 +57,10 @@ src/care_visibility_cdf/checkpoints/**/**/*_samples.npz
 
 # W&B local runtime files
 wandb/
+
+# Local qualification archives and model assets are not source releases.
+/*.zip
+CAREPlanner_C5_RESULT_*.zip
+CAREPlanner_PHASE_E_EMPTY_QUALIFICATION_*.zip
+src/care_visibility_cdf/checkpoints/
+src/care_collision_cdf/checkpoints/

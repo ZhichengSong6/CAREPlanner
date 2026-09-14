@@ -6,6 +6,10 @@
        default="$(find care_confidence_map)/config/body_samples.yaml" />
 
   <arg name="initialize_body_prior_once" default="true" />
+  <arg name="query_dedicated_queue" default="true" />
+  <arg name="body_prior_geometry_backend" default="samples" />
+  <arg name="body_prior_primitive_urdf_file"
+       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <arg name="initial_prior_retry_rate" default="20.0" />
   <arg name="initial_prior_ready_topic"
        default="/care_planner/confidence_map/initial_prior_ready" />
@@ -15,7 +19,10 @@
         name="confidence_map_node"
         output="screen">
     <rosparam command="load" file="$(arg config_file)" />
-    <param name="current_body_prior/body_samples_file"
+    <param name="confidence_map/query_dedicated_queue" value="$(arg query_dedicated_queue)" />
+    <param name="current_body_prior/geometry_backend" value="$(arg body_prior_geometry_backend)" />
+    <param name="current_body_prior/primitive_urdf_file" value="$(arg body_prior_primitive_urdf_file)" />
+    <param if="$(eval arg('body_prior_geometry_backend') == 'samples')" name="current_body_prior/body_samples_file"
            value="$(arg body_samples_file)" />
   </node>
 

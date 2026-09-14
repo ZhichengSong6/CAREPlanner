@@ -28,15 +28,22 @@ used as the stable execution token for PROBE completion handshakes.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import re
 import threading
+from pathlib import Path
+import sys
 
 import rospy
-from care_collision_cdf.msg import CollisionCDFConstraintBatch
+from care_collision_cdf.msg import CollisionCDFConstraintBatch, CollisionCDFRejectionFeedback
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+# catkin devel relay modules execute in a private context and do not export
+# helpers to importers. __file__ here names this actual source (or install) file.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from gcdf_rejection_feedback import rejection_points
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -57,9 +64,11 @@ def _as_bool(value):
 class OptimizedTrajectoryContinuityNode:
     def __init__(self) -> None:
         self._lock = threading.RLock()
-
         self.input_topic = str(rospy.get_param(
             "~input_topic", "/care_planner/mpc/predicted_trajectory"))
+        self.gcdf_rejection_feedback_pub = rospy.Publisher(
+            self.input_topic + "/gcdf_rejection_feedback", CollisionCDFRejectionFeedback,
+            queue_size=4)
         self.verification_topic = str(rospy.get_param(
             "~output_topic", "/care_planner/optimized_trajectory"))
         self.committed_topic = str(rospy.get_param(
@@ -382,13 +391,16 @@ class OptimizedTrajectoryContinuityNode:
         self.verification_event_pub = rospy.Publisher(
             self.verification_event_topic, String, queue_size=20, latch=False)
 
+        verification_tcp_nodelay = bool(rospy.get_param("~tcp_nodelay", False))
         self.raw_sub = rospy.Subscriber(
-            self.input_topic, JointTrajectory, self._raw_cb, queue_size=1)
+            self.input_topic, JointTrajectory, self._raw_cb, queue_size=1,
+            tcp_nodelay=verification_tcp_nodelay)
         self.summary_sub = rospy.Subscriber(
-            self.global_summary_topic, String, self._global_summary_cb, queue_size=1)
+            self.global_summary_topic, String, self._global_summary_cb, queue_size=1,
+            tcp_nodelay=verification_tcp_nodelay)
         self.final_gcdf_batch_sub = rospy.Subscriber(
             self.final_gcdf_batch_topic, CollisionCDFConstraintBatch,
-            self._final_gcdf_batch_cb, queue_size=2)
+            self._final_gcdf_batch_cb, queue_size=2, tcp_nodelay=verification_tcp_nodelay)
         self.repair_sub = rospy.Subscriber(
             self.repair_active_topic, Bool, self._repair_active_cb, queue_size=1)
         self.probe_sub = rospy.Subscriber(
@@ -1109,6 +1121,7 @@ class OptimizedTrajectoryContinuityNode:
             if candidate.points[0].positions else [])
         diag = {
             "raw_candidate_age_s": float(age),
+            "raw_candidate_stamp_ns": int(raw.header.stamp.to_nsec()),
             "dispatch_suffix_phase_s": dispatch_suffix_phase_s,
             "raw_candidate_duration_s": float(raw_duration_s),
             "dispatch_suffix_start_shift_inf": (
@@ -1363,6 +1376,12 @@ class OptimizedTrajectoryContinuityNode:
             self._diag_value(diag, "prefix_endpoint_max_abs_velocity"),
             self._diag_value(diag, "brake_duration_s"),
             self._diag_value(diag, "brake_displacement_inf"))
+        msg.data += " raw_candidate_stamp_ns={}".format(
+            int((diag or {}).get("raw_candidate_stamp_ns", 0)))
+        msg.data += " audited_trajectory_stamp_ns={} vbc_evidence={}".format(
+            int((diag or {}).get("audited_trajectory_stamp_ns", 0)),
+            (diag or {}).get("vbc_evidence", "none"))
+        msg.data += " rejection_snapshot=disabled"
         return msg
 
     def _classify_final_gcdf_unsafe(self, batch, distances):
@@ -1489,6 +1508,7 @@ class OptimizedTrajectoryContinuityNode:
         event_to_publish = None
         gcdf_recovery_trajectory_to_publish = None
         gcdf_recovery_event_to_publish = None
+        rejection_feedback_to_publish = None
 
         with self._lock:
             if (self._gcdf_outstanding is None or
@@ -1596,6 +1616,21 @@ class OptimizedTrajectoryContinuityNode:
                     "gcdf_{}".format(gcdf_blocker_class)
                     if gcdf_blocker_class in ("unknown", "occupied", "mixed")
                     else "gcdf")
+                if diag is None:
+                    diag = {}
+                # This is the GCDF-audited executable, not the future VBC epoch.
+                diag['audited_trajectory_stamp_ns'] = candidate.header.stamp.to_nsec()
+                if was_repair and not was_probe:
+                    try:
+                        points, overflow = rejection_points(msg, candidate, self.final_gcdf_safety_margin)
+                        raw_stamp = int(diag.get('raw_candidate_stamp_ns', 0))
+                        if raw_stamp > 0 and (points or overflow):
+                            rejection_feedback_to_publish = CollisionCDFRejectionFeedback(
+                                header=copy.deepcopy(candidate.header),
+                                raw_candidate_stamp=rospy.Time(raw_stamp // 1000000000, raw_stamp % 1000000000),
+                                point_flat=points, overflow=overflow)
+                    except (ValueError, OverflowError) as exc:
+                        rospy.logwarn('GCDF rejection feedback unavailable: %s', exc)
                 event_to_publish = self._make_verification_event(
                     seq, "unsafe", False, age, view,
                     safety_gate=gcdf_safety_gate, diag=diag)
@@ -1609,6 +1644,8 @@ class OptimizedTrajectoryContinuityNode:
 
             self._publish_summary_locked()
 
+        if rejection_feedback_to_publish is not None:
+            self.gcdf_rejection_feedback_pub.publish(rejection_feedback_to_publish)
         if gcdf_recovery_trajectory_to_publish is not None:
             self.final_gcdf_recovery_trajectory_pub.publish(
                 gcdf_recovery_trajectory_to_publish)
@@ -1689,6 +1726,12 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_exact_vbc_roundtrip_ms = 1000.0 * verification_age
                     raw_received = self._outstanding_raw_received
                     diag = copy.deepcopy(self._outstanding_diag)
+                    if diag is None:
+                        diag = {}
+                    # Carry the exact accepted summary, not the latest periodic
+                    # refresh for this trajectory or a nearby raw candidate.
+                    diag["audited_trajectory_stamp_ns"] = expected_stamp_ns
+                    diag["vbc_evidence"] = fields.get("vbc_evidence", "none")
                     if raw_received is not None:
                         self._last_candidate_total_safety_pipeline_ms = (
                             1000.0 * max(0.0, (now - raw_received).to_sec()))

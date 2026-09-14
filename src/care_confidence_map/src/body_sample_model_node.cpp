@@ -1,4 +1,6 @@
+#include <care_confidence_map/tf_primitive_geometry.hpp>
 #include <care_confidence_map/body_sample_model.hpp>
+#include <care_confidence_map/legacy_body_backend.hpp>
 
 #include <ros/ros.h>
 
@@ -33,7 +35,17 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!model_.loadFromYaml(body_samples_file_, &error_msg))
+    pnh_.param<std::string>("body_sample_model/geometry_backend",geometry_backend_,"samples");
+    std::string urdf;pnh_.getParam("body_sample_model/primitive_urdf_file",urdf);
+    if(geometry_backend_!="samples" && geometry_backend_!="primitive")return false;
+    double display_scale;pnh_.param("body_sample_model/primitive_display_scale",display_scale,1.);
+    if(geometry_backend_=="primitive" && display_scale!=1.) {
+      ROS_ERROR("Primitive markers show exact URDF geometry; non-unit display scaling is unsupported.");return false;
+    }
+    const bool loaded=geometry_backend_=="primitive" ? primitive_model_.load(urdf,
+        show_non_risk_samples_?std::vector<std::string>{}:std::vector<std::string>{"base_link"},&error_msg)
+        : care_confidence_map::loadLegacyBodySamples(&model_,body_samples_file_,&error_msg);
+    if (!loaded)
     {
       ROS_ERROR_STREAM("[body_sample_model_node] Failed to load body samples: "
                        << error_msg);
@@ -299,6 +311,31 @@ private:
 
   void timerCallback(const ros::TimerEvent&)
   {
+    if(geometry_backend_=="primitive") {
+      visualization_msgs::MarkerArray markers;markers.markers.push_back(makeDeleteAllMarker());
+      try {
+        const auto shapes=care_confidence_map::transformPrimitiveGeometry(primitive_model_,tf_buffer_,map_frame_);
+        int id=1;
+        for(const auto& p:shapes) {
+          visualization_msgs::Marker m;m.header.frame_id=map_frame_;m.header.stamp=ros::Time::now();
+          m.ns="body_primitives/"+p.link_name;m.id=id++;m.action=visualization_msgs::Marker::ADD;
+          m.pose.position.x=p.center.x();m.pose.position.y=p.center.y();m.pose.position.z=p.center.z();
+          const Eigen::Quaterniond q(p.rotation);m.pose.orientation.x=q.x();m.pose.orientation.y=q.y();
+          m.pose.orientation.z=q.z();m.pose.orientation.w=q.w();
+          using care_confidence_map::PrimitiveKind;
+          m.type=p.kind==PrimitiveKind::Box?visualization_msgs::Marker::CUBE:
+              p.kind==PrimitiveKind::Cylinder?visualization_msgs::Marker::CYLINDER:visualization_msgs::Marker::SPHERE;
+          m.scale.x=p.kind==PrimitiveKind::Box?2*p.half_size.x():2*p.radius;
+          m.scale.y=p.kind==PrimitiveKind::Box?2*p.half_size.y():2*p.radius;
+          m.scale.z=p.kind==PrimitiveKind::Box?2*p.half_size.z():p.kind==PrimitiveKind::Cylinder?2*p.half_length:2*p.radius;
+          m.color.g=.8;m.color.b=1.;m.color.a=marker_alpha_;
+          markers.markers.push_back(m);
+          if(show_text_labels_)markers.markers.push_back(makeTextMarker(p.link_name,
+              tf2::Vector3(p.center.x(),p.center.y(),p.center.z()),id++));
+        }
+      } catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,e.what());}
+      marker_pub_.publish(markers);return;
+    }
     std::map<std::string, tf2::Transform> T_map_frame;
     if (!lookupFrameTransforms(T_map_frame))
     {
@@ -384,7 +421,7 @@ private:
     ROS_INFO_STREAM("show_non_risk_samples: " << show_non_risk_samples_);
     ROS_INFO_STREAM("show_text_labels: " << show_text_labels_);
     ROS_INFO_STREAM("samples: " << model_.size());
-    ROS_INFO_STREAM("risk samples: " << model_.riskSampleCount());
+    ROS_INFO_STREAM("risk samples: " << care_confidence_map::legacyRiskSampleCount(model_));
     ROS_INFO_STREAM("frames: " << model_.frames().size());
     for (const auto& frame : model_.frames())
     {
@@ -406,6 +443,8 @@ private:
   care_confidence_map::BodySampleModel model_;
 
   std::string body_samples_file_;
+  std::string geometry_backend_="samples";
+  care_confidence_map::VbcPrimitiveModel primitive_model_;
   std::string map_frame_ = "base_link";
   std::string marker_topic_ = "/care_planner/body_samples/world_markers";
 

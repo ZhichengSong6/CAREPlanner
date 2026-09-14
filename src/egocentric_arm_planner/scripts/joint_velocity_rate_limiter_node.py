@@ -18,6 +18,7 @@ from std_msgs.msg import Float64MultiArray, String
 class JointVelocityRateLimiter:
     def __init__(self):
         self._lock = threading.Lock()
+        self._stopping = False
 
         self.rate = float(rospy.get_param("~rate", 100.0))
         self.input_topic = str(rospy.get_param(
@@ -67,6 +68,7 @@ class JointVelocityRateLimiter:
             self.input_topic, Float64MultiArray, self._desired_cb, queue_size=1)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
+        rospy.on_shutdown(self._on_shutdown)
 
         rospy.logwarn(
             "[joint_velocity_rate_limiter] desired=%s actuator=%s rate=%.1fHz "
@@ -104,7 +106,28 @@ class JointVelocityRateLimiter:
             self._desired_received = rospy.Time.now()
             self._input_count += 1
 
+    def _on_shutdown(self):
+        self._stopping = True
+        self.timer.shutdown()
+
+    def _shutdown_requested(self):
+        # on_shutdown runs before rospy closes publishers. Also cover the
+        # interval before our hook runs, when is_shutdown() is still false.
+        return self._stopping or rospy.core.is_shutdown_requested() or rospy.is_shutdown()
+
     def _timer_cb(self, _event):
+        if self._shutdown_requested():
+            return
+        try:
+            self._timer_tick(_event)
+        except rospy.ROSException:
+            # Timer.shutdown does not join an in-flight callback. A topic may
+            # close between the entry check and publish; runtime errors still
+            # propagate. Never wait on a callback/RPC from the shutdown hook.
+            if not self._shutdown_requested():
+                raise
+
+    def _timer_tick(self, _event):
         now = rospy.Time.now()
         with self._lock:
             desired = self._desired.copy()
@@ -137,6 +160,8 @@ class JointVelocityRateLimiter:
 
         msg = Float64MultiArray()
         msg.data = output.astype(float).tolist()
+        if self._shutdown_requested():
+            return
         self.pub.publish(msg)
 
         with self._lock:
@@ -165,7 +190,13 @@ class JointVelocityRateLimiter:
                 float(dt),
                 float(max_accel_ratio),
             )
-        self.summary_pub.publish(String(data=text))
+        if self._shutdown_requested():
+            return
+        try:
+            self.summary_pub.publish(String(data=text))
+        except rospy.ROSException:
+            if not self._shutdown_requested():
+                raise
 
 
 def main():

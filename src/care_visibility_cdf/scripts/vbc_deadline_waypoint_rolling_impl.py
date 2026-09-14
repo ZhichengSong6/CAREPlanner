@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -191,7 +192,20 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             int(self.use_active_set),
             self.active_set_points_topic)
 
-    def _maybe_apply_per_sensor_hybrid(
+    def _maybe_apply_per_sensor_hybrid(self, points_np, result):
+        # Observe every invocation, including shared/refinement calls which may
+        # not materialize a new obligation. The original API/result are intact.
+        try:
+            return self._apply_per_sensor_hybrid_impl(points_np, result)
+        finally:
+            trace = getattr(self, "_trace_observation", None)
+            if callable(trace) and self.per_sensor_hybrid_enabled:
+                trace("hybrid_call", points=np.asarray(points_np).tolist(),
+                      q_zero=result.get("q_zero"),
+                      branch_seed_q=result.get("q_deadline_nominal"),
+                      hybrid=result.get("per_sensor_hybrid", {}))
+
+    def _apply_per_sensor_hybrid_impl(
             self, points_np: np.ndarray, result: Dict[str, object]):
         """Post-process scalar q_zero with mode-preserving 8-head fallback.
 
@@ -208,6 +222,10 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 1.0,
                 "[vbc_waypoint_rolling] per-sensor hybrid enabled but runtime "
                 "helper is unavailable; preserving scalar q_vis")
+            result["per_sensor_hybrid"] = dict(enabled=True, accepted=False,
+                runtime_error="runtime_unavailable", compute_ms=0.0,
+                scalar_q_vis_preserved=True)
+            result["per_sensor_hybrid_used"] = False
             return result
 
         q_zero = np.asarray(result["q_zero"], dtype=np.float64).reshape(7)
@@ -215,6 +233,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             result["q_deadline_nominal"], dtype=np.float64).reshape(7)
         scalar_q_vis = np.asarray(
             result["q_vis"], dtype=np.float64).reshape(7).copy()
+        hybrid_tic = time.perf_counter()
         try:
             hybrid = self._per_sensor_runtime.generate(
                 points_np,
@@ -228,6 +247,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 "enabled": True,
                 "accepted": False,
                 "runtime_error": str(exc),
+                "compute_ms": 1000.0 * (time.perf_counter() - hybrid_tic),
                 "scalar_q_vis_preserved": True,
             }
             result["per_sensor_hybrid_used"] = False

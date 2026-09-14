@@ -7,12 +7,14 @@
 #include "egocentric_arm_planner/task_trajectory_generator.hpp"
 #include "egocentric_arm_planner/dummy_trajectory_evaluator.hpp"
 #include "egocentric_arm_planner/intervention_manager.hpp"
+#include "egocentric_arm_planner/task_reference_retry.hpp"
 
 #include <ros/ros.h>
 
 #include <sensor_msgs/JointState.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
 #include <trajectory_msgs/JointTrajectory.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 
@@ -46,6 +48,7 @@ private:
       trajectory_msgs::JointTrajectory& msg) const;
 
   bool hasValidInputs() const;
+  void publishReferenceStatusLocked(const std::string& status, const std::string& reason);
 
 private:
   ros::NodeHandle nh_;
@@ -57,6 +60,10 @@ private:
 
   ros::Publisher task_traj_pub_;
   ros::Publisher command_traj_pub_;
+  ros::Publisher reference_status_pub_;
+  TaskReferenceRetry reference_retry_;
+  Eigen::VectorXd reference_ik_seed_;  // solver-only, scoped to request identity
+  ros::Time reference_request_ros_time_;
 
   ros::Timer planning_timer_;
 

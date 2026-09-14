@@ -1,5 +1,7 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
+#include <care_confidence_map/body_geometry_params.hpp>
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/confidence_query_validation.hpp>
 
 #include <ros/ros.h>
 
@@ -36,7 +38,7 @@ public:
     loadParams();
 
     std::string error_msg;
-    if (!evaluator_.initialize(
+    if (!care_confidence_map::initializeBodyGeometry(evaluator_, pnh_, "trajectory_vbc",
             robot_urdf_file_, body_samples_file_, base_frame_, &error_msg))
     {
       ROS_ERROR_STREAM("[trajectory_vbc] Failed to initialize evaluator: "
@@ -402,6 +404,7 @@ private:
       return false;
     if (!confidence_query_client_.call(*srv)) return false;
 
+    if(evaluator_.usesPrimitives() && !care_confidence_map::validConfidenceResponse(*srv,true))return false;
     const std::size_t n = srv->request.points.size();
     return srv->response.confidence.size() == n &&
            srv->response.current_visibility.size() == n &&
@@ -512,6 +515,7 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=0"
+        << " geometry_backend=" << evaluator_.geometryBackend()
         << " reason=" << reason
         << " trajectory_source=" << trajectory_source
         << " candidate_count=" << candidate_count
@@ -569,6 +573,7 @@ private:
 
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=1"
+        << " geometry_backend=" << evaluator_.geometryBackend()
         << " reason=selected"
         << " trajectory_source=" << trajectory_source
         << " candidate_count=" << candidate_count
@@ -657,6 +662,10 @@ private:
     care_confidence_map::QueryConfidence confidence_srv;
     if (!queryConfidence(sample_result, &confidence_srv))
     {
+      if(evaluator_.usesPrimitives()) {
+        std_msgs::String m;m.data="vbc success=0 geometry_backend=primitive reason=invalid_confidence_or_outside_map";
+        summary_pub_.publish(m);
+      }
       ROS_WARN_THROTTLE(
           2.0, "[trajectory_vbc] confidence query failed or returned invalid sizes");
       return;
