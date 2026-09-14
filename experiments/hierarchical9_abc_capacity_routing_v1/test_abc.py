@@ -61,6 +61,13 @@ class ABCTests(unittest.TestCase):
             self.assertTrue(b.requires_grad)
 
     def test_routed_loss_microbatch_additivity(self):
+        """Optimizer loss must match; diagnostic FP32 reductions need FP32 tolerance.
+
+        The production objective intentionally accumulates SDF/gradient/Eikonal sums
+        in FP32 (matching hierarchical9). Splitting a batch changes floating-point
+        reduction order, so continuous diagnostic sums are not bitwise additive.
+        Integer-valued count/sign statistics, however, must remain exact.
+        """
         obj=old.module("objective",old.SCRATCH)
         weights=obj.LossWeights(tension=0.0)
         model=build_arm(self.base,"A")
@@ -75,7 +82,14 @@ class ABCTests(unittest.TestCase):
         l0,s0=routed.loss_for_microbatch(model,inputs[:9],target[:9],grad[:9],mask[:9],counts,weights,training=False)
         l1,s1=routed.loss_for_microbatch(model,inputs[9:],target[9:],grad[9:],mask[9:],counts,weights,training=False)
         self.assertTrue(torch.allclose(full,l0+l1,atol=2e-6,rtol=2e-6))
-        self.assertTrue(torch.allclose(st_full,s0+s1,atol=1e-8,rtol=1e-8))
+        summed=s0+s1
+        # count and sign_correct are integer sums represented in float64 stats.
+        for col in (routed.COUNT,routed.SIGN):
+            self.assertTrue(torch.equal(st_full[:,col],summed[:,col]),f"column={col}")
+        # Continuous entries originate from FP32 reductions, so use an FP32-scale
+        # tolerance rather than an impossible 1e-8 exact-reduction requirement.
+        continuous=[routed.SDF,routed.GRAD,routed.EIK,routed.TENSION,routed.ABS,routed.NORM]
+        self.assertTrue(torch.allclose(st_full[:,continuous],summed[:,continuous],atol=3e-6,rtol=3e-6))
 
     def test_trainable_capacity_order(self):
         a=build_arm(self.base,"A").trainable_parameter_count()
