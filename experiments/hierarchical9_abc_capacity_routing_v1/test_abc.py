@@ -7,6 +7,7 @@ import torch
 
 import abc_protocol as proto
 from abc_model import build_arm, function_equivalence
+from eval_compat import legacy_compatible
 import sensor_objective as routed
 from train_arm import sample_global_indices_single, sample_shared_q_single
 
@@ -76,6 +77,24 @@ class ABCTests(unittest.TestCase):
             self.assertTrue(torch.equal(a,b))
             self.assertFalse(a.requires_grad)
             self.assertTrue(b.requires_grad)
+
+    def test_c_legacy_planning_headview_preserves_values_and_q_gradients(self):
+        """Regression for the old planning sentinel's hard-coded `.shared` access."""
+        ev=old.module("evaluate",old.SCRATCH)
+        c=build_arm(self.base,"C").eval()
+        compat=legacy_compatible(c).eval()
+        q0=self.x[:,3:].detach().clone().requires_grad_(True)
+        q1=q0.detach().clone().requires_grad_(True)
+        x=self.x[:,:3].detach()
+        inp0=torch.cat((x,q0),1)
+        inp1=torch.cat((x,q1),1)
+        ref=c.forward_sensors(inp0)
+        got=ev.HeadView(compat,"sensors")(inp1)
+        self.assertTrue(torch.allclose(ref,got,atol=1e-7,rtol=1e-7))
+        gr=torch.autograd.grad(ref.sum(),q0)[0]
+        gg=torch.autograd.grad(got.sum(),q1)[0]
+        self.assertTrue(torch.allclose(gr,gg,atol=1e-7,rtol=1e-7))
+        self.assertTrue(torch.allclose(c.forward_union(inp0),ev.HeadView(compat,"union")(inp1)[:,0],atol=1e-7,rtol=1e-7))
 
     def test_single_process_sampler_needs_no_process_group_and_is_reproducible(self):
         class FakeDataset:
