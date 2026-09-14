@@ -60,8 +60,27 @@ fi
 [[ ! -e "$ROOT/$TRAIN_DIR" && ! -e "$ROOT/$EVAL_DIR" ]] || { echo 'E012 output exists without reclaimable failed reservation'; exit 2; }
 mkdir "$LOCK"; HEAD=$(git rev-parse HEAD)
 EXPORT="ALL,E012_REFERENCE_ROOT=$ROOT,E012_CODE_REPO=$REPO,E012_CODE_SHA=$HEAD,E012_STAGE=$STAGE"
-if ! JOB=$(sbatch --parsable --partition=GPU --nodelist=3090node3 --nodes=1 --ntasks=1 --gres=gpu:3090:4 --cpus-per-task=16 --time="$LIMIT" --job-name="h9_e012_$STAGE" --chdir="$REPO" --output="$ROOT/logs/e012_${STAGE}_%j.out" --error="$ROOT/logs/e012_${STAGE}_%j.out" --export="$EXPORT" "$REPO/$DIR/worker.sbatch"); then
-  rmdir "$LOCK"; exit 1
+ERR=$(mktemp)
+trap 'rm -f "$ERR"' EXIT
+set +e
+JOB=$(sbatch --parsable --partition=GPU --nodelist=3090node3 --nodes=1 --ntasks=1 --gres=gpu:3090:4 --cpus-per-task=16 --time="$LIMIT" --job-name="h9_e012_$STAGE" --chdir="$REPO" --output="$ROOT/logs/e012_${STAGE}_%j.out" --error="$ROOT/logs/e012_${STAGE}_%j.out" --export="$EXPORT" "$REPO/$DIR/worker.sbatch" 2>"$ERR")
+RC=$?
+set -e
+if [[ $RC -ne 0 ]]; then
+  rmdir "$LOCK"
+  cat "$ERR" >&2
+  if grep -q 'AssocMaxSubmitJobLimit' "$ERR"; then
+    echo >&2
+    echo '[scheduler] Slurm rejected the job because this association has reached its submitted-job limit.' >&2
+    echo '[scheduler] No E012 job was created; no e012_jobs.env entry should exist yet.' >&2
+    echo '[scheduler] Current RUNNING/PENDING jobs for this user:' >&2
+    squeue -u "$USER" -t RUNNING,PENDING -o '%.18i %.12P %.28j %.10T %.10M %.10l %.4D %R' >&2 || true
+    echo >&2
+    echo '[scheduler] Finish/cancel one of your existing submitted jobs, then rerun exactly:' >&2
+    echo "  export E012_REFERENCE_ROOT=\"$ROOT\"" >&2
+    echo "  bash $DIR/submit.sh $STAGE" >&2
+  fi
+  exit $RC
 fi
 JOB=${JOB%%;*}; [[ "$JOB" =~ ^[0-9]+$ ]] || { echo "$JOB" > "$LOCK/unparsed_submission.txt"; exit 2; }
 echo "$JOB" > "$LOCK/job_id"; printf '%s=%s\n' "$KEY" "$JOB" >> "$ROOT/e012_jobs.env"
