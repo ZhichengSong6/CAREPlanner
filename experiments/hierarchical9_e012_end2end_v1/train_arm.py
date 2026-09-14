@@ -117,30 +117,27 @@ def run_update(model,batches,counts9,weights,args,obj,optimizer,scaler,step,repl
                 with torch.enable_grad(),amp_context(device,args.amp):
                     loss,st=obj.loss_for_microbatch(model,*batch,counts9,weights,world_size=1,training=True)
             else:
-                # Uniform private paths still receive the exact original global objective.
-                # Only sensor -> early parameter gradients are blocked here; q derivatives
-                # are preserved by the model's functional detached-parameter early call.
                 with model.sensor_early_parameter_frozen():
                     with torch.enable_grad(),amp_context(device,args.amp):
                         loss,st=obj.loss_for_microbatch(model,*batch,counts9,weights,world_size=1,training=True)
                 with torch.enable_grad(),torch.autocast(device_type=device.type,enabled=False):
-                    shared_loss=routed.selected_sensor_shared_objective(
-                        model,*batch,counts9,weights,selected)
+                    shared_loss=routed.selected_sensor_shared_objective(model,*batch,counts9,weights,selected)
                     sg=torch.autograd.grad(shared_loss,early,allow_unused=False)
                 _accumulate(early_aux,sg)
             if not torch.isfinite(loss.detach()) or not torch.isfinite(st).all():
                 raise RuntimeError("Nonfinite uniform loss")
-            scaler.scale(loss).backward()
-            stats+=st
+            scaler.scale(loss).backward(); stats+=st
 
-        hard_stats={"count":0,"fp":0,"fn":0,"outside":0,"inside":0,"alpha":alpha}
+        hard_stats={"count":0,"fp":0,"fn":0,"outside":0,"inside":0,"alpha":alpha,
+                    "field_margin":args.hard_field_margin}
         if args.arm=="E2" and replay_batches and alpha>0:
             with torch.enable_grad(),amp_context(device,args.amp):
-                hard_private,hs=routed.replay_private_loss(model,replay_batches,args.hard_fn_ratio)
-            scaler.scale(alpha*hard_private).backward()
-            hard_stats.update(hs)
+                hard_private,hs=routed.replay_private_loss(
+                    model,replay_batches,args.hard_fn_ratio,args.hard_field_margin)
+            scaler.scale(alpha*hard_private).backward(); hard_stats.update(hs)
             with torch.enable_grad(),torch.autocast(device_type=device.type,enabled=False):
-                hard_shared=routed.replay_shared_sensor_loss(model,replay_batches,selected,args.hard_fn_ratio)
+                hard_shared=routed.replay_shared_sensor_loss(
+                    model,replay_batches,selected,args.hard_fn_ratio,args.hard_field_margin)
                 hg=torch.autograd.grad(alpha*hard_shared,early,allow_unused=False)
             _accumulate(early_aux,hg)
 
@@ -165,12 +162,10 @@ def weight_drift(model,initial_state):
         if not torch.is_floating_point(p): continue
         key=("early" if name.startswith("early.") else "union" if name.startswith(("union_tail.","union_head."))
              else "sensor_tails" if name.startswith("sensor_tails.") else "sensor_heads")
-        base=initial_state[name].to(p.device,dtype=p.dtype); diff=(p-base).double()
-        groups[key].append((diff,base.double()))
+        base=initial_state[name].to(p.device,dtype=p.dtype); diff=(p-base).double(); groups[key].append((diff,base.double()))
     out={}
     for key,rows in groups.items():
-        d2=sum(float((d*d).sum()) for d,_ in rows); b2=sum(float((b*b).sum()) for _,b in rows)
-        max_abs=max(float(d.abs().max()) for d,_ in rows)
+        d2=sum(float((d*d).sum()) for d,_ in rows); b2=sum(float((b*b).sum()) for _,b in rows); max_abs=max(float(d.abs().max()) for d,_ in rows)
         out[key]={"relative_l2":math.sqrt(d2/max(b2,1e-30)),"max_abs":max_abs}
     return out
 
@@ -197,11 +192,8 @@ _GLOBAL_P0=None
 
 def main():
     global _GLOBAL_P0
-    ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--reference-root",type=Path,required=True)
-    ap.add_argument("--arm",choices=proto.ARMS,required=True)
-    ap.add_argument("--mode",choices=("smoke","pilot"),required=True)
-    a0=ap.parse_args()
+    ap=argparse.ArgumentParser(description=__doc__); ap.add_argument("--reference-root",type=Path,required=True)
+    ap.add_argument("--arm",choices=proto.ARMS,required=True); ap.add_argument("--mode",choices=("smoke","pilot"),required=True); a0=ap.parse_args()
     if not torch.cuda.is_available(): raise RuntimeError("One CUDA GPU required")
     device=torch.device("cuda",0); torch.cuda.set_device(0); torch.set_num_threads(4)
     torch.backends.cuda.matmul.allow_tf32=False; torch.backends.cudnn.allow_tf32=False
@@ -212,16 +204,13 @@ def main():
     out.mkdir(parents=True)
     baseline=old.module("train",old.SCRATCH); obj=old.module("objective",old.SCRATCH); weights=obj.LossWeights()
     api=baseline.load_repo_api(old.REPO); artifact=Path(args.artifact_root)
-    dataset=api["VisibilityQ0Dataset"](str(artifact/old.DATA_REL),val_count=1000,seed=0)
-    cache.verify_dataset(dataset,artifact/old.DATA_REL)
+    dataset=api["VisibilityQ0Dataset"](str(artifact/old.DATA_REL),val_count=1000,seed=0); cache.verify_dataset(dataset,artifact/old.DATA_REL)
     oracle=api["PinocchioFOVOracle"](urdf_path=str(old.URDF),joint_names=api["DEFAULT_JOINT_NAMES"],
         sensor_frames=api["DEFAULT_SENSOR_FRAMES"],horizontal_fov_deg=50.,vertical_fov_deg=66.,z_min=.2,z_max=.7,delta=.01)
-    projection=old.module("compare_scalar_vs_per_sensor_apples_to_apples",old.SCRIPTS)
-    lo,hi=dataset.q_limits(device)
+    projection=old.module("compare_scalar_vs_per_sensor_apples_to_apples",old.SCRIPTS); lo,hi=dataset.q_limits(device)
 
     baseline.seed_everything(args.seed)
-    p0_model=proto.p0_model(p0,device).eval().requires_grad_(False)
-    model=build_from_p0(p0_model).to(device=device,dtype=torch.float32)
+    p0_model=proto.p0_model(p0,device).eval().requires_grad_(False); model=build_from_p0(p0_model).to(device=device,dtype=torch.float32)
     initial_state={k:v.detach().cpu().clone() for k,v in model.state_dict().items()}
     optimizer=torch.optim.Adam(model.optimizer_groups(lr_early=args.lr_early,lr_union=args.lr_union,lr_sensor=args.lr_sensor))
     scaler=torch.amp.GradScaler("cuda",enabled=args.amp=="fp16",init_scale=1024.)
@@ -229,58 +218,38 @@ def main():
 
     val_batches,val_counts9,_=prepare_batch_single(api,dataset,oracle,args,device,"val",baseline,obj)
     equivalence=function_equivalence(p0_model,model,val_batches[0][0][:32])
-    if equivalence["max_abs_value_error"]>2e-6 or equivalence["max_abs_q_gradient_error"]>2e-6:
-        raise RuntimeError(f"Not P0-equivalent at initialization: {equivalence}")
-    validation=validate(model,val_batches,val_counts9,weights,obj)
-    proto.write_json(out/"initial_validation.json",validation)
-    proto.write_json(out/"run.json",dict(status="RUNNING",arm=args.arm,mode=args.mode,args=vars(args),
-        parent="P0",parent_sha256=p0_sha,cache_manifest_sha256=cache.identity,
-        architecture=model.architecture(),initial_equivalence=equivalence,
-        training_source_sha256=proto.training_fingerprints()))
-    print(f"[e012] arm={args.arm} mode={args.mode} P0={p0_sha} params={model.parameter_count()} "
-          f"equivalence={equivalence} routing={proto.arm_definition(args.arm)}",flush=True)
+    if equivalence["max_abs_value_error"]>2e-6 or equivalence["max_abs_q_gradient_error"]>2e-6: raise RuntimeError(f"Not P0-equivalent: {equivalence}")
+    validation=validate(model,val_batches,val_counts9,weights,obj); proto.write_json(out/"initial_validation.json",validation)
+    proto.write_json(out/"run.json",dict(status="RUNNING",arm=args.arm,mode=args.mode,args=vars(args),parent="P0",parent_sha256=p0_sha,
+        cache_manifest_sha256=cache.identity,architecture=model.architecture(),initial_equivalence=equivalence,training_source_sha256=proto.training_fingerprints()))
+    print(f"[e012] arm={args.arm} mode={args.mode} P0={p0_sha} params={model.parameter_count()} equivalence={equivalence} routing={proto.arm_definition(args.arm)}",flush=True)
 
     stream=hashlib.sha256(); last_mining=None
     for step in range(1,args.steps+1):
         started=time.perf_counter(); baseline.seed_everything(proto.seed_for_update(args.seed,step))
-        batches,counts9,identity=prepare_batch_single(api,dataset,oracle,args,device,"train",baseline,obj); stream.update(identity)
-        torch.cuda.reset_peak_memory_stats(device)
+        batches,counts9,identity=prepare_batch_single(api,dataset,oracle,args,device,"train",baseline,obj); stream.update(identity); torch.cuda.reset_peak_memory_stats(device)
         result=run_update(model,batches,counts9,weights,args,obj,optimizer,scaler,step,replay_buffer)
         if args.arm=="E2" and step%args.mine_every==0:
-            last_mining=mine_projection_candidates(model,dataset,oracle,projection,args,step,device,lo,hi,replay_buffer)
-            result["mining"]=last_mining
-        torch.cuda.synchronize(device)
-        result.update(update=step,seconds=time.perf_counter()-started,
-            peak_allocated_gib=torch.cuda.max_memory_allocated(device)/1024**3)
+            last_mining=mine_projection_candidates(model,dataset,oracle,projection,args,step,device,lo,hi,replay_buffer); result["mining"]=last_mining
+        torch.cuda.synchronize(device); result.update(update=step,seconds=time.perf_counter()-started,peak_allocated_gib=torch.cuda.max_memory_allocated(device)/1024**3)
         if step==1 or step%args.log_every==0 or step==args.steps:
             h=result["global"]["heads"]
-            print(f"[train] {args.arm} {step}/{args.steps} loss={result['global']['loss']:.6f} "
-                  f"Ucos={h['union']['grad_cosine']:.4f} S0cos={h['s0']['grad_cosine']:.4f} "
-                  f"S6cos={h['s6']['grad_cosine']:.4f} sel={result['selected_shared_sensor']} "
-                  f"hardN={result['hard']['count']} sec={result['seconds']:.2f}",flush=True)
+            print(f"[train] {args.arm} {step}/{args.steps} loss={result['global']['loss']:.6f} Ucos={h['union']['grad_cosine']:.4f} "
+                  f"S0cos={h['s0']['grad_cosine']:.4f} S6cos={h['s6']['grad_cosine']:.4f} sel={result['selected_shared_sensor']} hardN={result['hard']['count']} sec={result['seconds']:.2f}",flush=True)
             with (out/"metrics.jsonl").open("a") as f: f.write(json.dumps(result,allow_nan=False)+"\n")
         if step==1 or step%args.val_every==0 or step==args.steps:
-            validation=validate(model,val_batches,val_counts9,weights,obj)
-            drift=weight_drift(model,initial_state)
-            with (out/"validation.jsonl").open("a") as f:
-                f.write(json.dumps({"update":step,"validation":validation,"weight_drift":drift,
-                    "replay":None if replay_buffer is None else replay_buffer.summary()},allow_nan=False)+"\n")
+            validation=validate(model,val_batches,val_counts9,weights,obj); drift=weight_drift(model,initial_state)
+            with (out/"validation.jsonl").open("a") as f: f.write(json.dumps({"update":step,"validation":validation,"weight_drift":drift,"replay":None if replay_buffer is None else replay_buffer.summary()},allow_nan=False)+"\n")
             vh=validation["heads"]
-            print(f"[val] {args.arm} update={step} loss={validation['loss']:.6f} "
-                  f"Ucos={vh['union']['grad_cosine']:.4f} S0cos={vh['s0']['grad_cosine']:.4f} "
+            print(f"[val] {args.arm} update={step} loss={validation['loss']:.6f} Ucos={vh['union']['grad_cosine']:.4f} S0cos={vh['s0']['grad_cosine']:.4f} "
                   f"S6cos={vh['s6']['grad_cosine']:.4f} early_drift={drift['early']['relative_l2']:.4e}",flush=True)
-            save(out/"latest.pt",model,optimizer,scaler,args,step,validation,p0_sha,cache.identity,
-                 stream.hexdigest(),equivalence,initial_state,replay_buffer,last_mining,baseline)
+            save(out/"latest.pt",model,optimizer,scaler,args,step,validation,p0_sha,cache.identity,stream.hexdigest(),equivalence,initial_state,replay_buffer,last_mining,baseline)
         del batches
 
-    save(out/"final.pt",model,optimizer,scaler,args,args.steps,validation,p0_sha,cache.identity,
-         stream.hexdigest(),equivalence,initial_state,replay_buffer,last_mining,baseline,final=True)
-    run=json.loads((out/"run.json").read_text()); run.update(status="COMPLETE",successful_updates=args.steps,
-        training_stream_sha256=stream.hexdigest(),final_sha256=proto.sha256(out/"final.pt"),
-        weight_drift_from_initial=weight_drift(model,initial_state),
-        replay=None if replay_buffer is None else replay_buffer.summary())
-    proto.write_json(out/"run.json",run)
-    print(f"[done] e012_arm_complete arm={args.arm} mode={args.mode} updates={args.steps} output={out}",flush=True)
+    save(out/"final.pt",model,optimizer,scaler,args,args.steps,validation,p0_sha,cache.identity,stream.hexdigest(),equivalence,initial_state,replay_buffer,last_mining,baseline,final=True)
+    run=json.loads((out/"run.json").read_text()); run.update(status="COMPLETE",successful_updates=args.steps,training_stream_sha256=stream.hexdigest(),
+        final_sha256=proto.sha256(out/"final.pt"),weight_drift_from_initial=weight_drift(model,initial_state),replay=None if replay_buffer is None else replay_buffer.summary())
+    proto.write_json(out/"run.json",run); print(f"[done] e012_arm_complete arm={args.arm} mode={args.mode} updates={args.steps} output={out}",flush=True)
 
 
 if __name__=="__main__": main()
