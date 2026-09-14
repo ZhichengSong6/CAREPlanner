@@ -40,7 +40,28 @@ fi
 [[ ! -e "$ROOT/$TRAIN_DIR" && ! -e "$ROOT/$EVAL_DIR" ]] || { echo 'ABC output already exists; refusing overwrite'; exit 2; }
 mkdir -p "$ROOT/logs"
 LOCK="$ROOT/.abc_${STAGE}_submission"
-mkdir "$LOCK" || { echo 'ABC stage already reserved'; exit 2; }
+if ! mkdir "$LOCK" 2>/dev/null; then
+  # A failed pre-training smoke may leave only the reservation. Reclaim it only
+  # when Slurm proves the recorded job is terminal-failed AND no output dirs exist.
+  OLD_JOB=""
+  [[ -s "$LOCK/job_id" ]] && OLD_JOB=$(cat "$LOCK/job_id")
+  STATE=""
+  if [[ "$OLD_JOB" =~ ^[0-9]+$ ]]; then
+    STATE=$(sacct -n -X -j "$OLD_JOB" --format=State --noheader 2>/dev/null | awk 'NF{print $1; exit}' | sed 's/+.*//')
+  fi
+  case "$STATE" in
+    FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL)
+      ARCHIVE="$ROOT/.abc_${STAGE}_failed_${OLD_JOB}_$(date +%Y%m%d_%H%M%S)"
+      mv "$LOCK" "$ARCHIVE"
+      mkdir "$LOCK"
+      echo "[reclaim] archived failed reservation job=$OLD_JOB state=$STATE to $ARCHIVE"
+      ;;
+    *)
+      echo "ABC stage already reserved${OLD_JOB:+ by job $OLD_JOB}${STATE:+ state=$STATE}; not reclaiming"
+      exit 2
+      ;;
+  esac
+fi
 HEAD=$(git rev-parse HEAD)
 EXPORT="ALL,ABC_REFERENCE_ROOT=$ROOT,ABC_CODE_REPO=$REPO,ABC_CODE_SHA=$HEAD,ABC_STAGE=$STAGE"
 if ! JOB=$(sbatch --parsable --partition=GPU --nodelist=3090node3 --nodes=1 --ntasks=1 --gres=gpu:3090:4 --cpus-per-task=16 --time="$LIMIT" --job-name="h9_abc_$STAGE" --chdir="$REPO" --output="$ROOT/logs/abc_${STAGE}_%j.out" --error="$ROOT/logs/abc_${STAGE}_%j.out" --export="$EXPORT" "$REPO/$DIR/worker.sbatch"); then
@@ -48,6 +69,11 @@ if ! JOB=$(sbatch --parsable --partition=GPU --nodelist=3090node3 --nodes=1 --nt
   exit 1
 fi
 JOB=${JOB%%;*}
+if [[ ! "$JOB" =~ ^[0-9]+$ ]]; then
+  printf '%s\n' "$JOB" > "$LOCK/unparsed_submission.txt"
+  echo 'Unexpected sbatch response; keep reservation and inspect Slurm before retrying'
+  exit 2
+fi
 printf '%s\n' "$JOB" > "$LOCK/job_id"
 printf '%s=%s\n' "$KEY" "$JOB" >> "$ROOT/abc_jobs.env"
 echo "[submitted] ABC stage=$STAGE job=$JOB"
