@@ -6,12 +6,22 @@ import argparse
 from collections import Counter,defaultdict
 import json
 from pathlib import Path
+import sys
 import time
 
 import numpy as np
 import torch
 
 import e012_protocol as proto
+
+# abc_protocol.py is loaded by path from e012_protocol, but its checkpoint loader
+# intentionally uses `from abc_model import build_arm`.  When this evaluator is
+# launched from the E012 directory, the sibling ABC experiment directory is not
+# automatically on sys.path.  Add that directory explicitly for evaluation-only
+# baseline reconstruction.  This does not change any E012 training fingerprint.
+_abc_dir = str(proto.ABC_DIR)
+if _abc_dir not in sys.path:
+    sys.path.insert(0, _abc_dir)
 
 old=proto.old
 compat=proto._load("e012_eval_compat",proto.ABC_DIR/"eval_compat.py")
