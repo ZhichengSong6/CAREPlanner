@@ -37,12 +37,14 @@ else
   LIMIT=08:00:00
   KEY=ABC_PILOT_JOB
 fi
-[[ ! -e "$ROOT/$TRAIN_DIR" && ! -e "$ROOT/$EVAL_DIR" ]] || { echo 'ABC output already exists; refusing overwrite'; exit 2; }
 mkdir -p "$ROOT/logs"
 LOCK="$ROOT/.abc_${STAGE}_submission"
-if ! mkdir "$LOCK" 2>/dev/null; then
-  # A failed pre-training smoke may leave only the reservation. Reclaim it only
-  # when Slurm proves the recorded job is terminal-failed AND no output dirs exist.
+
+# Reclaim an earlier failed workflow safely.  A/B/C create their arm directories
+# before model construction, so a pre-update crash can leave partial output trees.
+# Never delete them: archive lock + partial outputs only when Slurm proves the
+# recorded job terminal-failed and no completed arm/evaluation is present.
+if [[ -e "$LOCK" ]]; then
   OLD_JOB=""
   [[ -s "$LOCK/job_id" ]] && OLD_JOB=$(cat "$LOCK/job_id")
   STATE=""
@@ -51,10 +53,30 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
   case "$STATE" in
     FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL)
+      python3 - "$ROOT/$TRAIN_DIR" "$ROOT/$EVAL_DIR" <<'PY'
+import json,sys
+from pathlib import Path
+train,ev=map(Path,sys.argv[1:])
+for arm in ('A','B','C'):
+    run=train/arm/'run.json'
+    if run.is_file():
+        try: data=json.loads(run.read_text())
+        except Exception: data={}
+        if data.get('status')=='COMPLETE':
+            raise SystemExit(f'Refusing reclaim: completed arm exists: {run}')
+manifest=ev/'manifest.json'
+if manifest.is_file():
+    try: data=json.loads(manifest.read_text())
+    except Exception: data={}
+    if data.get('status')=='COMPLETE':
+        raise SystemExit(f'Refusing reclaim: completed evaluation exists: {manifest}')
+PY
       ARCHIVE="$ROOT/.abc_${STAGE}_failed_${OLD_JOB}_$(date +%Y%m%d_%H%M%S)"
-      mv "$LOCK" "$ARCHIVE"
-      mkdir "$LOCK"
-      echo "[reclaim] archived failed reservation job=$OLD_JOB state=$STATE to $ARCHIVE"
+      mkdir "$ARCHIVE"
+      mv "$LOCK" "$ARCHIVE/submission_lock"
+      [[ -e "$ROOT/$TRAIN_DIR" ]] && mv "$ROOT/$TRAIN_DIR" "$ARCHIVE/$TRAIN_DIR"
+      [[ -e "$ROOT/$EVAL_DIR" ]] && mv "$ROOT/$EVAL_DIR" "$ARCHIVE/$EVAL_DIR"
+      echo "[reclaim] archived failed job=$OLD_JOB state=$STATE partial outputs to $ARCHIVE"
       ;;
     *)
       echo "ABC stage already reserved${OLD_JOB:+ by job $OLD_JOB}${STATE:+ state=$STATE}; not reclaiming"
@@ -62,6 +84,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
       ;;
   esac
 fi
+
+[[ ! -e "$ROOT/$TRAIN_DIR" && ! -e "$ROOT/$EVAL_DIR" ]] || {
+  echo 'ABC output already exists without a reclaimable failed reservation; refusing overwrite'
+  exit 2
+}
+mkdir "$LOCK"
 HEAD=$(git rev-parse HEAD)
 EXPORT="ALL,ABC_REFERENCE_ROOT=$ROOT,ABC_CODE_REPO=$REPO,ABC_CODE_SHA=$HEAD,ABC_STAGE=$STAGE"
 if ! JOB=$(sbatch --parsable --partition=GPU --nodelist=3090node3 --nodes=1 --ntasks=1 --gres=gpu:3090:4 --cpus-per-task=16 --time="$LIMIT" --job-name="h9_abc_$STAGE" --chdir="$REPO" --output="$ROOT/logs/abc_${STAGE}_%j.out" --error="$ROOT/logs/abc_${STAGE}_%j.out" --export="$EXPORT" "$REPO/$DIR/worker.sbatch"); then
