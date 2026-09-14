@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import copy
 import unittest
 import torch
 
 import abc_protocol as proto
 from abc_model import build_arm, function_equivalence
 import sensor_objective as routed
+from train_arm import sample_global_indices_single, sample_shared_q_single
 
 old=proto.old
 
@@ -25,6 +27,21 @@ class ABCTests(unittest.TestCase):
             result=function_equivalence(self.base,model,self.x)
             self.assertLess(result["max_abs_value_error"],1e-7,arm)
             self.assertLess(result["max_abs_q_gradient_error"],1e-7,arm)
+
+    def test_frozen_p0_reenables_only_sensor_specific_copies(self):
+        frozen=copy.deepcopy(self.base).requires_grad_(False)
+        for arm in proto.ARMS:
+            model=build_arm(frozen,arm)
+            trainable={n for n,p in model.named_parameters() if p.requires_grad}
+            self.assertTrue(any(n.startswith("sensor_heads.") for n in trainable),arm)
+            self.assertFalse(any(n.startswith("union_head") for n in trainable),arm)
+            if arm in ("A","B"):
+                self.assertFalse(any(n.startswith("shared") for n in trainable),arm)
+            if arm=="B":
+                self.assertTrue(any(n.startswith("adapters.") for n in trainable))
+            if arm=="C":
+                self.assertTrue(any(n.startswith("private_tails.") for n in trainable))
+                self.assertFalse(any(n.startswith("early") or n.startswith("union_tail") for n in trainable))
 
     def test_gradient_routing_is_sensor_specific(self):
         for arm in proto.ARMS:
@@ -60,6 +77,27 @@ class ABCTests(unittest.TestCase):
             self.assertFalse(a.requires_grad)
             self.assertTrue(b.requires_grad)
 
+    def test_single_process_sampler_needs_no_process_group_and_is_reproducible(self):
+        class FakeDataset:
+            J=3
+            train_indices_cpu=torch.tensor([10,20,30,40],dtype=torch.long)
+            val_indices_cpu=torch.tensor([50,60],dtype=torch.long)
+            def q_limits(self,device):
+                return (torch.tensor([-1.,-2.,-3.],device=device),
+                        torch.tensor([1.,2.,3.],device=device))
+        ds=FakeDataset(); device=torch.device("cpu")
+        torch.manual_seed(123)
+        i0=sample_global_indices_single(ds,"train",7,device)
+        q0=sample_shared_q_single(ds,5,device)
+        torch.manual_seed(123)
+        i1=sample_global_indices_single(ds,"train",7,device)
+        q1=sample_shared_q_single(ds,5,device)
+        self.assertTrue(torch.equal(i0,i1))
+        self.assertTrue(torch.equal(q0,q1))
+        self.assertTrue(torch.isin(i0,ds.train_indices_cpu).all())
+        self.assertTrue(((q0>=torch.tensor([-1.,-2.,-3.])) &
+                         (q0<=torch.tensor([1.,2.,3.]))).all())
+
     def test_routed_loss_microbatch_additivity(self):
         """Optimizer loss must match; diagnostic FP32 reductions need FP32 tolerance.
 
@@ -83,11 +121,8 @@ class ABCTests(unittest.TestCase):
         l1,s1=routed.loss_for_microbatch(model,inputs[9:],target[9:],grad[9:],mask[9:],counts,weights,training=False)
         self.assertTrue(torch.allclose(full,l0+l1,atol=2e-6,rtol=2e-6))
         summed=s0+s1
-        # count and sign_correct are integer sums represented in float64 stats.
         for col in (routed.COUNT,routed.SIGN):
             self.assertTrue(torch.equal(st_full[:,col],summed[:,col]),f"column={col}")
-        # Continuous entries originate from FP32 reductions, so use an FP32-scale
-        # tolerance rather than an impossible 1e-8 exact-reduction requirement.
         continuous=[routed.SDF,routed.GRAD,routed.EIK,routed.TENSION,routed.ABS,routed.NORM]
         self.assertTrue(torch.allclose(st_full[:,continuous],summed[:,continuous],atol=3e-6,rtol=3e-6))
 
