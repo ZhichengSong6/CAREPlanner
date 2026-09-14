@@ -23,6 +23,16 @@ def _freeze(module: nn.Module) -> nn.Module:
     return module
 
 
+def _train(module: nn.Module) -> nn.Module:
+    """Explicitly re-enable copied task-specific parameters.
+
+    P0 is intentionally passed in frozen. deepcopy preserves requires_grad=False,
+    so every sensor-specific copy that is meant to train must be re-enabled here.
+    """
+    module.requires_grad_(True)
+    return module
+
+
 class ResidualAdapter(nn.Module):
     """Small trainable residual block initialized to exact identity."""
     def __init__(self, width: int, bottleneck: int | None = None) -> None:
@@ -52,14 +62,18 @@ class ABCVisibilityModel(nn.Module):
         if len(self.shared_layers) != 3:
             raise ValueError("ABC C split assumes exactly three shared hidden layers")
 
+        # Union always stays exactly on the P0 path and is frozen.
         self.union_head = _freeze(copy.deepcopy(p0.union_head))
+
         children = list(p0.shared.children())
         if len(children) != 6:
             raise ValueError("Expected Linear/ReLU x3 shared trunk")
 
         if arm in ("A", "B"):
             self.shared = _freeze(copy.deepcopy(p0.shared))
-            self.sensor_heads = copy.deepcopy(p0.sensor_heads)
+            # P0 itself is loaded frozen for safety. Re-enable ONLY task-specific
+            # decoder copies; otherwise deepcopy would silently preserve False.
+            self.sensor_heads = _train(copy.deepcopy(p0.sensor_heads))
             if arm == "B":
                 width = self.shared_layers[-1]
                 self.adapters = nn.ModuleList([
@@ -68,13 +82,16 @@ class ABCVisibilityModel(nn.Module):
             else:
                 self.adapters = None
         else:
+            # Early trunk 30->1024->512 is immutable. The original final
+            # 512->256 shared block is copied once for union and eight times for sensors.
             self.early = _freeze(nn.Sequential(*copy.deepcopy(children[:4])))
             self.union_tail = _freeze(nn.Sequential(*copy.deepcopy(children[4:])))
-            self.private_tails = nn.ModuleList([
+            self.private_tails = _train(nn.ModuleList([
                 nn.Sequential(*copy.deepcopy(children[4:])) for _ in range(NUM_SENSORS)
-            ])
-            self.sensor_heads = copy.deepcopy(p0.sensor_heads)
+            ]))
+            self.sensor_heads = _train(copy.deepcopy(p0.sensor_heads))
 
+        # Defensive invariant: only intended sensor-specific modules are trainable.
         trainable = [n for n, p in self.named_parameters() if p.requires_grad]
         if not trainable:
             raise RuntimeError("ABC model has no trainable sensor-specific parameters")
@@ -128,20 +145,7 @@ class ABCVisibilityModel(nn.Module):
         return self.sensor_heads[sensor_id](h).squeeze(-1)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        """Compute the shared prefix once so latency is not artificially doubled."""
-        e = self.encode(inputs)
-        if self.arm in ("A", "B"):
-            h = self.shared(e)
-            union = self.union_head(h)
-            if self.arm == "A":
-                sensors = [self.sensor_heads[s](h) for s in range(NUM_SENSORS)]
-            else:
-                sensors = [self.sensor_heads[s](self.adapters[s](h)) for s in range(NUM_SENSORS)]
-        else:
-            h512 = self.early(e)
-            union = self.union_head(self.union_tail(h512))
-            sensors = [self.sensor_heads[s](self.private_tails[s](h512)) for s in range(NUM_SENSORS)]
-        return torch.cat([union] + sensors, dim=-1)
+        return torch.cat((self.forward_union(inputs)[:, None], self.forward_sensors(inputs)), dim=1)
 
     def trainable_parameters(self) -> Iterable[nn.Parameter]:
         return (p for p in self.parameters() if p.requires_grad)
