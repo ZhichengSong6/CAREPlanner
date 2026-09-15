@@ -64,16 +64,17 @@ PY
 done
 
 if [[ "$R012_MODE" == smoke ]]; then
-python - "$BASE" "$ROOT/smoke_manifest.json" <<'PY'
+python - "$BASE" "$ROOT/smoke_manifest.json" "$R012_CODE_SHA" <<'PY'
 import json,sys
 from pathlib import Path
-base=Path(sys.argv[1]);out=Path(sys.argv[2]); rows={a:json.load(open(base/a/'run.json')) for a in ('R0','R1','R2')}
+base=Path(sys.argv[1]);out=Path(sys.argv[2]);code_sha=sys.argv[3]
+rows={a:json.load(open(base/a/'run.json')) for a in ('R0','R1','R2')}
 h={r['training_stream_sha256'] for r in rows.values()}
 if len(h)!=1: raise SystemExit(f'smoke streams differ: {h}')
-m={'status':'COMPLETE','mode':'smoke','arms':list(rows),'training_streams':'MATCH','training_stream_sha256':next(iter(h))}
+m={'status':'COMPLETE','mode':'smoke','arms':list(rows),'training_streams':'MATCH','training_stream_sha256':next(iter(h)),'code_sha':code_sha}
 out.write_text(json.dumps(m,indent=2)+'\n')
-print('[done] r012_smoke_complete stream='+next(iter(h)),flush=True)
+print('[done] r012_smoke_complete code='+code_sha+' stream='+next(iter(h)),flush=True)
 PY
 else
-  echo "[done] r012_formal_arm_complete arm=$R012_ARM"
+  echo "[done] r012_formal_arm_complete arm=$R012_ARM code=$R012_CODE_SHA"
 fi
