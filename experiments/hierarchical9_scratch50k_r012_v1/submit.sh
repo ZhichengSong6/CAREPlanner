@@ -9,6 +9,7 @@ mkdir -p "$ROOT/logs"; ROOT=$(realpath -e "$ROOT")
 cd "$REPO"
 
 git diff --quiet && git diff --cached --quiet || { echo '[ERROR] save tracked changes before submission'; exit 2; }
+HEAD=$(git rev-parse HEAD)
 
 verify_arm() {
   local arm="$1" steps="$2" p="$ROOT/formal/$arm/run.json"
@@ -40,11 +41,19 @@ fi
 
 if [[ "$STAGE" != smoke ]]; then
   [[ -s "$ROOT/smoke_manifest.json" ]] || { echo '[ERROR] complete smoke first'; exit 2; }
-  python3 - "$ROOT/smoke_manifest.json" <<'PY'
+  SMOKE_SHA=$(python3 - "$ROOT/smoke_manifest.json" <<'PY'
 import json,sys
-m=json.load(open(sys.argv[1]));assert m.get('status')=='COMPLETE' and m.get('training_streams')=='MATCH',m
-print('[preflight] smoke COMPLETE, streams MATCH')
+m=json.load(open(sys.argv[1]))
+assert m.get('status')=='COMPLETE' and m.get('training_streams')=='MATCH',m
+print(m['code_sha'])
 PY
+)
+  [[ "$HEAD" == "$SMOKE_SHA" ]] || {
+    echo "[ERROR] code changed since smoke: smoke=$SMOKE_SHA current=$HEAD" >&2
+    echo '[ERROR] keep this branch frozen through R0/R1/R2, or archive the experiment and rerun smoke.' >&2
+    exit 2
+  }
+  echo "[preflight] smoke COMPLETE, streams MATCH, frozen code=$SMOKE_SHA"
 fi
 
 RESUME=0
@@ -78,7 +87,6 @@ if [[ -e "$LOCK" ]]; then
   case "$STATE" in COMPLETED|FAILED|CANCELLED|TIMEOUT|OUT_OF_MEMORY|NODE_FAIL|PREEMPTED|BOOT_FAIL) mv "$LOCK" "$ROOT/.submit_archive_${STAGE}_${OLD}_$(date +%Y%m%d_%H%M%S)";; *) echo "[ERROR] stage reserved${OLD:+ job=$OLD}${STATE:+ state=$STATE}"; exit 2;; esac
 fi
 mkdir "$LOCK"
-HEAD=$(git rev-parse HEAD)
 EXPORT="ALL,R012_ROOT=$ROOT,R012_CODE_REPO=$REPO,R012_CODE_SHA=$HEAD,R012_MODE=$MODE,R012_ARM=$ARM,R012_RESUME=$RESUME"
 ERR=$(mktemp); trap 'rm -f "$ERR"' EXIT
 set +e
@@ -96,6 +104,6 @@ if [[ $RC -ne 0 ]]; then
 fi
 JOB=${JOB%%;*}; [[ "$JOB" =~ ^[0-9]+$ ]] || { echo "$JOB" > "$LOCK/unparsed"; exit 2; }
 echo "$JOB" > "$LOCK/job_id"; printf '%s=%s\n' "$KEY" "$JOB" >> "$ROOT/r012_jobs.env"
-echo "[submitted] R012 stage=$STAGE job=$JOB mode=$MODE arm=$ARM node=3090node3 gpus=4"
+echo "[submitted] R012 stage=$STAGE job=$JOB mode=$MODE arm=$ARM node=3090node3 gpus=4 code=$HEAD"
 echo "tail -n 160 -F $ROOT/logs/r012_${STAGE}_${JOB}.out"
 echo "sacct -j $JOB --format=JobID,State,ExitCode,Elapsed"
