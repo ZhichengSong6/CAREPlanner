@@ -12,15 +12,26 @@ git diff --quiet && git diff --cached --quiet || { echo '[ERROR] save tracked ch
 HEAD=$(git rev-parse HEAD)
 
 verify_arm() {
-  local arm="$1" steps="$2" p="$ROOT/formal/$arm/run.json"
+  # Keep these declarations separate under `set -u`: Bash expands the RHS of a
+  # compound `local arm=... p=...$arm...` before `arm` is assigned.
+  local arm="$1"
+  local steps="$2"
+  local p="$ROOT/formal/$arm/run.json"
   python3 - "$p" "$arm" "$steps" <<'PY'
-import json,sys
+import hashlib,json,sys
 from pathlib import Path
 p,arm,n=Path(sys.argv[1]),sys.argv[2],int(sys.argv[3])
 if not p.is_file(): raise SystemExit(f'Missing {p}')
 r=json.loads(p.read_text())
+final=p.parent/'final.pt'
 if r.get('status')!='COMPLETE' or r.get('arm')!=arm or r.get('successful_updates')!=n or not r.get('final_sha256'):
     raise SystemExit(f'Incomplete {arm}: {r}')
+if not final.is_file(): raise SystemExit(f'Missing {final}')
+h=hashlib.sha256()
+with final.open('rb') as f:
+    for b in iter(lambda:f.read(1<<20),b''): h.update(b)
+if h.hexdigest()!=r['final_sha256']:
+    raise SystemExit(f'Checkpoint SHA mismatch for {arm}')
 print(f'[verified] {arm} COMPLETE updates={n} stream={r.get("training_stream_sha256")}')
 PY
 }
@@ -48,12 +59,25 @@ assert m.get('status')=='COMPLETE' and m.get('training_streams')=='MATCH',m
 print(m['code_sha'])
 PY
 )
-  [[ "$HEAD" == "$SMOKE_SHA" ]] || {
-    echo "[ERROR] code changed since smoke: smoke=$SMOKE_SHA current=$HEAD" >&2
-    echo '[ERROR] keep this branch frozen through R0/R1/R2, or archive the experiment and rerun smoke.' >&2
-    exit 2
-  }
-  echo "[preflight] smoke COMPLETE, streams MATCH, frozen code=$SMOKE_SHA"
+  if [[ "$HEAD" != "$SMOKE_SHA" ]]; then
+    # Training/scientific code must stay byte-for-byte frozen after smoke.  Permit
+    # only this submission wrapper to change so scheduler/preflight bugs can be
+    # repaired without invalidating an already-complete 50k arm.
+    mapfile -t CHANGED < <(git diff --name-only "$SMOKE_SHA" "$HEAD")
+    BAD=()
+    for f in "${CHANGED[@]}"; do
+      [[ "$f" == "$DIR/submit.sh" ]] || BAD+=("$f")
+    done
+    if (( ${#BAD[@]} )); then
+      echo "[ERROR] scientific code changed since smoke: smoke=$SMOKE_SHA current=$HEAD" >&2
+      printf '[ERROR] changed: %s\n' "${BAD[@]}" >&2
+      echo '[ERROR] archive the experiment and rerun smoke before continuing.' >&2
+      exit 2
+    fi
+    echo "[preflight] smoke COMPLETE; training code frozen at $SMOKE_SHA; allowing submit.sh-only orchestration patch at $HEAD"
+  else
+    echo "[preflight] smoke COMPLETE, streams MATCH, frozen code=$SMOKE_SHA"
+  fi
 fi
 
 RESUME=0
