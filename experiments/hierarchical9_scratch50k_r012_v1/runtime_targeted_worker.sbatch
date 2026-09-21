@@ -10,7 +10,20 @@ R1="$ROOT/formal/R1/final.pt"
 V1=$(realpath -e "$V1_CHECKPOINT")
 SCALAR=$(realpath -e "$SCALAR_CHECKPOINT")
 OUT="$ROOT/runtime_targeted_v1_r1"
-[[ ! -e "$OUT" ]] || { echo "[ERROR] output exists: $OUT"; exit 2; }
+if [[ -e "$OUT" ]]; then
+  if [[ -s "$OUT/targeted_compare.json" ]] && python3 - "$OUT/targeted_compare.json" <<'PY'
+import json,sys
+r=json.load(open(sys.argv[1]))
+raise SystemExit(0 if r.get("valid_diagnostic") is True else 1)
+PY
+  then
+    echo "[ERROR] completed targeted qualification already exists: $OUT" >&2
+    exit 2
+  fi
+  ARCHIVE="$ROOT/.runtime_targeted_v1_r1_failed_$(date +%Y%m%d_%H%M%S)"
+  mv "$OUT" "$ARCHIVE"
+  echo "[archive] previous incomplete targeted output -> $ARCHIVE"
+fi
 cd "$REPO"
 OUT="$OUT" REPO="$REPO" V1_CHECKPOINT="$V1" R1_CHECKPOINT="$R1" SCALAR_CHECKPOINT="$SCALAR" VIS_PYTHON="$VIS_PYTHON" DEVICE=cuda \
   bash scripts/run_phase_e_v1_r1_targeted_qualification.sh
