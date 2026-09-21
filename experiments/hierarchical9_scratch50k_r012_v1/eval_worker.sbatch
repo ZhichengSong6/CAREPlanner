@@ -20,6 +20,43 @@ export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
 export PYTHONUNBUFFERED=1
 
 python -m py_compile "$DIR/evaluate_unified.py"
+
+# Fail fast on every dynamic import used by the evaluator.  old.module() requires
+# the import name to equal the actual filename, so verify both importability and
+# resolved __file__ before loading any checkpoint or running any solve.
+python - <<'PY'
+from pathlib import Path
+import os, sys
+repo=Path(os.environ['R012_CODE_REPO']).resolve()
+rdir=repo/'experiments/hierarchical9_scratch50k_r012_v1'
+e012=repo/'experiments/hierarchical9_e012_end2end_v1'
+abc=repo/'experiments/hierarchical9_abc_capacity_routing_v1'
+for p in (str(rdir),str(abc),str(e012)):
+    if p not in sys.path: sys.path.insert(0,p)
+import e012_protocol as proto
+local=proto._load('r012_eval_preflight_local_model',rdir/'model.py')
+assert hasattr(local,'build_model')
+compat=proto._load('r012_eval_preflight_compat',abc/'eval_compat.py')
+assert hasattr(compat,'legacy_compatible')
+checks=[
+    ('evaluate_pair',proto.abc.p2.LEGACY),
+    ('evaluate_p2',proto.abc.P2_DIR),
+    ('neighborhood',proto.P3_DIR),
+    ('train_signed_visibility_cdf_pairwise_replace',proto.old.SCRIPTS),
+    ('oracle',proto.old.AUDIT),
+    ('core',proto.old.AUDIT),
+    ('runtime_probe',proto.old.AUDIT),
+    ('audit',proto.old.AUDIT),
+]
+for name,directory in checks:
+    mod=proto.old.module(name,directory)
+    expected=(Path(directory)/(name+'.py')).resolve()
+    got=Path(mod.__file__).resolve()
+    assert got==expected,(name,got,expected)
+    print('[import-ok]',name,got,flush=True)
+print('[done] unified-eval import preflight OK',flush=True)
+PY
+
 python - <<'PY'
 import torch
 assert torch.cuda.is_available(), 'CUDA unavailable'
