@@ -49,6 +49,11 @@ from check_visibility_self_occlusion import (
     q_row_to_map,
     raycast_self_occlusion,
 )
+from hierarchical_visibility_cdf_model import (
+    HierarchicalSensorView,
+    build_from_checkpoint_args,
+    build_private_tail_from_checkpoint_architecture,
+)
 
 
 class _RayArgs:
@@ -79,7 +84,53 @@ def _parse_skips(raw) -> Tuple[int, ...]:
 
 
 def build_per_sensor_model(checkpoint_path: str, device: torch.device):
+    """Load old8, hierarchical9 V1, or the frozen R1 private-tail champion.
+
+    Runtime semantics remain eight sensor outputs. Hierarchical checkpoints are
+    loaded as complete 9-output networks and wrapped only at the interface so
+    union weights remain present and q gradients through sensor outputs are exact.
+    """
     ckpt = torch_load_checkpoint(checkpoint_path, device)
+    fmt = str(ckpt.get("format", ""))
+
+    if fmt == "careplanner_hierarchical9_scratch_v1":
+        if int(ckpt.get("step", -1)) != 50000:
+            raise RuntimeError("hierarchical9 V1 runtime requires step=50000")
+        if int(ckpt.get("out_dim", -1)) != 9:
+            raise RuntimeError("hierarchical9 V1 runtime requires out_dim=9")
+        if str(ckpt.get("initialization", "")) != "random_from_scratch":
+            raise RuntimeError("hierarchical9 V1 runtime requires scratch initialization")
+        semantics = str(ckpt.get("output_semantics", ""))
+        if semantics != "hierarchical_union_plus_per_sensor_signed_visibility_cdf":
+            raise RuntimeError(
+                "unexpected hierarchical9 V1 semantics: {!r}".format(semantics)
+            )
+        full = build_from_checkpoint_args(ckpt.get("args", {})).to(device)
+        full.load_state_dict(ckpt["model_state"], strict=True)
+        full.eval().requires_grad_(False)
+        return HierarchicalSensorView(full).to(device).eval(), ckpt
+
+    if fmt == "care_h9_scratch50k_r012_v1":
+        if ckpt.get("arm") != "R1":
+            raise RuntimeError(
+                "R012 runtime qualification accepts only promoted arm R1, got {!r}".format(
+                    ckpt.get("arm")
+                )
+            )
+        if not bool(ckpt.get("completed", False)) or int(ckpt.get("step", -1)) != 50000:
+            raise RuntimeError("R1 runtime requires completed step=50000 checkpoint")
+        if str(ckpt.get("initialization", "")) != "random_from_scratch":
+            raise RuntimeError("R1 runtime requires scratch initialization")
+        if int(ckpt.get("frozen_parameters", -1)) != 0:
+            raise RuntimeError("R1 runtime checkpoint unexpectedly reports frozen parameters")
+        full = build_private_tail_from_checkpoint_architecture(
+            ckpt.get("architecture", {})
+        ).to(device)
+        full.load_state_dict(ckpt["model_state"], strict=True)
+        full.eval().requires_grad_(False)
+        return HierarchicalSensorView(full).to(device).eval(), ckpt
+
+    # Historical 8-head checkpoint path: preserve the old loader exactly.
     semantics = str(ckpt.get("output_semantics", ""))
     if semantics and semantics != "per_sensor_signed_visibility_cdf":
         raise RuntimeError(
@@ -90,7 +141,7 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
     out_dim = int(ckpt.get("out_dim", 8))
     if out_dim != 8:
         raise RuntimeError(
-            "per-sensor runtime requires out_dim=8, checkpoint has {}".format(
+            "per-sensor runtime requires old8 out_dim=8, checkpoint has {}".format(
                 out_dim
             )
         )
@@ -109,6 +160,7 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
     model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     return model, ckpt
+
 
 
 class PerSensorVisibilityRuntime:
