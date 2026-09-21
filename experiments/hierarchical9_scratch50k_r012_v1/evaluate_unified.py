@@ -149,13 +149,13 @@ def main():
     if len(r_streams)!=1: raise ValueError(f'R0/R1/R2 stream mismatch: {r_streams}')
     names=list(MODEL_ORDER)
     if list(models)!=names: raise RuntimeError(f'Unexpected model order: {list(models)}')
-    ev=old.module('r012_unified_evaluate_pair',eproto.abc.p2.LEGACY); stats=old.module('r012_unified_evaluate_p2',eproto.abc.P2_DIR)
-    side=old.module('r012_unified_neighborhood',eproto.P3_DIR); api=old.module('r012_unified_train_api',old.SCRIPTS)
+    ev=old.module('evaluate_pair',eproto.abc.p2.LEGACY); stats=old.module('evaluate_p2',eproto.abc.P2_DIR)
+    side=old.module('neighborhood',eproto.P3_DIR); api=old.module('train_signed_visibility_cdf_pairwise_replace',old.SCRIPTS)
     dataset=api.VisibilityQ0Dataset(str(artifact/old.DATA_REL),1000,0); cache.verify_dataset(dataset,artifact/old.DATA_REL)
-    oracle=old.module('r012_unified_oracle',old.AUDIT).SensorOracle(old.URDF,device,api.DEFAULT_JOINT_NAMES,api.DEFAULT_SENSOR_FRAMES)
-    pair=side.PairwiseFOV(oracle); core=old.module('r012_unified_core',old.AUDIT); probeapi=old.module('r012_unified_runtime_probe',old.AUDIT)
+    oracle=old.module('oracle',old.AUDIT).SensorOracle(old.URDF,device,api.DEFAULT_JOINT_NAMES,api.DEFAULT_SENSOR_FRAMES)
+    pair=side.PairwiseFOV(oracle); core=old.module('core',old.AUDIT); probeapi=old.module('runtime_probe',old.AUDIT)
     lo,hi=dataset.q_limits(device); probes={k:probeapi.make_probe(ev.SensorView(v),dataset.sensor_masks(device),lo,hi) for k,v in models.items()}
-    checks=old.module('r012_unified_audit',old.AUDIT).preflight(dataset,oracle,probes,device); checks['pairwise_neighbor_FOV']=pair.verify(cache,device)
+    checks=old.module('audit',old.AUDIT).preflight(dataset,oracle,probes,device); checks['pairwise_neighbor_FOV']=pair.verify(cache,device)
     out.mkdir(parents=True)
     manifest={'status':'RUNNING','evaluation':'unified_development','evaluated_models':names,'r012_training_streams':'MATCH','r012_training_stream_sha256':next(iter(r_streams)),
         'r012_training_stream_updates':50000,'checkpoint_sha256':checkpoint_digests,'p0_sha256':p0_sha,'cache_manifest_sha256':cache.identity,'preflight':checks,
