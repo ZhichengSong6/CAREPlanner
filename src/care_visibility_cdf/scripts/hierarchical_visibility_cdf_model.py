@@ -138,3 +138,129 @@ def build_from_checkpoint_args(args: dict) -> HierarchicalVisibilityCDF:
         nerf=bool(args.get("nerf", True)),
         num_sensors=NUM_SENSORS,
     )
+
+
+class PrivateTailVisibilityCDF(nn.Module):
+    """R1 runtime architecture: shared 30->1024->512 then nine private 512->256 tails."""
+
+    def __init__(
+        self,
+        in_dim: int = 10,
+        shared_early=(1024, 512),
+        tail_dim: int = 256,
+        branch_layers=(128, 128),
+        nerf: bool = True,
+        num_sensors: int = NUM_SENSORS,
+    ):
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.nerf = bool(nerf)
+        self.num_sensors = int(num_sensors)
+        if self.num_sensors != NUM_SENSORS:
+            raise ValueError(
+                f"CAREPlanner private-tail model expects {NUM_SENSORS} sensors"
+            )
+        early = parse_layers(shared_early, default=(1024, 512))
+        if len(early) != 2:
+            raise ValueError("private-tail runtime expects exactly two shared-early layers")
+        self.shared_early_layers = early
+        self.tail_dim = int(tail_dim)
+        if self.tail_dim <= 0:
+            raise ValueError("tail_dim must be positive")
+        self.branch_layers = parse_layers(branch_layers, default=(128, 128))
+        self.encoded_dim = 3 * self.in_dim if self.nerf else self.in_dim
+
+        layers = []
+        prev = self.encoded_dim
+        for width in self.shared_early_layers:
+            layers.extend([nn.Linear(prev, width), nn.ReLU()])
+            prev = width
+        self.early = nn.Sequential(*layers)
+        self.union_tail = nn.Sequential(nn.Linear(prev, self.tail_dim), nn.ReLU())
+        self.sensor_tails = nn.ModuleList([
+            nn.Sequential(nn.Linear(prev, self.tail_dim), nn.ReLU())
+            for _ in range(self.num_sensors)
+        ])
+        self.union_head = _make_mlp(self.tail_dim, self.branch_layers, 1)
+        self.sensor_heads = nn.ModuleList([
+            _make_mlp(self.tail_dim, self.branch_layers, 1)
+            for _ in range(self.num_sensors)
+        ])
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        if self.nerf:
+            return torch.cat((x, torch.sin(x), torch.cos(x)), dim=-1)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.early(self.encode(x))
+        union = self.union_head(self.union_tail(h))
+        sensors = torch.cat([
+            self.sensor_heads[s](self.sensor_tails[s](h))
+            for s in range(self.num_sensors)
+        ], dim=-1)
+        return torch.cat([union, sensors], dim=-1)
+
+    def forward_union(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.early(self.encode(x))
+        return self.union_head(self.union_tail(h)).squeeze(-1)
+
+    def forward_sensor(self, x: torch.Tensor, sensor_id: int) -> torch.Tensor:
+        sensor_id = int(sensor_id)
+        if not 0 <= sensor_id < self.num_sensors:
+            raise ValueError("sensor_id out of range")
+        h = self.early(self.encode(x))
+        return self.sensor_heads[sensor_id](self.sensor_tails[sensor_id](h)).squeeze(-1)
+
+    def forward_sensors(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.early(self.encode(x))
+        return torch.cat([
+            self.sensor_heads[s](self.sensor_tails[s](h))
+            for s in range(self.num_sensors)
+        ], dim=-1)
+
+    def parameter_count(self) -> int:
+        return sum(p.numel() for p in self.parameters())
+
+
+class HierarchicalSensorView(nn.Module):
+    """Expose only S0..S7 while retaining the complete 9-output model and q gradients."""
+
+    def __init__(self, full_model: nn.Module):
+        super().__init__()
+        self.full_model = full_model
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pred = self.full_model(x)
+        if pred.ndim != 2 or pred.shape[1] != OUTPUT_DIM:
+            raise RuntimeError(
+                f"expected full hierarchical [N,{OUTPUT_DIM}], got {tuple(pred.shape)}"
+            )
+        return pred[:, 1:]
+
+
+def build_private_tail_from_checkpoint_architecture(
+    architecture: dict | None = None,
+) -> PrivateTailVisibilityCDF:
+    architecture = dict(architecture or {})
+    name = architecture.get("name")
+    if name not in (None, "private_tail_h9"):
+        raise ValueError(f"unexpected private-tail architecture name: {name!r}")
+    shared = architecture.get("shared_early", [30, 1024, 512])
+    if list(shared) != [30, 1024, 512]:
+        raise ValueError(f"unexpected shared_early: {shared!r}")
+    tail = architecture.get("sensor_tail", [512, 256])
+    union_tail = architecture.get("union_tail", [512, 256])
+    if list(tail) != [512, 256] or list(union_tail) != [512, 256]:
+        raise ValueError("unexpected private-tail dimensions")
+    branch = architecture.get("sensor_decoder", [256, 128, 128, 1])
+    if list(branch) != [256, 128, 128, 1]:
+        raise ValueError(f"unexpected sensor decoder: {branch!r}")
+    return PrivateTailVisibilityCDF(
+        in_dim=10,
+        shared_early=(1024, 512),
+        tail_dim=256,
+        branch_layers=(128, 128),
+        nerf=True,
+        num_sensors=NUM_SENSORS,
+    )
