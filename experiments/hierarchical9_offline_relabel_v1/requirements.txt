@@ -1,0 +1,8 @@
+# Use the existing viscdf environment. No automatic install/upgrade is performed.
+# CPU synthetic tests were run with numpy 2.3.5, scipy 1.17.0, torch 2.10.0+cpu.
+# No SciPy multipliers/workers feature specific to a new release is used.
+numpy>=1.24
+scipy>=1.10
+torch>=2.0
+urdf-parser-py>=0.0.4
+# Also requires the existing CAREPlanner scripts and their normal dependencies.
