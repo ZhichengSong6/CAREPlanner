@@ -41,11 +41,12 @@ PY
 python - <<'PY'
 import torch
 assert torch.cuda.is_available()
-assert torch.cuda.device_count()>=1
-print('[gpu]',torch.cuda.get_device_name(0),flush=True)
+assert torch.cuda.device_count()==4, torch.cuda.device_count()
+print('[gpus]',[torch.cuda.get_device_name(i) for i in range(4)],flush=True)
 PY
 
-python "$DIR/evaluate_fresh_holdout.py" --r012-root "$ROOT" --reference-root "$REF"
+python -m torch.distributed.run --standalone --nproc_per_node=4 \
+  "$DIR/evaluate_fresh_holdout.py" --r012-root "$ROOT" --reference-root "$REF"
 
 python - "$ROOT/evaluation_fresh_holdout_v1/manifest.json" <<'PY'
 import json,sys
