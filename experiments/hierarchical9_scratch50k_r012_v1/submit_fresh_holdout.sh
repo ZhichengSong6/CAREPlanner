@@ -44,8 +44,8 @@ JOB=$(sbatch --parsable \
   --nodelist='3090node[1-3]' \
   --nodes=1 \
   --ntasks=1 \
-  --gres=gpu:3090:1 \
-  --cpus-per-task=8 \
+  --gres=gpu:3090:4 \
+  --cpus-per-task=16 \
   --time=02:00:00 \
   --job-name=h9_r1_fresh \
   --chdir="$REPO" \
@@ -57,6 +57,6 @@ JOB=$(sbatch --parsable \
 JOB=${JOB%%;*}
 printf 'R012_FRESH_HOLDOUT_JOB=%s\n' "$JOB" >> "$ROOT/r012_jobs.env"
 
-echo "[submitted] fresh holdout job=$JOB nodes=3090node[1-3] gpu=1 code=$HEAD"
+echo "[submitted] fresh holdout job=$JOB nodes=3090node[1-3] gpus=4 code=$HEAD"
 echo "tail -n 160 -F $ROOT/logs/r012_fresh_holdout_${JOB}.out"
 echo "sacct -j $JOB --format=JobID,State,ExitCode,Elapsed,NodeList"
