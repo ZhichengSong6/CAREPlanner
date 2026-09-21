@@ -15,6 +15,7 @@ from per_sensor_visibility_runtime import build_per_sensor_model
 
 V1_SHA="979552db20bc7e20775758b273613532921c5dbf11c480b13597127683c4c199"
 R1_SHA="4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002"
+OLD8_SHA="43f962729adcd17aa114edb9fc410facbbb97ebe7343f0ad3309fe50d273acdb"
 
 def sha256(path:Path)->str:
     h=hashlib.sha256()
@@ -106,10 +107,29 @@ def check_one(kind,path,expected_sha,device,repeats):
             "q_recompute_max_delta":recompute_delta,"sensors":rows,
             "latency":latency(adapter,x,q,device,repeats)}
 
+def check_old8(path,device):
+    p=Path(path).expanduser().resolve()
+    if not p.is_file():
+        return {"status":"NOT_PRESENT","checkpoint":str(p)}
+    digest=sha256(p)
+    if digest!=OLD8_SHA: raise RuntimeError(f"old8 SHA mismatch {digest} != {OLD8_SHA}")
+    model,ckpt=build_per_sensor_model(str(p),device)
+    x=torch.tensor([[.1,.05,.15]],device=device,dtype=torch.float32)
+    q=torch.zeros((1,7),device=device,dtype=torch.float32,requires_grad=True)
+    pred=model(torch.cat([x,q],dim=-1))
+    if pred.shape!=(1,8): raise RuntimeError(f"old8 shape {tuple(pred.shape)}")
+    g=torch.autograd.grad(pred[0,0],q)[0]
+    if not torch.isfinite(g).all(): raise RuntimeError("old8 q gradient non-finite")
+    return {"status":"PASS","checkpoint":str(p),"sha256":digest,
+            "format":ckpt.get("format"),"shape":list(pred.shape),
+            "grad_norm":float(torch.linalg.vector_norm(g).item())}
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--v1-checkpoint",default=str(REPO/"src/care_visibility_cdf/checkpoints/hierarchical9_scratch_seed0/final.pt"))
     ap.add_argument("--r1-checkpoint",required=True)
+    ap.add_argument("--old8-checkpoint",default=str(REPO/"src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt"))
     ap.add_argument("--device",choices=("cpu","cuda"),default="cuda")
     ap.add_argument("--repeats",type=int,default=80)
     ap.add_argument("--output",default="")
@@ -120,6 +140,7 @@ def main():
     report={"device":str(device),"torch":torch.__version__,
             "V1":check_one("V1",a.v1_checkpoint,V1_SHA,device,a.repeats),
             "R1":check_one("R1",a.r1_checkpoint,R1_SHA,device,a.repeats),
+            "old8":check_old8(a.old8_checkpoint,device),
             "status":"PASS"}
     out=Path(a.output).resolve() if a.output else REPO/"outputs/phase_e_r1_runtime_qualification/runtime_adapter_test.json"
     out.parent.mkdir(parents=True,exist_ok=True); out.write_text(json.dumps(report,indent=2))
