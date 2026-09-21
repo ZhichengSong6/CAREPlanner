@@ -6,18 +6,19 @@ V1_CHECKPOINT="${V1_CHECKPOINT:-$REPO/src/care_visibility_cdf/checkpoints/hierar
 R1_CHECKPOINT="${R1_CHECKPOINT:-$REPO/outputs/mainline_b/h9_scratch50k_r012_v1/formal/R1/final.pt}"
 SCALAR_CHECKPOINT="${SCALAR_CHECKPOINT:-$REPO/src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt}"
 DEVICE="${DEVICE:-cuda}"
+VIS_PYTHON="${VIS_PYTHON:-python3}"
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUT="${OUT:-$REPO/outputs/phase_e_r1_runtime_qualification/$STAMP/targeted}"
 mkdir -p "$OUT"
 cd "$REPO"
 
-python3 -m py_compile \
+"$VIS_PYTHON" -m py_compile \
   src/care_visibility_cdf/scripts/hierarchical_visibility_cdf_model.py \
   src/care_visibility_cdf/scripts/per_sensor_visibility_runtime.py \
   scripts/test_phase_e_v1_r1_runtime_adapter.py \
   scripts/test_phase_e_case026_targeted_per_sensor_fallback.py
 
-python3 scripts/test_phase_e_v1_r1_runtime_adapter.py \
+"$VIS_PYTHON" scripts/test_phase_e_v1_r1_runtime_adapter.py \
   --v1-checkpoint "$V1_CHECKPOINT" \
   --r1-checkpoint "$R1_CHECKPOINT" \
   --device "$DEVICE" \
@@ -25,7 +26,7 @@ python3 scripts/test_phase_e_v1_r1_runtime_adapter.py \
 
 for label in v1 r1; do
   if [[ "$label" == v1 ]]; then ckpt="$V1_CHECKPOINT"; else ckpt="$R1_CHECKPOINT"; fi
-  python3 scripts/test_phase_e_case026_targeted_per_sensor_fallback.py \
+  "$VIS_PYTHON" scripts/test_phase_e_case026_targeted_per_sensor_fallback.py \
     --scalar-checkpoint "$SCALAR_CHECKPOINT" \
     --per-sensor-checkpoint "$ckpt" \
     --device "$DEVICE" \
@@ -44,7 +45,7 @@ for label in v1 r1; do
     2>&1 | tee "$OUT/case026_${label}.log"
 done
 
-python3 - "$OUT" <<'PY'
+"$VIS_PYTHON" - "$OUT" <<'PY'
 import json, os, sys
 root=sys.argv[1]
 v=json.load(open(os.path.join(root,'case026_v1.json')))
