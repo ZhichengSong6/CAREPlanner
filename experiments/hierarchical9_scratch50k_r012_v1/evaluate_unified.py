@@ -15,7 +15,11 @@ ABC_DIR=REPO/'experiments/hierarchical9_abc_capacity_routing_v1'
 for p in (str(E012_DIR),str(ABC_DIR),str(HERE)):
     if p not in sys.path: sys.path.insert(0,p)
 import e012_protocol as eproto
-from model import build_model as build_r012_model
+# e012_protocol loads the historical scratch trainer, which may register its
+# own model.py as sys.modules["model"].  Load the R012 architecture explicitly
+# by file path so evaluation cannot resolve the wrong module by name.
+r012_model=eproto._load('r012_unified_local_model',HERE/'model.py')
+build_r012_model=r012_model.build_model
 compat=eproto._load('r012_unified_eval_compat',ABC_DIR/'eval_compat.py')
 old=eproto.old
 R_ARMS=('R0','R1','R2'); E_ARMS=('E0','E1')
