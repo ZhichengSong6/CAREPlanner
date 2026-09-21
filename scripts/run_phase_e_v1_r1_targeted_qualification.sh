@@ -7,6 +7,7 @@ R1_CHECKPOINT="${R1_CHECKPOINT:-$REPO/outputs/mainline_b/h9_scratch50k_r012_v1/f
 SCALAR_CHECKPOINT="${SCALAR_CHECKPOINT:-$REPO/src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt}"
 DEVICE="${DEVICE:-cuda}"
 VIS_PYTHON="${VIS_PYTHON:-python3}"
+TARGETED_PARALLEL_4GPU="${TARGETED_PARALLEL_4GPU:-false}"
 STAMP="${STAMP:-$(date +%Y%m%d-%H%M%S)}"
 OUT="${OUT:-$REPO/outputs/phase_e_r1_runtime_qualification/$STAMP/targeted}"
 mkdir -p "$OUT"
@@ -24,9 +25,16 @@ cd "$REPO"
   --device "$DEVICE" \
   --output "$OUT/runtime_adapter_test.json"
 
-for label in v1 r1; do
-  if [[ "$label" == v1 ]]; then ckpt="$V1_CHECKPOINT"; else ckpt="$R1_CHECKPOINT"; fi
-  "$VIS_PYTHON" scripts/test_phase_e_case026_targeted_per_sensor_fallback.py \
+run_case026() {
+  local gpu="$1"
+  local label="$2"
+  local ckpt="$3"
+  local forced="$4"
+  local suffix="$5"
+  local out_json="$OUT/case026_${label}${suffix}.json"
+  local out_log="$OUT/case026_${label}${suffix}.log"
+
+  CUDA_VISIBLE_DEVICES="$gpu" "$VIS_PYTHON" scripts/test_phase_e_case026_targeted_per_sensor_fallback.py \
     --scalar-checkpoint "$SCALAR_CHECKPOINT" \
     --per-sensor-checkpoint "$ckpt" \
     --device "$DEVICE" \
@@ -40,10 +48,41 @@ for label in v1 r1; do
     --branch-step-size 0.05 \
     --branch-max-step-norm 0.25 \
     --max-branch-attempts 8 \
-    --force-first-sensor 4 \
-    --output "$OUT/case026_${label}.json" \
-    2>&1 | tee "$OUT/case026_${label}.log"
-done
+    --force-first-sensor "$forced" \
+    --output "$out_json" \
+    > >(tee "$out_log") 2>&1
+}
+
+if [[ "$TARGETED_PARALLEL_4GPU" == true ]]; then
+  "$VIS_PYTHON" - <<'PY'
+import torch
+assert torch.cuda.is_available(), "CUDA unavailable"
+assert torch.cuda.device_count() >= 4, torch.cuda.device_count()
+print("[targeted] 4-GPU parallel mode:", [torch.cuda.get_device_name(i) for i in range(4)], flush=True)
+PY
+
+  # Frozen primary protocol on GPU0/1: force historical S4 first.
+  run_case026 0 v1 "$V1_CHECKPOINT" 4 "" &
+  P0=$!
+  run_case026 1 r1 "$R1_CHECKPOINT" 4 "" &
+  P1=$!
+
+  # Supplemental online-order diagnostic on GPU2/3: pure learned ranking.
+  run_case026 2 v1 "$V1_CHECKPOINT" -1 "_pure" &
+  P2=$!
+  run_case026 3 r1 "$R1_CHECKPOINT" -1 "_pure" &
+  P3=$!
+
+  rc=0
+  wait "$P0" || rc=1
+  wait "$P1" || rc=1
+  wait "$P2" || rc=1
+  wait "$P3" || rc=1
+  [[ "$rc" -eq 0 ]] || { echo "[ERROR] one or more 4-GPU targeted subprocesses failed" >&2; exit 5; }
+else
+  run_case026 0 v1 "$V1_CHECKPOINT" 4 ""
+  run_case026 0 r1 "$R1_CHECKPOINT" 4 ""
+fi
 
 "$VIS_PYTHON" - "$OUT" <<'PY'
 import json, os, sys
@@ -77,11 +116,18 @@ def sanity(x):
     g=x['known_blocked_s4_geometry']
     return bool(g.get('any_primitive_self_occluded')) and float(g.get('min_conservative_g',-1)) > 0.0
 
+pure={}
+for name in ('v1','r1'):
+    p=os.path.join(root,f'case026_{name}_pure.json')
+    if os.path.isfile(p):
+        pure[name.upper()]=summary(json.load(open(p)))
+
 report={
     'qualification':'case026_targeted_v1_vs_r1',
     'adapter_status':a.get('status'),
     'known_blocked_s4_sanity':{'V1':sanity(v),'R1':sanity(r)},
     'V1':summary(v),'R1':summary(r),
+    'pure_ranking_diagnostic':pure,
 }
 report['valid_diagnostic']=bool(report['adapter_status']=='PASS' and all(report['known_blocked_s4_sanity'].values()))
 report['verdict']='TARGETED_VALID' if report['valid_diagnostic'] else 'TARGETED_INVALID'
@@ -96,6 +142,15 @@ lines=[
 for name in ('V1','R1'):
     x=report[name]
     lines.append(f"| {name} | {x['verdict']} | {x['selected_sensor_id']} | {x['rejected_sensor_ids']} | {int(x['strict_original_mode_fallback'])} | {x['branch_compute_ms']:.3f} |")
+if pure:
+    lines += ['', '## Pure learned ranking diagnostic','',
+              '| Model | branch verdict | selected sensor | learned ranking | branch ms |',
+              '|---|---|---:|---|---:|']
+    for name in ('V1','R1'):
+        if name in pure:
+            x=pure[name]
+            lines.append(f"| {name} | {x['verdict']} | {x['selected_sensor_id']} | {x['learned_ranking']} | {x['branch_compute_ms']:.3f} |")
+
 lines += ['', 'Historical blocked S4 sanity:', f"- V1: {report['known_blocked_s4_sanity']['V1']}", f"- R1: {report['known_blocked_s4_sanity']['R1']}", '',
           'NO_CLEAR_SENSOR_BRANCH is a valid targeted outcome. This stage does not certify trajectory/collision/execution safety.']
 open(os.path.join(root,'targeted_summary.md'),'w').write('\n'.join(lines)+'\n')
