@@ -1,0 +1,37 @@
+{
+  "origin": "User supplied smoke 16513 query_id=4 sensor_id=0; selection regression only, no geometry assertion",
+  "candidates": [
+    {
+      "attempt_id": 13,
+      "q_star": [
+        -1.2315887997388466,
+        2.2806933890123364,
+        -2.67513108253479,
+        0.4812181890010834,
+        -2.4206483364105225,
+        -2.0837481021881104,
+        -0.5173114538192749
+      ],
+      "distance_rad": 3.5848550393264667,
+      "qualified": false,
+      "stationarity_relative": 5.107672972330044e-16,
+      "equality_residual_m": 5.122598113055377e-09
+    },
+    {
+      "attempt_id": 1,
+      "q_star": [
+        -1.231588764934105,
+        2.2806933996766743,
+        -2.67513108253479,
+        0.4812181890010834,
+        -2.4206483364105225,
+        -2.0837481021881104,
+        -0.5173114538192749
+      ],
+      "distance_rad": 3.5848550592671455,
+      "qualified": true,
+      "stationarity_relative": 5.255752099516403e-16,
+      "equality_residual_m": 5.377642775528102e-17
+    }
+  ]
+}
