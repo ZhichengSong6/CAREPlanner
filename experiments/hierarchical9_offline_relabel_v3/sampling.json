@@ -1,0 +1,11 @@
+{
+  "train_x": 64,
+  "val_x": 16,
+  "uniform_per_x": 2,
+  "normal_pairs_per_x": 1,
+  "normal_step_rad": 0.02,
+  "coverage_per_sensor": 2,
+  "seed": 260923,
+  "audit_per_stratum": 1,
+  "audit_seed": 882616
+}
