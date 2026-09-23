@@ -66,22 +66,46 @@ export CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-true}"
 # Strict Phase-E/C5.5 semantics: the trusted-free body prior is startup-only.
 # Do not allow the formal runner to revive the old moving 10-cm free bubble.
 export TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY=false
-# Visibility and collision margins are intentionally different:
-#   VBC certifies the conservative body-sphere approximation itself.
-#   GCDF keeps the independent collision-clearance proximity margin.
-export VBC_SWEPT_VOLUME_MARGIN_M=0.0
+# Visibility coverage and GCDF proximity are independent. Preserve the caller's
+# explicit test margin; primitive tests default to 10 mm, legacy samples to 0.
+if [[ "${VBC_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND:-primitive}}" == "primitive" ]]; then
+  export VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.010}"
+else
+  export VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
+fi
+export VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-false}"
+# The tracker guard is an execution tolerance, separate from VBC's certified
+# swept-volume margin. Keep VBC at 10 mm while allowing 20 mm tracker deviation.
+export TRACKER_CERTIFIED_MARGIN_M="${TRACKER_CERTIFIED_MARGIN_M:-0.020}"
+# The ordinary/final GCDF QP margins are configured separately below; the
+# primitive anchor inflation remains the geometric model setting, not the QP
+# safety margin.
+export FINAL_GCDF_SAFETY_MARGIN="${FINAL_GCDF_SAFETY_MARGIN:-0.010}"
 export LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 # Prefer one local measured-q -> active-q_vis frontier step. The long-range
 # q_vis objective is suppressed while this local target is active; every
-# proposal still passes final GCDF + exact VBC before execution.
-# Full-q_vis REPAIR experiment: disable both the 0.05-rad local frontier step
-# and the older multi-obligation soft-min frontier. The local Sparse-SCP then
-# receives the current active q_vis as its terminal-horizon visibility target.
-export FRONTIER_STEERING_ENABLED="${FRONTIER_STEERING_ENABLED:-false}"
-export VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-false}"
+# proposal still passes final GCDF + exact VBC before execution.  The bounded
+# branch is also valid with exactly one active obligation (the common UNKNOWN
+# recovery case), so C5.5 enables it by default.  Callers can still set either
+# variable to false for an explicit legacy/full-q_vis A/B run.
+export FRONTIER_STEERING_ENABLED="${FRONTIER_STEERING_ENABLED:-true}"
+export VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-true}"
+export FRONTIER_STEP_INF="${FRONTIER_STEP_INF:-0.05}"
+# After three final-VBC rejections for the same q_vis token, widen exactly
+# one bounded frontier proposal to 0.10 rad. This is steering only; final
+# GCDF and exact VBC remain unchanged certification gates.
+export FRONTIER_VBC_ESCALATION_ENABLED="${FRONTIER_VBC_ESCALATION_ENABLED:-true}"
+export FRONTIER_VBC_ESCALATION_AFTER="${FRONTIER_VBC_ESCALATION_AFTER:-3}"
+export FRONTIER_ESCALATED_STEP_INF="${FRONTIER_ESCALATED_STEP_INF:-0.10}"
 # Keep refinement available as an opt-in diagnostic, but do not let it
 # dominate the first strict-frontier qualification.
 export ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
+# Lock the current q_vis while ordinary new obligations are queued. Only a
+# confirmed earliest-layer/path-associated blocker may enter shared steering.
+export PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY="${PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY:-true}"
+# New obligations may preempt only from the earliest predicted sweep. Keep
+# the conservative default; experiments may widen this bounded window.
+export BLOCKER_PUSH_MAX_SWEEP_S="${BLOCKER_PUSH_MAX_SWEEP_S:-0.30}"
 
 python3 -m py_compile \
   "${REPO}/src/egocentric_arm_planner/scripts/probe_single_flight_gate_node.py"
@@ -97,6 +121,8 @@ echo "[C5.5] NORMAL: task objective + full-horizon hard GCDF"
 echo "[C5.40] PROBE ROLLING: certified prefix executes while one raw next-probe candidate may preplan behind the gate"
 echo "[C5.9] COMMIT GATE: exact executable prefix+brake+hold -> final GCDF -> exact VBC -> single commit"
 echo "[C5.9] GCDF transport: one GPU client, independent local/final channels, final priority"
+echo "[PATH ASSOCIATION] earliest sweep <= ${BLOCKER_PUSH_MAX_SWEEP_S}s; confirmations=${BLOCKER_CONFIRMATIONS:-2}"
+echo "[PATH ASSOCIATION] explicit GCDF recovery blockers preempt immediately"
 echo "[C5.9] EXECUTION: committed trajectory published once; tracker owns execution to completion"
 echo "[C5.9] EXECUTION VBC: elapsed suffixes use a separate audit-only topic; tracker is never reset"
 echo "[C5.40] PROBE success: matching execution token reaches certified prefix duration; brake+hold remains fallback while replacement is certified"
@@ -104,16 +130,21 @@ echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
 echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
-echo "[MARGIN SPLIT] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
-echo "[FULL Q_VIS REPAIR] frontier_steering=${FRONTIER_STEERING_ENABLED}; vbc_gated_local_step=${VBC_GATED_FRONTIER_STEP_ENABLED}"
-echo "[FULL Q_VIS REPAIR] current active q_vis is optimized as the 1.0 s terminal-horizon visibility target; Sparse-SCP CDF + final GCDF + exact VBC remain unchanged"
+echo "[MARGIN] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity search band=${LOCAL_SCP_PROXIMITY_MARGIN} m"
+echo "[VBC] continuous motion bound=${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}"
+echo "[MARGIN SPLIT] tracker certified body-envelope threshold=${TRACKER_CERTIFIED_MARGIN_M} m"
+echo "[BOUNDED Q_VIS REPAIR] frontier_steering=${FRONTIER_STEERING_ENABLED}; vbc_gated_local_step=${VBC_GATED_FRONTIER_STEP_ENABLED}"
+echo "[BOUNDED Q_VIS REPAIR] max step=${FRONTIER_STEP_INF} rad; active q_vis is approached locally; Sparse-SCP CDF + final GCDF + exact VBC remain unchanged"
+echo "[BOUNDED Q_VIS ESCALATION] enabled=${FRONTIER_VBC_ESCALATION_ENABLED}; after=${FRONTIER_VBC_ESCALATION_AFTER} final-VBC rejections; widened step=${FRONTIER_ESCALATED_STEP_INF} rad"
 echo "[VISIBILITY FRONTIER] every local frontier proposal remains final-GCDF + exact-VBC gated"
 echo "[ADAPTIVE O] enabled=${ADAPTIVE_REFINEMENT_ENABLED}; retained as opt-in fallback, not the primary strict-Phase-E mechanism"
 echo "[ADAPTIVE O] refined zones stay refined on later active-set updates; final GCDF + exact VBC unchanged"
+echo "[Q_VIS TARGET LOCK] path-associated shared steering only=${PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY}; ordinary obligations queue"
 echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time scaling)"
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
 echo "[C5.5] NORMAL exact-VBC view: full horizon"
 echo "[C5.5] config: ${CONFIG_FILE}"
+echo "[MARGIN ALIGNMENT] local/final GCDF safety margin=${FINAL_GCDF_SAFETY_MARGIN} m"
 echo "[C5.5] startup gate wait is fail-fast (~25 s worst case)"
 
 CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" \

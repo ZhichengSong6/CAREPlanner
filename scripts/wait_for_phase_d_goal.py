@@ -17,6 +17,7 @@ import numpy as np
 import rospy
 from sensor_msgs.msg import JointState
 from urdf_parser_py.urdf import URDF
+from phase_e_evaluation_common import quat_rot, pose_error, seconds_to_ns
 
 
 JOINTS = [
@@ -36,19 +37,6 @@ def load_fk_helper(repo):
     return module
 
 
-def quat_rot(q):
-    x, y, z, w = map(float, q)
-    n = math.sqrt(x*x + y*y + z*z + w*w)
-    if n <= 0.0:
-        raise ValueError("goal quaternion has zero norm")
-    x, y, z, w = x/n, y/n, z/n, w/n
-    return np.array([
-        [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
-        [2*(x*z+y*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
-        [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)],
-    ])
-
-
 def fk_T(helper, chain, qmap):
     T = np.eye(4)
     for joint in chain:
@@ -59,13 +47,6 @@ def fk_T(helper, chain, qmap):
                 joint, qmap.get(joint.name, 0.0))
         )
     return T
-
-
-def pose_error(T, p_goal, R_goal):
-    pos = float(np.linalg.norm(T[:3, 3] - p_goal))
-    c = (float(np.trace(R_goal.T @ T[:3, :3])) - 1.0) / 2.0
-    rot = math.acos(max(-1.0, min(1.0, c)))
-    return pos, rot
 
 
 def write_status(path, payload):
@@ -91,6 +72,8 @@ def main():
     ap.add_argument("--goal-position", type=float, nargs=3, required=True)
     ap.add_argument("--goal-orientation", type=float, nargs=4, required=True)
     ap.add_argument("--status-json", default="")
+    ap.add_argument("--arm-token", default="")
+    ap.add_argument("--required-recorder", nargs="*", default=[])
     args = ap.parse_args()
 
     if args.timeout_s <= 0.0:
@@ -117,8 +100,31 @@ def main():
         disable_signals=True,
     )
 
+    arm_pub = None
+    if args.arm_token:
+        from phase_e_benchmark_arm import prepare_arm
+        try:
+            arm_pub = prepare_arm(args.required_recorder)
+        except Exception as exc:
+            write_status(args.status_json, dict(goal_reached=False,
+                benchmark_window={"valid": False}, startup_error=str(exc)))
+            raise
+
     wall_start = time.monotonic()
-    inside_since_ros = None
+    start_ros_ns = rospy.Time.now().to_nsec()
+    required_hold_ns = seconds_to_ns(args.hold_s, duration=True)
+    window = {"schema_version": 3, "valid": False,
+              "start_wall_unix_s": time.time(), "start_monotonic_s": wall_start,
+              "start_ros_s": start_ros_ns / 1e9, "start_ros_ns": start_ros_ns,
+              "watchdog_start_wall_unix_s": time.time(),
+              "watchdog_start_monotonic_s": wall_start,
+              "joint_names": JOINTS, "first_measured_q": None,
+              "end_ros_s": None, "end_ros_ns": None, "end_measured_q": None}
+    window["protocol"] = "pre_goal_arm_v1" if arm_pub is not None else "legacy_post_gate_v2"
+    window["required_recorders"] = list(args.required_recorder)
+    previous_stamp = None
+    inside_since_ros_ns = None
+    success_hold_start_ns = None
     success_wall_s = None
     success_latched_wall = None
     last_pos = math.nan
@@ -154,14 +160,53 @@ def main():
         except rospy.ROSException:
             continue
 
+        # A message returned just after the wall deadline must not create a
+        # late success or extend the benchmark window.
+        if time.monotonic() - wall_start >= args.timeout_s:
+            break
+
         if len(msg.name) != len(msg.position):
             continue
         qmap = {
             str(name): float(value)
             for name, value in zip(msg.name, msg.position)
         }
-        if not all(name in qmap for name in JOINTS):
+        if not all(name in qmap and math.isfinite(qmap[name]) for name in JOINTS):
             continue
+
+        stamp_ns = msg.header.stamp.to_nsec()
+        now_ros_ns = stamp_ns if stamp_ns > 0 else rospy.Time.now().to_nsec()
+        now_ros = now_ros_ns / 1e9  # display/legacy fields only
+        if now_ros_ns < window["start_ros_ns"]:
+            continue
+        if previous_stamp is not None and now_ros_ns <= previous_stamp:
+            inside_since_ros_ns = None
+            continue
+        previous_stamp = now_ros_ns
+        if success_wall_s is None:
+            measured_q = [qmap[name] for name in JOINTS]
+            if window["first_measured_q"] is None:
+                # /clock is often still zero immediately after init_node.
+                # Anchor all three clocks to the first accepted measured
+                # sample; the watchdog still starts at the original wall time.
+                window["start_ros_s"] = now_ros
+                window["start_ros_ns"] = now_ros_ns
+                window["start_wall_unix_s"] = time.time()
+                window["start_monotonic_s"] = time.monotonic()
+                window["first_measured_q"] = measured_q
+                window["first_sample_ros_s"] = now_ros
+                window["first_sample_ros_ns"] = now_ros_ns
+                if arm_pub is not None:
+                    # Capture measured q BEFORE the broker sends the first goal.
+                    # Planning/gate wait is inside the unchanged task budget.
+                    wall_start = time.monotonic()
+                    window["watchdog_start_monotonic_s"] = wall_start
+                    window["watchdog_start_wall_unix_s"] = time.time()
+                    window["arm_token"] = args.arm_token
+                    arm_pub.publish(args.arm_token)
+                    print("[GOAL WATCH] armed after measured q and recorder readiness")
+            window.update(valid=True, end_ros_s=now_ros, end_ros_ns=now_ros_ns, end_measured_q=measured_q,
+                          end_wall_unix_s=time.time(), end_monotonic_s=time.monotonic())
 
         dqmap = {}
         if len(msg.velocity) == len(msg.name):
@@ -182,14 +227,12 @@ def main():
             and last_rot <= args.orientation_tolerance_rad
         )
 
-        stamp_s = msg.header.stamp.to_sec()
-        now_ros = stamp_s if stamp_s > 0.0 else rospy.Time.now().to_sec()
-
         if success_wall_s is None:
             if inside:
-                if inside_since_ros is None:
-                    inside_since_ros = now_ros
-                if now_ros - inside_since_ros >= args.hold_s:
+                if inside_since_ros_ns is None:
+                    inside_since_ros_ns = now_ros_ns
+                if now_ros_ns - inside_since_ros_ns >= required_hold_ns:
+                    success_hold_start_ns = inside_since_ros_ns
                     success_wall_s = time.monotonic() - wall_start
                     success_latched_wall = time.monotonic()
                     print(
@@ -201,7 +244,7 @@ def main():
                         )
                     )
             else:
-                inside_since_ros = None
+                inside_since_ros_ns = None
         else:
             speed_ok = (
                 math.isfinite(last_speed_inf)
@@ -243,6 +286,9 @@ def main():
         time.sleep(min(args.post_success_record_s, remaining))
 
     elapsed = time.monotonic() - wall_start
+    # Success is latched independently of settling, including a success very
+    # close to the hard watchdog limit. Settling never extends task metrics.
+    goal_reached = success_wall_s is not None
     reason = "goal_tolerance_stable" if goal_reached else "max_timeout"
     status = {
         "goal_reached": bool(goal_reached),
@@ -253,6 +299,9 @@ def main():
         "position_tolerance_m": args.position_tolerance_m,
         "orientation_tolerance_rad": args.orientation_tolerance_rad,
         "required_hold_s": args.hold_s,
+        "required_hold_ns": required_hold_ns,
+        "goal_hold_start_ros_ns": success_hold_start_ns,
+        "goal_hold_end_ros_ns": window['end_ros_ns'] if success_wall_s is not None else None,
         "settle_velocity_inf_rad_s": args.settle_velocity_inf_rad_s,
         "settle_timeout_s": args.settle_timeout_s,
         "settled_before_exit": bool(settled_before_exit),
@@ -264,6 +313,7 @@ def main():
         "last_orientation_error_rad": (
             last_rot if math.isfinite(last_rot) else None),
         "sample_count": sample_count,
+        "benchmark_window": window,
     }
     write_status(args.status_json, status)
 

@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
   arm_model
   arm_trajectory
   care_collision_cdf
+  care_confidence_map
 )
 
 find_package(Eigen3 REQUIRED)
@@ -43,6 +44,7 @@ catkin_package(
     arm_model
     arm_trajectory
     care_collision_cdf
+    care_confidence_map
   DEPENDS EIGEN3
 )
 
@@ -211,6 +213,7 @@ catkin_install_python(PROGRAMS
   scripts/c4_4_verified_regime_manager_node.py
   scripts/optimized_trajectory_continuity_node.py
   scripts/gcdf_rejection_feedback.py
+  scripts/occupied_clearance.py
   scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
   scripts/execution_gcdf_measured_state_trajectory_node.py

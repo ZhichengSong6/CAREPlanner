@@ -25,6 +25,24 @@ bool finiteMatrix(const Eigen::MatrixXd& x) {
   return true;
 }
 
+Eigen::VectorXd jointMaskFromLayout(
+    const std_msgs::MultiArrayLayout& layout, int dof) {
+  Eigen::VectorXd mask = Eigen::VectorXd::Ones(dof);
+  const std::string prefix = "care_qmask_v1_";
+  for (const auto& dim : layout.dim) {
+    if (dim.label.compare(0, prefix.size(), prefix) != 0) continue;
+    const std::string bits = dim.label.substr(prefix.size());
+    if (bits.size() != static_cast<std::size_t>(dof)) return mask;
+    for (int j = 0; j < dof; ++j) {
+      const char bit = bits[static_cast<std::size_t>(j)];
+      if (bit != '0' && bit != '1') return Eigen::VectorXd::Ones(dof);
+      mask[j] = bit == '1' ? 1.0 : 0.0;
+    }
+    return mask;
+  }
+  return mask;
+}
+
 }  // namespace
 
 VelocityQPMPCWaypoint::~VelocityQPMPCWaypoint() {
@@ -42,6 +60,7 @@ bool VelocityQPMPCWaypoint::initialize(const ros::NodeHandle& nh,
 
   previous_command_ = Eigen::VectorXd::Zero(dof_);
   latest_waypoint_q_ = Eigen::VectorXd::Zero(dof_);
+  latest_waypoint_joint_mask_ = Eigen::VectorXd::Ones(dof_);
 
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1, &VelocityQPMPCWaypoint::jointStateCallback, this);
@@ -542,6 +561,7 @@ void VelocityQPMPCWaypoint::waypointQCallback(
   }
   std::lock_guard<std::mutex> lock(data_mutex_);
   latest_waypoint_q_ = q;
+  latest_waypoint_joint_mask_ = jointMaskFromLayout(msg->layout, dof_);
   latest_waypoint_q_received_ = ros::Time::now();
   has_waypoint_q_ = true;
 }
@@ -562,8 +582,11 @@ void VelocityQPMPCWaypoint::waypointDeadlineCallback(
 void VelocityQPMPCWaypoint::waypointScheduleCallback(
     const std_msgs::Float64MultiArrayConstPtr& msg) {
   if (!msg) return;
-  constexpr std::size_t kRecord = 9;
-  if (msg->data.size() % kRecord != 0) {
+  const bool has_joint_masks =
+      !msg->layout.dim.empty() &&
+      msg->layout.dim.front().label == "care_visibility_schedule_v2_qmask";
+  const std::size_t record_size = has_joint_masks ? 16u : 9u;
+  if (msg->data.size() % record_size != 0) {
     ROS_WARN_THROTTLE(
         1.0,
         "[VelocityQPMPCWaypoint] ignoring malformed multi-deadline schedule");
@@ -571,11 +594,11 @@ void VelocityQPMPCWaypoint::waypointScheduleCallback(
   }
 
   std::vector<DeadlineWaypoint> schedule;
-  const std::size_t n = msg->data.size() / kRecord;
+  const std::size_t n = msg->data.size() / record_size;
   schedule.reserve(std::min<std::size_t>(
       n, static_cast<std::size_t>(max_repair_waypoints_)));
   for (std::size_t r = 0; r < n; ++r) {
-    const std::size_t off = r * kRecord;
+    const std::size_t off = r * record_size;
     const double id_raw = msg->data[off];
     const double deadline = msg->data[off + 1];
     if (!std::isfinite(id_raw) || !std::isfinite(deadline) || deadline <= 0.0) {
@@ -587,10 +610,15 @@ void VelocityQPMPCWaypoint::waypointScheduleCallback(
     wp.id = static_cast<long long>(std::llround(id_raw));
     wp.deadline_abs_s = deadline;
     wp.q = Eigen::VectorXd::Zero(dof_);
+    wp.joint_mask = Eigen::VectorXd::Ones(dof_);
     for (int j = 0; j < dof_; ++j) {
       wp.q[j] = msg->data[off + 2 + static_cast<std::size_t>(j)];
+      if (has_joint_masks)
+        wp.joint_mask[j] = msg->data[off + 9 + static_cast<std::size_t>(j)];
     }
-    if (!finiteVector(wp.q)) {
+    if (!finiteVector(wp.q) || !finiteVector(wp.joint_mask) ||
+        (wp.joint_mask.array() < 0.0).any() ||
+        (wp.joint_mask.array() > 1.0).any()) {
       ROS_WARN_THROTTLE(
           1.0, "[VelocityQPMPCWaypoint] schedule contains non-finite q_vis");
       return;
@@ -1437,6 +1465,7 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
   ros::Time wp_q_received;
   ros::Time wp_deadline_received;
   Eigen::VectorXd q_vis;
+  Eigen::VectorXd q_vis_joint_mask = Eigen::VectorXd::Ones(dof_);
   double deadline_abs_s = 0.0;
 
   bool has_schedule = false;
@@ -1479,7 +1508,10 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
     wp_active_received = latest_waypoint_active_received_;
     wp_q_received = latest_waypoint_q_received_;
     wp_deadline_received = latest_waypoint_deadline_received_;
-    if (has_waypoint_q_) q_vis = latest_waypoint_q_;
+    if (has_waypoint_q_) {
+      q_vis = latest_waypoint_q_;
+      q_vis_joint_mask = latest_waypoint_joint_mask_;
+    }
     deadline_abs_s = latest_waypoint_deadline_abs_s_;
 
     has_schedule = has_waypoint_schedule_;
@@ -1719,16 +1751,21 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
           waypoint_k = k;
           waypoint_grid_time = k * dt_;
           q_vis = ob.q;
+          q_vis_joint_mask = ob.joint_mask;
           deadline_remaining = remaining;
         }
 
         const Eigen::MatrixXd S_k =
             S_.block((k - 1) * dof_, 0, dof_, n_u_);
-        const Eigen::VectorXd offset = q_current - ob.q;
+        const Eigen::DiagonalMatrix<double, Eigen::Dynamic> mask(
+            ob.joint_mask);
+        const Eigen::MatrixXd masked_S_k = mask * S_k;
+        const Eigen::VectorXd offset = mask * (q_current - ob.q);
         const Eigen::MatrixXd H_wp =
-            2.0 * applied_waypoint_weight * S_k.transpose() * S_k;
+            2.0 * applied_waypoint_weight *
+            masked_S_k.transpose() * masked_S_k;
         const Eigen::VectorXd g_wp =
-            2.0 * applied_waypoint_weight * S_k.transpose() * offset;
+            2.0 * applied_waypoint_weight * masked_S_k.transpose() * offset;
         if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
           publishSafeStop("invalid multi-deadline recovery visibility cost");
           return;
@@ -1748,13 +1785,16 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       }
       waypoint_k = num_intervals_;
       waypoint_grid_time = horizon_duration_;
-      const Eigen::VectorXd waypoint_offset = q_current - q_vis;
+      const Eigen::DiagonalMatrix<double, Eigen::Dynamic> mask(
+          q_vis_joint_mask);
+      const Eigen::MatrixXd masked_S_terminal = mask * S_terminal_;
+      const Eigen::VectorXd waypoint_offset = mask * (q_current - q_vis);
       const Eigen::MatrixXd H_wp =
           2.0 * applied_waypoint_weight *
-          S_terminal_.transpose() * S_terminal_;
+          masked_S_terminal.transpose() * masked_S_terminal;
       const Eigen::VectorXd g_wp =
           2.0 * applied_waypoint_weight *
-          S_terminal_.transpose() * waypoint_offset;
+          masked_S_terminal.transpose() * waypoint_offset;
       if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
         publishSafeStop("invalid recovery visibility cost");
         return;
@@ -1764,7 +1804,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       waypoint_linear_inf = g_wp.lpNorm<Eigen::Infinity>();
       waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
       waypoint_nominal_error_inf =
-          (q_ref.col(num_intervals_) - q_vis).lpNorm<Eigen::Infinity>();
+          (mask * (q_ref.col(num_intervals_) - q_vis))
+              .lpNorm<Eigen::Infinity>();
     }
   } else if (verification_hold_active) {
     control_mode = "verification_hold";
@@ -1803,12 +1844,16 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
 
         const Eigen::MatrixXd S_k =
             S_.block((waypoint_k - 1) * dof_, 0, dof_, n_u_);
-        const Eigen::VectorXd waypoint_offset = q_current - q_vis;
+        const Eigen::DiagonalMatrix<double, Eigen::Dynamic> mask(
+            q_vis_joint_mask);
+        const Eigen::MatrixXd masked_S_k = mask * S_k;
+        const Eigen::VectorXd waypoint_offset = mask * (q_current - q_vis);
         applied_waypoint_weight = waypoint_weight_;
         const Eigen::MatrixXd H_wp =
-            2.0 * applied_waypoint_weight * S_k.transpose() * S_k;
+            2.0 * applied_waypoint_weight *
+            masked_S_k.transpose() * masked_S_k;
         const Eigen::VectorXd g_wp =
-            2.0 * applied_waypoint_weight * S_k.transpose() * waypoint_offset;
+            2.0 * applied_waypoint_weight * masked_S_k.transpose() * waypoint_offset;
 
         if (!finiteMatrix(H_wp) || !finiteVector(g_wp)) {
           waypoint_status = "invalid_cost";
@@ -1819,7 +1864,8 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
           waypoint_linear_inf = g_wp.lpNorm<Eigen::Infinity>();
           waypoint_hessian_inf = H_wp.lpNorm<Eigen::Infinity>();
           waypoint_nominal_error_inf =
-              (q_ref.col(waypoint_k) - q_vis).lpNorm<Eigen::Infinity>();
+              (mask * (q_ref.col(waypoint_k) - q_vis))
+                  .lpNorm<Eigen::Infinity>();
           waypoint_status = "used";
         }
       }
@@ -1878,14 +1924,18 @@ void VelocityQPMPCWaypoint::timerCallback(const ros::TimerEvent&) {
       const int k = repair_k[r];
       max_error = std::max(
           max_error,
-          (q_pred.col(k) - schedule[r].q).lpNorm<Eigen::Infinity>());
+          (schedule[r].joint_mask.array() *
+           (q_pred.col(k) - schedule[r].q).array()).matrix()
+              .lpNorm<Eigen::Infinity>());
     }
     repair_max_pred_error_inf = max_error;
     waypoint_pred_error_inf = max_error;
   } else if (waypoint_k >= 1 && q_vis.size() == dof_ &&
              (waypoint_status == "used" || waypoint_status == "recovery")) {
     waypoint_pred_error_inf =
-        (q_pred.col(waypoint_k) - q_vis).lpNorm<Eigen::Infinity>();
+        (q_vis_joint_mask.array() *
+         (q_pred.col(waypoint_k) - q_vis).array()).matrix()
+            .lpNorm<Eigen::Infinity>();
   }
 
   std_msgs::Float32 solve_msg;

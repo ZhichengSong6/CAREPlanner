@@ -44,6 +44,7 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 # helpers to importers. __file__ here names this actual source (or install) file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gcdf_rejection_feedback import rejection_points
+from occupied_clearance import occupied_violations
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -66,8 +67,16 @@ class OptimizedTrajectoryContinuityNode:
         self._lock = threading.RLock()
         self.input_topic = str(rospy.get_param(
             "~input_topic", "/care_planner/mpc/predicted_trajectory"))
+        # Rejection identities belong to the planner that produced the raw
+        # candidate.  With the C5.9 single-flight gate enabled, ``input_topic``
+        # is the gate output while the local planner still owns the raw input
+        # topic.  Keep the feedback channel explicit so the gate cannot hide
+        # confirmed GCDF witnesses from the planner's repair state.
+        self.gcdf_rejection_feedback_topic = str(rospy.get_param(
+            "~gcdf_rejection_feedback_topic",
+            self.input_topic + "/gcdf_rejection_feedback"))
         self.gcdf_rejection_feedback_pub = rospy.Publisher(
-            self.input_topic + "/gcdf_rejection_feedback", CollisionCDFRejectionFeedback,
+            self.gcdf_rejection_feedback_topic, CollisionCDFRejectionFeedback,
             queue_size=4)
         self.verification_topic = str(rospy.get_param(
             "~output_topic", "/care_planner/optimized_trajectory"))
@@ -153,6 +162,14 @@ class OptimizedTrajectoryContinuityNode:
             "~final_gcdf_timeout_s", 0.50))
         self.final_gcdf_safety_margin = float(rospy.get_param(
             "~final_gcdf_safety_margin", 0.0))
+        self.final_occupied_resolution_m = float(rospy.get_param(
+            "~final_occupied_resolution_m", 0.05))
+        self.final_occupied_hard_margin_m = float(rospy.get_param(
+            "~final_occupied_hard_margin_m", 0.0))
+        if (not math.isfinite(self.final_occupied_resolution_m) or
+                self.final_occupied_resolution_m <= 0 or
+                not math.isfinite(self.final_occupied_hard_margin_m)):
+            raise ValueError('Invalid final occupied geometry contract')
         self.final_gcdf_stamp_tolerance_s = float(rospy.get_param(
             "~final_gcdf_stamp_tolerance_s", 1e-6))
 
@@ -407,6 +424,11 @@ class OptimizedTrajectoryContinuityNode:
             self.probe_active_topic, Bool, self._probe_active_cb, queue_size=1)
         self.joint_state_sub = rospy.Subscriber(
             self.joint_state_topic, JointState, self._joint_state_cb, queue_size=1)
+        self._execution_tracker_state = None
+        self._execution_tracker_received = None
+        self.execution_tracker_sub = rospy.Subscriber(
+            '/care_planner/execution/tracker_summary', String,
+            self._execution_tracker_cb, queue_size=1)
         self.blocker_stack_sub = rospy.Subscriber(
             self.blocker_stack_summary_topic, String,
             self._blocker_stack_summary_cb, queue_size=1)
@@ -535,6 +557,18 @@ class OptimizedTrajectoryContinuityNode:
             self._cycle_recovery_last_reason = "exact_vbc_unsafe_at_floor"
             self._last_cycle_recovery_prefix_s = float(
                 self.cycle_recovery_prefixes_s[-1])
+
+    def _execution_tracker_cb(self, msg):
+        values = dict(_TOKEN_RE.findall(msg.data))
+        try:
+            state = (int(values['execution_stamp_ns']), float(values['phase_s']))
+            if not math.isfinite(state[1]) or state[1] < 0:
+                return
+        except (KeyError, ValueError):
+            return
+        with self._lock:
+            self._execution_tracker_state = state
+            self._execution_tracker_received = rospy.Time.now()
 
     def _joint_state_cb(self, msg):
         if msg is None or len(msg.name) != len(msg.position):
@@ -1382,9 +1416,13 @@ class OptimizedTrajectoryContinuityNode:
             int((diag or {}).get("audited_trajectory_stamp_ns", 0)),
             (diag or {}).get("vbc_evidence", "none"))
         msg.data += " rejection_snapshot=disabled"
+        msg.data += " occupied_volume_min_m={} occupied_geometry_unsafe_count={} occupied_geometry_malformed={}".format(
+            (diag or {}).get('occupied_volume_min_m', math.nan),
+            (diag or {}).get('occupied_geometry_unsafe_count', 0),
+            (diag or {}).get('occupied_geometry_malformed', 0))
         return msg
 
-    def _classify_final_gcdf_unsafe(self, batch, distances):
+    def _classify_final_gcdf_unsafe(self, batch, distances, geometry_unsafe=()):
         """Return semantic blocker class for violated final-GCDF rows."""
         source_types = list(getattr(batch, "source_type", []))
         source_unknown = int(getattr(batch, "SOURCE_UNKNOWN", 0))
@@ -1392,7 +1430,7 @@ class OptimizedTrajectoryContinuityNode:
         unknown = 0
         occupied = 0
         for i, d in enumerate(distances):
-            if (not math.isfinite(d) or
+            if i not in geometry_unsafe and (not math.isfinite(d) or
                     d >= self.final_gcdf_safety_margin):
                 continue
             source_type = (
@@ -1548,9 +1586,22 @@ class OptimizedTrajectoryContinuityNode:
                 len(distances) != int(msg.num_pairs))
             min_d = min(finite_distances) if finite_distances else math.inf
             self._last_final_gcdf_min_d = min_d
+            geometry_unsafe = []
+            geometry_min = math.inf
+            try:
+                geometry_unsafe, geometry_min = occupied_violations(
+                    msg, self.final_occupied_resolution_m,
+                    self.final_occupied_hard_margin_m)
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                malformed = True
+            if diag is None:
+                diag = {}
+            diag['occupied_volume_min_m'] = geometry_min
+            diag['occupied_geometry_unsafe_count'] = len(geometry_unsafe)
+            diag['occupied_geometry_malformed'] = int(malformed)
 
             gcdf_safe = (
-                not malformed and
+                not malformed and not geometry_unsafe and
                 (int(msg.num_pairs) == 0 or
                  min_d >= self.final_gcdf_safety_margin))
 
@@ -1592,7 +1643,7 @@ class OptimizedTrajectoryContinuityNode:
                     gcdf_blocker_class,
                     gcdf_unknown_count,
                     gcdf_occupied_count,
-                ) = self._classify_final_gcdf_unsafe(msg, distances)
+                ) = self._classify_final_gcdf_unsafe(msg, distances, geometry_unsafe)
                 self._last_final_gcdf_blocker_class = gcdf_blocker_class
                 self._last_final_gcdf_unsafe_unknown_count = gcdf_unknown_count
                 self._last_final_gcdf_unsafe_occupied_count = gcdf_occupied_count
@@ -2003,11 +2054,19 @@ class OptimizedTrajectoryContinuityNode:
                 execution_audit_age = (
                     now - self._committed_received).to_sec()
                 master_duration = self._duration(self._committed_master)
-                if (0.0 <= execution_audit_age <=
-                        master_duration + self.execution_audit_post_hold_s):
-                    execution_audit_to_publish = self._suffix_from_phase(
-                        self._committed_master,
-                        min(execution_audit_age, master_duration))
+                # Tracker may pause/discard an execution on a safety hold.
+                # Wall time since commit is not evidence of executed progress.
+                # A missing/stale/mismatched tracker token retains the complete
+                # path rather than discarding unexecuted geometry by elapsed time.
+                phase = 0.0
+                state = self._execution_tracker_state
+                received = self._execution_tracker_received
+                if (state is not None and received is not None and
+                        state[0] == self._committed_master.header.stamp.to_nsec() and
+                        0.0 <= (now - received).to_sec() <= 0.15):
+                    phase = min(state[1], master_duration)
+                execution_audit_to_publish = self._suffix_from_phase(
+                    self._committed_master, phase)
 
             if (self.continuation_enabled and
                     self._committed_master is not None and

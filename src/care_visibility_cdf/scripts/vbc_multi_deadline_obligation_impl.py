@@ -51,7 +51,21 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import rospy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, MultiArrayDimension, String
+
+
+def q_vis_joint_mask(source) -> np.ndarray:
+    """Return a validated objective mask; legacy/scalar targets constrain all joints."""
+    try:
+        mask = np.asarray(
+            source.get("q_vis_joint_mask", [1.0] * 7),
+            dtype=np.float64).reshape(7)
+    except (AttributeError, TypeError, ValueError):
+        return np.ones(7, dtype=np.float64)
+    if (not np.all(np.isfinite(mask)) or
+            np.any(mask < 0.0) or np.any(mask > 1.0)):
+        return np.ones(7, dtype=np.float64)
+    return mask
 
 from evaluate_direct_vs_projection_ascent import DEFAULT_JOINT_NAMES
 from vbc_deadline_waypoint_node import _fmt, _vector_msg
@@ -452,6 +466,9 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             "refinement_partition_anchor":
                 refinement_partition_anchor.copy(),
             "q_vis": q_vis,
+            "q_vis_joint_mask": (
+                np.ones(7, dtype=np.float64) if override_applied else
+                q_vis_joint_mask(result)),
             "diagnostic_qvis_override_applied": bool(override_applied),
             "diagnostic_qvis_override_label": (
                 self._diag_qvis_override_label if override_applied else "none"),
@@ -653,11 +670,16 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         data = []
         for ob in obligations:
             q = np.asarray(ob["q_vis"], dtype=np.float64).reshape(7)
+            mask = q_vis_joint_mask(ob)
             data.extend([
                 float(ob["id"]), float(ob["deadline_abs_s"]),
                 *[float(v) for v in q],
+                *[float(v) for v in mask],
             ])
         msg.data = data
+        msg.layout.dim = [MultiArrayDimension(
+            label="care_visibility_schedule_v2_qmask",
+            size=len(obligations), stride=16)]
         self.schedule_pub.publish(msg)
 
         # Backward-compatible single waypoint = earliest accumulated obligation.

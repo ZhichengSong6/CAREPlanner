@@ -4,6 +4,7 @@ import argparse, csv, importlib.util, json, math, os, re, statistics, sys
 from collections import defaultdict
 import numpy as np
 from urdf_parser_py.urdf import URDF
+from phase_e_evaluation_common import quat_rot, pose_error as pose_err, load_window, window_rows, window_joint_samples, rejection_counts, seconds_to_ns, parse_stamp_ns
 
 TOK = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
 JOINTS = ["joint1","joint2","joint3","joint4","wrist_joint1","wrist_joint2","wrist_joint3"]
@@ -66,11 +67,11 @@ def indexed_cols(header,prefix):
         if m and m.group(1)==prefix: out[int(m.group(2))]=i
     return out
 
-def joint_states(path,names):
+def joint_states(path,names,timestamps_ns=False):
     if not os.path.isfile(path): return []
     out=[]; need=set(names)
     with open(path,newline="",errors="replace") as f:
-        rd=csv.reader(f); h=next(rd,[]); ti=h.index("%time") if "%time" in h else 0
+        rd=csv.reader(f); h=next(rd,[]); ti=h.index("field.header.stamp") if "field.header.stamp" in h else (h.index("%time") if "%time" in h else 0)
         nc=indexed_cols(h,"name"); pc=indexed_cols(h,"position"); ids=sorted(set(nc)&set(pc))
         if not ids: raise RuntimeError("joint_states.csv has no flattened name*/position* columns")
         for r in rd:
@@ -79,7 +80,9 @@ def joint_states(path,names):
                 if nc[k]>=len(r) or pc[k]>=len(r): continue
                 n=r[nc[k]].strip(); v=num(r[pc[k]])
                 if n in need and math.isfinite(v): q[n]=v
-            if need.issubset(q): out.append((num(r[ti])/1e9,[q[n] for n in names]))
+            if need.issubset(q):
+                stamp = parse_stamp_ns(r[ti])
+                out.append((stamp if timestamps_ns else stamp/1e9,[q[n] for n in names]))
     return out
 
 def load_fk_helper(repo):
@@ -87,38 +90,31 @@ def load_fk_helper(repo):
     spec=importlib.util.spec_from_file_location("care_fk_helper",p); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
     return m
 
-def quat_rot(q):
-    x,y,z,w=map(float,q); n=math.sqrt(x*x+y*y+z*z+w*w); x,y,z,w=x/n,y/n,z/n,w/n
-    return np.array([[1-2*(y*y+z*z),2*(x*y-z*w),2*(x*z+y*w)],
-                     [2*(x*y+z*w),1-2*(x*x+z*z),2*(y*z-x*w)],
-                     [2*(x*z-y*w),2*(y*z+x*w),1-2*(x*x+y*y)]])
-
 def fk_T(helper,chain,qmap):
     T=np.eye(4)
     for j in chain: T=T@helper.get_joint_origin_transform(j)@helper.joint_motion_transform(j,qmap.get(j.name,0.0))
     return T
 
-def pose_err(T,pg,Rg):
-    pe=float(np.linalg.norm(T[:3,3]-pg)); c=(float(np.trace(Rg.T@T[:3,:3]))-1)/2
-    return pe,math.acos(max(-1,min(1,c)))
-
-def goal_eval(samples,helper,chain,names,case,ptol,rtol,hold):
+def goal_eval(samples,helper,chain,names,case,ptol,rtol,hold,timestamps_ns=False):
     if not samples: return {"joint_state_samples":0,"task_success":False,"time_to_success_s":None}
     pg=np.array(case["goal_position"]); Rg=quat_rot(case["goal_orientation"]); tr=[]
+    required_ns=seconds_to_ns(hold,duration=True)
     for t,q in samples:
+        t = parse_stamp_ns(t) if timestamps_ns else seconds_to_ns(t)
         pe,re_=pose_err(fk_T(helper,chain,dict(zip(names,q))),pg,Rg); tr.append((t,pe,re_,pe<=ptol and re_<=rtol))
     start=None; success=None
     for i,(t,_,_,ok) in enumerate(tr):
         if ok:
             if start is None: start=i
-            if t-tr[start][0]>=hold: success=tr[start][0]; break
+            if t-tr[start][0]>=required_ns: success=tr[start][0]; break
         else: start=None
     return {"joint_state_samples":len(tr),"task_success":success is not None,
-            "time_to_success_s":None if success is None else success-tr[0][0],
+            "time_to_success_s":None if success is None else (success-tr[0][0])/1e9,
+            "goal_hold_clock":"integer_ros_nanoseconds", "required_hold_ns":required_ns,
             "final_goal_within_tolerance":tr[-1][3],"final_position_error_m":tr[-1][1],
             "final_orientation_error_rad":tr[-1][2],"best_position_error_m":min(x[1] for x in tr),
-            "best_orientation_error_rad":min(x[2] for x in tr),"trace_start_time_s":tr[0][0],
-            "trace_end_time_s":tr[-1][0],"trace_duration_s":tr[-1][0]-tr[0][0]}
+            "best_orientation_error_rad":min(x[2] for x in tr),"trace_start_time_s":tr[0][0]/1e9,
+            "trace_end_time_s":tr[-1][0]/1e9,"trace_duration_s":(tr[-1][0]-tr[0][0])/1e9}
 
 def regime_times(rows,end_t):
     d=defaultdict(float)
@@ -134,16 +130,23 @@ def main():
     ap.add_argument("--urdf",default="src/arm_description/urdf/Arm.urdf"); ap.add_argument("--position-tolerance-m",type=float,default=.02)
     ap.add_argument("--orientation-tolerance-rad",type=float,default=.20); ap.add_argument("--success-hold-s",type=float,default=.10)
     ap.add_argument("--method",default="careplanner_full"); ap.add_argument("--trial-id",default="trial_00"); ap.add_argument("--output-json",default="")
+    ap.add_argument("--require-benchmark-window", action="store_true")
     a=ap.parse_args(); repo=os.path.abspath(a.repo); run=os.path.abspath(a.run_dir)
     with open(os.path.join(repo,a.cases_json)) as f: db=json.load(f)
     case=next((c for c in db["cases"] if c["case_id"]==a.case_id),None)
     if case is None: raise KeyError(a.case_id)
     helper=load_fk_helper(repo); robot=URDF.from_xml_file(os.path.join(repo,a.urdf)); chain=helper.find_chain_joints(robot,"base_link","EE_link")
-    js=joint_states(os.path.join(run,"joint_states.csv"),JOINTS)
-    goal=goal_eval(js,helper,chain,JOINTS,case,a.position_tolerance_m,a.orientation_tolerance_rad,a.success_hold_s)
+    js=joint_states(os.path.join(run,"joint_states.csv"),JOINTS,timestamps_ns=True)
+    window=load_window(run, a.require_benchmark_window)
+    js=window_joint_samples(js,window,timestamps_ns=True)
+    goal=goal_eval(js,helper,chain,JOINTS,case,a.position_tolerance_m,a.orientation_tolerance_rad,a.success_hold_s,timestamps_ns=True)
     reg=tokens(os.path.join(run,"regime_summary.csv")); com=tokens(os.path.join(run,"commit_summary.csv")); exe=tokens(os.path.join(run,"execution_vbc_summary.csv"))
     cand=tokens(os.path.join(run,"candidate_vbc_summary.csv")); trk=tokens(os.path.join(run,"tracker_summary.csv")); loc=tokens(os.path.join(run,"local_planner_summary.csv"))
     acq=tokens(os.path.join(run,"visibility_acquisition_summary.csv")); prog=tokens(os.path.join(run,"nominal_progress_summary.csv"))
+    reg=window_rows(reg,window,True); com=window_rows(com,window,True)
+    exe=window_rows(exe,window); cand=window_rows(cand,window)
+    trk=window_rows(trk,window); loc=window_rows(loc,window)
+    acq=window_rows(acq,window,True); prog=window_rows(prog,window,True)
     lr=reg[-1] if reg else {}; lc=com[-1] if com else {}; lp=prog[-1] if prog else {}
     commits=integer(lc.get("commit_count")); gs=integer(lc.get("final_gcdf_safe_count")); gu=integer(lc.get("final_gcdf_unsafe_count")); gt=integer(lc.get("final_gcdf_timeout_count"))
     vs=integer(lc.get("verification_safe_count")); vu=integer(lc.get("verification_unsafe_count")); vt=integer(lc.get("verification_timeout_count"))
@@ -215,6 +218,11 @@ def main():
     authoritative_phase=None if legacy_stale else legacy_phase
 
     out={"phase":"D.1","method":a.method,"trial_id":a.trial_id,"case_id":a.case_id,"difficulty":case.get("difficulty_bin"),
+         "evaluation_window_mode":"bounded_measured_samples" if window else "legacy_unbounded",
+         "benchmark_window":window,
+         "commit_counter_scope":"cumulative_since_node_start_at_window_end" if window else "legacy_cumulative",
+         "verification_unsafe_rejection_count_semantics":"combined_gcdf_and_exact_vbc",
+         "time_to_success_clock":"ros_sample_time",
          "goal_position":case["goal_position"],"goal_orientation_xyzw":case["goal_orientation"],
          "success_thresholds":{"position_tolerance_m":a.position_tolerance_m,"orientation_tolerance_rad":a.orientation_tolerance_rad,"required_hold_s":a.success_hold_s},**goal,
          "task_progress_authority":"measured_fk_goal",
@@ -231,10 +239,24 @@ def main():
          "execution_vbc_records":len(er),"execution_vbc_unsafe_records":eu,
          "candidate_vbc_records":sum(r.get("trajectory_source")=="predicted" for r in cand),
          "candidate_vbc_unsafe_records":sum(r.get("trajectory_source")=="predicted" and r.get("has_violation")=="1" for r in cand),
-         "commit_gate_rejection_count":gu+gt+vu+vt,"repair_count":integer(lr.get("repair_entry_count")),"probe_count":integer(lr.get("probe_entry_count")),
+         **rejection_counts(gu,gt,vu,vt),"repair_count":integer(lr.get("repair_entry_count")),"probe_count":integer(lr.get("probe_entry_count")),
          **regime_times(reg,goal.get("trace_end_time_s")),"max_remaining_obligation_count":max(rem) if rem else 0,
          "obligation_clear_events":sum(x>0 and y==0 for x,y in zip(rem,rem[1:])),
          "tracking_error_inf":stats(r.get("tracking_error_inf") for r in trk),
+         # Keep the legacy same-phase error and the phase-aligned spatial
+         # diagnostics side by side.  The latter are emitted by the tracker
+         # when tracking_phase_alignment_enabled is active.
+         "spatial_tracking_error_inf":stats(
+             r.get("spatial_tracking_error_inf") for r in trk),
+         "spatial_tracking_bound_m":stats(
+             r.get("spatial_tracking_bound_m") for r in trk),
+         "primitive_tracking_same_phase_bound_m":stats(
+             r.get("primitive_tracking_same_phase_bound_m") for r in trk),
+         "tracking_phase_lag_s":stats(
+             r.get("tracking_phase_lag_s") for r in trk),
+         "tracking_phase_abs_lag_s":stats(
+             abs(num(r.get("tracking_phase_lag_s")))
+             for r in trk if math.isfinite(num(r.get("tracking_phase_lag_s")))),
          "timing_sample_counts":{"candidate_plans":len(candidate_plans),"completed_verifications":len(timing_commit)},
          "local_plan_ms":local_plan_ms,
          "local_plan_equivalent_hz":hz_from_ms(local_plan_ms),

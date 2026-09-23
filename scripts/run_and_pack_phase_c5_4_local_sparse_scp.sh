@@ -17,6 +17,10 @@ CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/
 GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
+VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-false}"
+# Opt-in exact local/final GCDF pair recording for a geometry audit.
+# Disabled by default so ordinary 10 Hz runs keep the lean recorder set.
+LOCAL_CDF_PAIR_AUDIT_ENABLED="${LOCAL_CDF_PAIR_AUDIT_ENABLED:-false}"
 
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
@@ -51,6 +55,8 @@ echo "[C5.8] architecture: Sparse SCP -> executable GCDF -> exact VBC -> single 
 echo "[C5.4] planner latency target: diagnostic first; NOT a 50 ms MPC deadline"
 echo "[COLLISION] local+final GCDF proximity margin: ${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[VISIBILITY] VBC swept-volume extra margin: ${VBC_SWEPT_VOLUME_MARGIN_M} m"
+echo "[VISIBILITY] VBC continuous motion bound: ${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}"
+echo "[AUDIT] exact local/final GCDF pair recording: ${LOCAL_CDF_PAIR_AUDIT_ENABLED}"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[ERROR] signed CDF checkpoint not found: ${CHECKPOINT}"
@@ -544,6 +550,11 @@ if os.path.isfile(breakdown_path):
             "execution_stamp_ns", "tracker_seq", "mode", "verification_seq",
             "duration_s", "initial_error_inf", "mean_error_inf",
             "p95_error_inf", "max_error_inf", "terminal_error_inf",
+            "spatial_mean_error_inf", "spatial_p95_error_inf",
+            "spatial_max_error_inf", "active_spatial_max_error_inf",
+            "spatial_tracking_bound_max_m",
+            "same_phase_tracking_bound_max_m",
+            "tracking_phase_lag_mean_s", "tracking_phase_lag_max_abs_s",
             "max_error_phase_s", "max_error_phase_fraction",
             "fraction_error_gt_0p10", "fraction_error_gt_0p25",
             "raw_candidate_age_s", "dispatch_suffix_phase_s",
@@ -974,7 +985,9 @@ PROBE_SINGLE_FLIGHT_TOPIC="/care_planner/local_planner/candidate_trajectory_sing
 LOCAL_SCP_GPU_SOCKET="${GPU_SOCKET}" \
 LOCAL_SCP_SELECTOR_JSONL="${SELECTOR_JSONL}" \
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN}" \
+LOCAL_CDF_PAIR_AUDIT_ENABLED="${LOCAL_CDF_PAIR_AUDIT_ENABLED}" \
 VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M}" \
+VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}" \
 LOCAL_SCP_CANDIDATE_TOPIC="/care_planner/local_planner/candidate_trajectory" \
 LOCAL_SCP_SUMMARY_TOPIC="/care_planner/local_planner/summary" \
 LOCAL_SCP_REPLAN_TOPIC="/care_planner/local_planner/replan_request" \

@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from phase_e_offline_body_geometry import add_geometry_arguments, selected_body_path
 import pinocchio as pin
 
 # scripts/ is on sys.path when this file is executed directly.
@@ -273,6 +274,7 @@ def main() -> int:
         type=int,
         default=25,
     )
+    add_geometry_arguments(ap)
     args = ap.parse_args()
 
     if args.target_count <= 0:
@@ -303,6 +305,7 @@ def main() -> int:
     body_samples_path = (args.body_samples or (
         repo / "src/care_confidence_map/config/body_samples.yaml"
     )).resolve()
+    body_samples_path = selected_body_path(args, repo, body_samples_path)
     world = (args.world or (
         repo / "src/arm_description/worlds/maixsense_obstacles.world"
     )).resolve()
@@ -353,7 +356,7 @@ def main() -> int:
         raise SystemExit("ERROR: invalid/non-finite joint limits")
 
     spheres = load_body_spheres(
-        body_samples_path, body_inflation=args.body_inflation)
+        body_samples_path, body_inflation=args.body_inflation, geometry_backend=args.geometry_backend)
     boxes = load_world_boxes(world)
 
     rng = np.random.default_rng(args.seed)
@@ -536,7 +539,9 @@ def main() -> int:
         },
         "inputs": {
             "urdf": str(urdf),
-            "body_samples": str(body_samples_path),
+            "body_samples": str(body_samples_path) if args.geometry_backend == "samples" else None,
+            "geometry_backend": args.geometry_backend,
+            "primitive_urdf": str(body_samples_path) if args.geometry_backend == "primitive" else None,
             "world": str(world),
             "cases_json": str(cases_json),
         },

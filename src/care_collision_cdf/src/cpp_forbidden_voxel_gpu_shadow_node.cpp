@@ -103,6 +103,11 @@ struct ResponseHeader {
 static_assert(sizeof(RequestHeader) == 8, "Unexpected request-header packing");
 static_assert(sizeof(ResponseHeader) == 40, "Unexpected response-header packing");
 
+// A repair request can contain one identity per obligation point and knot.
+// The planner retains at most 32 witness points, so 1024 leaves room for the
+// complete 20-knot expansion while keeping malformed requests bounded.
+constexpr std::size_t kMaxWitnessRequestPairs = 1024;
+
 bool sendAll(int fd, const void* data, std::size_t bytes) {
   const auto* ptr = static_cast<const uint8_t*>(data);
   std::size_t sent = 0;
@@ -240,6 +245,9 @@ class CppForbiddenVoxelGpuShadow {
     pnh_.param("z_min", z_min_, 0.0);
     pnh_.param("z_max", z_max_, 1.15);
     pnh_.param("map_resolution", resolution_, 0.05);
+    pnh_.param("occupied_hard_margin_m", occupied_hard_margin_m_, 0.0);
+    if (!std::isfinite(occupied_hard_margin_m_))
+      throw std::invalid_argument("Nonfinite occupied hard margin");
 
     if (rate_hz_ <= 0.0 || resolution_ <= 0.0 ||
         proximity_margin_ < 0.0 || execution_proximity_margin_ < 0.0) {
@@ -617,6 +625,14 @@ class CppForbiddenVoxelGpuShadow {
     pairs.reserve(
         static_cast<std::size_t>(steps.size()) *
         static_cast<std::size_t>(max_pairs_per_step_));
+    // Preserve the worst physical obstacle before either learned-query cap.
+    const bool protect_occupied = channel == Channel::FINAL || channel == Channel::EXECUTION;
+    const double occupied_band = std::max(proximity_margin, static_cast<double>(std::nextafter(
+        static_cast<float>(0.5 * std::sqrt(3.0) * resolution_ + occupied_hard_margin_m_),
+        std::numeric_limits<float>::infinity())));
+    const double search_margin = protect_occupied ? occupied_band : proximity_margin;
+    PairMeta worst_occupied;
+    bool have_worst_occupied = false;
 
     std::size_t raw_total = 0;
     int active_steps = 0;
@@ -636,10 +652,12 @@ class CppForbiddenVoxelGpuShadow {
         const Anchor& anchor = *anchor_ptr;
         if (anchor.primitive) {
           const auto& a=*anchor.primitive;
-          care_confidence_map::visitPrimitiveProximity(a.shape,a.inflation,proximity_margin,
+          care_confidence_map::visitPrimitiveProximity(a.shape,a.inflation,search_margin,
               Eigen::Vector3d(x_min_,y_min_,z_min_),Eigen::Vector3i(nx_,ny_,nz_),resolution_,
               [&](int x,int y,int z,float clearance) {
                 const int index=linearIndex(x,y,z);
+                if (clearance > proximity_margin &&
+                    map.source_type[index] != CollisionCDFConstraintBatch::SOURCE_OCCUPIED) return;
                 float& best=best_clearance_[index];
                 if (!std::isfinite(best)) {best=clearance;touched.push_back(index);}
                 else if (clearance<best) best=clearance;
@@ -651,7 +669,7 @@ class CppForbiddenVoxelGpuShadow {
           continue;
         }
         const double search_radius =
-            static_cast<double>(anchor.radius) + proximity_margin;
+            static_cast<double>(anchor.radius) + search_margin;
         const int n = static_cast<int>(
             std::ceil(search_radius / resolution_));
 
@@ -698,7 +716,8 @@ class CppForbiddenVoxelGpuShadow {
               const float clearance = static_cast<float>(
                   std::sqrt(dx * dx + dy * dy + dz * dz) -
                   static_cast<double>(anchor.radius));
-              if (static_cast<double>(clearance) > proximity_margin) {
+              if (static_cast<double>(clearance) > proximity_margin &&
+                  (!protect_occupied || map.source_type[ulinear] != CollisionCDFConstraintBatch::SOURCE_OCCUPIED)) {
                 continue;
               }
 
@@ -719,6 +738,20 @@ class CppForbiddenVoxelGpuShadow {
         continue;
       }
       ++active_steps;
+
+      if (protect_occupied) for (int index : touched) {
+        if (map.source_type[index] != CollisionCDFConstraintBatch::SOURCE_OCCUPIED) continue;
+        if (have_worst_occupied && worst_occupied.approx_body_clearance_m <= best_clearance_[index]) continue;
+        have_worst_occupied = true;
+        worst_occupied.point = pointForIndex(index);
+        worst_occupied.q = representative.q;
+        worst_occupied.confidence = map.confidence[index];
+        worst_occupied.current_visibility = map.current_visibility[index];
+        worst_occupied.source_type = map.source_type[index];
+        worst_occupied.approx_body_clearance_m = best_clearance_[index];
+        worst_occupied.eval_timestep = representative.eval_timestep;
+        worst_occupied.original_timestep = step;
+      }
 
       std::sort(
           touched.begin(), touched.end(),
@@ -784,6 +817,17 @@ class CppForbiddenVoxelGpuShadow {
       pairs.resize(static_cast<std::size_t>(max_pairs_));
     }
 
+    if (have_worst_occupied && std::none_of(pairs.begin(), pairs.end(), [&](const PairMeta& p) {
+          return p.original_timestep == worst_occupied.original_timestep && p.point == worst_occupied.point;
+        })) {
+      // Reserve physical safety inside the existing GPU capacity. If full,
+      // replace the geometrically farthest budgeted row, never exceed the
+      // worker's max_pairs contract. VBC still checks all swept UNKNOWN voxels.
+      if (pairs.size() < static_cast<std::size_t>(max_pairs_)) pairs.push_back(worst_occupied);
+      else *std::max_element(pairs.begin(),pairs.end(),[](const PairMeta& a,const PairMeta& b) {
+        return a.approx_body_clearance_m < b.approx_body_clearance_m;
+      })=worst_occupied;
+    }
     if (raw_pair_count) {
       *raw_pair_count = raw_total;
     }
@@ -843,7 +887,8 @@ class CppForbiddenVoxelGpuShadow {
     if (!active_witness_response_) return true;
     const auto& req = active_witness_response_->request;
     const std::size_t n = req.original_timestep.size();
-    if (req.dof != 7 || n > 32 || req.point_flat.size() != 3*n || req.q_flat.size() != 7*n) {
+    if (req.dof != 7 || n > kMaxWitnessRequestPairs ||
+        req.point_flat.size() != 3*n || req.q_flat.size() != 7*n) {
       failWitnessResponse("request_dimension"); return false;
     }
     bool valid = true;
@@ -1617,6 +1662,7 @@ class CppForbiddenVoxelGpuShadow {
   double confidence_threshold_ = 0.50;
   double proximity_margin_ = 0.075;
   double execution_proximity_margin_ = 0.075;
+  double occupied_hard_margin_m_ = 0.0;
   int max_pairs_per_step_ = 250;
   int max_pairs_ = 8000;
   double zero_band_ = 0.05;

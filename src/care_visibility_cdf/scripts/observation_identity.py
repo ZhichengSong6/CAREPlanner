@@ -34,5 +34,11 @@ def observation_token(ob):
                "id": int(ob["id"]),
                "points": sorted(tuple(float(x) for x in p) for p in ob["points"]),
                "q_vis": [float(x) for x in ob["q_vis"]]}
+    # Preserve historical token identity for legacy obligations. Newly
+    # generated masked targets include the mask because it changes the
+    # optimizer semantics even when all seven q values happen to match.
+    if "q_vis_joint_mask" in ob:
+        payload["joint_mask"] = [
+            float(x) for x in ob["q_vis_joint_mask"]]
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
     return "care_obs_v1_" + str(ob["id"]) + "_" + digest

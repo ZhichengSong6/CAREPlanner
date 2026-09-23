@@ -43,6 +43,7 @@ from evaluate_direct_vs_projection_ascent import (
     torch_load_checkpoint,
 )
 from hierarchical_visibility_cdf_model import build_from_checkpoint_args
+from r1_visibility_model import R1_SHA256, load_r1_checkpoint
 from validate_visibility_oracle import (
     find_chain_joints,
     fk_transform,
@@ -53,6 +54,7 @@ from check_visibility_self_occlusion import (
     q_row_to_map,
     raycast_self_occlusion,
 )
+from candidate_replacement_runtime import replacement_mount_group_pool
 
 
 _LEGACY_OUTPUT_SEMANTICS = "per_sensor_signed_visibility_cdf"
@@ -71,6 +73,30 @@ _HIERARCHICAL9_V1_ARCHITECTURE = {
     "dedicated_union_head": True,
     "sensor_specific_nonlinear_heads": True,
 }
+
+
+def preferred_sensor_selection(ranked, max_attempts, preferred_sensor_ids=None):
+    """Put explicitly preferred heads first while preserving scalar ranks."""
+    ranked = [(int(rank), int(sensor_id)) for rank, sensor_id in ranked]
+    if any(sensor_id < 0 or sensor_id >= 8 for _, sensor_id in ranked):
+        raise ValueError("ranked sensor id outside [0,7]")
+    if int(max_attempts) < 1:
+        raise ValueError("max_attempts must be positive")
+    preferred = [] if preferred_sensor_ids is None else [
+        int(sensor_id) for sensor_id in preferred_sensor_ids]
+    if (len(set(preferred)) != len(preferred) or
+            any(sensor_id < 0 or sensor_id >= 8 for sensor_id in preferred)):
+        raise ValueError("preferred sensor ids must be unique values in [0,7]")
+    by_sensor = {sensor_id: (rank, sensor_id) for rank, sensor_id in ranked}
+    front = [by_sensor[sensor_id] for sensor_id in preferred
+             if sensor_id in by_sensor]
+    preferred_set = set(preferred)
+    ordered = front + [row for row in ranked if row[1] not in preferred_set]
+    return ordered[:int(max_attempts)], {
+        "enabled": bool(preferred),
+        "requested_sensor_ids": preferred,
+        "ordered_sensor_ids": [sensor_id for _, sensor_id in ordered],
+    }
 
 
 class _Hierarchical9SensorView(torch.nn.Module):
@@ -222,11 +248,25 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
     # Hash before unpickling.  H9 V1 is a fixed runtime artifact and must match
     # the reviewed final.pt byte-for-byte regardless of its filename.
     checkpoint_sha256 = _checkpoint_sha256(checkpoint_path)
+    # Dispatch the pinned R1 before the generic loader: deserialize only once,
+    # using its independent private-tail definition (never the V1 constructor).
+    if checkpoint_sha256 == R1_SHA256:
+        model, ckpt = load_r1_checkpoint(checkpoint_path, device)
+        _record_runtime_model_metadata(
+            ckpt, checkpoint_sha256, "hierarchical9_r1_sensor_view"
+        )
+        return model, ckpt
     ckpt = torch_load_checkpoint(checkpoint_path, device)
     if not isinstance(ckpt, dict) or "model_state" not in ckpt:
         raise RuntimeError("unsupported per-sensor checkpoint structure")
 
     checkpoint_format = ckpt.get("format")
+    if checkpoint_format == "care_h9_scratch50k_r012_v1":
+        raise RuntimeError(
+            "R1 checkpoint SHA256 mismatch: got {}, expected {}".format(
+                checkpoint_sha256, R1_SHA256
+            )
+        )
     semantics = str(ckpt.get("output_semantics", ""))
     if checkpoint_format == _HIERARCHICAL9_FORMAT:
         cargs = _validate_hierarchical9_v1_checkpoint(
@@ -848,7 +888,8 @@ class PerSensorVisibilityRuntime:
         }
 
     def _candidate_geometry(
-        self, points_xyz, q_row, sensor_id: int
+        self, points_xyz, q_row, sensor_id: int,
+        minimum_conservative_g=None,
     ) -> Dict[str, object]:
         points = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
         q = np.asarray(q_row, dtype=np.float64).reshape(7)
@@ -912,14 +953,26 @@ class PerSensorVisibilityRuntime:
                 "primitive_hit": hit,
             })
 
+        threshold = (self.min_conservative_g if minimum_conservative_g is None
+                     else float(minimum_conservative_g))
+        if not math.isfinite(threshold) or threshold < -0.02:
+            raise ValueError("replacement conservative FOV threshold outside [-0.02, inf)")
+        # Keep the original numerical tolerance at the normal zero gate.
+        # The opt-in negative gate follows the requested strict > threshold.
+        conservative_passes = (min_cons_g > threshold if threshold < 0.0
+                               else min_cons_g + 1e-12 >= threshold)
         accepted = bool(
             len(point_rows) > 0
             and math.isfinite(min_cons_g)
-            and min_cons_g + 1e-12 >= self.min_conservative_g
+            and math.isfinite(min_nom_margin)
+            and conservative_passes
+            and min_nom_margin >= 0.0
             and (not self.require_primitive_los or not any_occluded)
         )
-        if min_cons_g < self.min_conservative_g:
+        if not conservative_passes:
             reject_reason = "conservative_fov"
+        elif min_nom_margin < 0.0:
+            reject_reason = "nominal_fov"
         elif self.require_primitive_los and any_occluded:
             reject_reason = "primitive_self_occlusion"
         else:
@@ -929,6 +982,7 @@ class PerSensorVisibilityRuntime:
             "accepted": accepted,
             "reject_reason": reject_reason,
             "min_conservative_g": float(min_cons_g),
+            "minimum_conservative_g_required": float(threshold),
             "min_nominal_margin": float(min_nom_margin),
             "any_primitive_self_occluded": bool(any_occluded),
             "per_point": point_rows,
@@ -939,6 +993,9 @@ class PerSensorVisibilityRuntime:
         points_xyz,
         q_zero_row,
         branch_seed_row=None,
+        replacement=None,
+        preferred_sensor_ids=None,
+        preference_reason=None,
     ) -> Dict[str, object]:
         """Return first FOV+LOS-certified sensor branch.
 
@@ -982,15 +1039,72 @@ class PerSensorVisibilityRuntime:
         attempts = []
         selected = None
 
-        for rank, sensor_id in enumerate(
-            order[: self.max_branch_attempts].tolist(), start=1
-        ):
+        ranked = [(rank, int(sid)) for rank, sid in enumerate(order.tolist(), 1)]
+        selection, sensor_priority = preferred_sensor_selection(
+            ranked, self.max_branch_attempts, preferred_sensor_ids)
+        sensor_priority["reason"] = (
+            str(preference_reason) if preferred_sensor_ids else "none")
+        diversity = []
+        replacement_group_priority = None
+        if replacement is not None:
+            # One pre-reserved recovery attempt buys ONE branch optimization.
+            # Rank locations remain scalar q_zero. Diversity only orders this
+            # opt-in failure-recovery proposal, never ordinary generation.
+            excluded = set(int(s) for s in replacement['excluded'])
+            group_pool, replacement_group_priority = replacement_mount_group_pool(
+                ranked, excluded,
+                bool(replacement.get(
+                    'ee_sensor_priority_first',
+                    replacement.get('wrist_pair_first', False))))
+            declared_groups = replacement.get('tried_mount_groups')
+            if (declared_groups is not None and
+                    sorted({int(group) for group in declared_groups}) !=
+                    replacement_group_priority['tried_mount_groups']):
+                raise ValueError('replacement mount-group ledger mismatch')
+            eligible = {sid for _, sid in group_pool}
+            replacement_preferred = replacement.get(
+                'preferred_sensor_ids', preferred_sensor_ids)
+            if replacement_preferred is not None:
+                replacement_preferred = [int(sensor_id)
+                                         for sensor_id in replacement_preferred]
+            preferred_pool, replacement_priority = preferred_sensor_selection(
+                group_pool, max(1, len(group_pool)), replacement_preferred)
+            replacement_group_priority['sensor_priority'] = replacement_priority
+            replacement_group_priority['sensor_priority']['reason'] = str(
+                replacement.get('preference_reason', preference_reason or 'none'))
+            desired = np.asarray(replacement['previous_q'], dtype=float)-branch_seed_np
+            for rank, sid in ranked:
+                if sid in excluded:
+                    continue
+                _, grad = self.branch_value_and_grad(points, branch_seed, sid)
+                g = grad.detach().cpu().numpy().reshape(7)
+                denom = float(np.linalg.norm(g)*np.linalg.norm(desired))
+                if denom > 1e-12 and np.all(np.isfinite(g)):
+                    diversity.append((float(g @ desired / denom), rank, sid))
+            diversity.sort()
+            explicitly_preferred = [
+                row for row in preferred_pool
+                if row[1] in set(replacement_preferred or [])]
+            if explicitly_preferred:
+                selection = explicitly_preferred[:1]
+            else:
+                selection = [(rank, sid) for _, rank, sid in diversity
+                             if sid in eligible][:1]
+            replacement_group_priority['selected_sensor_id'] = (
+                int(selection[0][1]) if selection else -1)
+
+        geometry_threshold = (self.min_conservative_g if replacement is None
+                              else float(replacement.get(
+                                  'minimum_conservative_g', self.min_conservative_g)))
+
+        for rank, sensor_id in selection:
             branch_tic = time.perf_counter()
             branch = self._optimize_branch(
                 points, branch_seed, int(sensor_id)
             )
             geometry = self._candidate_geometry(
-                points_np, branch["q_candidate"], int(sensor_id)
+                points_np, branch["q_candidate"], int(sensor_id),
+                minimum_conservative_g=geometry_threshold,
             )
             attempt = dict(branch)
             attempt["rank"] = int(rank)
@@ -1022,6 +1136,15 @@ class PerSensorVisibilityRuntime:
             "selected_q_vis": (
                 list(selected["q_candidate"]) if selected is not None else None
             ),
+            # A zero means that this sensor's pose is kinematically independent
+            # of that joint.  q_vis still carries seven finite values for the
+            # legacy interface, but downstream optimizers must not interpret a
+            # masked value (often zero or the branch seed) as a pose target.
+            "selected_joint_mask": (
+                self.sensor_masks_np[int(selected["sensor_id"])].astype(
+                    float).tolist()
+                if selected is not None else None
+            ),
             "scalar_q_zero": q_zero_np.astype(float).tolist(),
             "branch_seed_q": branch_seed_np.astype(float).tolist(),
             "scores_at_scalar_q_zero": [float(v) for v in scores.tolist()],
@@ -1031,6 +1154,9 @@ class PerSensorVisibilityRuntime:
                 DEFAULT_SENSOR_FRAMES[int(v)] for v in order.tolist()
             ],
             "attempts": attempts,
+            "replacement_diversity": diversity,
+            "replacement_group_priority": replacement_group_priority,
+            "sensor_priority": sensor_priority,
             "rejected_sensor_ids": [
                 int(a["sensor_id"])
                 for a in attempts

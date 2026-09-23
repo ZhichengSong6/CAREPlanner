@@ -44,6 +44,8 @@ install(FILES
   scripts/ncdf_stage3_trajectory_qp_runtime.py
   scripts/observation_identity.py
   scripts/per_sensor_visibility_runtime.py
+  scripts/r1_visibility_model.py
+  scripts/candidate_replacement_runtime.py
   scripts/test_ncdf_local_optimizer.py
   scripts/validate_visibility_oracle.py
   scripts/vbc_blocker_aware_acquisition_impl.py

@@ -47,6 +47,9 @@ from evaluate_direct_vs_projection_ascent import (  # noqa: E402
     model_value_and_grad_q,
 )
 from per_sensor_visibility_runtime import PerSensorVisibilityRuntime  # noqa: E402
+from candidate_replacement_runtime import (  # noqa: E402
+    high_witness_sensor_preference,
+)
 
 
 class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
@@ -115,8 +118,14 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             "~per_sensor_max_branch_attempts", 4))
         self.per_sensor_min_conservative_g = float(rospy.get_param(
             "~per_sensor_min_conservative_g", 0.0))
+        self.per_sensor_replacement_min_conservative_g = float(rospy.get_param(
+            "~per_sensor_replacement_min_conservative_g", -0.02))
         self.per_sensor_require_primitive_los = bool(rospy.get_param(
             "~per_sensor_require_primitive_los", True))
+        self.per_sensor_high_witness_priority_enabled = bool(rospy.get_param(
+            "~per_sensor_high_witness_priority_enabled", False))
+        self.per_sensor_high_witness_z_min = float(rospy.get_param(
+            "~per_sensor_high_witness_z_min", 0.85))
 
         if self.predicted_trajectory_timeout <= 0.0:
             raise ValueError("~predicted_trajectory_timeout must be positive")
@@ -124,6 +133,11 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             raise ValueError("~target_cell_resolution must be positive")
         if self.shared_fallback_ascent_steps < 1:
             raise ValueError("~shared_fallback_ascent_steps must be >= 1")
+        if not math.isfinite(self.per_sensor_high_witness_z_min):
+            raise ValueError("~per_sensor_high_witness_z_min must be finite")
+        if (not math.isfinite(self.per_sensor_replacement_min_conservative_g) or
+                not -0.02 <= self.per_sensor_replacement_min_conservative_g <= 0.0):
+            raise ValueError("~per_sensor_replacement_min_conservative_g must be in [-0.02,0]")
 
         if self.per_sensor_hybrid_enabled:
             if not self.per_sensor_checkpoint_path.is_file():
@@ -158,13 +172,16 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             rospy.logwarn(
                 "[vbc_waypoint_rolling] PER-SENSOR HYBRID ENABLED "
                 "checkpoint=%s solver=projection_root_ascent "
-                "proj=%d root=%d ascent=%d attempts=%d primitive_los=%d",
+                "proj=%d root=%d ascent=%d attempts=%d primitive_los=%d "
+                "high_witness_priority=%d high_witness_z_min=%.3f",
                 self.per_sensor_checkpoint_path,
                 self.projection_iters,
                 self.root_refine_iters,
                 self.per_sensor_branch_ascent_steps,
                 self.per_sensor_max_branch_attempts,
-                int(self.per_sensor_require_primitive_los))
+                int(self.per_sensor_require_primitive_los),
+                int(self.per_sensor_high_witness_priority_enabled),
+                self.per_sensor_high_witness_z_min)
         else:
             rospy.loginfo(
                 "[vbc_waypoint_rolling] per-sensor hybrid disabled; "
@@ -215,6 +232,9 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         VisCDF.  In Phase-E obligation generation q_deadline_nominal is the
         measured-q seed.  The scalar q_vis remains the fail-soft fallback.
         """
+        # Scalar/fallback q_vis is a seven-joint target.  A successful
+        # per-sensor branch replaces this with that sensor's kinematic mask.
+        result["q_vis_joint_mask"] = [1.0] * 7
         if not self.per_sensor_hybrid_enabled:
             return result
         if self._per_sensor_runtime is None:
@@ -235,10 +255,26 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             result["q_vis"], dtype=np.float64).reshape(7).copy()
         hybrid_tic = time.perf_counter()
         try:
+            replacement = getattr(self, '_candidate_replacement_override', None)
+            options = {} if replacement is None else {'replacement': replacement}
+            preferred = high_witness_sensor_preference(
+                points_np,
+                getattr(self, 'per_sensor_high_witness_priority_enabled', False),
+                getattr(self, 'per_sensor_high_witness_z_min', .85))
+            if replacement is not None and replacement.get('preferred_sensor_ids'):
+                preferred = [int(sensor_id) for sensor_id in
+                             replacement['preferred_sensor_ids']]
+                preference_reason = replacement.get(
+                    'preference_reason', 'replacement_high_witness')
+            else:
+                preference_reason = 'all_points_above_z_threshold'
+            if preferred:
+                options['preferred_sensor_ids'] = preferred
+                options['preference_reason'] = preference_reason
             hybrid = self._per_sensor_runtime.generate(
                 points_np,
                 q_zero,
-                branch_seed_row=branch_seed)
+                branch_seed_row=branch_seed, **options)
         except Exception as exc:
             rospy.logerr(
                 "[vbc_waypoint_rolling] per-sensor branch generation failed; "
@@ -289,6 +325,12 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         result["distance_qvis_from_nominal"] = float(
             np.linalg.norm(q_vis_np - q_nominal))
         sid = int(hybrid["selected_sensor_id"])
+        joint_mask = np.asarray(
+            hybrid["selected_joint_mask"], dtype=np.float64).reshape(7)
+        if (not np.all(np.isfinite(joint_mask)) or
+                np.any(joint_mask < 0.0) or np.any(joint_mask > 1.0)):
+            raise ValueError("per-sensor branch returned invalid joint mask")
+        result["q_vis_joint_mask"] = joint_mask.astype(float).tolist()
         result["per_sensor_selected_sensor_id"] = sid
         result["per_sensor_selected_sensor_frame"] = str(
             hybrid["selected_sensor_frame"])
@@ -299,11 +341,12 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
         rospy.logwarn(
             "[vbc_waypoint_rolling] PER-SENSOR BRANCH ACCEPTED S%d rank=%d "
-            "rejected=%s branch_ms=%.2f q_vis=%s",
+            "rejected=%s branch_ms=%.2f q_vis=%s joint_mask=%s",
             sid, int(hybrid["selected_rank"]),
             hybrid.get("rejected_sensor_ids"),
             float(hybrid.get("compute_ms", math.nan)),
-            _fmt(q_vis_np, 5))
+            _fmt(q_vis_np, 5),
+            "".join("1" if v > 0.5 else "0" for v in joint_mask))
         return result
 
     def _cell_key(self, xyz):

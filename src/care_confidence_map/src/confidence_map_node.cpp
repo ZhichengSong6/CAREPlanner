@@ -55,6 +55,10 @@ struct GridPoint
   // ToF observations acquired during the first task.
   float confidence = 0.0f;
   float bootstrap_confidence = 0.0f;
+  // Optional test-only oracle layer.  It is deliberately kept separate from
+  // sensor/bootstrap provenance so a diagnostic known-free injection cannot
+  // be erased by the next perception update or body-prior refresh.
+  float test_known_free_confidence = 0.0f;
   float current_visibility = 0.0f;
   // Phase E3 semantic state. 0 = not occupied / unknown-or-free,
   // 1 = most recently observed as occupied. Confidence distinguishes
@@ -116,6 +120,7 @@ public:
     }
 
     generateGlobalGrid();
+    applyConfiguredTestKnownFreePoints();
     if (observation_mode_ == "ideal_fov")
     {
       generateSensorLocalVisiblePoints();
@@ -218,6 +223,83 @@ private:
     nh.param("confidence_map/update_rate", update_rate_, 30.0);
     nh.param("confidence_map/publish_rate", publish_rate_, 10.0);
     nh.param("confidence_map/temporal_decay_time", temporal_decay_time_, 2.0);
+
+    // Test-only diagnostic oracle.  Empty/default configuration has no effect
+    // on production semantics.  Points are interpreted in map_frame and
+    // snapped to the nearest confidence-map voxel; an optional radius can be
+    // used to mark a small neighborhood for controlled sensitivity tests.
+    nh.param(
+        "confidence_map/test_known_free/enabled",
+        test_known_free_enabled_,
+        false);
+    nh.param(
+        "confidence_map/test_known_free/inflation_radius",
+        test_known_free_inflation_radius_,
+        0.0);
+    XmlRpc::XmlRpcValue test_points;
+    if (nh.getParam("confidence_map/test_known_free/points", test_points))
+    {
+      if (test_points.getType() != XmlRpc::XmlRpcValue::TypeArray)
+      {
+        ROS_ERROR("[confidence_map_node] confidence_map/test_known_free/points must be an array.");
+        return false;
+      }
+      for (int i = 0; i < test_points.size(); ++i)
+      {
+        const XmlRpc::XmlRpcValue& item = test_points[i];
+        double x = 0.0, y = 0.0, z = 0.0;
+        bool valid = false;
+        if (item.getType() == XmlRpc::XmlRpcValue::TypeArray && item.size() == 3)
+        {
+          auto number = [](const XmlRpc::XmlRpcValue& value, double* out) {
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+            {
+              *out = static_cast<int>(value);
+              return true;
+            }
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+            {
+              *out = static_cast<double>(value);
+              return true;
+            }
+            return false;
+          };
+          valid = number(item[0], &x) && number(item[1], &y) && number(item[2], &z);
+        }
+        else if (item.getType() == XmlRpc::XmlRpcValue::TypeStruct)
+        {
+          auto numberField = [&item](const char* key, double* out) {
+            if (!item.hasMember(key)) return false;
+            const XmlRpc::XmlRpcValue& value = item[key];
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+            {
+              *out = static_cast<int>(value);
+              return true;
+            }
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+            {
+              *out = static_cast<double>(value);
+              return true;
+            }
+            return false;
+          };
+          valid = numberField("x", &x) && numberField("y", &y) && numberField("z", &z);
+        }
+        if (!valid || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid test known-free point at index " << i);
+          return false;
+        }
+        test_known_free_points_.emplace_back(x, y, z);
+      }
+    }
+    if (test_known_free_inflation_radius_ < 0.0 ||
+        !std::isfinite(test_known_free_inflation_radius_))
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] invalid test_known_free/inflation_radius: "
+                       << test_known_free_inflation_radius_);
+      return false;
+    }
 
     nh.param<std::string>(
         "confidence_map/observation_mode",
@@ -729,6 +811,7 @@ private:
           p.z = static_cast<float>(z);
           p.confidence = 0.0f;
           p.bootstrap_confidence = 0.0f;
+          p.test_known_free_confidence = 0.0f;
           p.current_visibility = 0.0f;
           p.occupancy = 0.0f;
           p.last_seen_time = -1.0;
@@ -752,7 +835,63 @@ private:
     const float bootstrap = current_body_prior_active_
         ? p.bootstrap_confidence
         : 0.0f;
-    return std::max(p.confidence, bootstrap);
+    return std::max(std::max(p.confidence, bootstrap),
+                    p.test_known_free_confidence);
+  }
+
+  void applyConfiguredTestKnownFreePoints()
+  {
+    if (!test_known_free_enabled_ || test_known_free_points_.empty())
+    {
+      return;
+    }
+
+    int updated_cells = 0;
+    for (const auto& point : test_known_free_points_)
+    {
+      const double radius = test_known_free_inflation_radius_;
+      if (radius <= 1e-12)
+      {
+        int index = -1;
+        if (!positionToGridIndex(point, index))
+        {
+          ROS_WARN_STREAM("[confidence_map_node] test known-free point outside map: ["
+                          << point.x() << "," << point.y() << "," << point.z() << "]");
+          continue;
+        }
+        GridPoint& gp = grid_points_[static_cast<std::size_t>(index)];
+        if (gp.test_known_free_confidence <= 0.5f) ++updated_cells;
+        gp.test_known_free_confidence = 1.0f;
+        continue;
+      }
+
+      const double r2 = radius * radius;
+      int ix_min = std::max(0, static_cast<int>(std::floor((point.x() - radius - x_min_) / resolution_)));
+      int ix_max = std::min(nx_ - 1, static_cast<int>(std::ceil((point.x() + radius - x_min_) / resolution_)));
+      int iy_min = std::max(0, static_cast<int>(std::floor((point.y() - radius - y_min_) / resolution_)));
+      int iy_max = std::min(ny_ - 1, static_cast<int>(std::ceil((point.y() + radius - y_min_) / resolution_)));
+      int iz_min = std::max(0, static_cast<int>(std::floor((point.z() - radius - z_min_) / resolution_)));
+      int iz_max = std::min(nz_ - 1, static_cast<int>(std::ceil((point.z() + radius - z_min_) / resolution_)));
+      for (int ix = ix_min; ix <= ix_max; ++ix)
+      for (int iy = iy_min; iy <= iy_max; ++iy)
+      for (int iz = iz_min; iz <= iz_max; ++iz)
+      {
+        const double gx = x_min_ + static_cast<double>(ix) * resolution_;
+        const double gy = y_min_ + static_cast<double>(iy) * resolution_;
+        const double gz = z_min_ + static_cast<double>(iz) * resolution_;
+        const double dx = gx - point.x();
+        const double dy = gy - point.y();
+        const double dz = gz - point.z();
+        if (dx * dx + dy * dy + dz * dz > r2) continue;
+        GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
+        if (gp.test_known_free_confidence <= 0.5f) ++updated_cells;
+        gp.test_known_free_confidence = 1.0f;
+      }
+    }
+    ROS_WARN_STREAM("[confidence_map_node] TEST known-free oracle enabled: points="
+                    << test_known_free_points_.size()
+                    << ", inflation_radius=" << test_known_free_inflation_radius_
+                    << ", marked_voxels=" << updated_cells);
   }
 
   void clearBootstrapConfidenceLayer()
@@ -2615,6 +2754,9 @@ private:
     ROS_INFO_STREAM("publish_rate: " << publish_rate_);
     ROS_INFO_STREAM("temporal_decay_time: " << temporal_decay_time_);
     ROS_INFO_STREAM("observation_mode: " << observation_mode_);
+    ROS_INFO_STREAM("test_known_free_oracle: " << test_known_free_enabled_
+                    << ", configured_points=" << test_known_free_points_.size()
+                    << ", inflation_radius=" << test_known_free_inflation_radius_);
     ROS_INFO_STREAM("ray_observation_topic: " << ray_observation_topic_);
     ROS_INFO_STREAM("e3_summary_topic: " << e3_summary_topic_);
     ROS_INFO_STREAM("query_service: " << query_service_name_);
@@ -2701,6 +2843,10 @@ private:
   double update_rate_ = 30.0;
   double publish_rate_ = 10.0;
   double temporal_decay_time_ = 2.0;
+
+  bool test_known_free_enabled_ = false;
+  double test_known_free_inflation_radius_ = 0.0;
+  std::vector<tf2::Vector3> test_known_free_points_;
 
   std::string observation_mode_ = "ideal_fov";
   std::string ray_observation_topic_ =

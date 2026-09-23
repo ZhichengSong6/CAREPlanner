@@ -43,6 +43,12 @@
        Collision/GCDF clearance inflation is independent and must not
        silently enlarge the set of mandatory visibility obligations. -->
   <arg name="swept_volume_margin_m" default="0.0" />
+  <!-- The VBC runs adaptive midpoint samples at the configured temporal
+       resolution.  Keep the optional analytic enclosure disabled by default:
+       it is a conservative inflation on top of the discrete swept-volume
+       check, not a required sample. -->
+  <arg name="continuous_motion_bound_enabled" default="false" />
+  <arg name="include_measured_body" default="false" />
 
   <!-- The controlled C4.3 path already sets prefer_predicted_trajectory=true;
        the frozen C4.2 path leaves it false. Use that existing routing signal so
@@ -117,6 +123,8 @@
     <param name="trajectory_vbc/confidence_query_service" value="$(arg confidence_query_service)" />
     <param name="trajectory_vbc/min_visibility_before_sweep_margin_s" value="$(arg min_visibility_before_sweep_margin_s)" />
     <param name="trajectory_vbc/swept_volume_margin_m" value="$(arg swept_volume_margin_m)" />
+    <param name="trajectory_vbc/continuous_motion_bound_enabled" value="$(arg continuous_motion_bound_enabled)" />
+    <param name="trajectory_vbc/include_measured_body" value="$(arg include_measured_body)" />
     <param name="trajectory_vbc/temporal_layer_mpc_steps" value="$(arg temporal_layer_mpc_steps)" />
     <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
     <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />

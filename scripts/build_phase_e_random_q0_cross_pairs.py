@@ -12,14 +12,15 @@ Targets and initial configurations are intentionally separated:
 
 A q0 is eligible only if it passes BOTH:
   1) current CAREPlanner obstacle-body feasibility
-       risk body sphere + body_inflation, clearance >= required_q0_clearance;
-  2) the CURRENT Phase-E startup trusted-free assumption
-       every startup-prior body sphere (raw radius + startup_prior_inflation)
+       selected risk body + body_inflation, clearance >= required_q0_clearance;
+  2) the configured UNIFORM startup-envelope assumption
+       every startup-prior body shape (+ startup_prior_inflation)
        is non-overlapping with every static obstacle.
 
 The second check is essential in an obstacle world. Otherwise the one-shot
-startup body prior would mark a real obstacle region as trusted free before
-planning even starts.
+startup body prior could mark a real obstacle region as trusted free before
+planning even starts. This CLI's uniform inflation is NOT automatically the
+runtime Phase-E per-link prior profile; that profile must be checked separately.
 
 The builder then chooses a seeded, one-to-one assignment of distinct q0
 candidates to all 30 targets, with:
@@ -42,6 +43,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pinocchio as pin
 import yaml
+from phase_e_offline_body_geometry import add_geometry_arguments, selected_body_path, load_body_primitives
 
 from test_phase_e_goal_terminal_feasibility import (
     BodySphere,
@@ -90,6 +92,7 @@ def load_startup_prior_spheres(
     path: Path,
     inflation_m: float,
     risk_samples_only: bool,
+    geometry_backend="samples",
 ) -> List[BodySphere]:
     """Mirror confidence_map current_body_prior sphere selection.
 
@@ -97,6 +100,10 @@ def load_startup_prior_spheres(
     body samples, including links excluded from trajectory risk, participate in
     the one-shot trusted-free startup envelope.
     """
+    if geometry_backend == "primitive":
+        return load_body_primitives(path, inflation_m, risk_only=risk_samples_only)
+    if geometry_backend != "samples":
+        raise ValueError("Unknown geometry backend")
     doc = yaml.safe_load(path.read_text())
     links = doc.get("body_sampling", {}).get("links", [])
     spheres: List[BodySphere] = []
@@ -215,6 +222,7 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=20260906)
     ap.add_argument("--assignment-attempts", type=int, default=200000)
     ap.add_argument("--output-json", type=Path, required=True)
+    add_geometry_arguments(ap)
     args = ap.parse_args()
 
     repo = args.repo.resolve()
@@ -229,6 +237,7 @@ def main() -> int:
     body_samples_path = (args.body_samples or (
         repo / "src/care_confidence_map/config/body_samples.yaml"
     )).resolve()
+    body_samples_path = selected_body_path(args, repo, body_samples_path)
     out = args.output_json.resolve()
 
     for p in (target_pool, q0_pool, world, urdf, body_samples_path):
@@ -259,11 +268,12 @@ def main() -> int:
         raise SystemExit(f"ERROR: EE frame {args.ee_frame!r} not found")
 
     risk_spheres = load_body_spheres(
-        body_samples_path, body_inflation=float(args.body_inflation))
+        body_samples_path, body_inflation=float(args.body_inflation), geometry_backend=args.geometry_backend)
     startup_spheres = load_startup_prior_spheres(
         body_samples_path,
         inflation_m=float(args.startup_prior_inflation),
         risk_samples_only=bool(args.startup_prior_risk_samples_only),
+        geometry_backend=args.geometry_backend,
     )
     boxes = load_world_boxes(world)
 
@@ -456,7 +466,9 @@ def main() -> int:
         "q0_source_pool": str(q0_pool),
         "world": str(world),
         "urdf": str(urdf),
-        "body_samples": str(body_samples_path),
+        "body_samples": str(body_samples_path) if args.geometry_backend == "samples" else None,
+        "geometry_backend": args.geometry_backend,
+        "primitive_urdf": str(body_samples_path) if args.geometry_backend == "primitive" else None,
         "eligibility": {
             "source_count": len(q0_cases),
             "eligible_count": len(eligible),

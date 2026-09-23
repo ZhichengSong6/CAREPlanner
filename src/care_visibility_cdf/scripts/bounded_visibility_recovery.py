@@ -30,12 +30,28 @@ class VisibilityRecoveryBudget:
 
 
 def certified_distinct_q(result, previous):
-    hybrid = result.get('per_sensor_hybrid', {})
+    hybrid = result.get('per_sensor_hybrid')
     q = result.get('q_vis', [])
-    if (hybrid.get('accepted') is not True or len(q) != 7 or len(previous) != 7 or
+    if (len(q) != 7 or len(previous) != 7 or
             not all(math.isfinite(float(v)) for v in q) or
-            list(q) != list(hybrid.get('selected_q_vis', []))):
+            not all(math.isfinite(float(v)) for v in previous)):
         return False
+    if hybrid is not None:
+        # When the optional per-sensor proposer ran, only its explicitly
+        # accepted branch is a valid bounded refresh. A rejected branch must
+        # not silently fall back to the scalar pose in this path.
+        if (hybrid.get('accepted') is not True or
+                list(q) != list(hybrid.get('selected_q_vis', []))):
+            return False
+    else:
+        # The scalar proposer is the normal CASE001 path when the optional
+        # per-sensor runtime is disabled. It is still only a steering proposal;
+        # final GCDF and exact VBC remain the execution authorities.
+        try:
+            if not math.isfinite(float(result.get('final_f_min'))):
+                return False
+        except (TypeError, ValueError):
+            return False
     # Existing measured-progress scale: microscopic optimizer drift is not an
     # alternative target and must not reopen the planner's liveness budget.
     return max(abs(float(a)-float(b)) for a,b in zip(q,previous)) > .01

@@ -2,6 +2,8 @@
 
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
 #include <care_confidence_map/primitive_geometry.hpp>
+#include <pinocchio/multibody/data.hpp>
+#include <pinocchio/multibody/model.hpp>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -14,6 +16,10 @@ namespace care_confidence_map {
 
 struct VbcPrimitiveFrame {
   std::vector<VbcPrimitive> primitives;
+  // Per-solid displacement enclosure about this representative configuration.
+  // Empty means an exact static pose (legacy discrete API).
+  std::vector<double> motion_bounds;
+  int original_eval_timestep = -1;
 };
 
 class VbcPrimitiveModel {
@@ -25,9 +31,39 @@ class VbcPrimitiveModel {
                          std::vector<VbcPrimitiveFrame>* out, std::string* error) const;
   const std::vector<VbcPrimitive>& primitives() const { return primitives_; }
   const std::vector<std::string>& frames() const { return frames_; }
+  bool computeContinuousTrajectory(const TrajectoryRiskEvaluator& fk,
+      const std::vector<Eigen::VectorXd>& q, const std::vector<int>& indices,
+      const std::vector<double>& times, std::vector<VbcPrimitiveFrame>* out,
+      std::vector<int>* out_indices, std::vector<double>* out_times,
+      std::string* error, bool use_motion_bounds = false) const;
+  std::vector<double> displacementBounds(const std::vector<std::string>& names,
+      const Eigen::VectorXd& delta) const;
+
+  // Configuration-aware runtime body displacement.  Each returned value is a
+  // conservative bound for one primitive between q_measured and q_reference:
+  // center translation plus the relative rotation of the primitive times its
+  // local enclosing radius.  This is intentionally separate from
+  // displacementBounds(), which remains the continuous-sweep certificate used
+  // by VBC.
+  bool initializeRelativeFk(const std::string& urdf_file,
+                            const std::vector<std::string>& joint_names,
+                            std::string* error = nullptr);
+  std::vector<double> relativeFkDisplacementBounds(
+      const Eigen::VectorXd& q_measured,
+      const Eigen::VectorXd& q_reference) const;
+
  private:
   std::vector<std::string> frames_;
   std::vector<VbcPrimitive> primitives_;
+  std::vector<std::map<std::string, double>> joint_radii_;
+
+  bool relative_fk_initialized_ = false;
+  pinocchio::Model relative_fk_model_;
+  mutable pinocchio::Data relative_fk_measured_data_;
+  mutable pinocchio::Data relative_fk_reference_data_;
+  std::vector<int> relative_fk_q_indices_;
+  std::vector<pinocchio::FrameIndex> relative_fk_frame_ids_;
+  std::vector<double> relative_fk_primitive_radii_;
 };
 
 struct VbcGrid {
@@ -35,8 +71,9 @@ struct VbcGrid {
   double resolution = 0.05;
 };
 
-// Same grid-center and discrete-knot semantics as the existing sphere sweep.
-// No continuous-motion or full voxel-cube intersection certificate is implied.
+// Grid-center rasterization of static poses or conservative interval enclosures.
+// Continuous coverage requires frames from computeContinuousTrajectory; this
+// does not certify voxel-cube intersections or unmodelled actuator motion.
 // Template output keeps the selector's evidence/temporal pipeline unchanged.
 template <class Voxel>
 std::vector<Voxel> buildPrimitiveSweptVoxels(
@@ -73,10 +110,16 @@ std::vector<Voxel> buildPrimitiveSweptVoxels(
   for (std::size_t k = 0; k < frames.size(); ++k) {
     if (!std::isfinite(times[k]) || times[k] < 0 || original_indices[k] < 0)
       throw std::invalid_argument("Invalid primitive sweep time/index");
-    for (const auto& p : frames[k].primitives) {
+    if (!frames[k].motion_bounds.empty() && frames[k].motion_bounds.size() != frames[k].primitives.size())
+      throw std::invalid_argument("Incomplete continuous primitive enclosure");
+    for (std::size_t pi = 0; pi < frames[k].primitives.size(); ++pi) {
+      const auto& p = frames[k].primitives[pi];
+      const double bound = frames[k].motion_bounds.empty() ? 0.0 : frames[k].motion_bounds[pi];
+      if (!std::isfinite(bound) || bound < 0) throw std::invalid_argument("Invalid motion bound");
+      const double effective_margin = margin + bound;
       // Bounds must include the same floating-point tolerance as the SDF test,
       // otherwise ceil/floor can discard an exactly-on-surface grid center.
-      const Eigen::Vector3d extent = p.aabbHalfExtent(margin + 1e-12);
+      const Eigen::Vector3d extent = p.aabbHalfExtent(effective_margin + 1e-12);
       if (!p.center.allFinite() || !p.rotation.allFinite() || !extent.allFinite())
         throw std::invalid_argument("Nonfinite primitive FK geometry");
       // Clip in floating point BEFORE integer conversion, including distant bodies.
@@ -108,7 +151,7 @@ std::vector<Voxel> buildPrimitiveSweptVoxels(
             if (previous && previous->sweep_time_s <= times[k] + 1e-12) continue;
             const Eigen::Vector3d point(x, y, grid_z + grid.resolution * iz);
             const double distance = p.signedDistance(point);
-            if (distance > margin + 1e-12) continue;
+            if (distance > effective_margin + 1e-12) continue;
             Voxel v;
             v.point_base = point;
             v.link_name = p.link_name;
@@ -120,7 +163,8 @@ std::vector<Voxel> buildPrimitiveSweptVoxels(
             v.raw_sample_radius_m = v.swept_radius_m = std::numeric_limits<double>::quiet_NaN();
             v.point_center_distance_m = (point - p.center).norm();
             v.primitive_signed_distance_m = distance;
-            v.sweep_eval_timestep = static_cast<int>(k);
+            v.sweep_eval_timestep = frames[k].original_eval_timestep >= 0
+                ? frames[k].original_eval_timestep : static_cast<int>(k);
             v.sweep_original_timestep = original_indices[k];
             v.sweep_time_s = times[k];
             if (previous) *previous = std::move(v);

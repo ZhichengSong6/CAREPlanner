@@ -1,5 +1,6 @@
 #pragma once
 
+#include <care_confidence_map/vbc_primitive_model.hpp>
 #include <ros/ros.h>
 
 #include <sensor_msgs/JointState.h>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace egocentric_arm_planner {
@@ -35,6 +37,28 @@ public:
   bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
 
 private:
+  care_confidence_map::VbcPrimitiveModel tracking_geometry_;
+  bool primitive_tracking_guard_ = false;
+  // Use a configuration-aware maximum primitive displacement only for ticks
+  // where the legacy conservative bound is already over the guard margin.
+  // This keeps the normal 100 Hz path allocation-free and inexpensive.
+  // Keep the legacy guard as the default for configurations that do not opt
+  // into the configuration-aware fallback.  The C5.5 regime enables it
+  // explicitly in its YAML file.
+  bool primitive_tracking_relative_fk_ = false;
+  bool primitive_tracking_relative_fk_ready_ = false;
+  // Runtime tracker body-envelope threshold. This is separate from the VBC
+  // swept-volume margin; VBC keeps its own certification margin.
+  double certified_tracking_margin_m_ = 0.020;
+  double last_tracking_bound_m_ = 0.0;
+  double last_same_phase_tracking_bound_m_ = 0.0;
+  double last_spatial_tracking_error_inf_ = 0.0;
+  double last_spatial_tracking_bound_m_ = 0.0;
+  double last_relative_fk_tracking_bound_m_ = 0.0;
+  bool last_relative_fk_used_ = false;
+  double last_tracking_phase_match_s_ = 0.0;
+  double last_tracking_phase_lag_s_ = 0.0;
+  bool last_tracking_phase_alignment_used_ = false;
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void safetyHoldCallback(const std_msgs::BoolConstPtr& msg);
@@ -53,18 +77,34 @@ private:
       const trajectory_msgs::JointTrajectory& traj,
       std::vector<int>& traj_index_for_control_joint) const;
 
-  bool sampleTrajectory(const trajectory_msgs::JointTrajectory& traj,
-                        const std::vector<int>& traj_index_for_control_joint,
-                        double t,
-                        Eigen::VectorXd& q_ref,
-                        Eigen::VectorXd& dq_ref,
-                        Eigen::VectorXd& ddq_ref) const;
+  static bool sampleTrajectory(
+      const trajectory_msgs::JointTrajectory& traj,
+      const std::vector<int>& traj_index_for_control_joint,
+      double t,
+      Eigen::VectorXd& q_ref,
+      Eigen::VectorXd& dq_ref,
+      Eigen::VectorXd& ddq_ref);
 
-  bool getPointVector(const trajectory_msgs::JointTrajectoryPoint& point,
-                      const std::vector<double>& field,
-                      const std::vector<int>& traj_index_for_control_joint,
-                      Eigen::VectorXd& out,
-                      bool allow_missing_as_zero) const;
+  // Find the closest point on the locally time-windowed piecewise-linear
+  // reference path in joint space. This separates spatial path error from
+  // longitudinal phase lag: the tracker still executes at its current phase,
+  // but the body-envelope monitor compares measured q with this nearest path
+  // point rather than blindly comparing against q_ref(current_phase).
+  static bool findNearestTrajectoryReference(
+      const trajectory_msgs::JointTrajectory& traj,
+      const std::vector<int>& traj_index_for_control_joint,
+      double center_t,
+      double search_window_s,
+      const Eigen::VectorXd& q_measured,
+      double& matched_t,
+      Eigen::VectorXd& q_match);
+
+  static bool getPointVector(
+      const trajectory_msgs::JointTrajectoryPoint& point,
+      const std::vector<double>& field,
+      const std::vector<int>& traj_index_for_control_joint,
+      Eigen::VectorXd& out,
+      bool allow_missing_as_zero);
 
   double getTrajectoryEndTime(
       const trajectory_msgs::JointTrajectory& traj) const;
@@ -93,6 +133,7 @@ private:
                       const std::string& source);
 
   void maybePublishReplanRequest(double tracking_error_inf);
+  void flushPendingReplanRequest();
   void maybePublishSmoothHandoffReplanRequest(
       bool trajectory_active,
       uint64_t execution_stamp_ns,
@@ -162,6 +203,8 @@ private:
   bool hold_initial_zero_pose_ = true;
   bool hold_last_reference_when_no_trajectory_ = true;
   double reference_timeout_ = 0.15;
+  bool tracking_phase_alignment_enabled_ = true;
+  double tracking_phase_search_window_s_ = 0.50;
 
   double position_feedback_gain_ = 1.0;
   double max_command_velocity_ = 0.2;
@@ -171,6 +214,16 @@ private:
   double replan_tracking_error_inf_ = 0.25;
   double replan_request_min_interval_s_ = 0.50;
   ros::Time last_replan_request_time_;
+  bool replan_request_pending_ = false;
+  ros::Time replan_request_pending_time_;
+  uint64_t replan_request_pending_execution_stamp_ns_ = 0;
+  unsigned long long replan_request_count_ = 0;
+  unsigned long long replan_request_deferred_count_ = 0;
+
+  // A tracking-envelope abort is a terminal event for the committed token.
+  // Keep a bounded-in-practice tombstone set so delayed duplicate trajectory
+  // messages cannot reactivate a trajectory that was stopped for safety.
+  std::unordered_set<uint64_t> aborted_execution_stamps_;
 
   // Smooth certified receding-horizon handoff. The current certified
   // trajectory always remains executable through its own braking/hold tail;

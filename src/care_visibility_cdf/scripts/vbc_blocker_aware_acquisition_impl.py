@@ -12,10 +12,17 @@ kept active until seen, except when the earliest VBC temporal layer of the curre
 repair motion exposes another urgent spatial region.  That region is pushed as a
 nested blocker.  Once actual confidence clears it, the previous obligation is
 resumed.  Spatial proximity alone never causes preemption.
+
+Non-urgent regions discovered by later trajectory evaluations remain queued.  The
+progressive shared q_vis solver is allowed to combine regions only after a new
+region has been confirmed as a path-associated earliest-layer blocker, or after
+an explicit GCDF rejection has identified it on a refused candidate; unrelated
+queued regions must not rewrite the current q_vis while it is being executed.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -30,8 +37,9 @@ from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
 from evaluate_direct_vs_projection_ascent import model_value_and_grad_q
-from observation_identity import observation_region_token, vbc_bundle_identity
+from observation_identity import observation_region_token, observation_token, vbc_bundle_identity
 from bounded_visibility_recovery import VisibilityRecoveryBudget, region_key, certified_distinct_q
+from candidate_replacement_runtime import attach_candidate_replacement
 
 
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
@@ -44,6 +52,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._coherent_bundle_enabled = True
         self._coherent_bundle_lock = threading.Lock()
         self._coherent_bundle_seq = 0
+        # Candidate and execution-audit selectors each start their publisher
+        # sequence at one.  Keep a local monotonically increasing generation
+        # for the shared processing queue, and track publisher sequence per
+        # source so an execution bundle cannot be discarded as "stale" merely
+        # because the candidate selector has already published many bundles.
+        self._coherent_bundle_generation = 0
+        self._coherent_bundle_last_candidate_seq = 0
+        self._coherent_bundle_last_execution_seq = 0
+        self._coherent_bundle_source = "none"
+        self._coherent_bundle_source_seq = 0
+        self._coherent_bundle_urgent_recovery = False
         self._coherent_bundle_sweep_s = math.nan
         self._coherent_bundle_points = np.zeros((0, 3), dtype=np.float64)
         self._coherent_bundle_pending_nonempty = False
@@ -61,9 +80,27 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._last_active_layer_ids: List[int] = []
         self._last_active_layer_sweep_s = math.nan
         self._last_switch_reason = "startup"
+        # Target persistence: ordinary new obligations are queued.  Only a
+        # confirmed blocker from the current earliest trajectory layer may join
+        # the active target's shared solve and change q_vis.
+        self._path_co_plan_ids: List[int] = []
+        self._path_associated_ids: List[int] = []
+        self._path_association_reason = "startup"
+        self._path_associated_count = 0
+        self._path_queued_count = 0
         self._process_attempt_count = 0
         self._process_success_count = 0
         self._last_process_reason = "startup"
+
+        # C5.44: an active VBC obligation has two different kinds of state.
+        # Its q_vis is the steering target and must remain fixed while the
+        # same obligation is active.  Its reported voxels are safety evidence
+        # and must accumulate; a later VBC bundle is allowed to add points but
+        # must not make an earlier point disappear from the repair CDF query.
+        # The lock is intentionally local to blocker-aware acquisition.  A
+        # different obligation id still changes the active target normally.
+        self._active_qvis_target_lock_enabled = True
+        self._safety_union_merge_count = 0
 
         # C5.41 motion-efficient progressive shared visibility steering.
         # This cache affects only the learned REPAIR steering target. Exact
@@ -100,6 +137,15 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._frontier_last_weight_scale = 0.0
         self._frontier_last_qvis_weight_scale = 1.0
         self._frontier_last_cycle_active = False
+        self._frontier_last_observation_token = "none"
+        # A rejected candidate leaves measured q unchanged.  Keep a bounded,
+        # target-scoped count so the producer can widen one later frontier
+        # step instead of proposing the identical target forever.
+        self._frontier_feedback_token = "none"
+        self._frontier_feedback_seq = -1
+        self._frontier_feedback_failures = 0
+        self._frontier_last_escalation_active = False
+        self._frontier_last_escalation_failures = 0
 
         # Adaptive-resolution obligations. Coarse regions remain the default.
         # A verified recursive dependency cycle may request one refinement of
@@ -170,14 +216,60 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._gcdf_recovery_cache_hit_count = 0
         self._gcdf_recovery_cache_miss_count = 0
         self._final_recovery_lock = threading.Lock()
+        self._dependency_lock = threading.Lock()
+        self._dependency_pending = None
+        self._dependency_processing = False
+        self._dependency_latest = (-1, -1, -1)
+        self._dependency_attempts = {}
+        self._dependency_pins = {}
+        self._dependency_edges = {}  # child id -> parent id; only observation clears it
+        self._dependency_reason = 'startup'
+        self._dependency_pushes = 0
+        self._dependency_resumes = 0
         self._final_recovery_pending = None
         self._final_recovery_active_request = None
         self._final_recovery_budget = VisibilityRecoveryBudget()
+        # Published q_vis may come from a shared-solve snapshot rather than
+        # the stored individual obligation. Keep a bounded identity history so
+        # a temporarily preempted target can still be joined to its live
+        # region without accepting an unboundedly old request.
+        self._final_recovery_target_history = OrderedDict()
+        self._final_recovery_target_history_capacity = 64
+        # ``_final_recovery_latest_seq`` orders final-hold requests only.  A
+        # planner summary for a newer plan may carry ``final_vbc_hold=0``
+        # while the hold request is still waiting for the next active-set
+        # callback.  That feedback must not cancel the request before it can
+        # be consumed.
         self._final_recovery_latest_seq = -1
+        self._final_recovery_latest_feedback_seq = -1
+        self._final_recovery_feedback_count = 0
+        self._final_recovery_hold_feedback_count = 0
+        self._final_recovery_nonhold_feedback_count = 0
+        self._final_recovery_preserved_pending_count = 0
+        self._final_recovery_process_count = 0
+        self._final_recovery_process_success_count = 0
+        self._final_recovery_live_obligation_fallback_count = 0
+        # A repeated scalar solve can converge to the same q_vis even though
+        # the active obligation is still unsafe.  Permit one deterministic
+        # alternate seed on that rare final-VBC hold; this is steering only and
+        # remains behind the unchanged final GCDF + exact VBC gates.
+        self._final_recovery_alternative_seed_attempt_count = 0
+        self._final_recovery_alternative_seed_success_count = 0
+        self._final_recovery_alternative_seed_rad = 0.05
         self._final_recovery_enabled = False
         self._final_recovery_last_reason = 'disabled'
         super().__init__()
         self._final_recovery_enabled = bool(rospy.get_param('~final_vbc_recovery_enabled', False))
+        # Independent liveness trigger from certified, tracker-observed tiny
+        # executions. It does not enable the legacy final-VBC-failure trigger.
+        self._safe_stall_recovery_enabled = bool(rospy.get_param('~safe_stall_recovery_enabled', True))
+        self._final_recovery_alternative_seed_rad = float(rospy.get_param(
+            '~final_vbc_recovery_alternative_seed_rad', 0.05))
+        if (not math.isfinite(self._final_recovery_alternative_seed_rad) or
+                self._final_recovery_alternative_seed_rad <= 0.01 or
+                self._final_recovery_alternative_seed_rad > 0.20):
+            raise ValueError(
+                '~final_vbc_recovery_alternative_seed_rad must be in (0.01, 0.20]')
         self._final_recovery_last_reason = ('waiting_final_vbc_hold' if self._final_recovery_enabled else 'disabled')
 
         self.blocker_push_max_sweep_s = float(rospy.get_param(
@@ -196,6 +288,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "~progressive_shared_max_regions", 3))
         self.progressive_shared_accept_f_min = float(rospy.get_param(
             "~progressive_shared_accept_f_min", 0.0))
+        self.progressive_shared_path_association_only = bool(rospy.get_param(
+            "~progressive_shared_path_association_only", True))
+        self._active_qvis_target_lock_enabled = bool(rospy.get_param(
+            "~active_qvis_target_lock_enabled", True))
         self._obligation_match_qvis_min_f = float(rospy.get_param(
             "~obligation_match_qvis_min_f", 0.0))
 
@@ -212,6 +308,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             "~frontier_softmin_temperature", 0.05))
         self.frontier_step_inf = float(rospy.get_param(
             "~frontier_step_inf", 0.05))
+        self.frontier_vbc_escalation_enabled = bool(rospy.get_param(
+            "~frontier_vbc_escalation_enabled", False))
+        self.frontier_vbc_escalation_after = int(rospy.get_param(
+            "~frontier_vbc_escalation_after", 3))
+        self.frontier_escalated_step_inf = float(rospy.get_param(
+            "~frontier_escalated_step_inf",
+            max(self.frontier_step_inf, 0.10)))
         self.frontier_recompute_q_inf = float(rospy.get_param(
             "~frontier_recompute_q_inf", 0.01))
         self.frontier_base_weight_scale = float(rospy.get_param(
@@ -253,6 +356,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.active_set_bundle_topic = str(rospy.get_param(
             "~active_set_bundle_topic",
             "/care_planner/trajectory_risk/vbc_active_set_bundle"))
+        # The execution audit is a separate, committed-trajectory safety
+        # stream.  When configured, its UNKNOWN witness is a certified
+        # recovery blocker and is handled immediately, while ordinary
+        # candidate VBC discoveries retain the bounded queue/confirmation
+        # policy above.
+        self.execution_active_set_bundle_topic = str(rospy.get_param(
+            "~execution_active_set_bundle_topic", "")).strip()
         self.gcdf_recovery_trajectory_topic = str(rospy.get_param(
             "~gcdf_recovery_trajectory_topic",
             "/care_planner/final_gcdf/recovery_trajectory"))
@@ -278,6 +388,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if (not math.isfinite(self.frontier_step_inf) or
                 self.frontier_step_inf <= 0.0):
             raise ValueError("~frontier_step_inf must be positive finite")
+        if self.frontier_vbc_escalation_after < 1:
+            raise ValueError("~frontier_vbc_escalation_after must be >= 1")
+        if (not math.isfinite(self.frontier_escalated_step_inf) or
+                self.frontier_escalated_step_inf < self.frontier_step_inf or
+                self.frontier_escalated_step_inf > 0.20):
+            raise ValueError(
+                "~frontier_escalated_step_inf must be finite, >= frontier_step_inf, and <= 0.20")
         if (not math.isfinite(self.frontier_recompute_q_inf) or
                 self.frontier_recompute_q_inf <= 0.0):
             raise ValueError(
@@ -325,25 +442,40 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.active_set_bundle_sub = rospy.Subscriber(
             self.active_set_bundle_topic, Float64MultiArray,
             self._active_set_bundle_cb, queue_size=1)
+        self.execution_active_set_bundle_sub = None
+        if (self.execution_active_set_bundle_topic and
+                self.execution_active_set_bundle_topic !=
+                self.active_set_bundle_topic):
+            self.execution_active_set_bundle_sub = rospy.Subscriber(
+                self.execution_active_set_bundle_topic, Float64MultiArray,
+                self._execution_active_set_bundle_cb, queue_size=1)
         self.gcdf_recovery_trajectory_sub = rospy.Subscriber(
             self.gcdf_recovery_trajectory_topic, JointTrajectory,
             self._gcdf_recovery_trajectory_cb, queue_size=1)
         self.gcdf_recovery_event_sub = rospy.Subscriber(
             self.gcdf_recovery_event_topic, Float64MultiArray,
             self._gcdf_recovery_event_cb, queue_size=1)
-        if self._final_recovery_enabled:
+        if self._final_recovery_enabled or self._safe_stall_recovery_enabled:
             self.final_recovery_sub = rospy.Subscriber(str(rospy.get_param(
                 '~final_vbc_recovery_feedback_topic', '/care_planner/local_planner/summary')),
                 String, self._final_recovery_feedback_cb, queue_size=8)
+        if self._safe_stall_recovery_enabled:
+            self.observation_dependency_sub = rospy.Subscriber(
+                '/care_planner/local_planner/observation_dependency', String,
+                self._observation_dependency_cb, queue_size=8)
+        self._candidate_replacement = attach_candidate_replacement(self)
         self._c49_ready = True
         self._prune_or_initialize_stack()
         self._publish_schedule()
         self._publish_blocker_stack_summary()
         rospy.logwarn(
             "[vbc_blocker_stack] C4.9/C5.26 ENABLED max_blocker_sweep=%.3fs "
-            "confirmations=%d coherent_bundle=%s",
+            "confirmations=%d shared_path_only=%s coherent_bundle=%s "
+            "execution_bundle=%s",
             self.blocker_push_max_sweep_s, self.blocker_confirmations,
-            self.active_set_bundle_topic)
+            self.progressive_shared_path_association_only,
+            self.active_set_bundle_topic,
+            self.execution_active_set_bundle_topic or "disabled")
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         """Ignore the legacy split active-set stream in C5.26 blocker mode.
@@ -356,7 +488,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
         super()._active_set_callback(msg)
 
-    def _active_set_bundle_cb(self, msg: Float64MultiArray) -> None:
+    def _execution_active_set_bundle_cb(self, msg: Float64MultiArray) -> None:
+        """Route committed-trajectory VBC evidence through urgent recovery."""
+        self._active_set_bundle_cb(msg, urgent_recovery=True)
+
+    def _active_set_bundle_cb(
+            self, msg: Float64MultiArray, urgent_recovery: bool = False) -> None:
         if msg is None:
             return
         values = np.asarray(list(msg.data), dtype=np.float64)
@@ -400,12 +537,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             np.asarray([by_key[k] for k in ordered_keys], dtype=np.float64)
             if ordered_keys else np.zeros((0, 3), dtype=np.float64))
 
+        source = "execution" if urgent_recovery else "candidate"
         with self._coherent_bundle_lock:
-            if seq <= self._coherent_bundle_seq:
+            last_source_seq = (
+                self._coherent_bundle_last_execution_seq
+                if source == "execution"
+                else self._coherent_bundle_last_candidate_seq)
+            if seq <= last_source_seq:
                 self._coherent_bundle_last_reason = "stale_bundle"
                 return
             was_pending = self._coherent_bundle_pending_nonempty
-            self._coherent_bundle_seq = seq
+            self._coherent_bundle_generation += 1
+            generation = self._coherent_bundle_generation
+            self._coherent_bundle_seq = generation
+            if source == "execution":
+                self._coherent_bundle_last_execution_seq = seq
+            else:
+                self._coherent_bundle_last_candidate_seq = seq
+            self._coherent_bundle_source = source
+            self._coherent_bundle_source_seq = seq
+            self._coherent_bundle_urgent_recovery = bool(urgent_recovery)
             self._trace_coherent_bundle_identity = vbc_bundle_identity(msg, seq)
             self._coherent_bundle_sweep_s = (
                 float(sweep) if canonical.shape[0] else math.nan)
@@ -419,7 +570,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # coherent generation ID rather than from split-topic callback count.
         with self._obligation_lock:
             self._raw_active_set = canonical.copy()
-            self._raw_active_set_serial = seq
+            # Internal serials are local generations because candidate and
+            # execution publishers have independent sequence domains.
+            self._raw_active_set_serial = generation
             no_obligations = len(self._obligations) == 0
 
         if canonical.shape[0] > 0:
@@ -648,7 +801,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._last_gcdf_recovery_reason = "handled"
 
         self._prune_or_initialize_stack()
-        self._consider_active_layer(active_ids, new_ids, sweep_s)
+        # A final/local GCDF rejection is already a certified failure of the
+        # candidate trajectory.  The resulting UNKNOWN region is therefore a
+        # path blocker, even when its sweep time is just beyond the ordinary
+        # earliest-layer window or when this is the first observation of it.
+        # Promote it immediately; ordinary VBC active-set discoveries below
+        # retain the bounded-window + confirmation policy.
+        self._consider_active_layer(
+            active_ids, new_ids, sweep_s, urgent_gcdf_recovery=True)
         self._process_pending_refinement(
             trajectory, trajectory_received,
             "gcdf_rejected", float(sweep_s))
@@ -1173,6 +1333,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if not parent_ids:
             return False
 
+        # Legacy cycle refinement replaces obligations and resets the whole
+        # stack. It must not silently discard an in-flight sensing dependency
+        # or make its disappearance look like actual observation completion.
+        with self._obligation_lock:
+            dependency_active = bool(getattr(self, '_dependency_edges', {}))
+        if dependency_active:
+            with self._adaptive_refinement_lock:
+                self._pending_refinement_ids = []
+            self._adaptive_refinement_skip_count += 1
+            self._adaptive_refinement_last_reason = 'observation_dependency_in_flight'
+            return False
+
         with self._obligation_lock:
             by_id = {
                 int(ob["id"]): dict(ob) for ob in self._obligations}
@@ -1305,11 +1477,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         new_root = self._select_nearest_qvis_id(child_ids)
         with self._obligation_lock:
             self._repair_stack = [new_root] if new_root is not None else []
+            self._path_co_plan_ids = []
         self._pending_blocker_id = None
         self._pending_blocker_count = 0
         self._last_active_layer_ids = []
         self._last_active_layer_sweep_s = math.nan
         self._last_switch_reason = "adaptive_refinement_reset_stack"
+        self._path_associated_ids = []
+        self._path_association_reason = "adaptive_refinement_reset_stack"
 
         with self._progressive_shared_lock:
             self._progressive_shared_cache_key = None
@@ -1419,19 +1594,41 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self, matched, region, source: str) -> None:
         """Refresh live matched-region geometry while preserving q_vis provenance.
 
-        This intentionally keeps the existing planner semantics: matched
-        obligations still inherit the newest region points/keys/centroid and
-        q_vis is NOT regenerated. The additional state only measures whether
-        the live geometry has drifted away from the geometry that originally
-        generated q_vis.
+        A matched obligation keeps the original q_vis, while its safety
+        geometry is accumulated as a monotone union of all matched VBC/CDF
+        points. This prevents a later earliest-layer refresh from removing a
+        previously reported unsafe voxel from the repair query.
         """
+        old_points = np.asarray(
+            matched.get("points", []), dtype=np.float64).reshape(-1, 3)
         old_centroid = np.asarray(
             matched.get("centroid", [math.nan, math.nan, math.nan]),
             dtype=np.float64).reshape(3)
-        new_centroid = np.asarray(
-            region["centroid"], dtype=np.float64).reshape(3)
+        region_points = np.asarray(
+            region.get("points", []), dtype=np.float64).reshape(-1, 3)
+        if region_points.shape[0] == 0 or not np.all(np.isfinite(region_points)):
+            return
+
+        # Keep a monotone safety union for the lifetime of this obligation.
+        # The VBC selector may report only the earliest layer on one callback
+        # and a larger layer on the next callback. Replacing ``points`` would
+        # remove a previously reported unsafe voxel from the repair query.
+        by_key = {}
+        for point in old_points:
+            if np.all(np.isfinite(point)):
+                by_key[self._cell_key(point)] = point.copy()
+        before_count = len(by_key)
+        for point in region_points:
+            by_key[self._cell_key(point)] = point.copy()
+        merged_keys = tuple(sorted(by_key.keys()))
+        merged_points = np.asarray(
+            [by_key[key] for key in merged_keys], dtype=np.float64).reshape(-1, 3)
+        new_centroid = np.mean(merged_points, axis=0)
+        added_count = len(merged_keys) - before_count
+        if added_count > 0:
+            self._safety_union_merge_count += int(added_count)
         old_keys = tuple(matched.get("keys", ()))
-        new_keys = tuple(region["keys"])
+        new_keys = merged_keys
         qvis_source_centroid = np.asarray(
             matched.get("q_vis_source_centroid", old_centroid),
             dtype=np.float64).reshape(3)
@@ -1466,8 +1663,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         matched["last_geometry_match_source"] = str(source)
 
         matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
-        matched["points"] = np.asarray(
-            region["points"], dtype=np.float64).copy()
+        matched["points"] = merged_points.copy()
         matched["keys"] = new_keys
         matched["centroid"] = new_centroid.copy()
 
@@ -1485,13 +1681,55 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
     def _prune_or_initialize_stack(self) -> None:
         with self._obligation_lock:
             existing = {int(ob["id"]) for ob in self._obligations}
+            if not existing and hasattr(self, '_dependency_attempts'):
+                # A genuinely completed acquisition episode may start anew;
+                # movement, token changes and temporary preemption may not.
+                self._dependency_attempts.clear()
+            for child, parent in list(getattr(self, '_dependency_edges', {}).items()):
+                if child not in existing or parent not in existing:
+                    del self._dependency_edges[child]
+                    if child not in existing and parent in existing:
+                        self._dependency_resumes += 1
+                        self._dependency_reason = 'child_observed_resume_parent'
+            for oid in list(getattr(self, '_dependency_pins', {})):
+                if oid not in existing:
+                    del self._dependency_pins[oid]
             before = list(self._repair_stack)
+            before_current = before[-1] if before else None
             self._repair_stack = [oid for oid in self._repair_stack if oid in existing]
             self._stack_pop_count += max(0, len(before) - len(self._repair_stack))
             if not self._repair_stack and existing:
                 root = min(existing)
                 self._repair_stack.append(root)
                 self._last_switch_reason = "initialize_oldest_obligation"
+            current = self._repair_stack[-1] if self._repair_stack else None
+            self._path_co_plan_ids = [
+                int(oid) for oid in self._path_co_plan_ids
+                if int(oid) in existing
+            ]
+            # A completed target advances to the queued target.  That is an
+            # intentional target transition, so the previous co-plan set must
+            # not carry unrelated regions into the new episode.
+            if before_current != current:
+                self._path_co_plan_ids = []
+                self._path_associated_ids = []
+                self._path_association_reason = "active_target_changed"
+
+    def _shared_path_candidate_ids(self, by_id, active_id):
+        """Return regions allowed to influence the currently locked q_vis.
+
+        By default, only the active target and a confirmed path-associated
+        blocker may enter the progressive shared solve.  Newly discovered
+        regions outside that set remain pending and cannot rewrite q_vis.
+        ``progressive_shared_path_association_only`` is a diagnostic escape
+        hatch for legacy A/B comparisons; the safety gates are unchanged.
+        """
+        if not self.progressive_shared_path_association_only:
+            return set(int(oid) for oid in by_id)
+        with self._obligation_lock:
+            co_plan = set(int(oid) for oid in self._path_co_plan_ids)
+        co_plan.add(int(active_id))
+        return {oid for oid in co_plan if oid in by_id}
 
     def _progressive_priority_order(self, by_id, active_id):
         """Current blocker first; then urgent-layer regions; then the rest.
@@ -1540,13 +1778,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 int(oid) for oid in self._repair_stack
                 if any(int(ob["id"]) == int(oid) for ob in self._obligations)
             ]
-        if len(copied) < 2:
-            return None
-
         by_id = {int(ob["id"]): ob for ob in copied}
         if not by_id:
             return None
         active_id = stack[-1] if stack else min(by_id)
+        allowed_ids = self._shared_path_candidate_ids(by_id, active_id)
+        copied = [ob for ob in copied if int(ob["id"]) in allowed_ids]
+        by_id = {int(ob["id"]): ob for ob in copied}
+        # The bounded VBC-gated mode is deliberately defined for one active
+        # obligation as well.  The old multi-region soft-min mode still needs
+        # two regions, but returning here would make the single-obligation
+        # recovery path silently fall back to a full q_vis jump.  CASE001's
+        # final UNKNOWN recovery commonly has exactly one active region.
+        if not by_id:
+            return None
 
         measured = (
             None if self._latest_measured_q is None
@@ -1558,15 +1803,46 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return None
 
         if self.vbc_gated_frontier_step_enabled:
+            with self._frontier_lock:
+                rejection_failures = int(self._frontier_feedback_failures)
+            escalation_active = bool(
+                self.frontier_vbc_escalation_enabled and
+                rejection_failures >= self.frontier_vbc_escalation_after)
             active = by_id.get(int(active_id))
             q_vis = np.asarray(
                 [] if active is None else active.get("q_vis", []),
                 dtype=np.float64).reshape(-1)
+            qvis_token = (
+                observation_token(active) if active is not None else "none")
+            joint_mask = np.asarray(
+                [1.0] * 7 if active is None else
+                active.get("q_vis_joint_mask", [1.0] * 7),
+                dtype=np.float64).reshape(7)
+            # The waypoint publication is the executable q_vis snapshot. A
+            # shared solve can refresh it before the obligation dictionary is
+            # replaced; use that same target for the frontier direction and
+            # expose its token in the diagnostic summary.
+            with self._schedule_publish_lock:
+                published = getattr(self, "_trace_published_target", None)
+                if (published is not None and active is not None and
+                        published.get("region_token") == observation_region_token(active)):
+                    published_q = np.asarray(
+                        published.get("q_vis", []), dtype=np.float64).reshape(-1)
+                    if published_q.shape == (7,) and np.all(np.isfinite(published_q)):
+                        q_vis = published_q
+                        joint_mask = np.asarray(
+                            published.get("q_vis_joint_mask", joint_mask),
+                            dtype=np.float64).reshape(7)
+                        qvis_token = str(
+                            published.get("observation_token", qvis_token))
             if (q_vis.shape != (7,) or not np.all(np.isfinite(q_vis))):
                 self._frontier_last_mode = "invalid_active_qvis"
                 return None
+            if (not np.all(np.isfinite(joint_mask)) or
+                    np.any(joint_mask < 0.0) or np.any(joint_mask > 1.0)):
+                joint_mask = np.ones(7, dtype=np.float64)
 
-            delta = q_vis - measured
+            delta = joint_mask * (q_vis - measured)
             delta_inf = float(np.max(np.abs(delta)))
             if not math.isfinite(delta_inf):
                 self._frontier_last_mode = "invalid_active_qvis_delta"
@@ -1575,7 +1851,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             if delta_inf <= self.frontier_gradient_eps:
                 target = q_vis.copy()
             else:
-                step_inf = min(self.frontier_step_inf, delta_inf)
+                step_limit = (self.frontier_escalated_step_inf
+                              if escalation_active else self.frontier_step_inf)
+                step_inf = min(step_limit, delta_inf)
                 target = measured + step_inf * delta / delta_inf
                 target_tensor = torch.tensor(
                     target.reshape(1, 7),
@@ -1591,6 +1869,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             result = {
                 "active": True,
                 "target": target,
+                "q_vis_joint_mask": joint_mask.copy(),
                 "frontier_weight_scale": 1.0,
                 "qvis_weight_scale": 0.0,
                 "cycle_active": bool(cycle_active),
@@ -1600,6 +1879,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "softmin_weights": {},
                 "direction_norm_inf": delta_inf,
                 "target_shift_inf": target_shift_inf,
+                "observation_token": qvis_token,
+                "vbc_rejection_failures": rejection_failures,
+                "escalation_active": escalation_active,
             }
             with self._frontier_lock:
                 self._frontier_cache_key = None
@@ -1614,7 +1896,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._frontier_last_weight_scale = 1.0
                 self._frontier_last_qvis_weight_scale = 0.0
                 self._frontier_last_cycle_active = bool(cycle_active)
+                self._frontier_last_observation_token = qvis_token
+                self._frontier_last_escalation_active = escalation_active
+                self._frontier_last_escalation_failures = rejection_failures
             return result
+
+        # The legacy soft-min frontier is a multi-region objective and cannot
+        # be formed from a single region.  Keep that behavior unchanged after
+        # allowing the bounded single-obligation branch above.
+        if len(copied) < 2:
+            return None
 
         priority = self._progressive_priority_order(by_id, active_id)
         considered = [
@@ -1768,16 +2059,24 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if not hasattr(self, "frontier_target_pub"):
             return
         result = self._compute_visibility_frontier()
+        with self._frontier_lock:
+            self._frontier_last_observation_token = (
+                "none" if result is None else
+                str(result.get("observation_token", "none")))
         msg = Float64MultiArray()
         if result is None:
-            msg.data = [0.0, 0.0, 1.0] + [0.0] * 7
+            msg.data = [0.0, 0.0, 1.0] + [0.0] * 7 + [1.0] * 7
         else:
+            joint_mask = np.asarray(
+                result.get("q_vis_joint_mask", [1.0] * 7),
+                dtype=np.float64).reshape(7)
             msg.data = [
                 1.0,
                 float(result["frontier_weight_scale"]),
                 float(result["qvis_weight_scale"]),
                 *[float(v) for v in np.asarray(
                     result["target"], dtype=np.float64).reshape(7)],
+                *[float(v) for v in joint_mask],
             ]
             self._frontier_publish_count += 1
         self.frontier_target_pub.publish(msg)
@@ -1804,6 +2103,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f"{self._frontier_last_weight_scale:.6f}"
             f" qvis_weight_scale="
             f"{self._frontier_last_qvis_weight_scale:.6f}"
+            f" vbc_rejection_failures={self._frontier_last_escalation_failures}"
+            f" escalation_active={int(self._frontier_last_escalation_active)}"
+            f" observation_token={self._frontier_last_observation_token}"
             f" compute_count={self._frontier_compute_count}"
             f" publish_count={self._frontier_publish_count}"
             f" error_count={self._frontier_error_count}"
@@ -1833,14 +2135,24 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         considered = priority_order[:self.progressive_shared_max_regions]
         # Cache by target identity + exact spatial cells. Do not continuously
         # re-solve as q moves; target persistence is intentional hysteresis.
-        geometry_key = tuple(
-            (oid, tuple(by_id[oid].get("keys", ())))
-            for oid in considered)
+        if self._active_qvis_target_lock_enabled:
+            # Geometry belongs to the safety union.  It must not invalidate
+            # the steering cache while the active obligation id and the
+            # allowed path members remain unchanged. A new active id or a new
+            # path-associated id still changes this key and gets a fresh q_vis.
+            geometry_key = tuple((oid,) for oid in considered)
+        else:
+            geometry_key = tuple(
+                (oid, tuple(by_id[oid].get("keys", ())))
+                for oid in considered)
+        layer_key = (
+            () if self._active_qvis_target_lock_enabled else
+            tuple(sorted(int(v) for v in self._last_active_layer_ids)))
         cache_key = (
             int(active_id),
             tuple(considered),
             geometry_key,
-            tuple(sorted(int(v) for v in self._last_active_layer_ids)))
+            layer_key)
         with self._progressive_shared_lock:
             if self._progressive_shared_cache_key == cache_key:
                 return self._progressive_shared_cache
@@ -1925,6 +2237,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                             "q_zero": np.asarray(
                                 result["q_zero"], dtype=np.float64).reshape(7).copy(),
                             "final_f_min": float(result["final_f_min"]),
+                            "q_vis_joint_mask": np.asarray(
+                                result.get("q_vis_joint_mask", [1.0] * 7),
+                                dtype=np.float64).reshape(7).copy(),
+                            "per_sensor_hybrid_used": bool(
+                                result.get("per_sensor_hybrid_used", False)),
+                            "per_sensor_selected_sensor_id": int(
+                                result.get("per_sensor_selected_sensor_id", -1)),
+                            "per_sensor_selected_sensor_frame": str(
+                                result.get("per_sensor_selected_sensor_frame", "none")),
+                            "per_sensor_selected_rank": int(
+                                result.get("per_sensor_selected_rank", -1)),
                             "kept_ids": list(active),
                             "dropped_ids": list(dropped),
                             "slacks": dict(slacks),
@@ -1996,21 +2319,60 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         active_id = valid_stack[-1] if valid_stack else min(by_id)
 
         priority_order = self._progressive_priority_order(by_id, active_id)
+        allowed_ids = self._shared_path_candidate_ids(by_id, active_id)
+        shared_priority_order = [
+            oid for oid in priority_order if oid in allowed_ids]
         # Retain a certified bounded refresh for this exact region. Otherwise
         # the shared-target cache could immediately overwrite it with the pose
         # whose final audit exhausted the budget. Other obligations stay live.
         recovering = (by_id[active_id].get('final_recovery_individual_region') ==
                       region_key(by_id[active_id]['points']))
+        pin = getattr(self, '_dependency_pins', {}).get(active_id)
+        pinned = pin is not None and (pin['region'] == region_key(by_id[active_id]['points']) or
+            (pin.get('preserve_on_growth', False) and
+             set(pin['region']).issubset(set(region_key(by_id[active_id]['points'])))))
+        # High-witness experiments test the selected EE sensor candidate itself.
+        # Shared generation must not silently replace it or bypass its ledger.
+        high_ee_target = bool(
+            getattr(self, 'per_sensor_high_witness_priority_enabled', False) and
+            len(by_id[active_id]['points']) and np.all(
+                np.asarray(by_id[active_id]['points'])[:, 2] >=
+                getattr(self, 'per_sensor_high_witness_z_min', .85)))
+        recovering = recovering or pinned or high_ee_target
         shared = None if recovering else self._compute_progressive_shared_target(
-            by_id, active_id, priority_order)
+            by_id, active_id, shared_priority_order)
+        if (shared is None and not recovering and
+                self.progressive_shared_path_association_only and
+                self.progressive_shared_repair_enabled):
+            # Make the target lock explicit in the runtime summary.  This is
+            # the normal case for queued, non-path-associated obligations.
+            self._progressive_shared_last_mode = "current_target_locked"
+            self._progressive_shared_last_considered_ids = [int(active_id)]
+            self._progressive_shared_last_kept_ids = [int(active_id)]
+            self._progressive_shared_last_dropped_ids = [
+                int(oid) for oid in priority_order if oid != active_id]
+            self._progressive_shared_last_slacks = {}
 
         first = dict(by_id[active_id])
+        if pinned:
+            first['q_vis'] = pin['q_vis'].copy()
+            first['shared_solution_mode'] = 'observation_dependency_target_locked'
         if shared is not None:
             first["q_vis"] = np.asarray(
                 shared["q_vis"], dtype=np.float64).copy()
             first["q_zero"] = np.asarray(
                 shared["q_zero"], dtype=np.float64).copy()
             first["final_f_min"] = float(shared["final_f_min"])
+            first["q_vis_joint_mask"] = np.asarray(
+                shared["q_vis_joint_mask"], dtype=np.float64).copy()
+            first["per_sensor_hybrid_used"] = bool(
+                shared["per_sensor_hybrid_used"])
+            first["per_sensor_selected_sensor_id"] = int(
+                shared["per_sensor_selected_sensor_id"])
+            first["per_sensor_selected_sensor_frame"] = str(
+                shared["per_sensor_selected_sensor_frame"])
+            first["per_sensor_selected_rank"] = int(
+                shared["per_sensor_selected_rank"])
             first["shared_solution_mode"] = str(shared["mode"])
             first["target_member_regions"] = list(shared["target_member_regions"])
             first["target_solver_points"] = list(shared["target_solver_points"])
@@ -2033,7 +2395,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return (float(np.linalg.norm(qv - q0)), oid)
         return min(ids, key=key)
 
-    def _consider_active_layer(self, active_ids: List[int], new_ids: List[int], sweep_s: float) -> None:
+    def _consider_active_layer(
+            self, active_ids: List[int], new_ids: List[int], sweep_s: float,
+            urgent_gcdf_recovery: bool = False) -> None:
         self._prune_or_initialize_stack()
         active_ids = sorted(set(int(v) for v in active_ids))
         new_ids = sorted(set(int(v) for v in new_ids))
@@ -2044,9 +2408,42 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             current = self._repair_stack[-1] if self._repair_stack else None
             stack = list(self._repair_stack)
 
+        self._path_associated_ids = []
         if current is None or not active_ids:
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
+            self._path_association_reason = "no_active_target_or_layer"
+            return
+
+        # A QP-failed q_vis owns the sensor-replacement experiment until its
+        # replacement target has received a hard-QP result. Keep newly found
+        # path blockers live and queued, but do not let them change the stack
+        # top (and invalidate the authenticated replacement identity) mid-flight.
+        replacement = getattr(self, '_candidate_replacement', None)
+        locked_owner = (replacement.locked_qp_owner_id()
+                        if replacement is not None else None)
+        if locked_owner is not None:
+            candidates = [
+                oid for oid in new_ids
+                if oid != locked_owner and oid in active_ids]
+            if (not candidates and self._pending_blocker_id is not None and
+                    self._pending_blocker_id in active_ids and
+                    self._pending_blocker_id != locked_owner):
+                candidates = [int(self._pending_blocker_id)]
+            if not candidates and locked_owner not in active_ids:
+                candidates = [oid for oid in active_ids if oid != locked_owner]
+            blocker = self._select_nearest_qvis_id(candidates)
+            self._path_associated_ids = list(candidates)
+            with self._obligation_lock:
+                self._path_co_plan_ids = [int(locked_owner)]
+            if blocker is not None:
+                if self._pending_blocker_id == blocker:
+                    self._pending_blocker_count += 1
+                else:
+                    self._pending_blocker_id = int(blocker)
+                    self._pending_blocker_count = 1
+            self._path_association_reason = "qp_replacement_owner_locked"
+            self._last_switch_reason = "qp_replacement_owner_locked"
             return
         # ROS trajectory times are floating-point values. A nominal 0.30 s
         # layer may arrive as 0.30000000000000004; treating that as strictly
@@ -2054,17 +2451,54 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # confirmation and defeats recursive blocker preemption. Admit the
         # configured boundary with a tiny numerical tolerance.
         sweep_tol_s = 1e-9
-        if (not math.isfinite(sweep_s) or
-                sweep_s > self.blocker_push_max_sweep_s + sweep_tol_s):
+        if (not urgent_gcdf_recovery and
+                (not math.isfinite(sweep_s) or
+                 sweep_s > self.blocker_push_max_sweep_s + sweep_tol_s)):
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
+            self._path_association_reason = "queued_non_path_layer"
+            self._path_queued_count += len(new_ids)
             return
 
-        # Prefer genuinely new regions in the earliest urgent layer.  Otherwise
-        # preempt only when the current target is absent from that earliest layer.
-        candidates = [oid for oid in new_ids if oid != current]
+        # A new region is path-associated only when it is part of the current
+        # earliest predicted sweep.  This is the temporal/spatial association
+        # available at this layer: unrelated later regions are queued and must
+        # not rewrite the active q_vis.  An absent current target is a separate
+        # safety invalidation path, not an ordinary queue insertion.
+        candidates = [
+            oid for oid in new_ids
+            if oid != current and oid in active_ids
+        ]
+        self._path_associated_ids = list(candidates)
+        self._path_associated_count += len(candidates)
+        self._path_association_reason = (
+            "path_associated_earliest_layer"
+            if candidates else "no_new_path_associated_obligation")
+
+        # Matching the same region on the next coherent bundle is still part
+        # of the same path event. Keep the confirmation alive even though the
+        # region is no longer listed in ``new_ids`` after the first insertion.
+        if (not candidates and self._pending_blocker_id is not None and
+                self._pending_blocker_id in active_ids and
+                self._pending_blocker_id != current):
+            candidates = [int(self._pending_blocker_id)]
+            self._path_associated_ids = list(candidates)
+            self._path_association_reason = (
+                "path_associated_confirmation_refresh")
+
+        # If the active target disappeared from the earliest layer, allow the
+        # existing blocker mechanism to fail safe. This is not used for normal
+        # new-obligation queuing.
         if not candidates and current not in active_ids:
             candidates = [oid for oid in active_ids if oid != current]
+            self._path_associated_ids = list(candidates)
+            self._path_association_reason = "active_target_missing_urgent_layer"
+        if any(oid in getattr(self, '_dependency_edges', {}) for oid in stack):
+            # An ancestor seen again in a VBC bundle is not a new emergency.
+            # Keep the unfinished child active instead of O1->A->O1 ping-pong.
+            candidates = [oid for oid in candidates if oid not in stack[:-1]]
+            if not candidates:
+                self._path_association_reason = 'observation_dependency_cycle_hold'
         if not candidates:
             self._pending_blocker_id = None
             self._pending_blocker_count = 0
@@ -2074,15 +2508,83 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if blocker is None:
             return
         if blocker in stack:
-            # Do not create O1->O4->O1 cycles from rejected hypothetical plans.
-            # First ask whether this is also a learned visibility conflict. If
-            # so, refine the coarse spatial representation instead of repeatedly
-            # negotiating between incompatible whole-region q_vis targets.
+            # A confirmed path blocker can already be below the current target
+            # in the recursive stack (for example O1->O4->O3 while the route
+            # to O3 keeps sweeping O4).  Treating that as a permanent cycle
+            # hold leaves the planner retrying the blocked target forever.
+            # If the same two regions have already formed a path pair, however,
+            # reversing the stack on every bundle creates a two-node ping-pong
+            # (O4->O3->O4...).  Keep the current top target and retain the pair
+            # for the progressive shared q_vis solve; a real target transition
+            # is still allowed after one member is seen and pruned.
+            with self._obligation_lock:
+                previous_pair = set(int(oid) for oid in self._path_co_plan_ids)
+            if previous_pair == {int(current), int(blocker)}:
+                self._stack_cycle_block_count += 1
+                with self._obligation_lock:
+                    self._path_co_plan_ids = [int(current), int(blocker)]
+                self._pending_blocker_id = None
+                self._pending_blocker_count = 0
+                self._last_switch_reason = (
+                    "path_associated_reciprocal_pair_held")
+                self._path_association_reason = (
+                    "path_associated_reciprocal_pair_held")
+                rospy.logwarn_throttle(
+                    0.5,
+                    "[vbc_blocker_stack] HOLD reciprocal path pair "
+                    "current=%d blocker=%d stack=%s",
+                    int(current), int(blocker),
+                    ":".join(str(v) for v in self._repair_stack))
+                return
+            # Move the existing blocker to the top while retaining the old
+            # target below it; once the blocker is actually seen, normal stack
+            # pruning exposes the saved target again.  This branch is reached
+            # only for an earliest-layer/path-associated candidate, so ordinary
+            # queued obligations still cannot preempt the active target.
             self._stack_cycle_block_count += 1
-            if self._request_cycle_refinement(int(current), int(blocker)):
-                self._last_switch_reason = "adaptive_refinement_pending"
-            else:
-                self._last_switch_reason = "existing_stack_cycle_not_pushed"
+            with self._obligation_lock:
+                self._repair_stack = [
+                    int(oid) for oid in self._repair_stack
+                    if int(oid) != int(blocker)]
+                self._repair_stack.append(int(blocker))
+                self._path_co_plan_ids = [int(current), int(blocker)]
+            self._pending_blocker_id = None
+            self._pending_blocker_count = 0
+            self._last_switch_reason = "path_associated_blocker_reordered"
+            self._path_association_reason = (
+                "path_associated_blocker_reordered")
+            rospy.logwarn(
+                "[vbc_blocker_stack] REORDER path blocker=%d current=%d stack=%s",
+                int(blocker), int(current),
+                ":".join(str(v) for v in self._repair_stack))
+            return
+
+        # A GCDF rejection is tied to the exact candidate that was refused,
+        # so a second temporal confirmation would only replay the same blocked
+        # target.  Keep confirmation for ordinary VBC active-set updates, but
+        # promote this certified recovery blocker immediately.
+        if urgent_gcdf_recovery:
+            with self._obligation_lock:
+                existing = {int(ob["id"]) for ob in self._obligations}
+                if blocker in existing and blocker not in self._repair_stack:
+                    previous_current = current
+                    self._repair_stack.append(blocker)
+                    self._path_co_plan_ids = [
+                        int(oid) for oid in (previous_current, blocker)
+                        if oid is not None
+                    ]
+                    self._stack_push_count += 1
+                    self._last_switch_reason = (
+                        "gcdf_recovery_blocker_pushed")
+                    self._path_association_reason = (
+                        "gcdf_recovery_blocker_pushed")
+                    rospy.logwarn(
+                        "[vbc_blocker_stack] PUSH urgent GCDF blocker=%d "
+                        "sweep=%.3fs stack=%s",
+                        blocker, sweep_s,
+                        ":".join(str(v) for v in self._repair_stack))
+            self._pending_blocker_id = None
+            self._pending_blocker_count = 0
             return
 
         if self._pending_blocker_id == blocker:
@@ -2091,20 +2593,194 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._pending_blocker_id = blocker
             self._pending_blocker_count = 1
         if self._pending_blocker_count < self.blocker_confirmations:
+            self._path_association_reason = "path_associated_pending_confirmation"
             return
 
         with self._obligation_lock:
             existing = {int(ob["id"]) for ob in self._obligations}
             if blocker in existing and blocker not in self._repair_stack:
+                previous_current = current
                 self._repair_stack.append(blocker)
+                self._path_co_plan_ids = [
+                    int(oid) for oid in (previous_current, blocker)
+                    if oid is not None
+                ]
                 self._stack_push_count += 1
-                self._last_switch_reason = "urgent_earliest_layer_blocker"
+                self._last_switch_reason = "path_associated_blocker_pushed"
+                self._path_association_reason = "path_associated_blocker_pushed"
                 rospy.logwarn(
                     "[vbc_blocker_stack] PUSH blocker=%d sweep=%.3fs stack=%s",
                     blocker, sweep_s,
                     ":".join(str(v) for v in self._repair_stack))
         self._pending_blocker_id = None
         self._pending_blocker_count = 0
+
+    def _observation_dependency_cb(self, msg):
+        """Queue a fresh local UNKNOWN blocking hypothesis, never execution authority."""
+        try:
+            def unique(items):
+                result = {}
+                for key, value in items:
+                    if key in result:
+                        raise ValueError('duplicate field')
+                    result[key] = value
+                return result
+            event = json.loads(msg.data, object_pairs_hook=unique)
+            identity = tuple(int(event[k]) for k in ('mode_epoch', 'plan_seq', 'query_stamp_ns'))
+            age = rospy.Time.now().to_sec() - float(event['query_ros_s'])
+            points = np.asarray(event['points'], dtype=np.float64)
+            if (event['version'] != 1 or min(identity) < 0 or identity[2] == 0 or
+                    not 0. <= age <= .5 or points.ndim != 2 or points.shape[1] != 3 or
+                    not 1 <= len(points) <= 32 or not np.all(np.isfinite(points)) or
+                    not event['observation_token'].startswith('care_obs_v1_')):
+                return
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            return
+        with self._dependency_lock:
+            if identity <= self._dependency_latest:
+                return
+            self._dependency_latest = identity
+            self._dependency_pending = event
+
+    def _process_observation_dependency(self):
+        if not hasattr(self, '_dependency_lock'):
+            return
+        with self._dependency_lock:
+            if getattr(self, '_dependency_processing', False):
+                return
+            event, self._dependency_pending = self._dependency_pending, None
+            if event is None:
+                return
+            self._dependency_processing = True
+        try:
+            self._process_observation_dependency_event(event)
+        finally:
+            with self._dependency_lock:
+                self._dependency_processing = False
+
+    def _process_observation_dependency_event(self, event):
+        if event is None:
+            return
+        self._dependency_reason = 'stale_dependency'
+        age = rospy.Time.now().to_sec() - float(event['query_ros_s'])
+        if not 0. <= age <= 1.:
+            return
+        with self._schedule_publish_lock, self._obligation_lock:
+            published = getattr(self, '_trace_published_target', None)
+            if not published or published['observation_token'] != event['observation_token']:
+                return
+            parent = next((ob for ob in self._obligations
+                if self._repair_stack and int(ob['id']) == self._repair_stack[-1] and
+                observation_region_token(ob) == published['region_token']), None)
+            if parent is None:
+                return
+            parent = dict(parent)
+            parent_q = np.asarray(published['q_vis'], dtype=np.float64).copy()
+            if parent_q.shape != (7,) or not np.all(np.isfinite(parent_q)):
+                return
+            snapshot = [dict(ob) for ob in self._obligations]
+            ancestors = set(self._repair_stack)
+        # Exact point ownership, not proximity. Choose one child at a time.
+        child, point, budget_key = None, None, None
+        for p in event['points']:
+            point_key = region_key([p])[0]
+            owners = [ob for ob in snapshot if point_key in region_key(ob['points'])]
+            if any(int(ob['id']) in ancestors for ob in owners):
+                self._dependency_reason = 'self_or_ancestor_dependency_hold'
+                continue
+            key = (region_key(parent['points']), point_key)
+            if self._dependency_attempts.get(key, 0) >= 2:
+                self._dependency_reason = 'dependency_budget_exhausted'
+                continue
+            child = min(owners, key=lambda ob: int(ob['id'])) if owners else None
+            point, budget_key = p, key
+            break
+        if point is None:
+            replacement = getattr(self, '_candidate_replacement', None)
+            if replacement is not None and self._dependency_reason == 'self_or_ancestor_dependency_hold':
+                replacement.offer(event)
+            return
+        if budget_key not in self._dependency_attempts and len(self._dependency_attempts) >= 64:
+            self._dependency_reason = 'dependency_capacity_hold'
+            return
+        if child is None:
+            with self._lock:
+                trajectory, received, _ = self._preferred_trajectory_locked()
+            if trajectory is None or self._latest_measured_q is None:
+                self._dependency_reason = 'dependency_waiting_state'
+                return
+            if len(snapshot) >= self.max_obligations:
+                self._dependency_reason = 'dependency_obligation_capacity_hold'
+                return
+        self._dependency_attempts[budget_key] = self._dependency_attempts.get(budget_key, 0) + 1
+        new_child = child is None
+        if new_child:
+            try:
+                region = self._cluster_regions(np.asarray([point], dtype=np.float64))[0]
+                with self._progressive_shared_lock:
+                    child = self._generate_new_obligation(
+                        region, trajectory, .1, received, 'unknown_constraint_dependency')
+            except Exception as exc:
+                self._dependency_reason = 'dependency_generation_failed'
+                rospy.logwarn('observation dependency generation failed: %s', exc)
+                return
+        child_q = np.asarray(child['q_vis'], dtype=np.float64)
+        if child_q.shape != (7,) or not np.all(np.isfinite(child_q)):
+            self._dependency_reason = 'dependency_invalid_target'
+            return
+        # Preserve the publication transaction, but release the non-reentrant
+        # obligation lock before publication re-enters _ordered_obligations().
+        with self._schedule_publish_lock:
+            with self._obligation_lock:
+                published = getattr(self, '_trace_published_target', None)
+                age = rospy.Time.now().to_sec() - float(event['query_ros_s'])
+                live = {int(ob['id']): ob for ob in self._obligations}
+                pid, cid = int(parent['id']), int(child['id'])
+                if (not 0. <= age <= 2. or not published or
+                        published['observation_token'] != event['observation_token'] or
+                        not self._repair_stack or self._repair_stack[-1] != pid or pid not in live or
+                        region_key(live[pid]['points']) != region_key(parent['points'])):
+                    self._dependency_reason = 'dependency_changed_during_generation'
+                    return
+                if new_child:
+                    # A concurrently discovered owner wins; do not duplicate it.
+                    owner = next((ob for ob in self._obligations
+                        if region_key([point])[0] in region_key(ob['points'])), None)
+                    if owner is not None:
+                        child, cid = owner, int(owner['id'])
+                    elif len(live) < self.max_obligations:
+                        self._obligations.append(child)
+                        self._schedule_new_obligations += 1
+                    else:
+                        self._dependency_reason = 'dependency_obligation_capacity_hold'
+                        return
+                elif cid not in live or region_key(live[cid]['points']) != region_key(child['points']):
+                    self._dependency_reason = 'dependency_child_changed'
+                    return
+                if cid in self._repair_stack:
+                    self._dependency_reason = 'dependency_cycle_hold'
+                    return
+                child_q = np.asarray(child['q_vis'], dtype=np.float64)
+                if child_q.shape != (7,) or not np.all(np.isfinite(child_q)):
+                    self._dependency_reason = 'dependency_invalid_target'
+                    return
+                self._dependency_pins[pid] = dict(region=region_key(parent['points']), q_vis=parent_q)
+                self._dependency_pins[cid] = dict(region=region_key(child['points']), q_vis=child_q.copy())
+                self._dependency_edges[cid] = pid
+                self._repair_stack.append(cid)
+                self._stack_push_count += 1
+                self._dependency_pushes += 1
+                self._dependency_reason = self._last_switch_reason = 'unknown_constraint_dependency_push'
+                self._path_co_plan_ids = []
+                self._pending_blocker_id = None
+                self._pending_blocker_count = 0
+                self._progressive_shared_cache_key = None
+                self._progressive_shared_cache = None
+                self._trace_observation('observation_dependency_push', parent_id=pid, child_id=cid,
+                    query_stamp_ns=event['query_stamp_ns'], points=[point],
+                    observation_token=event['observation_token'])
+            self._publish_schedule()
+        self._publish_blocker_stack_summary()
 
     def _final_recovery_feedback_cb(self, msg):
         """Queue only; generation stays off the ROS feedback thread."""
@@ -2121,39 +2797,154 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         except (KeyError, ValueError):
             return
         with self._final_recovery_lock:
+            self._final_recovery_feedback_count += 1
+            if seq < self._final_recovery_latest_feedback_seq:
+                return
+            self._final_recovery_latest_feedback_seq = seq
+            is_repair = fields.get('repair') == '1'
+            is_probe = fields.get('probe') == '1'
+            token = fields.get('observation_token', '')
+            # The local planner reports the cumulative final-VBC rejection
+            # count before entering its no-progress hold. Feed it back to the
+            # frontier producer, scoped by the immutable q_vis token. A new
+            # q_vis therefore starts a fresh bounded escalation ladder.
+            if is_repair and not is_probe and token.startswith('care_obs_v1_'):
+                try:
+                    failures = int(fields.get('final_vbc_failures', ''))
+                except (TypeError, ValueError):
+                    failures = None
+                if failures is not None and failures >= 0:
+                    with self._frontier_lock:
+                        if token != self._frontier_feedback_token:
+                            self._frontier_feedback_token = token
+                            self._frontier_feedback_seq = -1
+                            self._frontier_feedback_failures = 0
+                        if seq >= self._frontier_feedback_seq:
+                            self._frontier_feedback_seq = seq
+                            self._frontier_feedback_failures = max(
+                                self._frontier_feedback_failures, failures)
+                        # The strict single-obligation path normally bypasses
+                        # the general frontier cache, but invalidating here
+                        # keeps the feedback contract correct for soft-min A/B
+                        # runs too.
+                        self._frontier_cache_key = None
+            safe_stall = (getattr(self, '_safe_stall_recovery_enabled', False) and
+                          fields.get('observation_dependency_policy') != '1' and
+                          fields.get('safe_stall_reselect') == '1')
+            final_hold = (self._final_recovery_enabled and
+                          fields.get('final_vbc_hold') == '1')
+            if (not is_repair or is_probe or not (safe_stall or final_hold)):
+                # A newer non-hold summary is not a cancellation.  It is
+                # common for the planner to publish the same plan_seq first
+                # with final_vbc_hold=0 and then publish the terminal hold;
+                # it can also publish a newer plan before the acquisition
+                # node's next active-set callback runs.  Keep the newest
+                # pending hold until _process_final_recovery authenticates
+                # its target and measured seed.
+                self._final_recovery_nonhold_feedback_count += 1
+                if self._final_recovery_pending is not None:
+                    self._final_recovery_preserved_pending_count += 1
+                return
+            if not token.startswith('care_obs_v1_'):
+                return
+            self._final_recovery_hold_feedback_count += 1
             if seq < self._final_recovery_latest_seq:
                 return
             self._final_recovery_latest_seq = seq
-            if (fields.get('repair') != '1' or fields.get('probe') != '0' or
-                    fields.get('final_vbc_hold') != '1'):
-                self._final_recovery_pending = None
-                self._final_recovery_active_request = None
-                return
-            token = fields.get('observation_token', '')
-            if token.startswith('care_obs_v1_'):
-                self._final_recovery_pending = (seq, token)
-                self._final_recovery_active_request = (seq, token)
+            self._final_recovery_pending = (seq, token)
+            self._final_recovery_active_request = (seq, token)
+
+    def _traced_waypoint(self, ob, q):
+        """Record a bounded publication identity for target-aware recovery."""
+        msg = super()._traced_waypoint(ob, q)
+        target = getattr(self, '_trace_published_target', None)
+        if target is not None:
+            token = str(target.get('observation_token', ''))
+            if token:
+                with self._schedule_publish_lock:
+                    self._final_recovery_target_history[token] = dict(
+                        observation_token=token,
+                        region_token=str(target['region_token']),
+                        q_vis=np.asarray(target['q_vis'], dtype=np.float64).copy())
+                    self._final_recovery_target_history.move_to_end(token)
+                    while (len(self._final_recovery_target_history) >
+                           self._final_recovery_target_history_capacity):
+                        self._final_recovery_target_history.popitem(last=False)
+        return msg
+
+    def _final_recovery_alternative_seed(self, measured):
+        """Return one small, deterministic seed perturbation for scalar recovery.
+
+        The first recovery solve starts exactly at the measured state.  If the
+        frozen learned field returns the same q_vis, a second solve from a
+        nearby alternating joint-space seed can take a different local branch.
+        This is deliberately bounded and is still only a steering proposal;
+        final GCDF and exact VBC decide whether it may execute.
+        """
+        q = np.asarray(measured, dtype=np.float64).reshape(7).copy()
+        signs = np.asarray([1., -1., 1., -1., 1., -1., 1.], dtype=np.float64)
+        delta = float(self._final_recovery_alternative_seed_rad) * signs
+        candidate = q + delta
+        q_min = np.asarray(getattr(self, 'q_min_list', []), dtype=np.float64).reshape(-1)
+        q_max = np.asarray(getattr(self, 'q_max_list', []), dtype=np.float64).reshape(-1)
+        if q_min.shape == (7,) and q_max.shape == (7,):
+            candidate = np.clip(candidate, q_min, q_max)
+        # If the first signed direction is blocked by joint limits, try its
+        # opposite once.  The result remains deterministic and within limits.
+        if float(np.max(np.abs(candidate - q))) <= 1e-9:
+            candidate = q - delta
+            if q_min.shape == (7,) and q_max.shape == (7,):
+                candidate = np.clip(candidate, q_min, q_max)
+        return candidate
 
     def _process_final_recovery(self):
-        if not self._final_recovery_enabled:
+        if not (self._final_recovery_enabled or
+                getattr(self, '_safe_stall_recovery_enabled', False)):
             return
         with self._final_recovery_lock:
             request = self._final_recovery_pending
             self._final_recovery_pending = None
         if request is None:
             return
+        self._final_recovery_process_count += 1
         with self._schedule_publish_lock:
             published = getattr(self, '_trace_published_target', None)
-            if published is None or published['observation_token'] != request[1]:
+            published = None if published is None else dict(published)
+            published_matches = bool(
+                published is not None and
+                published.get('observation_token') == request[1])
+            historical = self._final_recovery_target_history.get(request[1])
+            historical = None if historical is None else dict(historical)
+        with self._obligation_lock:
+            # A blocker may temporarily become the published target after the
+            # planner emitted a final-VBC hold for the previous target. The
+            # hold is still actionable when that exact observation token is a
+            # live obligation; requiring it to remain the first published
+            # target turns ordinary blocker preemption into a false stale
+            # discard. Exact token matching prevents an old q_vis or changed
+            # geometry from borrowing the recovery budget.
+            live = next((ob for ob in self._obligations
+                         if observation_token(ob) == request[1]), None)
+            if live is None and published_matches:
+                live = next((ob for ob in self._obligations
+                             if observation_region_token(ob) == published['region_token']), None)
+            if live is None and historical is not None:
+                live = next((ob for ob in self._obligations
+                             if observation_region_token(ob) == historical['region_token']), None)
+            if live is None:
                 self._final_recovery_last_reason = 'stale_target'
                 return
-            published = dict(published)
-        with self._obligation_lock:
-            live = next((ob for ob in self._obligations
-                         if observation_region_token(ob) == published['region_token']), None)
-            if live is None:
-                return
             old = dict(live)
+        if not published_matches:
+            self._final_recovery_live_obligation_fallback_count += 1
+            self._final_recovery_last_reason = 'live_obligation_target_fallback'
+        previous_q_vis = (
+            published['q_vis'] if published_matches else
+            historical['q_vis'] if historical is not None else old.get('q_vis', []))
+        previous_q_vis = np.asarray(previous_q_vis, dtype=np.float64).reshape(-1)
+        if previous_q_vis.shape != (7,) or not np.all(np.isfinite(previous_q_vis)):
+            self._final_recovery_last_reason = 'stale_target'
+            return
         measured = self._latest_measured_q
         if measured is None:
             return
@@ -2166,23 +2957,53 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._final_recovery_last_reason = 'attempt_budget_hold'
             return
         start = time.perf_counter()
+        alternative_seed_attempted = False
         try:
             with self._progressive_shared_lock:
-                self._seed_override = measured.copy()
-                try:
-                    result = self._generate_active_set_waypoint(old['points'], trajectory,
-                        float(old['discovered_sweep_time_s']), received)
-                finally:
-                    self._seed_override = None
-            if not certified_distinct_q(result, published['q_vis']):
-                self._final_recovery_last_reason = 'no_certified_distinct_target_hold'
-                return
+                def generate(seed):
+                    self._seed_override = np.asarray(seed, dtype=np.float64).copy()
+                    try:
+                        return self._generate_active_set_waypoint(
+                            old['points'], trajectory,
+                            float(old['discovered_sweep_time_s']), received)
+                    finally:
+                        self._seed_override = None
+
+                result = generate(measured)
+            if not certified_distinct_q(result, previous_q_vis):
+                alternative = self._final_recovery_alternative_seed(measured)
+                if float(np.max(np.abs(alternative - measured))) > 1e-9:
+                    alternative_seed_attempted = True
+                    self._final_recovery_alternative_seed_attempt_count += 1
+                    with self._progressive_shared_lock:
+                        result = generate(alternative)
+                    if certified_distinct_q(result, previous_q_vis):
+                        self._final_recovery_alternative_seed_success_count += 1
+                if not certified_distinct_q(result, previous_q_vis):
+                    self._final_recovery_last_reason = 'no_certified_distinct_target_hold'
+                    return
             # Validate the entire update before touching a live obligation.
-            updates = {key: result[key] for key in [
-                'final_f_min', 'shared_solution_mode', 'per_sensor_hybrid_used',
-                'per_sensor_selected_sensor_id', 'per_sensor_selected_sensor_frame',
-                'per_sensor_selected_rank']}
+            updates = {}
+            for key in ['final_f_min', 'shared_solution_mode']:
+                if key not in result:
+                    raise ValueError('recovery result missing ' + key)
+                updates[key] = result[key]
+            # Per-sensor provenance is optional in the production scalar path.
+            # Preserve it when present, while allowing the same bounded
+            # recovery policy to refresh a scalar q_vis result.
+            sensor_keys = [
+                'per_sensor_hybrid_used', 'per_sensor_selected_sensor_id',
+                'per_sensor_selected_sensor_frame', 'per_sensor_selected_rank']
+            if 'per_sensor_hybrid' in result:
+                for key in sensor_keys:
+                    if key not in result:
+                        raise ValueError('recovery result missing ' + key)
+                    updates[key] = result[key]
+                updates['per_sensor_hybrid'] = result['per_sensor_hybrid']
             updates['q_vis'] = np.asarray(result['q_vis'], dtype=np.float64).reshape(7).copy()
+            updates['q_vis_joint_mask'] = np.asarray(
+                result.get('q_vis_joint_mask', [1.0] * 7),
+                dtype=np.float64).reshape(7).copy()
             updates['q_zero'] = np.asarray(result['q_zero'], dtype=np.float64).reshape(7).copy()
             if not np.all(np.isfinite(updates['q_zero'])):
                 raise ValueError('nonfinite regenerated q_zero')
@@ -2191,8 +3012,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             with self._schedule_publish_lock, self._obligation_lock, self._final_recovery_lock:
                 current = getattr(self, '_trace_published_target', None)
                 live = next((ob for ob in self._obligations if ob['id'] == old['id']), None)
-                if (current is None or current['observation_token'] != request[1] or live is None or
-                        observation_region_token(live) != published['region_token'] or
+                current_matches = bool(
+                    current is not None and
+                    current.get('observation_token') == request[1])
+                live_matches = bool(
+                    live is not None and
+                    (observation_token(live) == request[1] or
+                     (published_matches and current_matches and
+                      observation_region_token(live) == published['region_token']) or
+                     (historical is not None and
+                      observation_region_token(live) == historical['region_token'])))
+                if (live is None or not live_matches or
+                        (published_matches and not current_matches) or
                         self._final_recovery_latest_seq != request[0] or
                         self._final_recovery_active_request != request or
                         self._latest_measured_q is None or
@@ -2202,6 +3033,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     return
                 live.update(updates)
             self._final_recovery_last_reason = 'certified_steering_refresh_pending_hard_audit'
+            with self._final_recovery_lock:
+                if self._final_recovery_active_request == request:
+                    self._final_recovery_active_request = None
+                self._final_recovery_process_success_count += 1
             self._publish_schedule()
         except Exception as exc:
             self._final_recovery_last_reason = 'generation_error_hold'
@@ -2209,10 +3044,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         finally:
             self._trace_observation('final_vbc_recovery', observation_token=request[1],
                 reason=self._final_recovery_last_reason, measured_seed=measured.tolist(),
+                alternative_seed_attempted=bool(alternative_seed_attempted),
                 compute_ms=1000.*(time.perf_counter()-start))
 
     def _process_new_active_set(self) -> None:
         if self._c49_ready:
+            replacement = getattr(self, '_candidate_replacement', None)
+            if replacement is not None:
+                replacement.process()
+            if hasattr(self, '_dependency_lock'):
+                self._process_observation_dependency()
             self._process_final_recovery()
             self._process_gcdf_recovery_event()
         if not self._c49_ready:
@@ -2224,16 +3065,22 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 raw = self._coherent_bundle_points.copy()
                 sweep = self._coherent_bundle_sweep_s
                 trace_identity = getattr(self, '_trace_coherent_bundle_identity', None)
+                urgent_recovery = bool(self._coherent_bundle_urgent_recovery)
+                bundle_source = self._coherent_bundle_source
+                bundle_source_seq = self._coherent_bundle_source_seq
             with self._obligation_lock:
                 processed = self._processed_active_set_serial
         else:
             trace_identity = None
+            urgent_recovery = False
+            bundle_source = "legacy"
             with self._obligation_lock:
                 serial = self._raw_active_set_serial
                 processed = self._processed_active_set_serial
                 raw = self._raw_active_set.copy()
             with self._lock:
                 sweep = self._sweep_time_s
+            bundle_source_seq = serial
 
         if serial == processed:
             self._last_process_reason = "duplicate_serial"
@@ -2344,7 +3191,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         else:
             self._last_process_reason = "generation_failed"
         self._prune_or_initialize_stack()
-        self._consider_active_layer(active_ids, new_ids, float(sweep))
+        self._consider_active_layer(
+            active_ids, new_ids, float(sweep),
+            urgent_gcdf_recovery=urgent_recovery)
         self._process_pending_refinement(
             trajectory, trajectory_received,
             trajectory_source, float(sweep))
@@ -2362,9 +3211,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 published = getattr(self, '_trace_published_target', None)
                 published_token = published['observation_token'] if published else None
             self._trace_observation('blocker_route', vbc_identity=trace_identity,
-                bundle_seq=serial, points=raw.tolist(), routes=trace_routes,
+                bundle_seq=serial, bundle_source=bundle_source,
+                bundle_source_seq=bundle_source_seq,
+                urgent_recovery=urgent_recovery,
+                points=raw.tolist(), routes=trace_routes,
                 active_ids=active_ids, new_ids=new_ids, all_regions_handled=all_regions_handled,
                 stack_before=trace_stack_before, stack_after=list(self._repair_stack),
+                path_associated_ids=list(getattr(self, '_path_associated_ids', [])),
+                path_co_plan_ids=list(getattr(self, '_path_co_plan_ids', [])),
+                path_association_reason=getattr(
+                    self, '_path_association_reason', 'legacy_fixture'),
                 region_tokens=identities, stored_obligation_points=stored_points,
                 published_observation_token=published_token)
         except Exception as exc:
@@ -2407,6 +3263,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._obligation_lock:
             existing = sorted(int(ob["id"]) for ob in self._obligations)
             stack = [oid for oid in self._repair_stack if oid in set(existing)]
+            path_co_plan = [
+                oid for oid in self._path_co_plan_ids if oid in set(existing)]
             qvis_times = [
                 float(ob.get("q_vis_generation_ms", math.nan))
                 for ob in self._obligations
@@ -2415,8 +3273,28 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         msg = String()
         msg.data = (
             "policy=blocker_aware_recursive"
+            f" dependency_reason={getattr(self, '_dependency_reason', 'disabled')}"
+            f" dependency_pushes={getattr(self, '_dependency_pushes', 0)}"
+            f" dependency_resumes={getattr(self, '_dependency_resumes', 0)}"
             f" final_vbc_recovery_enabled={int(self._final_recovery_enabled)}"
+            f" safe_stall_recovery_enabled={int(getattr(self, '_safe_stall_recovery_enabled', False))}"
             f" final_vbc_recovery_reason={self._final_recovery_last_reason}"
+            f" final_vbc_recovery_latest_hold_seq={self._final_recovery_latest_seq}"
+            f" final_vbc_recovery_latest_feedback_seq={self._final_recovery_latest_feedback_seq}"
+            f" final_vbc_recovery_feedback_count={self._final_recovery_feedback_count}"
+            f" final_vbc_recovery_hold_feedback_count={self._final_recovery_hold_feedback_count}"
+            f" final_vbc_recovery_nonhold_feedback_count={self._final_recovery_nonhold_feedback_count}"
+            f" final_vbc_recovery_preserved_pending_count={self._final_recovery_preserved_pending_count}"
+            f" final_vbc_recovery_process_count={self._final_recovery_process_count}"
+            f" final_vbc_recovery_process_success_count={self._final_recovery_process_success_count}"
+            f" final_vbc_recovery_live_obligation_fallback_count="
+            f"{self._final_recovery_live_obligation_fallback_count}"
+            f" final_vbc_recovery_alternative_seed_attempt_count="
+            f"{self._final_recovery_alternative_seed_attempt_count}"
+            f" final_vbc_recovery_alternative_seed_success_count="
+            f"{self._final_recovery_alternative_seed_success_count}"
+            f" final_vbc_recovery_alternative_seed_rad="
+            f"{self._final_recovery_alternative_seed_rad:.6f}"
             f" current_target_id={(stack[-1] if stack else -1)}"
             f" stack={':'.join(str(v) for v in stack) or 'none'}"
             f" pending_ids={':'.join(str(v) for v in existing) or 'none'}"
@@ -2424,6 +3302,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" earliest_layer_sweep_s={self._last_active_layer_sweep_s:.6f}"
             f" pending_blocker_id={self._pending_blocker_id if self._pending_blocker_id is not None else -1}"
             f" pending_blocker_count={self._pending_blocker_count}"
+            f" path_co_plan_ids={':'.join(str(v) for v in path_co_plan) or 'none'}"
+            f" path_associated_ids={':'.join(str(v) for v in self._path_associated_ids) or 'none'}"
+            f" path_association_reason={self._path_association_reason}"
+            f" path_associated_count={self._path_associated_count}"
+            f" path_queued_count={self._path_queued_count}"
             f" push_count={self._stack_push_count}"
             f" pop_count={self._stack_pop_count}"
             f" cycle_block_count={self._stack_cycle_block_count}"
@@ -2449,6 +3332,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f"{(max(qvis_times) if qvis_times else math.nan):.3f}"
             f" coherent_bundle_enabled={int(self._coherent_bundle_enabled)}"
             f" coherent_bundle_seq={self._coherent_bundle_seq}"
+            f" coherent_bundle_source={self._coherent_bundle_source}"
+            f" coherent_bundle_source_seq={self._coherent_bundle_source_seq}"
+            f" coherent_bundle_urgent_recovery={int(self._coherent_bundle_urgent_recovery)}"
             f" coherent_bundle_pending={int(self._coherent_bundle_pending_nonempty)}"
             f" coherent_bundle_received_count={self._coherent_bundle_received_count}"
             f" coherent_bundle_processed_count={self._coherent_bundle_processed_count}"
@@ -2466,6 +3352,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" progressive_shared_enabled={int(self.progressive_shared_repair_enabled)}"
             f" progressive_shared_max_regions={self.progressive_shared_max_regions}"
             f" progressive_shared_accept_f_min={self.progressive_shared_accept_f_min:.6f}"
+            f" progressive_shared_path_association_only={int(self.progressive_shared_path_association_only)}"
+            f" active_qvis_target_lock_enabled={int(self._active_qvis_target_lock_enabled)}"
+            f" safety_union_merge_count={self._safety_union_merge_count}"
             f" progressive_shared_attempt_count={self._progressive_shared_attempt_count}"
             f" progressive_shared_success_count={self._progressive_shared_success_count}"
             f" progressive_shared_fallback_count={self._progressive_shared_fallback_count}"

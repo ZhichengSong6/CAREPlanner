@@ -39,12 +39,15 @@ import numpy as np
 import rospy
 from care_confidence_map.srv import QueryConfidenceRequest
 from geometry_msgs.msg import Point
-from std_msgs.msg import Bool, Float64, String
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from std_msgs.msg import MultiArrayDimension
 from observation_identity import observation_token, observation_region_token
 
 from vbc_deadline_waypoint_node import _vector_msg
-from vbc_multi_deadline_obligation_impl import AccumulatedMultiDeadlineWaypointNode
+from vbc_multi_deadline_obligation_impl import (
+    AccumulatedMultiDeadlineWaypointNode,
+    q_vis_joint_mask,
+)
 
 
 class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
@@ -80,6 +83,13 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self.acquisition_summary_topic = str(rospy.get_param(
             "~acquisition_summary_topic",
             "/care_planner/active_sensing/visibility_acquisition_summary"))
+        # The active obligation's spatial points are published separately from
+        # q_vis so the local repair planner can carry the urgent VBC region into
+        # its CDF query.  The message contains only the current target (the
+        # blocker-aware stack decides whether a new region is urgent).
+        self.current_obligation_points_topic = str(rospy.get_param(
+            "~current_obligation_points_topic",
+            "/care_planner/active_sensing/current_visibility_obligation_points"))
 
         if self.visibility_check_rate <= 0.0:
             raise ValueError("~visibility_check_rate must be positive")
@@ -90,6 +100,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             self.acquisition_complete_topic, Bool, queue_size=1, latch=True)
         self.acquisition_summary_pub = rospy.Publisher(
             self.acquisition_summary_topic, String, queue_size=1, latch=True)
+        self.current_obligation_points_pub = rospy.Publisher(
+            self.current_obligation_points_topic,
+            Float64MultiArray, queue_size=1, latch=True)
+        self._current_obligation_points_key = None
+        self._current_obligation_points_seq = 0
         self.acquisition_complete_pub.publish(Bool(data=False))
 
         self._c47_ready = True
@@ -218,7 +233,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 nan3.copy(), math.nan, query_diag)
 
         conf = np.asarray(res.confidence, dtype=np.float64)
-        inside = np.asarray(res.inside_map, dtype=bool)
+        # rospy may deserialize uint8[] as bytes; np.asarray(bytes, bool)
+        # produces one scalar True, incorrectly admitting out-of-map points.
+        inside = (np.frombuffer(res.inside_map, dtype=np.uint8).astype(bool)
+                  if isinstance(res.inside_map, (bytes, bytearray))
+                  else np.asarray(res.inside_map, dtype=bool))
         current_vis = np.asarray(res.current_visibility, dtype=np.float64)
         finite_conf = np.isfinite(conf)
         finite_inside = inside & finite_conf
@@ -466,13 +485,34 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             if measured is not None and measured.shape == (7,)
             else "none")
         active_q_vis_text = "none"
+        active_q_vis_token = "none"
+        active_q_vis_source = "none"
         if remaining:
-            if active_query_diag.get("q_distance_observation_token") != observation_token(remaining[0]):
-                # A newer shared solve may have replaced the pose since the
-                # query. Do not display an old distance beside the new q_vis.
-                active_q_dist_inf = math.nan
-            q_vis = np.asarray(
+            stored_token = observation_token(remaining[0])
+            stored_q_vis = np.asarray(
                 remaining[0].get("q_vis", []), dtype=np.float64).reshape(-1)
+            q_vis = stored_q_vis
+            active_q_vis_token = stored_token
+            active_q_vis_source = "stored"
+            # The waypoint publication is the executable target. A shared
+            # solve may refresh that target before the obligation dictionary is
+            # replaced; report the same snapshot used by the planner instead
+            # of pairing a new distance with an old q_vis.
+            with self._schedule_publish_lock:
+                published = getattr(self, "_trace_published_target", None)
+                if (published is not None and
+                        published.get("region_token") == observation_region_token(remaining[0])):
+                    published_q = np.asarray(
+                        published.get("q_vis", []), dtype=np.float64).reshape(-1)
+                    if published_q.shape == (7,) and np.all(np.isfinite(published_q)):
+                        q_vis = published_q
+                        active_q_vis_token = str(
+                            published.get("observation_token", stored_token))
+                        active_q_vis_source = "published" if (
+                            active_q_vis_token != stored_token) else "stored"
+            if active_query_diag.get("q_distance_observation_token") != active_q_vis_token:
+                # Do not display a distance for a different target snapshot.
+                active_q_dist_inf = math.nan
             if q_vis.shape == (7,) and np.all(np.isfinite(q_vis)):
                 active_q_vis_text = ",".join(
                     f"{float(v):.4f}" for v in q_vis)
@@ -498,6 +538,8 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" active_max_current_visibility={active_max_vis:.6f}"
             f" active_q_distance_inf={active_q_dist_inf:.6f}"
             f" active_q_distance_token={active_query_diag.get('q_distance_observation_token', 'none')}"
+            f" active_q_vis_token={active_q_vis_token}"
+            f" active_q_vis_source={active_q_vis_source}"
             f" active_worst_point_xyz="
             f"{float(active_worst_point[0]):.4f},"
             f"{float(active_worst_point[1]):.4f},"
@@ -610,6 +652,34 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                     self._generation_success = False
                     self._summary = "c47_no_visibility_obligations"
 
+            # Keep the point identity coupled to the same ordered snapshot as
+            # q_vis.  Only the active target is exported: queued obligations do
+            # not preempt the current repair target.
+            first = obligations[0] if obligations else None
+            if first is None:
+                obligation_id = -1
+                points = np.zeros((0, 3), dtype=np.float64)
+            else:
+                obligation_id = int(first["id"])
+                points = np.asarray(first["points"], dtype=np.float64).reshape(-1, 3).copy()
+                if not np.all(np.isfinite(points)):
+                    points = np.zeros((0, 3), dtype=np.float64)
+                    obligation_id = -1
+            key = (obligation_id, tuple(float(x) for x in points.reshape(-1)))
+            if key != self._current_obligation_points_key:
+                self._current_obligation_points_key = key
+                self._current_obligation_points_seq += 1
+                msg = Float64MultiArray()
+                # data = [publication_seq, obligation_id, point_count,
+                #         x0, y0, z0, ...].  An empty message is a clear.
+                msg.data = [float(self._current_obligation_points_seq),
+                            float(obligation_id), float(points.shape[0])]
+                msg.data.extend(float(x) for x in points.reshape(-1))
+                msg.layout.dim = [MultiArrayDimension(
+                    label="care_visibility_obligation_points_v1",
+                    size=len(msg.data), stride=len(msg.data))]
+                self.current_obligation_points_pub.publish(msg)
+
     def _maybe_generate(self) -> None:
         if not self._c47_ready:
             return
@@ -689,14 +759,22 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         msg = _vector_msg(q)
         token = observation_token(ob)
         region = observation_region_token(ob)
-        self._trace_published_target = dict(observation_token=token, region_token=region,
-                                            q_vis=np.asarray(q).copy())
-        msg.layout.dim = [MultiArrayDimension(label=token, size=7, stride=7)]
+        joint_mask = q_vis_joint_mask(ob)
+        self._trace_published_target = dict(
+            observation_token=token, region_token=region,
+            q_vis=np.asarray(q).copy(), q_vis_joint_mask=joint_mask.copy())
+        mask_label = "care_qmask_v1_" + "".join(
+            "1" if float(v) > 0.5 else "0" for v in joint_mask)
+        msg.layout.dim = [
+            MultiArrayDimension(label=token, size=7, stride=7),
+            MultiArrayDimension(label=mask_label, size=7, stride=7),
+        ]
         if token != self._trace_last_target:
             self._trace_last_target = token
             self._trace_observation("scheduled", observation_token=token,
                 generation_event_id=ob.get("generation_event_id", "legacy"),
                 obligation_id=int(ob["id"]), q_vis=q.tolist(),
+                q_vis_joint_mask=joint_mask.tolist(),
                 points=np.asarray(ob["points"]).tolist(), region_token=region,
                 target_source=ob.get("shared_solution_mode", "individual"),
                 target_member_regions=ob.get("target_member_regions", [region]),

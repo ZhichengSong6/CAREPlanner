@@ -294,6 +294,31 @@ def main():
         over_025 = sum(e > 0.25 for e in errs)
         active_rows = [r for r in rows if r.get("source") == "active_trajectory"]
         active_errs = [r["_err"] for r in active_rows]
+        spatial_errs = [
+            as_float(r.get("spatial_tracking_error_inf"))
+            for r in rows
+        ]
+        spatial_errs = [e for e in spatial_errs if e is not None]
+        active_spatial_errs = [
+            as_float(r.get("spatial_tracking_error_inf"))
+            for r in active_rows
+        ]
+        active_spatial_errs = [e for e in active_spatial_errs if e is not None]
+        spatial_bounds = [
+            as_float(r.get("spatial_tracking_bound_m"))
+            for r in rows
+        ]
+        spatial_bounds = [e for e in spatial_bounds if e is not None]
+        same_phase_bounds = [
+            as_float(r.get("primitive_tracking_same_phase_bound_m"))
+            for r in rows
+        ]
+        same_phase_bounds = [e for e in same_phase_bounds if e is not None]
+        phase_lags = [
+            as_float(r.get("tracking_phase_lag_s"))
+            for r in rows
+        ]
+        phase_lags = [e for e in phase_lags if e is not None]
 
         executions.append({
             "execution_stamp_ns": stamp,
@@ -312,6 +337,23 @@ def main():
                 sum(active_errs) / len(active_errs) if active_errs else None),
             "active_p95_error_inf": percentile(active_errs, 0.95),
             "active_max_error_inf": max(active_errs) if active_errs else None,
+            "spatial_mean_error_inf": (
+                sum(spatial_errs) / len(spatial_errs)
+                if spatial_errs else None),
+            "spatial_p95_error_inf": percentile(spatial_errs, 0.95),
+            "spatial_max_error_inf": max(spatial_errs)
+                if spatial_errs else None,
+            "active_spatial_max_error_inf": max(active_spatial_errs)
+                if active_spatial_errs else None,
+            "spatial_tracking_bound_max_m": max(spatial_bounds)
+                if spatial_bounds else None,
+            "same_phase_tracking_bound_max_m": max(same_phase_bounds)
+                if same_phase_bounds else None,
+            "tracking_phase_lag_mean_s": (
+                sum(phase_lags) / len(phase_lags)
+                if phase_lags else None),
+            "tracking_phase_lag_max_abs_s": max(
+                (abs(e) for e in phase_lags), default=None),
             "max_error_phase_s": max_phase,
             "max_error_phase_fraction": max_phase_fraction,
             "fraction_error_gt_0p10": over_010 / len(errs) if errs else None,
@@ -364,6 +406,22 @@ def main():
             "p95_error_inf": stats([e["p95_error_inf"] for e in exs]),
             "max_error_inf": stats([e["max_error_inf"] for e in exs]),
             "terminal_error_inf": stats([e["terminal_error_inf"] for e in exs]),
+            "spatial_mean_error_inf": stats([
+                e["spatial_mean_error_inf"] for e in exs]),
+            "spatial_p95_error_inf": stats([
+                e["spatial_p95_error_inf"] for e in exs]),
+            "spatial_max_error_inf": stats([
+                e["spatial_max_error_inf"] for e in exs]),
+            "active_spatial_max_error_inf": stats([
+                e["active_spatial_max_error_inf"] for e in exs]),
+            "spatial_tracking_bound_max_m": stats([
+                e["spatial_tracking_bound_max_m"] for e in exs]),
+            "same_phase_tracking_bound_max_m": stats([
+                e["same_phase_tracking_bound_max_m"] for e in exs]),
+            "tracking_phase_lag_mean_s": stats([
+                e["tracking_phase_lag_mean_s"] for e in exs]),
+            "tracking_phase_lag_max_abs_s": stats([
+                e["tracking_phase_lag_max_abs_s"] for e in exs]),
             "fraction_error_gt_0p10": stats([
                 e["fraction_error_gt_0p10"] for e in exs]),
             "fraction_error_gt_0p25": stats([
@@ -525,6 +583,10 @@ def main():
         "initial_error_inf", "mean_error_inf", "p95_error_inf",
         "max_error_inf", "terminal_error_inf", "active_mean_error_inf",
         "active_p95_error_inf", "active_max_error_inf",
+        "spatial_mean_error_inf", "spatial_p95_error_inf",
+        "spatial_max_error_inf", "active_spatial_max_error_inf",
+        "spatial_tracking_bound_max_m", "same_phase_tracking_bound_max_m",
+        "tracking_phase_lag_mean_s", "tracking_phase_lag_max_abs_s",
         "max_error_phase_s", "max_error_phase_fraction",
         "fraction_error_gt_0p10", "fraction_error_gt_0p25",
         "raw_candidate_age_s", "dispatch_suffix_phase_s",

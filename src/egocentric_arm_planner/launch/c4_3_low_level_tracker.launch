@@ -8,6 +8,9 @@
   <arg name="output_velocity_command"
        default="/care_arm/arm_group_velocity_controller/command" />
   <arg name="use_acceleration_limiter" default="false" />
+  <arg name="primitive_tracking_guard" default="false" />
+  <arg name="certified_tracking_margin_m" default="0.020" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
   <arg name="rate_limiter_output_velocity_command"
        default="/care_arm/arm_group_velocity_controller/command" />
   <arg name="external_safety_hold_topic"
@@ -30,6 +33,9 @@
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
     <param name="execution/input_trajectory" value="$(arg input_trajectory)" />
+    <param name="execution/primitive_tracking_guard" value="$(arg primitive_tracking_guard)" />
+    <param name="execution/certified_tracking_margin_m" value="$(arg certified_tracking_margin_m)" />
+    <param name="execution/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
     <param name="execution/output_velocity_command" value="$(arg output_velocity_command)" />
     <param name="execution/external_safety_hold_topic"
            value="$(arg external_safety_hold_topic)" />

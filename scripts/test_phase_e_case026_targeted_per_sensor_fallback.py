@@ -24,6 +24,7 @@ sanity check on the primitive LOS implementation.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -89,6 +90,95 @@ Q_MAX = np.asarray(
 
 def fmt(v, nd=5):
     return "[" + ", ".join(f"{float(x):+.{nd}f}" for x in v) + "]"
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def branch_root_found(branch):
+    if "root_found" in branch:
+        return bool(branch["root_found"])
+    return str(branch.get("root_source", "")) in {
+        "initial_branch_positive",
+        "initial_branch_tolerance",
+        "branch_sign_crossing_bisection",
+        "branch_projection_tolerance",
+    }
+
+
+def primitive_hit_link(geometry):
+    for point in geometry.get("per_point", []):
+        hit = point.get("primitive_hit")
+        if hit:
+            return str(hit.get("link", "unknown"))
+    return "-"
+
+
+def write_markdown_summary(report, path):
+    rows = []
+    for attempt in sorted(
+        report["per_sensor"]["attempts"], key=lambda row: int(row["sensor_id"])
+    ):
+        geometry = attempt["geometry"]
+        q_text = "[" + ", ".join(
+            f"{float(v):+.8f}" for v in attempt["q_candidate"]
+        ) + "]"
+        rows.append(
+            "| S{sensor_id} | {rank} | {initial_score:+.7f} | {root} | "
+            "{final_score:+.7f} | {g:+.7f} | {los} | {hit} | "
+            "`{q}` | {latency:.3f} |".format(
+                sensor_id=int(attempt["sensor_id"]),
+                rank=int(attempt["rank"]),
+                initial_score=float(attempt["initial_score"]),
+                root="yes" if branch_root_found(attempt) else "no",
+                final_score=float(attempt["final_score"]),
+                g=float(geometry["min_conservative_g"]),
+                los=(
+                    "FAIL"
+                    if geometry["any_primitive_self_occluded"]
+                    else "PASS"
+                ),
+                hit=primitive_hit_link(geometry),
+                q=q_text,
+                latency=float(attempt["branch_compute_ms"]),
+            )
+        )
+
+    blocked = report["known_blocked_s4_geometry"]
+    text = [
+        "# Case026 targeted per-sensor diagnostic",
+        "",
+        f"- Verdict: `{report['verdict']}`",
+        f"- Per-sensor model: `{report['per_sensor']['checkpoint_kind']}`",
+        f"- Checkpoint SHA256: `{report['per_sensor']['checkpoint_sha256']}`",
+        f"- Selected sensor: `{report['per_sensor']['selected_sensor_id']}`",
+        f"- Scalar q_zero f: `{float(report['scalar']['f_zero']):+.8f}`",
+        (
+            "- Historical blocked S4: "
+            f"g=`{float(blocked['min_conservative_g']):+.8f}`, "
+            "LOS=`{}`, hit=`{}`".format(
+                "FAIL" if blocked["any_primitive_self_occluded"] else "PASS",
+                primitive_hit_link(blocked),
+            )
+        ),
+        "",
+        "| Sensor | tested rank | initial f | root | final learned f | "
+        "conservative g | self-occlusion | hit link | final q | branch ms |",
+        "|---|---:|---:|:---:|---:|---:|:---:|---|---|---:|",
+        *rows,
+        "",
+        (
+            "Each branch started independently from the same full-precision "
+            "measured q. Ranking was computed at the unchanged scalar q_zero."
+        ),
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(text) + "\n")
 
 
 @torch.no_grad()
@@ -313,12 +403,26 @@ def main():
         ),
     )
     ap.add_argument(
+        "--evaluate-all-branches",
+        action="store_true",
+        help=(
+            "Continue diagnostic evaluation after the first accepted branch "
+            "so the report contains all tested sensors. Selection remains "
+            "the first accepted branch in the original tested order."
+        ),
+    )
+    ap.add_argument(
         "--output",
         default=str(
             REPO
             / "outputs/phase_e_case026_targeted_fallback/"
             "case026_targeted_per_sensor_fallback.json"
         ),
+    )
+    ap.add_argument(
+        "--summary-output",
+        default="",
+        help="Markdown summary path (default: JSON output with .md suffix).",
     )
     args = ap.parse_args()
 
@@ -459,13 +563,27 @@ def main():
     for rank, sid in enumerate(
         order[: args.max_branch_attempts], start=1
     ):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        branch_tic = time.perf_counter()
         branch = runtime._optimize_branch(points, q_seed, sid)
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        solver_ms = 1000.0 * (time.perf_counter() - branch_tic)
+
+        geometry_tic = time.perf_counter()
         geom = runtime._candidate_geometry(
             TARGET.reshape(1, 3), branch["q_candidate"], sid
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        geometry_ms = 1000.0 * (time.perf_counter() - geometry_tic)
         rec = dict(branch)
         rec["rank"] = rank
         rec["geometry"] = geom
+        rec["solver_compute_ms"] = float(solver_ms)
+        rec["geometry_compute_ms"] = float(geometry_ms)
+        rec["branch_compute_ms"] = float(solver_ms + geometry_ms)
         attempts.append(rec)
 
         hit = None
@@ -478,7 +596,8 @@ def main():
             f"root={branch['root_source']} "
             f"g={geom['min_conservative_g']:+.5f} "
             f"occ={int(geom['any_primitive_self_occluded'])} "
-            f"accepted={int(geom['accepted'])}"
+            f"accepted={int(geom['accepted'])} "
+            f"ms={rec['branch_compute_ms']:.2f}"
         )
         print("  q_start    :", fmt(branch["q_start"]))
         print("  q_zero     :", fmt(branch["q_zero"]))
@@ -488,9 +607,10 @@ def main():
         if hit is not None:
             print("  hit:", hit)
 
-        if geom["accepted"]:
+        if geom["accepted"] and selected is None:
             selected = rec
-            break
+            if not args.evaluate_all_branches:
+                break
 
     if device.type == "cuda":
         torch.cuda.synchronize(device)
@@ -502,10 +622,21 @@ def main():
         if not bool(a["geometry"]["accepted"])
     ]
     if selected is not None:
-        verdict = "FALLBACK_SUCCESS" if rejected else "DIRECT_BRANCH_SUCCESS"
+        selection_rejected = [
+            int(a["sensor_id"])
+            for a in attempts
+            if int(a["rank"]) < int(selected["rank"])
+            and not bool(a["geometry"]["accepted"])
+        ]
+        verdict = (
+            "FALLBACK_SUCCESS"
+            if selection_rejected
+            else "DIRECT_BRANCH_SUCCESS"
+        )
         selected_sid = int(selected["sensor_id"])
         selected_q = list(selected["q_candidate"])
     else:
+        selection_rejected = list(rejected)
         verdict = "NO_CLEAR_SENSOR_BRANCH"
         selected_sid = -1
         selected_q = None
@@ -531,6 +662,7 @@ def main():
         "known_blocked_s4_geometry": blocked_geometry,
         "scalar": {
             "checkpoint": args.scalar_checkpoint,
+            "checkpoint_sha256": file_sha256(args.scalar_checkpoint),
             "checkpoint_step": int(scalar_ckpt.get("step", -1)),
             "q_zero": q_zero_np.tolist(),
             "f_zero": float(scalar["f_zero"]),
@@ -541,18 +673,69 @@ def main():
         },
         "per_sensor": {
             "checkpoint": args.per_sensor_checkpoint,
+            "checkpoint_sha256": file_sha256(args.per_sensor_checkpoint),
+            "checkpoint_step": int(runtime.checkpoint.get("step", -1)),
+            "checkpoint_kind": str(
+                runtime.checkpoint.get("runtime_adapter", {}).get(
+                    "model_type", "unknown"
+                )
+            ),
+            "checkpoint_format": runtime.checkpoint.get("format"),
+            "output_semantics": runtime.checkpoint.get("output_semantics"),
             "scores_at_q_zero": [float(v) for v in scores.tolist()],
             "learned_ranking": [int(v) for v in learned_order.tolist()],
             "tested_order": order[: args.max_branch_attempts],
             "forced_first_sensor": int(args.force_first_sensor),
             "branch_seed_q": MEASURED_SEED.tolist(),
             "branch_solver": "projection_root_ascent",
+            "evaluate_all_branches": bool(args.evaluate_all_branches),
             "attempts": attempts,
             "rejected_sensor_ids": rejected,
+            "selection_rejected_sensor_ids": selection_rejected,
             "selected_sensor_id": selected_sid,
             "selected_q_vis": selected_q,
             "branch_compute_ms": float(branch_ms),
             "strict_original_mode_fallback": strict_original_mode_fallback,
+        },
+        "configuration": {
+            "projection_iters": int(args.projection_iters),
+            "projection_damping": float(args.projection_damping),
+            "projection_epsilon_f": float(args.projection_epsilon_f),
+            "projection_max_step_norm": float(args.projection_max_step_norm),
+            "root_refine_iters": int(args.root_refine_iters),
+            "root_tolerance_f": float(args.root_tolerance_f),
+            "branch_ascent_steps": int(args.branch_ascent_steps),
+            "branch_step_size": float(args.branch_step_size),
+            "branch_max_step_norm": float(args.branch_max_step_norm),
+            "branch_fallback_ascent_steps": 8,
+            "max_branch_attempts": int(args.max_branch_attempts),
+            "force_first_sensor": int(args.force_first_sensor),
+            "conservative_hfov_deg": float(runtime.cons_hfov),
+            "conservative_vfov_deg": float(runtime.cons_vfov),
+            "conservative_z_min": float(runtime.cons_z_min),
+            "conservative_z_max": float(runtime.cons_z_max),
+            "conservative_delta": float(runtime.cons_delta),
+            "min_conservative_g": float(runtime.min_conservative_g),
+            "require_primitive_los": bool(runtime.require_primitive_los),
+            "ray_start_offset": float(runtime.ray_args.ray_start_offset),
+            "point_end_offset": float(runtime.ray_args.point_end_offset),
+            "ignore_links": list(runtime.ray_args.ignore_links),
+            "self_filter_padding_m": 0.0,
+        },
+        "identity": {
+            "reference_urdf": args.reference_urdf,
+            "reference_urdf_sha256": file_sha256(args.reference_urdf),
+            "self_filter_urdf": args.self_filter_urdf,
+            "self_filter_urdf_sha256": file_sha256(args.self_filter_urdf),
+            "targeted_script_sha256": file_sha256(__file__),
+            "runtime_script_sha256": file_sha256(
+                VIS_SCRIPTS / "per_sensor_visibility_runtime.py"
+            ),
+            "device": str(device),
+            "torch": str(torch.__version__),
+            "torch_num_threads": int(torch.get_num_threads()),
+            "torch_num_interop_threads": int(torch.get_num_interop_threads()),
+            "numpy": str(np.__version__),
         },
         "verdict": verdict,
     }
@@ -560,6 +743,12 @@ def main():
     out = Path(args.output).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2, allow_nan=True))
+    summary_out = (
+        Path(args.summary_output).expanduser().resolve()
+        if args.summary_output
+        else out.with_suffix(".md")
+    )
+    write_markdown_summary(report, summary_out)
 
     print("")
     print("================ FINAL TARGETED VERDICT ================")
@@ -572,6 +761,7 @@ def main():
     print("verdict                     :", verdict)
     print("branch compute ms           :", f"{branch_ms:.2f}")
     print("[OUTPUT]", out)
+    print("[SUMMARY]", summary_out)
     print("========================================================")
 
 

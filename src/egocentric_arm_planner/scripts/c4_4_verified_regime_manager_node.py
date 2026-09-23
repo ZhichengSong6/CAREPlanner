@@ -187,6 +187,8 @@ class C44VerifiedRegimeManager:
         self.tracker_complete = False
         self.tracker_execution_stamp_ns = 0
         self.tracker_source = "none"
+        self.tracker_abort_count = 0
+        self.last_tracker_aborted_stamp_ns = 0
 
         # C5.17 decision-level PROBE single-flight. Candidate admission is
         # serialized by probe_single_flight_gate_node; mirror its phase here so
@@ -640,6 +642,26 @@ class C44VerifiedRegimeManager:
                     return
                 if not has_violation:
                     self.blocker_rediscovery_vbc_safe_count += 1
+                    # A real visibility waypoint may already be active when
+                    # the task QP stalls.  In that case the same-SCP VBC SAFE
+                    # result only says that the failed nominal trajectory did
+                    # not add a *new* swept-body blocker; it does not remove
+                    # the existing UNKNOWN obligation.  Keep the active
+                    # obligation as the recovery authority and enter REPAIR.
+                    # Without an active waypoint, preserve the original
+                    # conservative behavior and remain in NORMAL.
+                    if self.visibility_waypoint_active and self.execution_ready:
+                        self.task_stall_outcome = (
+                            "qp_stall_existing_visibility_obligation")
+                        self.task_stall_deadline = None
+                        self.blocker_rediscovery_pending = False
+                        self.blocker_rediscovery_origin = "none"
+                        self.blocker_rediscovery_force_bootstrap = False
+                        self._transition_locked(
+                            self.REPAIR,
+                            self.task_stall_outcome,
+                            rospy.Time.now())
+                        return
                     self._finish_task_stall_locked("QP_NO_PROGRESS_NO_VBC_BLOCKER")
                     return  # VBC SAFE is not a hard-QP feasibility certificate.
                 self.task_stall_confirmed = True
@@ -1111,6 +1133,7 @@ class C44VerifiedRegimeManager:
         execution_stamp_ns = _as_int(f.get("execution_stamp_ns"), 0)
         source = f.get("source", "")
         phase_s = _as_float(f.get("phase_s"), math.nan)
+        aborted = _as_bool(f.get("execution_aborted"))
 
         now = rospy.Time.now()
         request_next_probe = False
@@ -1123,6 +1146,11 @@ class C44VerifiedRegimeManager:
             self.tracker_complete = bool(complete) if complete is not None else False
             self.tracker_execution_stamp_ns = execution_stamp_ns
             self.tracker_source = source
+
+            if (aborted is True and execution_stamp_ns > 0 and
+                    execution_stamp_ns != self.last_tracker_aborted_stamp_ns):
+                self.tracker_abort_count += 1
+                self.last_tracker_aborted_stamp_ns = execution_stamp_ns
 
             # Preserve full-completion diagnostics independently of PROBE
             # progress counting.
@@ -1143,38 +1171,65 @@ class C44VerifiedRegimeManager:
                 # committed trajectory.
                 return
 
-            prefix_complete = (
-                math.isfinite(self.pending_probe_effective_prefix_s) and
-                self.pending_probe_effective_prefix_s > 0.0 and
-                math.isfinite(phase_s) and
-                phase_s + 1e-6 >= self.pending_probe_effective_prefix_s)
-
-            # Metadata-missing fallback preserves the old fail-closed behavior:
-            # only a full certified trajectory completion can count.
-            if not prefix_complete and not full_complete:
-                return
-
-            completed_stamp = self.pending_probe_execution_stamp_ns
-            self.pending_probe_candidate_seq = 0
-            self.pending_probe_execution_stamp_ns = 0
-            self.pending_probe_effective_prefix_s = math.nan
-            self.probe_completed_prefix_streak += 1
-            # Compatibility counter: this now means an actually executed,
-            # certified PROBE prefix (full completion remains separately logged
-            # through last_tracker_complete_*).
-            self.probe_completed_execution_count += 1
-
-            if self.probe_completed_prefix_streak >= self.probe_completed_prefixes_required:
-                self._transition_locked(
-                    self.NORMAL, "probe_normal_completed_prefixes", now)
-            else:
+            # Tracking protection cancels the committed token. It cannot count
+            # as a completed PROBE prefix, even if the stop was reported at a
+            # phase equal to the prefix duration. Clear the stale handshake and
+            # ask the planner for a fresh candidate from measured state.
+            if aborted is True:
+                self.pending_probe_candidate_seq = 0
+                self.pending_probe_execution_stamp_ns = 0
+                self.pending_probe_effective_prefix_s = math.nan
+                self.probe_completed_prefix_streak = 0
                 self.last_transition_reason = (
-                    "probe_certified_prefix_complete_stamp_{}".format(
-                        completed_stamp))
-                # Start the next measured-state PROBE now. The old committed
-                # trajectory remains safe through its certified brake+hold tail
-                # until the replacement itself passes final GCDF + exact VBC.
+                    "probe_execution_aborted_token_{}_replan".format(
+                        execution_stamp_ns))
                 request_next_probe = True
+                # Do not evaluate prefix/full completion for a cancelled token.
+                self._publish_summary()
+            else:
+                prefix_complete = (
+                    math.isfinite(self.pending_probe_effective_prefix_s) and
+                    self.pending_probe_effective_prefix_s > 0.0 and
+                    math.isfinite(phase_s) and
+                    phase_s + 1e-6 >= self.pending_probe_effective_prefix_s)
+
+                # Metadata-missing fallback preserves the old fail-closed behavior:
+                # only a full certified trajectory completion can count.
+                if not prefix_complete and not full_complete:
+                    return
+
+                completed_stamp = self.pending_probe_execution_stamp_ns
+                self.pending_probe_candidate_seq = 0
+                self.pending_probe_execution_stamp_ns = 0
+                self.pending_probe_effective_prefix_s = math.nan
+                self.probe_completed_prefix_streak += 1
+                # Compatibility counter: this now means an actually executed,
+                # certified PROBE prefix (full completion remains separately logged
+                # through last_tracker_complete_*).
+                self.probe_completed_execution_count += 1
+
+                if self.probe_completed_prefix_streak >= self.probe_completed_prefixes_required:
+                    # A new visibility obligation may arrive while the last
+                    # probe prefix is in flight. Do not pass through NORMAL in
+                    # that case: the task QP would treat the fresh blocker as
+                    # an ordinary UNKNOWN row and spend one cycle rediscovering
+                    # what the acquisition layer already reported.
+                    if self.visibility_waypoint_active:
+                        self._transition_locked(
+                            self.REPAIR,
+                            "probe_prefixes_complete_visibility_obligation",
+                            now)
+                    else:
+                        self._transition_locked(
+                            self.NORMAL, "probe_normal_completed_prefixes", now)
+                else:
+                    self.last_transition_reason = (
+                        "probe_certified_prefix_complete_stamp_{}".format(
+                            completed_stamp))
+                    # Start the next measured-state PROBE now. The old committed
+                    # trajectory remains safe through its certified brake+hold tail
+                    # until the replacement itself passes final GCDF + exact VBC.
+                    request_next_probe = True
 
         if request_next_probe:
             self.replan_request_pub.publish(Bool(data=True))
@@ -1297,6 +1352,9 @@ class C44VerifiedRegimeManager:
                 "tracker_execution_stamp_ns={}".format(
                     self.tracker_execution_stamp_ns),
                 "tracker_source={}".format(self.tracker_source),
+                "tracker_abort_count={}".format(self.tracker_abort_count),
+                "last_tracker_aborted_stamp_ns={}".format(
+                    self.last_tracker_aborted_stamp_ns),
                 "repair_entry_count={}".format(self.repair_entry_count),
                 "candidate_repair_entry_count={}".format(self.candidate_repair_entry_count),
                 "gcdf_repair_entry_count={}".format(self.gcdf_repair_entry_count),

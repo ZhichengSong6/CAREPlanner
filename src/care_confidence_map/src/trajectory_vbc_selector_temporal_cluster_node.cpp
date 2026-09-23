@@ -12,6 +12,7 @@
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/String.h>
 #include <trajectory_msgs/JointTrajectory.h>
+#include <sensor_msgs/JointState.h>
 
 #include <Eigen/Dense>
 
@@ -49,6 +50,11 @@ public:
   bool initialize()
   {
     loadParams();
+    pnh_.param("trajectory_vbc/include_measured_body", include_measured_body_, false);
+    if (include_measured_body_) measured_sub_=nh_.subscribe<sensor_msgs::JointState>(
+        "/care_arm/joint_states",1,[this](const sensor_msgs::JointStateConstPtr& msg) {
+          std::lock_guard<std::mutex> lock(mutex_); latest_measured_=msg;
+        });
 
     std::string error_msg;
     if (geometry_backend_ != "samples" && geometry_backend_ != "primitive")
@@ -361,6 +367,9 @@ private:
         "trajectory_vbc/swept_volume_margin_m",
         swept_volume_margin_m_, 0.025);
     pnh_.param(
+        "trajectory_vbc/continuous_motion_bound_enabled",
+        continuous_motion_bound_enabled_, false);
+    pnh_.param(
         "trajectory_vbc/map_resolution",
         map_resolution_, 0.05);
     pnh_.param("trajectory_vbc/map_x_min", map_x_min_, -0.95);
@@ -493,6 +502,10 @@ private:
     std::map<std::string, int> input_joint_index;
     for (int i = 0; i < static_cast<int>(traj.joint_names.size()); ++i)
       input_joint_index[traj.joint_names[static_cast<std::size_t>(i)]] = i;
+    if (geometry_backend_ == "primitive" && input_joint_index.size()!=traj.joint_names.size()) {
+      if(error_msg) *error_msg="Duplicate continuous trajectory joint names";
+      return false;
+    }
 
     const auto& required_names = evaluator_.activeJointNames();
     if (static_cast<int>(required_names.size()) != evaluator_.nq())
@@ -515,8 +528,16 @@ private:
       required_to_input[static_cast<std::size_t>(i)] = it->second;
     }
 
-    const std::vector<int> selected =
-        makeDownsampleIndices(static_cast<int>(traj.points.size()));
+    std::vector<int> selected;
+    if (geometry_backend_ == "primitive") {
+      // Dropping a knot changes the piecewise-linear path, including its brake
+      // and hold tail. Capacity failures must reject, never simplify the path.
+      if (traj.points.size() > 4096) {
+        if (error_msg) *error_msg="Continuous trajectory capacity exceeded";
+        return false;
+      }
+      for (std::size_t i=0;i<traj.points.size();++i) selected.push_back(static_cast<int>(i));
+    } else selected = makeDownsampleIndices(static_cast<int>(traj.points.size()));
     const bool has_timing = traj.points.size() > 1 &&
         traj.points.back().time_from_start.toSec() > 1e-9;
 
@@ -537,9 +558,15 @@ private:
         q(i) = pt.positions[static_cast<std::size_t>(
             required_to_input[static_cast<std::size_t>(i)])];
       }
-      double t = has_timing
+      double t = (geometry_backend_ == "primitive" || has_timing)
           ? pt.time_from_start.toSec()
           : static_cast<double>(original_index) * fallback_dt_;
+      if (geometry_backend_ == "primitive" && (!q.allFinite() || !std::isfinite(t) || t<0 ||
+          (eval_times_s->empty() && t!=0.0) ||
+          (!eval_times_s->empty() && t<=eval_times_s->back()))) {
+        if(error_msg) *error_msg="Invalid continuous knot positions/timing";
+        return false;
+      }
       if (!eval_times_s->empty() && t < eval_times_s->back())
         t = eval_times_s->back();
       q_traj->push_back(q);
@@ -1039,8 +1066,11 @@ private:
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=0"
         << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
+        << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
+        << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
+        << " continuous_motion_bound_enabled=" << continuous_motion_bound_enabled_
         << " reason=" << reason
         << " trajectory_source=" << trajectory_source
         << " trajectory_stamp_ns=" << current_eval_stamp_ns_
@@ -1145,8 +1175,11 @@ private:
     std::ostringstream oss;
     oss << "vbc success=1 has_violation=1"
         << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
+        << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
+        << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
+        << " continuous_motion_bound_enabled=" << continuous_motion_bound_enabled_
         << " reason=selected_temporal_cluster"
         << " trajectory_source=" << trajectory_source
         << " trajectory_stamp_ns=" << current_eval_stamp_ns_
@@ -1297,9 +1330,13 @@ private:
     const ros::WallTime body_fk_begin = ros::WallTime::now();
     care_confidence_map::TrajectorySampleResult sample_result;
     std::vector<care_confidence_map::VbcPrimitiveFrame> primitive_frames;
+    std::vector<int> sweep_indices;
+    std::vector<double> sweep_times;
     bool body_ok = false;
     if (geometry_backend_ == "primitive")
-      body_ok = primitive_model_.computeTrajectory(evaluator_, q_traj, &primitive_frames, &error_msg);
+      body_ok = primitive_model_.computeContinuousTrajectory(evaluator_, q_traj,
+          original_indices, eval_times_s, &primitive_frames, &sweep_indices,
+          &sweep_times, &error_msg, continuous_motion_bound_enabled_);
     else
     {
       sample_result = evaluator_.computeTrajectorySamples(q_traj);
@@ -1315,13 +1352,38 @@ private:
       return;
     }
 
+    if (geometry_backend_ == "primitive" && include_measured_body_) {
+      sensor_msgs::JointStateConstPtr measured;
+      {std::lock_guard<std::mutex> lock(mutex_); measured=latest_measured_;}
+      const double age=measured ? (ros::Time::now()-measured->header.stamp).toSec() : 1.;
+      if (!measured || measured->header.stamp.isZero() || age<0 || age>0.15 ||
+          measured->name.size()!=measured->position.size()) {
+        ROS_WARN_STREAM_THROTTLE(1.0,"VBC actual-body audit unavailable: measured age=" << age);
+        return;
+      }
+      Eigen::VectorXd actual(evaluator_.nq());
+      for (int j=0;j<evaluator_.nq();++j) {
+        auto it=std::find(measured->name.begin(),measured->name.end(),evaluator_.activeJointNames()[j]);
+        if(it==measured->name.end()) {
+          ROS_WARN_STREAM_THROTTLE(1.0,"VBC actual-body audit missing joint " << evaluator_.activeJointNames()[j]);
+          return;
+        }
+        actual[j]=measured->position[std::distance(measured->name.begin(),it)];
+      }
+      std::vector<care_confidence_map::VbcPrimitiveFrame> actual_frames;
+      if (!actual.allFinite() || !primitive_model_.computeTrajectory(evaluator_,{actual},&actual_frames,&error_msg)) return;
+      actual_frames[0].original_eval_timestep=0;
+      primitive_frames.insert(primitive_frames.begin(),std::move(actual_frames[0]));
+      sweep_indices.insert(sweep_indices.begin(),original_indices.front());
+      sweep_times.insert(sweep_times.begin(),0.0);
+    }
     const ros::WallTime swept_begin = ros::WallTime::now();
     std::vector<SweepVoxel> swept_voxels;
     try
     {
       if (geometry_backend_ == "primitive")
         swept_voxels = care_confidence_map::buildPrimitiveSweptVoxels<SweepVoxel>(
-            primitive_frames, original_indices, eval_times_s,
+            primitive_frames, sweep_indices, sweep_times,
             {{map_x_min_, map_y_min_, map_z_min_}, {map_x_max_, map_y_max_, map_z_max_},
              map_resolution_}, swept_volume_margin_m_);
       else
@@ -1739,7 +1801,7 @@ private:
                     << map_resolution_ << " m");
     ROS_INFO_STREAM("FK URDF: " << robot_urdf_file_ << "; primitive URDF: "
                     << (geometry_backend_ == "primitive" ? primitive_urdf_file_ : "unused")
-                    << "; semantics: voxel centers at discrete knots");
+                    << "; primitive semantics: continuous linear interval enclosures, 5mm tightness");
     ROS_INFO_STREAM("temporal layer maximum span: "
                     << temporal_layer_mpc_steps_ << " MPC steps");
     ROS_INFO_STREAM("spatial region maximum diameter: "
@@ -1804,6 +1866,7 @@ private:
   double frontier_confidence_threshold_ = 0.50;
   double candidate_resolution_ = 0.05;
   double swept_volume_margin_m_ = 0.025;
+  bool continuous_motion_bound_enabled_ = false;
   double map_resolution_ = 0.05;
   double map_x_min_ = -0.95;
   double map_x_max_ = 0.95;
@@ -1831,6 +1894,9 @@ private:
   std::string geometry_backend_ = "samples";
   std::string primitive_urdf_file_;
   care_confidence_map::VbcPrimitiveModel primitive_model_;
+  bool include_measured_body_ = false;
+  ros::Subscriber measured_sub_;
+  sensor_msgs::JointStateConstPtr latest_measured_;
   std::string base_frame_ = "base_link";
   std::string input_trajectory_topic_ = "/care_planner/task_trajectory";
   std::string predicted_trajectory_topic_ =

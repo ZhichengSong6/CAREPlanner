@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import math
 import threading
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from occupied_clearance import voxel_volume_clearance
 
 import rospy
 from std_msgs.msg import Bool, String
@@ -149,7 +153,7 @@ class ExecutionGCDFSafetyMonitor:
             # Convert sphere-to-voxel-CENTER clearance into a conservative
             # sphere-to-voxel-VOLUME clearance. Anchor radius already includes
             # the Phase-E body-model inflation.
-            d = raw_clearance - self.voxel_half_diagonal_m
+            d = voxel_volume_clearance(raw_clearance, self.voxel_resolution_m)
             raw_center_clearance_valid.append(raw_clearance)
 
             source = int(sources[i]) if i < len(sources) else source_unknown

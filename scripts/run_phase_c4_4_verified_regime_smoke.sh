@@ -14,6 +14,12 @@ WORLD_FILE="${WORLD_FILE:-${REPO}/src/arm_description/worlds/maixsense_empty.wor
 CONFIDENCE_MAP_CONFIG_FILE="${CONFIDENCE_MAP_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/confidence_map.yaml}"
 TOF_FUSION_CONFIG_FILE="${TOF_FUSION_CONFIG_FILE:-${REPO}/src/care_confidence_map/config/tof_fusion_self_filter.yaml}"
 TOF_FUSION_ENABLED="${TOF_FUSION_ENABLED:-false}"
+REQUIRE_REAL_TOF_READINESS="${REQUIRE_REAL_TOF_READINESS:-false}"
+PERCEPTION_READY_TIMEOUT_S="${PERCEPTION_READY_TIMEOUT_S:-20}"
+if [ "${REQUIRE_REAL_TOF_READINESS}" = "true" ] && [ -z "${DISPLAY:-}" ]; then
+  echo "[ERROR] Missing DISPLAY: Gazebo depth cameras need rendering even with gazebo_gui=false" >&2
+  exit 2
+fi
 RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED:-false}"
 TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY="${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY:-false}"
 EXECUTION_GCDF_AUDIT_ENABLED="${EXECUTION_GCDF_AUDIT_ENABLED:-false}"
@@ -21,6 +27,33 @@ EXECUTION_GCDF_WARNING_MARGIN="${EXECUTION_GCDF_WARNING_MARGIN:-0.05}"
 EXECUTION_GCDF_HARD_MARGIN="${EXECUTION_GCDF_HARD_MARGIN:-0.0}"
 EXECUTION_GCDF_STALE_TIMEOUT_S="${EXECUTION_GCDF_STALE_TIMEOUT_S:-0.35}"
 GCDF_BODY_INFLATION_M="${GCDF_BODY_INFLATION_M:-0.0}"
+GEOMETRY_BACKEND="${GEOMETRY_BACKEND:-primitive}"
+CONFIDENCE_QUERY_DEDICATED_QUEUE="${CONFIDENCE_QUERY_DEDICATED_QUEUE:-true}"
+# Legacy override, used only if at least one geometry consumer selects samples.
+BODY_SAMPLES_FILE="${BODY_SAMPLES_FILE:-}"
+case "${GEOMETRY_BACKEND}" in
+  samples|primitive) ;;
+  *) echo "Invalid GEOMETRY_BACKEND: ${GEOMETRY_BACKEND}" >&2; exit 2 ;;
+esac
+GCDF_GEOMETRY_BACKEND="${GCDF_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND}}"
+BODY_PRIOR_GEOMETRY_BACKEND="${BODY_PRIOR_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND}}"
+DIAGNOSTIC_GEOMETRY_BACKEND="${DIAGNOSTIC_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND}}"
+case "${DIAGNOSTIC_GEOMETRY_BACKEND}" in
+  samples|primitive) ;;
+  *) echo "Invalid DIAGNOSTIC_GEOMETRY_BACKEND: ${DIAGNOSTIC_GEOMETRY_BACKEND}" >&2; exit 2 ;;
+esac
+case "${BODY_PRIOR_GEOMETRY_BACKEND}" in
+  samples|primitive) ;;
+  *) echo "Invalid BODY_PRIOR_GEOMETRY_BACKEND: ${BODY_PRIOR_GEOMETRY_BACKEND}" >&2; exit 2 ;;
+esac
+case "${GCDF_GEOMETRY_BACKEND}" in
+  samples|primitive) ;;
+  *) echo "Invalid GCDF_GEOMETRY_BACKEND: ${GCDF_GEOMETRY_BACKEND}" >&2; exit 2 ;;
+esac
+GCDF_EXPORT_NODE=trajectory_risk_node
+if [[ "${GCDF_GEOMETRY_BACKEND}" == "primitive" ]]; then
+  GCDF_EXPORT_NODE=gcdf_primitive_anchors
+fi
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
@@ -54,6 +87,7 @@ CDF_SELECTOR_PROXIMITY_MARGIN="${CDF_SELECTOR_PROXIMITY_MARGIN:-0.075}"
 CDF_SELECTOR_MAX_PAIRS_PER_STEP="${CDF_SELECTOR_MAX_PAIRS_PER_STEP:-250}"
 CDF_SELECTOR_SIGNED_ZERO_BAND="${CDF_SELECTOR_SIGNED_ZERO_BAND:-0.05}"
 CDF_SHADOW_VBC_AUDIT_ENABLED="${CDF_SHADOW_VBC_AUDIT_ENABLED:-false}"
+CDF_SHADOW_VBC_EVENT_DRIVEN_EVAL="${CDF_SHADOW_VBC_EVENT_DRIVEN_EVAL:-true}"
 CDF_SHADOW_VBC_SUMMARY_TOPIC="${CDF_SHADOW_VBC_SUMMARY_TOPIC:-/care_planner/cdf_shadow_vbc/summary}"
 
 # C5.4 event-triggered local trajectory optimizer. Default false preserves
@@ -62,7 +96,28 @@ USE_LOCAL_SPARSE_SCP="${USE_LOCAL_SPARSE_SCP:-false}"
 LOCAL_SCP_GPU_SOCKET="${LOCAL_SCP_GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
 LOCAL_SCP_SELECTOR_JSONL="${LOCAL_SCP_SELECTOR_JSONL:-/tmp/c5_4_local_scp_selector.jsonl}"
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
-VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
+FINAL_GCDF_SAFETY_MARGIN="${FINAL_GCDF_SAFETY_MARGIN:-0.0}"
+VBC_GEOMETRY_BACKEND="${VBC_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND}}"
+# Primitive tests use an explicit 10 mm visibility envelope. Keep the legacy
+# sample baseline and caller overrides available for controlled comparisons.
+if [[ "${VBC_GEOMETRY_BACKEND}" == "primitive" ]]; then
+  VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.010}"
+  PRIMITIVE_TRACKING_GUARD=true
+else
+  VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
+  PRIMITIVE_TRACKING_GUARD=false
+fi
+VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-false}"
+# Keep the runtime tracker threshold independent from the VBC swept-volume
+# margin. The tracker defaults to the requested 20 mm tolerance; callers can
+# override it for a controlled comparison without changing VBC certification.
+TRACKER_CERTIFIED_MARGIN_M="${TRACKER_CERTIFIED_MARGIN_M:-0.020}"
+BODY_SAMPLES_LAUNCH_ARGS=()
+if [[ "${GCDF_GEOMETRY_BACKEND}" == samples || "${BODY_PRIOR_GEOMETRY_BACKEND}" == samples ||
+      "${DIAGNOSTIC_GEOMETRY_BACKEND}" == samples || "${VBC_GEOMETRY_BACKEND}" == samples ]]; then
+  BODY_SAMPLES_FILE="${BODY_SAMPLES_FILE:-${REPO}/src/care_confidence_map/config/body_samples.yaml}"
+  BODY_SAMPLES_LAUNCH_ARGS=("body_samples_file:=${BODY_SAMPLES_FILE}")
+fi
 LOCAL_SCP_CANDIDATE_TOPIC="${LOCAL_SCP_CANDIDATE_TOPIC:-/care_planner/local_planner/candidate_trajectory}"
 LOCAL_SCP_SUMMARY_TOPIC="${LOCAL_SCP_SUMMARY_TOPIC:-/care_planner/local_planner/summary}"
 LOCAL_SCP_REPLAN_TOPIC="${LOCAL_SCP_REPLAN_TOPIC:-/care_planner/local_planner/replan_request}"
@@ -72,6 +127,9 @@ FINAL_EXECUTABLE_GCDF_ENABLED="${FINAL_EXECUTABLE_GCDF_ENABLED:-false}"
 COMMITTED_CONTINUATION_ENABLED="${COMMITTED_CONTINUATION_ENABLED:-true}"
 EXECUTION_AUDIT_STREAM_ENABLED="${EXECUTION_AUDIT_STREAM_ENABLED:-false}"
 EXECUTION_VBC_TRAJECTORY_TOPIC="${EXECUTION_VBC_TRAJECTORY_TOPIC:-/care_planner/committed_trajectory}"
+EXECUTION_VBC_EVENT_DRIVEN_EVAL="${EXECUTION_VBC_EVENT_DRIVEN_EVAL:-true}"
+VERIFICATION_TCP_NODELAY="${VERIFICATION_TCP_NODELAY:-true}"
+VBC_CONFIDENCE_QUERY_PERSISTENT="${VBC_CONFIDENCE_QUERY_PERSISTENT:-true}"
 PROBE_SINGLE_FLIGHT_ENABLED="${PROBE_SINGLE_FLIGHT_ENABLED:-false}"
 PROBE_SINGLE_FLIGHT_TOPIC="${PROBE_SINGLE_FLIGHT_TOPIC:-/care_planner/local_planner/candidate_trajectory_single_flight}"
 PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC:-/care_planner/execution/probe_single_flight_summary}"
@@ -88,11 +146,16 @@ CYCLE_RECOVERY_ENABLED="${CYCLE_RECOVERY_ENABLED:-false}"
 ADAPTIVE_REFINEMENT_ENABLED="${ADAPTIVE_REFINEMENT_ENABLED:-false}"
 FRONTIER_STEERING_ENABLED="${FRONTIER_STEERING_ENABLED:-true}"
 VBC_GATED_FRONTIER_STEP_ENABLED="${VBC_GATED_FRONTIER_STEP_ENABLED:-false}"
+FRONTIER_STEP_INF="${FRONTIER_STEP_INF:-0.05}"
+FRONTIER_VBC_ESCALATION_ENABLED="${FRONTIER_VBC_ESCALATION_ENABLED:-false}"
+FRONTIER_VBC_ESCALATION_AFTER="${FRONTIER_VBC_ESCALATION_AFTER:-3}"
+FRONTIER_ESCALATED_STEP_INF="${FRONTIER_ESCALATED_STEP_INF:-0.10}"
 ENABLE_ORACLE_DIAGNOSTICS="${ENABLE_ORACLE_DIAGNOSTICS:-false}"
 
 # Optional scalar + 8-head hybrid visibility steering.  Disabled by default so
 # historical C4/C5 runs are unchanged.  Phase-E per-sensor experiments opt in.
 PER_SENSOR_HYBRID_ENABLED="${PER_SENSOR_HYBRID_ENABLED:-false}"
+FINAL_VBC_RECOVERY_ENABLED="${FINAL_VBC_RECOVERY_ENABLED:-false}"
 PER_SENSOR_CHECKPOINT="${PER_SENSOR_CHECKPOINT:-${REPO}/src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt}"
 PER_SENSOR_SELF_FILTER_URDF="${PER_SENSOR_SELF_FILTER_URDF:-${REPO}/src/arm_description/urdf/Arm_with_self_filter_collision.urdf}"
 PER_SENSOR_BRANCH_ASCENT_STEPS="${PER_SENSOR_BRANCH_ASCENT_STEPS:-1}"
@@ -101,10 +164,17 @@ PER_SENSOR_BRANCH_MAX_STEP_NORM="${PER_SENSOR_BRANCH_MAX_STEP_NORM:-0.25}"
 PER_SENSOR_MAX_BRANCH_ATTEMPTS="${PER_SENSOR_MAX_BRANCH_ATTEMPTS:-4}"
 PER_SENSOR_MIN_CONSERVATIVE_G="${PER_SENSOR_MIN_CONSERVATIVE_G:-0.0}"
 PER_SENSOR_REQUIRE_PRIMITIVE_LOS="${PER_SENSOR_REQUIRE_PRIMITIVE_LOS:-true}"
+PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED="${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED:-false}"
+PER_SENSOR_HIGH_WITNESS_Z_MIN="${PER_SENSOR_HIGH_WITNESS_Z_MIN:-0.85}"
 
 # Optional online task-success stop. Defaults off here so historical C4/C5
 # diagnostics retain their fixed-duration semantics. Phase-D enables it.
 EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
+if [ "${REQUIRE_REAL_TOF_READINESS}" = "true" ] && \
+   [ "${EARLY_STOP_ON_GOAL}" != "true" ] && [ "${EARLY_STOP_ON_GOAL}" != "1" ]; then
+  echo "[ERROR] Real-ToF qualification requires the pre-goal benchmark arm protocol" >&2
+  exit 2
+fi
 GOAL_POSITION_TOLERANCE_M="${GOAL_POSITION_TOLERANCE_M:-0.02}"
 GOAL_ORIENTATION_TOLERANCE_RAD="${GOAL_ORIENTATION_TOLERANCE_RAD:-0.20}"
 GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
@@ -118,6 +188,11 @@ GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.0}"
 #                      tests; avoids dozens of rostopic echo processes
 #                      perturbing Gazebo wall-clock real-time factor.
 RECORDING_PROFILE="${RECORDING_PROFILE:-full}"
+# Optional exact GCDF pair audit. When enabled, retain the complete local and
+# final CDF batches (point coordinates, timestep, source, distance and
+# linearization) so a VBC witness can be matched against the actual GCDF
+# input. Keep this opt-in because the messages contain dense arrays.
+LOCAL_CDF_PAIR_AUDIT_ENABLED="${LOCAL_CDF_PAIR_AUDIT_ENABLED:-false}"
 
 OUT="${OUT:-${REPO}/outputs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
 LOG="${LOG:-${REPO}/logs/phase_c4_4_verified_regime_smoke/${CASE_ID}}"
@@ -145,6 +220,7 @@ VERIFY_TOPIC="/care_planner/optimized_trajectory"
 COMMITTED_TOPIC="/care_planner/committed_trajectory"
 CANDIDATE_VBC_TOPIC="/care_planner/candidate_vbc/summary"
 EXECUTION_VBC_TOPIC="/care_planner/execution_vbc/summary"
+EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC="/care_planner/execution_vbc/audit_active_set_bundle"
 REGIME_TOPIC="/care_planner/c4_4/regime_summary"
 TRACKER_DESIRED_TOPIC="/care_planner/execution/tracker_velocity_desired"
 ACTUATOR_TOPIC="/care_arm/arm_group_velocity_controller/command"
@@ -170,8 +246,14 @@ if [[ "${PER_SENSOR_HYBRID_ENABLED}" == "true" || "${PER_SENSOR_HYBRID_ENABLED}"
   fi
 fi
 
-rm -rf "${OUT}" "${LOG}"
-mkdir -p "${OUT}/projector_traces" "${LOG}"
+# Never overwrite another trial or user log. Callers must allocate fresh paths.
+if [[ -e "${OUT}" || -e "${LOG}" ]]; then
+  echo "[ERROR] OUT/LOG already exists; choose fresh trial directories." >&2
+  exit 2
+fi
+mkdir -p "$(dirname -- "${OUT}")" "$(dirname -- "${LOG}")" || exit 2
+mkdir -- "${OUT}" "${LOG}" || exit 2
+mkdir -- "${OUT}/projector_traces" || exit 2
 
 if timeout 2 rosnode list >/dev/null 2>&1; then
   echo "[ERROR] ROS master already running. Close other ROS/Gazebo sessions first."
@@ -250,10 +332,24 @@ echo "[INITIAL Q] apply_initial_joint_overrides=${APPLY_INITIAL_JOINT_OVERRIDES}
 
 GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
 REC_PIDS=()
+REC_NAMES=()
+# A unique token prevents a stale/latching arm message from another run from
+# dispatching this benchmark goal. The broker's existing prior gates stay on.
+export CARE_BENCHMARK_ARM_TOKEN=""
+if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  export CARE_BENCHMARK_ARM_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+fi
 kill_group() {
   local pid="${1:-}"; [ -z "${pid}" ] && return 0
-  if kill -0 "${pid}" 2>/dev/null; then kill -INT -- "-${pid}" 2>/dev/null || true; sleep 0.25; fi
-  if kill -0 "${pid}" 2>/dev/null; then kill -TERM -- "-${pid}" 2>/dev/null || true; sleep 0.25; fi
+  local attempt
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -INT -- "-${pid}" 2>/dev/null || true
+    for attempt in {1..50}; do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+  fi
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+    for attempt in {1..20}; do kill -0 "${pid}" 2>/dev/null || break; sleep 0.1; done
+  fi
   if kill -0 "${pid}" 2>/dev/null; then kill -KILL -- "-${pid}" 2>/dev/null || true; fi
   wait "${pid}" 2>/dev/null || true
 }
@@ -264,9 +360,10 @@ cleanup() {
   kill_group "${GEN_PID}"; GEN_PID=""
   kill_group "${TRACKER_PID}"; TRACKER_PID=""
   kill_group "${GAZEBO_PID}"; GAZEBO_PID=""
-  for name in gzclient gzserver rviz rosmaster roscore roslaunch; do pkill -TERM -x "${name}" 2>/dev/null || true; done
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "[VIS] gazebo_gui=${GAZEBO_GUI} use_rviz=${USE_RVIZ} world_file=${WORLD_FILE}"
 setsid roslaunch arm_description gazebo_velocity_control.launch \
@@ -362,6 +459,16 @@ then
   exit 1
 fi
 
+if [ "${REQUIRE_REAL_TOF_READINESS}" = "true" ]; then
+  echo "[WAIT] eight real ToF clouds before planner startup"
+  if ! python3 scripts/wait_for_phase_e_perception.py \
+    --config "${TOF_FUSION_CONFIG_FILE}" --raw-only \
+    --timeout "${PERCEPTION_READY_TIMEOUT_S}" --output "${OUT}/perception_raw_ready.json"; then
+    echo "[ERROR] ToF cloud readiness failed; no task goal will be published"
+    exit 2
+  fi
+fi
+
 echo "[WAIT] validating Gazebo actual link/render poses against ROS TF"
 POSE_AUDIT_JSON="${OUT}/startup_gazebo_tf_snapshot.json"
 if ! python3 src/care_confidence_map/scripts/capture_static_gazebo_tf_snapshot.py \
@@ -404,6 +511,8 @@ then
 fi
 
 setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
+  primitive_tracking_guard:="${PRIMITIVE_TRACKING_GUARD}" \
+  certified_tracking_margin_m:="${TRACKER_CERTIFIED_MARGIN_M}" \
   config_file:="${CONFIG_FILE}" input_trajectory:="${COMMITTED_TOPIC}" \
   output_velocity_command:="${TRACKER_DESIRED_TOPIC}" \
   use_acceleration_limiter:=true \
@@ -411,9 +520,9 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
-echo "[PER-SENSOR HYBRID] enabled=${PER_SENSOR_HYBRID_ENABLED} checkpoint=${PER_SENSOR_CHECKPOINT} branch_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS} attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} LOS=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS}"
+echo "[PER-SENSOR HYBRID] enabled=${PER_SENSOR_HYBRID_ENABLED} checkpoint=${PER_SENSOR_CHECKPOINT} branch_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS} attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} LOS=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} high_witness_priority=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} high_witness_z_min=${PER_SENSOR_HIGH_WITNESS_Z_MIN}"
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _frontier_step_inf:=${FRONTIER_STEP_INF} _frontier_vbc_escalation_enabled:=${FRONTIER_VBC_ESCALATION_ENABLED} _frontier_vbc_escalation_after:=${FRONTIER_VBC_ESCALATION_AFTER} _frontier_escalated_step_inf:=${FRONTIER_ESCALATED_STEP_INF} _blocker_push_max_sweep_s:=${BLOCKER_PUSH_MAX_SWEEP_S:-0.30} _blocker_confirmations:=${BLOCKER_CONFIRMATIONS:-2} _final_vbc_recovery_enabled:=${FINAL_VBC_RECOVERY_ENABLED} _final_vbc_recovery_feedback_topic:='${LOCAL_SCP_SUMMARY_TOPIC}' _execution_active_set_bundle_topic:='${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}' _candidate_replacement_enabled:=${CANDIDATE_REPLACEMENT_ENABLED:-false} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _per_sensor_high_witness_priority_enabled:=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} _per_sensor_high_witness_z_min:=${PER_SENSOR_HIGH_WITNESS_Z_MIN} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -432,8 +541,14 @@ fi
 echo "[MODE] region_schedule_mode=${REGION_SCHEDULE_MODE}"
 
 setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch \
+  rejection_snapshot_dir:="${OUT}/rejection_snapshots" \
   config_file:="${CONFIG_FILE}" \
   confidence_map_config_file:="${CONFIDENCE_MAP_CONFIG_FILE}" \
+  confidence_query_dedicated_queue:="${CONFIDENCE_QUERY_DEDICATED_QUEUE}" \
+  body_prior_geometry_backend:="${BODY_PRIOR_GEOMETRY_BACKEND}" \
+  geometry_backend:="${GEOMETRY_BACKEND}" \
+  "${BODY_SAMPLES_LAUNCH_ARGS[@]}" \
+  diagnostic_geometry_backend:="${DIAGNOSTIC_GEOMETRY_BACKEND}" \
   tof_fusion_config_file:="${TOF_FUSION_CONFIG_FILE}" \
   tof_fusion_enabled:="${TOF_FUSION_ENABLED}" \
   runtime_self_hit_rviz_diag_enabled:="${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}" \
@@ -462,18 +577,24 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   cdf_selector_max_pairs_per_step:="${CDF_SELECTOR_MAX_PAIRS_PER_STEP}" \
   cdf_selector_signed_zero_band:="${CDF_SELECTOR_SIGNED_ZERO_BAND}" \
   cdf_shadow_vbc_audit_enabled:="${CDF_SHADOW_VBC_AUDIT_ENABLED}" \
+  cdf_shadow_vbc_event_driven_eval:="${CDF_SHADOW_VBC_EVENT_DRIVEN_EVAL}" \
   cdf_shadow_vbc_summary_topic:="${CDF_SHADOW_VBC_SUMMARY_TOPIC}" \
   use_local_sparse_scp:="${USE_LOCAL_SPARSE_SCP}" \
   raw_mpc_trajectory_topic:="${RAW_PLANNER_TOPIC}" \
   final_executable_gcdf_enabled:="${FINAL_EXECUTABLE_GCDF_ENABLED}" \
+  final_gcdf_safety_margin:="${FINAL_GCDF_SAFETY_MARGIN}" \
   committed_continuation_enabled:="${COMMITTED_CONTINUATION_ENABLED}" \
   execution_audit_stream_enabled:="${EXECUTION_AUDIT_STREAM_ENABLED}" \
   execution_vbc_trajectory_topic:="${EXECUTION_VBC_TRAJECTORY_TOPIC}" \
+  execution_vbc_event_driven_eval:="${EXECUTION_VBC_EVENT_DRIVEN_EVAL}" \
+  verification_tcp_nodelay:="${VERIFICATION_TCP_NODELAY}" \
+  vbc_confidence_query_persistent:="${VBC_CONFIDENCE_QUERY_PERSISTENT}" \
   execution_gcdf_audit_enabled:="${EXECUTION_GCDF_AUDIT_ENABLED}" \
   execution_gcdf_warning_margin:="${EXECUTION_GCDF_WARNING_MARGIN}" \
   execution_gcdf_hard_margin:="${EXECUTION_GCDF_HARD_MARGIN}" \
   execution_gcdf_stale_timeout_s:="${EXECUTION_GCDF_STALE_TIMEOUT_S}" \
   gcdf_body_inflation_m:="${GCDF_BODY_INFLATION_M}" \
+  gcdf_geometry_backend:="${GCDF_GEOMETRY_BACKEND}" \
   probe_single_flight_enabled:="${PROBE_SINGLE_FLIGHT_ENABLED}" \
   commit_pipeline_candidate_topic:="${COMMIT_PIPELINE_CANDIDATE_TOPIC}" \
   probe_single_flight_summary_topic:="${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" \
@@ -484,6 +605,8 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   local_scp_selector_jsonl:="${LOCAL_SCP_SELECTOR_JSONL}" \
   local_scp_proximity_margin:="${LOCAL_SCP_PROXIMITY_MARGIN}" \
   vbc_swept_volume_margin_m:="${VBC_SWEPT_VOLUME_MARGIN_M}" \
+  vbc_continuous_motion_bound_enabled:="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}" \
+  vbc_geometry_backend:="${VBC_GEOMETRY_BACKEND}" \
   repair_prefix_verification_enabled:="${REPAIR_PREFIX_VERIFY}" \
   repair_execution_prefix_s:="${REPAIR_PREFIX_S}" \
   probe_execution_prefix_s:="${PROBE_PREFIX_S}" \
@@ -520,7 +643,7 @@ for _ in $(seq 1 400); do
 
   if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
     if echo "${NODES}" | grep -q '^/local_sparse_scp_planner_node$' && \
-       echo "${NODES}" | grep -q '^/local_scp_pair_export/trajectory_risk_node$' && \
+       echo "${NODES}" | grep -Fxq "/local_scp_pair_export/${GCDF_EXPORT_NODE}" && \
        echo "${NODES}" | grep -q '^/c5_4_local_scp_cdf_selector$'; then
       BACKEND_READY=1
     fi
@@ -543,7 +666,7 @@ for _ in $(seq 1 400); do
   fi
 
   if [ "${FINAL_EXECUTABLE_GCDF_ENABLED}" = "true" ]; then
-    if ! echo "${NODES}" | grep -q '^/final_executable_gcdf_pair_export/trajectory_risk_node$'; then
+    if ! echo "${NODES}" | grep -Fxq "/final_executable_gcdf_pair_export/${GCDF_EXPORT_NODE}"; then
       CDF_READY=0
     fi
   fi
@@ -562,7 +685,7 @@ for _ in $(seq 1 400); do
 
   if [ "${EXECUTION_GCDF_AUDIT_ENABLED}" = "true" ]; then
     if ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/measured_state_trajectory$' || \
-       ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/trajectory_risk_node$' || \
+       ! echo "${NODES}" | grep -Fxq "/execution_gcdf_audit/${GCDF_EXPORT_NODE}" || \
        ! echo "${NODES}" | grep -q '^/execution_gcdf_audit/safety_monitor$'; then
       CDF_READY=0
     fi
@@ -585,6 +708,16 @@ if [ "${READY}" != "1" ]; then
   rosnode list 2>/dev/null || true
   tail -n 320 "${LOG}/controlled.log" || true
   exit 1
+fi
+
+if [ "${REQUIRE_REAL_TOF_READINESS}" = "true" ]; then
+  echo "[WAIT] real ToF fusion and nonempty map rays before benchmark arm"
+  if ! python3 scripts/wait_for_phase_e_perception.py \
+    --config "${TOF_FUSION_CONFIG_FILE}" --timeout "${PERCEPTION_READY_TIMEOUT_S}" \
+    --output "${OUT}/perception_ready.json"; then
+    echo "[ERROR] Perception readiness failed; no task goal will be published"
+    exit 2
+  fi
 fi
 
 if rosnode list | grep -q '^/predicted_vbc_recovery_guard$'; then
@@ -622,6 +755,7 @@ echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} runtime_self_hit_rviz_diag=${RU
 echo "[BODY PRIOR A/B] main_trajectory_risk_refresh=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}; local/final/execution exporters remain false"
 echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
 echo "[MARGIN SPLIT] VBC swept margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
+echo "[MARGIN SPLIT] tracker certified body-envelope threshold=${TRACKER_CERTIFIED_MARGIN_M} m"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
 RUNTIME_HEAD="$(git rev-parse HEAD)"
@@ -641,6 +775,11 @@ gazebo_gui=${GAZEBO_GUI}
 use_rviz=${USE_RVIZ}
 world_file=${WORLD_FILE}
 confidence_map_config_file=${CONFIDENCE_MAP_CONFIG_FILE}
+confidence_query_dedicated_queue=${CONFIDENCE_QUERY_DEDICATED_QUEUE}
+body_prior_geometry_backend=${BODY_PRIOR_GEOMETRY_BACKEND}
+geometry_backend=${GEOMETRY_BACKEND}
+body_samples_file=${BODY_SAMPLES_FILE}
+diagnostic_geometry_backend=${DIAGNOSTIC_GEOMETRY_BACKEND}
 tof_fusion_enabled=${TOF_FUSION_ENABLED}
 runtime_self_hit_rviz_diag_enabled=${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED}
 main_trajectory_risk_refresh_body_prior_before_query=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}
@@ -649,15 +788,25 @@ execution_gcdf_warning_margin=${EXECUTION_GCDF_WARNING_MARGIN}
 execution_gcdf_hard_margin=${EXECUTION_GCDF_HARD_MARGIN}
 execution_gcdf_stale_timeout_s=${EXECUTION_GCDF_STALE_TIMEOUT_S}
 gcdf_body_inflation_m=${GCDF_BODY_INFLATION_M}
+gcdf_geometry_backend=${GCDF_GEOMETRY_BACKEND}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
 vbc_swept_volume_margin_m=${VBC_SWEPT_VOLUME_MARGIN_M}
+vbc_continuous_motion_bound_enabled=${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}
+tracker_certified_margin_m=${TRACKER_CERTIFIED_MARGIN_M}
+primitive_tracking_guard=${PRIMITIVE_TRACKING_GUARD}
+vbc_geometry_backend=${VBC_GEOMETRY_BACKEND}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
 commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
 final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
 continuation_enabled=${RUNTIME_CONTINUATION}
 execution_audit_enabled=${RUNTIME_EXEC_AUDIT}
 execution_vbc_trajectory_topic=${EXECUTION_VBC_TRAJECTORY_TOPIC}
+execution_vbc_event_driven_eval=${EXECUTION_VBC_EVENT_DRIVEN_EVAL}
+execution_vbc_active_set_bundle_topic=${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}
+verification_tcp_nodelay=${VERIFICATION_TCP_NODELAY}
+vbc_confidence_query_persistent=${VBC_CONFIDENCE_QUERY_PERSISTENT}
+cdf_shadow_vbc_event_driven_eval=${CDF_SHADOW_VBC_EVENT_DRIVEN_EVAL}
 probe_single_flight_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
 probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
 probe_single_flight_input_topic=${RAW_PLANNER_TOPIC}
@@ -669,7 +818,23 @@ adaptive_refinement_enabled=${ADAPTIVE_REFINEMENT_ENABLED}
 adaptive_refinement_policy=coarse_default_refine_learned_incompatible_dependency_cycle_once
 frontier_steering_enabled=${FRONTIER_STEERING_ENABLED}
 vbc_gated_frontier_step_enabled=${VBC_GATED_FRONTIER_STEP_ENABLED}
+frontier_vbc_escalation_enabled=${FRONTIER_VBC_ESCALATION_ENABLED}
+frontier_vbc_escalation_after=${FRONTIER_VBC_ESCALATION_AFTER}
+frontier_escalated_step_inf=${FRONTIER_ESCALATED_STEP_INF}
+per_sensor_hybrid_enabled=${PER_SENSOR_HYBRID_ENABLED}
+final_vbc_recovery_enabled=${FINAL_VBC_RECOVERY_ENABLED}
+per_sensor_checkpoint=${PER_SENSOR_CHECKPOINT}
+candidate_replacement_enabled=${CANDIDATE_REPLACEMENT_ENABLED:-false}
+per_sensor_branch_ascent_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS}
+per_sensor_branch_step_size=${PER_SENSOR_BRANCH_STEP_SIZE}
+per_sensor_branch_max_step_norm=${PER_SENSOR_BRANCH_MAX_STEP_NORM}
+per_sensor_max_branch_attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS}
+per_sensor_min_conservative_g=${PER_SENSOR_MIN_CONSERVATIVE_G}
+per_sensor_require_primitive_los=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS}
+per_sensor_high_witness_priority_enabled=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED}
+per_sensor_high_witness_z_min=${PER_SENSOR_HIGH_WITNESS_Z_MIN}
 recording_profile=${RECORDING_PROFILE}
+local_cdf_pair_audit_enabled=${LOCAL_CDF_PAIR_AUDIT_ENABLED}
 probe_solver_failure_uses_blocker_rediscovery=true
 probe_vbc_unsafe_uses_blocker_rediscovery=true
 probe_final_gcdf_unsafe_uses_direct_recovery_evidence=true
@@ -680,8 +845,10 @@ EOF
 
 record_topic() {
   local topic="$1"; local path="$2"
-  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}'" > "${path}" 2>&1 &
+  local rec_name="phase_e_record_${#REC_PIDS[@]}"
+  setsid bash -lc "source '${REPO}/devel/setup.bash'; exec rostopic echo -p '${topic}' __name:=${rec_name}" > "${path}" 2>&1 &
   REC_PIDS+=("$!")
+  REC_NAMES+=("/${rec_name}")
 }
 if [ "${RECORDING_PROFILE}" = "self_filter_perf" ]; then
   echo "[RECORDING] profile=self_filter_perf (lean perception/safety set)"
@@ -702,6 +869,8 @@ else
   record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
   record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
   record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
+  record_topic /care_planner/trajectory_risk/vbc_active_set_bundle "${OUT}/candidate_vbc_active_set_bundle.csv"
+  record_topic "${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}" "${OUT}/execution_vbc_active_set_bundle.csv"
   record_topic "${REGIME_TOPIC}" "${OUT}/regime_summary.csv"
   record_topic /care_planner/c4_4/probe_active "${OUT}/probe_active.csv"
   record_topic /care_planner/local_planner/task_infeasible "${OUT}/task_infeasible.csv"
@@ -734,6 +903,18 @@ else
   if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
     record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
     record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
+    record_topic /care_planner/local_planner/scp_query_trajectory "${OUT}/local_gcdf_query.csv"
+    record_topic /care_planner/local_planner/body_sweep_anchors/geometry_summary "${OUT}/local_gcdf_geometry_summary.csv"
+    record_topic "${LOCAL_SCP_SUMMARY_TOPIC}/witness" "${OUT}/local_witness_diagnostics.csv"
+    record_topic /care_planner/local_planner/cdf_selector_summary/witness "${OUT}/local_witness_selector_diagnostics.csv"
+    if [ "${LOCAL_CDF_PAIR_AUDIT_ENABLED}" = "true" ] ||
+       [ "${LOCAL_CDF_PAIR_AUDIT_ENABLED}" = "1" ]; then
+      # These are the exact CollisionCDFConstraintBatch messages consumed by
+      # the local SCP and final verification gates. They are deliberately
+      # recorded only for an audit run to avoid perturbing the 10 Hz loop.
+      record_topic /care_planner/local_planner/cdf_constraint_batch "${OUT}/local_gcdf_constraint_batch.csv"
+      record_topic /care_planner/final_gcdf/constraint_batch "${OUT}/final_gcdf_constraint_batch.csv"
+    fi
     record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/mpc_summary.csv"
   else
     record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
@@ -741,15 +922,24 @@ else
   record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
   record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
   record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
+  record_topic /care_planner/local_planner/observation_candidate_identity "${OUT}/observation_candidate_identity.csv"
+  record_topic /care_planner/local_planner/observation_dependency "${OUT}/observation_dependency.csv"
+  if [[ "${CANDIDATE_REPLACEMENT_ENABLED:-false}" == "true" ]]; then
+    record_topic /care_planner/local_planner/candidate_replacement_trigger "${OUT}/candidate_replacement_trigger.csv"
+    record_topic /care_planner/local_planner/candidate_replacement_request "${OUT}/candidate_replacement_request.csv"
+    record_topic /care_planner/local_planner/candidate_replacement_grant "${OUT}/candidate_replacement_grant.csv"
+  fi
   record_topic /care_planner/execution/reference_state "${OUT}/low_level_reference_state.csv"
   record_topic /care_planner/execution/rate_limiter_summary "${OUT}/rate_limiter_summary.csv"
   record_topic /care_arm/joint_states "${OUT}/joint_states.csv"
   record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
+  record_topic /care_planner/ee_target_pose "${OUT}/ee_target_pose.csv"
   record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
   record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
   record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
 fi
 
+if [ -z "${CARE_BENCHMARK_ARM_TOKEN}" ]; then
 echo "[WAIT] initial execution gate release (tries=${INITIAL_GATE_MAX_TRIES}, msg_timeout=${INITIAL_GATE_ECHO_TIMEOUT}s)"
 if ! python3 - "${INITIAL_GATE_MAX_TRIES}" "${INITIAL_GATE_ECHO_TIMEOUT}" <<'PY'
 import sys
@@ -806,6 +996,9 @@ then
   tail -n 260 "${LOG}/controlled.log" || true
   exit 1
 fi
+else
+  echo "[BENCHMARK] watcher and recorders arm goal first; execution gate wait is inside task window"
+fi
 
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
@@ -818,6 +1011,8 @@ if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; th
   echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} up to ${RUN_SECONDS}s; early stop on stable EE goal"
   python3 scripts/wait_for_phase_d_goal.py \
     --repo "${REPO}" \
+    --arm-token "${CARE_BENCHMARK_ARM_TOKEN}" \
+    --required-recorder "${REC_NAMES[@]}" \
     --timeout-s "${RUN_SECONDS}" \
     --position-tolerance-m "${GOAL_POSITION_TOLERANCE_M}" \
     --orientation-tolerance-rad "${GOAL_ORIENTATION_TOLERANCE_RAD}" \
@@ -911,4 +1106,5 @@ echo "[RESULT]    ${OUT}/c4_4_verified_regime_summary.json"
 echo "[REGIME]    ${OUT}/regime_summary.csv"
 echo "[CANDIDATE] ${OUT}/candidate_vbc_summary.csv"
 echo "[EXECUTION] ${OUT}/execution_vbc_summary.csv"
+echo "[EXECUTION BUNDLE] ${OUT}/execution_vbc_active_set_bundle.csv"
 echo "[SCHEDULE]  ${OUT}/waypoint_schedule_summary.csv"

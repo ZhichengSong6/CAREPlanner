@@ -9,16 +9,16 @@ joint configuration q such that:
 
   1) FK(q) reaches the requested EE pose within tolerance;
   2) q respects URDF joint limits;
-  3) the conservative CAREPlanner body-sphere model is collision-free with
+  3) the selected CAREPlanner body geometry is collision-free with
      the static box obstacles in the Gazebo world?
 
 This is intentionally OFFLINE. It does not start ROS, Gazebo, the planner,
 confidence map, or any controller.
 
 Kinematics/IK use the full Arm.urdf because the benchmark goal is defined at
-EE_link. Collision checking remains independent and matches the current
-CAREPlanner GCDF body proxy:
-  body_samples.yaml sphere radius + --body-inflation (default 0.015 m).
+EE_link. Collision checking remains independent: legacy body_samples.yaml
+spheres by default, or exact URDF solids with --geometry-backend primitive.
+Both use the unchanged --body-inflation distance offset (default 0.015 m).
 
 Outputs one JSON report plus a concise terminal summary with one of:
   NO_IK
@@ -40,6 +40,8 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import yaml
+from phase_e_offline_body_geometry import (BodyPrimitive, add_geometry_arguments,
+    selected_body_path, load_body_primitives, terminal_primitive_clearance)
 
 try:
     import pinocchio as pin
@@ -151,7 +153,13 @@ def load_world_boxes(world_path: Path) -> List[BoxObstacle]:
     return boxes
 
 
-def load_body_spheres(path: Path, body_inflation: float) -> List[BodySphere]:
+def load_body_spheres(path: Path, body_inflation: float, geometry_backend="samples") -> List[BodySphere]:
+    # Historical function name/signature retained; explicit primitive mode returns
+    # BodyPrimitive objects, never approximating solids with BodySphere instances.
+    if geometry_backend == "primitive":
+        return load_body_primitives(path, body_inflation, risk_only=True)
+    if geometry_backend != "samples":
+        raise ValueError("Unknown geometry backend")
     with path.open("r") as f:
         doc = yaml.safe_load(f)
 
@@ -324,6 +332,8 @@ def terminal_clearance(
     spheres: Sequence[BodySphere],
     boxes: Sequence[BoxObstacle],
 ) -> Tuple[float, Dict[str, object]]:
+    if spheres and isinstance(spheres[0], BodyPrimitive):
+        return terminal_primitive_clearance(model, q, spheres, boxes)
     data = model.createData()
     best = float("inf")
     best_info: Dict[str, object] = {}
@@ -372,8 +382,8 @@ def main() -> int:
         default=None,
         help=(
             "Default: full Arm.urdf. The full model is required because the "
-            "benchmark goal is defined at EE_link; collision geometry is still "
-            "taken from body_samples.yaml."
+            "benchmark goal is defined at EE_link; collision geometry comes "
+            "from the separately selected samples/primitive backend."
         ),
     )
     ap.add_argument(
@@ -400,7 +410,7 @@ def main() -> int:
         "--body-inflation",
         type=float,
         default=0.015,
-        help="Meters added to every CAREPlanner risk-body sphere (default 15 mm).",
+        help="Euclidean clearance offset for each risk-body shape (default 15 mm).",
     )
     ap.add_argument(
         "--required-clearance",
@@ -419,6 +429,7 @@ def main() -> int:
         type=Path,
         default=None,
     )
+    add_geometry_arguments(ap)
     args = ap.parse_args()
 
     repo = args.repo.resolve()
@@ -428,6 +439,7 @@ def main() -> int:
         repo / "src/arm_description/urdf/Arm.urdf")).resolve()
     body_samples_path = (args.body_samples or (
         repo / "src/care_confidence_map/config/body_samples.yaml")).resolve()
+    body_samples_path = selected_body_path(args, repo, body_samples_path)
     world = (args.world or (
         repo / "src/arm_description/worlds/maixsense_obstacles.world")).resolve()
     output_json = (args.output_json or (
@@ -470,7 +482,7 @@ def main() -> int:
         raise SystemExit(
             "ERROR: invalid/non-finite joint limits in Pinocchio model")
 
-    spheres = load_body_spheres(body_samples_path, args.body_inflation)
+    spheres = load_body_spheres(body_samples_path, args.body_inflation, args.geometry_backend)
     boxes = load_world_boxes(world)
 
     # Deterministic seeds first because they are physically meaningful.
@@ -560,7 +572,9 @@ def main() -> int:
         "goal_orientation_xyzw": list(case["goal_orientation"]),
         "ee_frame": args.ee_frame,
         "urdf": str(urdf),
-        "body_samples": str(body_samples_path),
+        "body_samples": str(body_samples_path) if args.geometry_backend == "samples" else None,
+        "geometry_backend": args.geometry_backend,
+        "primitive_urdf": str(body_samples_path) if args.geometry_backend == "primitive" else None,
         "world": str(world),
         "body_inflation_m": float(args.body_inflation),
         "required_clearance_m": float(args.required_clearance),

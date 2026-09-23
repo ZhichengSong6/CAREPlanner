@@ -215,6 +215,26 @@ def _configure_runtime_mode(mode: str) -> None:
             "[vbc_waypoint_online] override progressive_shared_repair_enabled=%d",
             int(_env_bool("PROGRESSIVE_SHARED_REPAIR_ENABLED", True)))
 
+    if "PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY" in os.environ:
+        rospy.set_param(
+            "~progressive_shared_path_association_only",
+            _env_bool("PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY", True))
+        rospy.logwarn(
+            "[vbc_waypoint_online] override progressive_shared_path_association_only=%d",
+            int(_env_bool("PROGRESSIVE_SHARED_PATH_ASSOCIATION_ONLY", True)))
+
+    # C5.44 A/B hook: keep the active obligation's q_vis fixed while its
+    # VBC-reported safety point union is refreshed. The default is enabled in
+    # blocker-aware mode; an explicit environment override is useful for a
+    # controlled regression without changing the launch/config files.
+    if "ACTIVE_QVIS_TARGET_LOCK_ENABLED" in os.environ:
+        rospy.set_param(
+            "~active_qvis_target_lock_enabled",
+            _env_bool("ACTIVE_QVIS_TARGET_LOCK_ENABLED", True))
+        rospy.logwarn(
+            "[vbc_waypoint_online] override active_qvis_target_lock_enabled=%d",
+            int(_env_bool("ACTIVE_QVIS_TARGET_LOCK_ENABLED", True)))
+
     mpc_prefix = "/velocity_qp_mpc_waypoint_node/mpc/visibility_waypoint"
     multi = mode == "accumulated_multi_deadline"
     rospy.set_param(mpc_prefix + "/multi_deadline_enabled", bool(multi))

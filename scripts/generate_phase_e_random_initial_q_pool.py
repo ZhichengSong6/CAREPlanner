@@ -7,11 +7,11 @@ old terminal IK pool.
 
 A candidate q0 is accepted only if:
   1. it lies inside shrunken URDF joint limits;
-  2. the CAREPlanner risk-body spheres (+15 mm by default) are collision-free
+  2. the selected CAREPlanner risk-body geometry (+15 mm by default) is collision-free
      with the static obstacle world;
   3. the experiment's startup trusted-free body prior is obstacle-free
      (raw body by default: +0 mm);
-  4. an approximate non-adjacent-link body-sphere self-collision check passes;
+  4. the non-adjacent-link self-collision check for the selected geometry passes;
   5. the whole risk body remains inside the confidence-map workspace;
   6. its EE lies in a broad useful workspace;
   7. it is sufficiently different in q-space from already accepted q0s.
@@ -32,6 +32,9 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import pinocchio as pin
 import yaml
+from phase_e_offline_body_geometry import (BodyPrimitive, add_geometry_arguments,
+    selected_body_path, load_body_primitives, world_primitives, primitive_self_clearance,
+    primitive_inside_workspace)
 
 from test_phase_e_goal_terminal_feasibility import (
     BodySphere,
@@ -54,7 +57,11 @@ LINK_ORDER = {
 }
 
 
-def load_all_body_spheres(path: Path, inflation_m: float) -> List[BodySphere]:
+def load_all_body_spheres(path: Path, inflation_m: float, geometry_backend="samples") -> List[BodySphere]:
+    if geometry_backend == "primitive":
+        return load_body_primitives(path, inflation_m, risk_only=False)
+    if geometry_backend != "samples":
+        raise ValueError("Unknown geometry backend")
     doc = yaml.safe_load(path.read_text())
     out: List[BodySphere] = []
     for item in doc.get("body_sampling", {}).get("links", []):
@@ -77,6 +84,8 @@ def load_all_body_spheres(path: Path, inflation_m: float) -> List[BodySphere]:
 def transformed(
     model, q: np.ndarray, spheres: Sequence[BodySphere]
 ) -> Tuple[List[BodySphere], np.ndarray]:
+    if spheres and isinstance(spheres[0], BodyPrimitive):
+        return list(spheres), world_primitives(model, q, spheres)
     data = model.createData()
     ss: List[BodySphere] = []
     cc: List[np.ndarray] = []
@@ -95,6 +104,8 @@ def nonadjacent_self_clearance(
     Same-link and directly adjacent-link pairs are intentionally ignored because
     their sphere covers overlap by construction around joints.
     """
+    if spheres and isinstance(spheres[0], BodyPrimitive):
+        return primitive_self_clearance(spheres, centers, LINK_ORDER)
     best = float("inf")
     info: Dict[str, object] = {}
     n = len(spheres)
@@ -128,6 +139,8 @@ def body_inside_workspace(
     bounds: Tuple[float, float, float, float, float, float],
     boundary_margin_m: float,
 ) -> bool:
+    if spheres and isinstance(spheres[0], BodyPrimitive):
+        return primitive_inside_workspace(spheres, centers, bounds, boundary_margin_m)
     xmin, xmax, ymin, ymax, zmin, zmax = bounds
     for s, c in zip(spheres, centers):
         # The confidence map starts at z=0 while the fixed proximal robot
@@ -191,6 +204,7 @@ def main() -> int:
     ap.add_argument("--ee-z-range", nargs=2, type=float, default=[0.25, 1.00])
 
     ap.add_argument("--output-json", type=Path, required=True)
+    add_geometry_arguments(ap)
     args = ap.parse_args()
 
     repo = args.repo.resolve()
@@ -203,6 +217,7 @@ def main() -> int:
     body_path = (args.body_samples or (
         repo / "src/care_confidence_map/config/body_samples.yaml"
     )).resolve()
+    body_path = selected_body_path(args, repo, body_path)
     out = args.output_json.resolve()
 
     for p in (world, urdf, body_path):
@@ -228,10 +243,10 @@ def main() -> int:
     sample_upper = upper - m * span
 
     risk_spheres = load_body_spheres(
-        body_path, body_inflation=float(args.risk_body_inflation))
+        body_path, body_inflation=float(args.risk_body_inflation), geometry_backend=args.geometry_backend)
     startup_spheres = load_all_body_spheres(
-        body_path, inflation_m=float(args.startup_prior_inflation))
-    raw_all_spheres = load_all_body_spheres(body_path, inflation_m=0.0)
+        body_path, inflation_m=float(args.startup_prior_inflation), geometry_backend=args.geometry_backend)
+    raw_all_spheres = load_all_body_spheres(body_path, inflation_m=0.0, geometry_backend=args.geometry_backend)
     boxes = load_world_boxes(world)
 
     bounds = tuple(float(x) for x in args.map_bounds)
@@ -344,12 +359,15 @@ def main() -> int:
         "semantics": (
             "direct joint-space q0 sampling; obstacle-world feasible; "
             "raw-body startup prior by default; broad workspace; "
-            "non-adjacent sphere self-collision filter"
+            "non-adjacent " + ("primitive" if args.geometry_backend == "primitive" else "sphere") + " self-collision filter; "
+            "startup envelope is the CLI uniform inflation, not a claim of matching the runtime per-link prior"
         ),
         "inputs": {
             "world": str(world),
             "urdf": str(urdf),
-            "body_samples": str(body_path),
+            "body_samples": str(body_path) if args.geometry_backend == "samples" else None,
+            "geometry_backend": args.geometry_backend,
+            "primitive_urdf": str(body_path) if args.geometry_backend == "primitive" else None,
         },
         "sampling": {
             "target_count": int(args.target_count),

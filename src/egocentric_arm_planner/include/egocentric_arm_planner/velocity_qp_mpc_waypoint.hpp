@@ -96,6 +96,7 @@ private:
     long long id = -1;
     double deadline_abs_s = 0.0;
     Eigen::VectorXd q;
+    Eigen::VectorXd joint_mask;
   };
 
   struct CDFQPSnapshot {
@@ -264,10 +265,11 @@ private:
   ros::Time latest_waypoint_q_received_;
   ros::Time latest_waypoint_deadline_received_;
   Eigen::VectorXd latest_waypoint_q_;
+  Eigen::VectorXd latest_waypoint_joint_mask_;
   double latest_waypoint_deadline_abs_s_ = 0.0;
 
-  // C4.6 schedule message format is a flat sequence of 9 doubles per record:
-  //   [obligation_id, absolute_deadline_ros_s, q1, ..., q7]
+  // Legacy records contain id, deadline and q(7). V2 appends joint_mask(7)
+  // so joints outside a selected sensor's kinematic chain remain objective-free.
   // The schedule producer accumulates obligations across rejected candidates and
   // clears them only after an exact predicted-VBC SAFE verdict.
   bool multi_deadline_enabled_ = false;

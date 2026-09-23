@@ -132,6 +132,8 @@ local_planner:
   # retained for legacy/diagnostic frontier modes only. Hard CDF constraints,
   # final GCDF, and exact VBC remain the safety authorities.
   visibility_frontier_horizon_step: 2
+  # Objective-only bounded tangent recovery after certified tiny executions.
+  safe_frontier_recovery_enabled: true
   visibility_frontier_topic: /care_planner/active_sensing/visibility_frontier_target
 
   scp:
@@ -139,15 +141,33 @@ local_planner:
     step_tolerance_inf: 0.01
     # Small local steps are intentional in REPAIR: the current trusted-free
     # envelope is tiny and should expand through repeated sense/replan cycles.
-    trust_region_initial: 0.05
+    trust_region_initial: 0.15
     trust_region_min: 0.02
-    trust_region_max: 0.10
+    trust_region_max: 0.20
     trust_region_grow: 1.50
     trust_region_shrink: 0.50
     improvement_tolerance: 0.002
 
   cdf:
-    safety_margin: 0.0
+    # Learned CDF safety margin. This is in the CDF output/configuration-space
+    # units, not meters and not a conversion of the VBC primitive margin.
+    # proximity_margin remains only the selector's candidate search band.
+    # The numeric value is model-space tuning and requires CDF-side validation;
+    # it has no physical-clearance interpretation.
+    safety_margin: 0.010
+    # Active visibility obligations use a separate CDF-unit guard. It is not a
+    # spatial margin and is not mapped from the VBC's meter-valued margin.
+    # Ordinary UNKNOWN/occupied CDF rows keep the safety_margin above.
+    # It may be read as rad-equivalent only if the CDF checkpoint documents
+    # that scale; it is never inferred from a VBC meter value.
+    visibility_obligation_cdf_margin: 0.05
+    # Each distinct VBC rejection advances only the rejected point by 0.15:
+    # 0.05 -> 0.20 -> 0.30, then remains capped. Other observation
+    # points retain their own 0.05 base.
+    # Both active and queued points use this native CDF ladder, not meters.
+    vbc_feedback_cdf_margin_step: 0.15
+    vbc_feedback_cdf_margin_max: 0.30
+    visibility_obligation_horizon_steps: 20
 
     # Hard GCDF safety in both NORMAL and REPAIR.
     # No user slack variables: low-confidence space is a true forbidden set.
@@ -325,6 +345,19 @@ execution:
   hold_initial_zero_pose: true
   hold_last_reference_when_no_trajectory: true
   reference_timeout: 0.15
+  # Runtime tracker body-envelope threshold (20 mm). VBC's 10 mm swept-volume
+  # margin remains independent and unchanged.
+  certified_tracking_margin_m: 0.020
+  # Body tracking protection compares measured q with the nearest point on
+  # the local reference path, so pure phase lag is recorded separately from
+  # spatial path error. Keep the window bounded to avoid matching a distant
+  # loop of a non-monotone trajectory.
+  tracking_phase_alignment_enabled: true
+  tracking_phase_search_window_s: 0.50
+  # When the legacy conservative body bound would trip, run the lightweight
+  # configuration-aware maximum primitive displacement check. Normal ticks
+  # keep the legacy fast path; FK failures remain fail-closed.
+  primitive_tracking_relative_fk: true
   replan_tracking_error_inf: 0.25
   replan_request_min_interval: 0.50
 

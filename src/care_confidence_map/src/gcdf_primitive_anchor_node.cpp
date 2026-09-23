@@ -62,6 +62,7 @@ class GcdfPrimitiveAnchorNode {
         previous=p.time_from_start;
       }
       const int n=msg->points.size();
+      if (n>max_steps_) throw std::invalid_argument("GCDF knot capacity exceeded; cannot drop safety knots");
       if (max_steps_==1 && n!=1) throw std::invalid_argument("Single-state audit requires one knot");
       std::vector<int> indices;
       for (int k=0;k<std::min(n,max_steps_);++k)

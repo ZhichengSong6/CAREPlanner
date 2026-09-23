@@ -13,14 +13,17 @@
 #include <std_msgs/String.h>
 #include "egocentric_arm_planner/task_reference_retry.hpp"
 #include "egocentric_arm_planner/qp_no_progress.hpp"
+#include "egocentric_arm_planner/qp_backtrack_policy.hpp"
 #include "egocentric_arm_planner/repair_no_progress.hpp"
 #include "egocentric_arm_planner/final_vbc_no_progress.hpp"
+#include "egocentric_arm_planner/safe_frontier_recovery.hpp"
 #include <trajectory_msgs/JointTrajectory.h>
 
 #include <Eigen/Dense>
 #include <Eigen/Sparse>
 
 #include <condition_variable>
+#include <atomic>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -43,6 +46,7 @@ private:
     double deadline_abs_s = 0.0;
     bool terminal_objective = false;
     Eigen::VectorXd q;
+    Eigen::VectorXd joint_mask;
   };
 
   // Learned visibility-frontier steering is an objective-only hint. The
@@ -53,6 +57,9 @@ private:
     double frontier_weight_scale = 0.0;
     double qvis_weight_scale = 1.0;
     Eigen::VectorXd q;
+    Eigen::VectorXd joint_mask;
+    int recovery_attempt = 0;
+    Eigen::VectorXd recovery_target;
   };
 
   struct SparseSolveResult {
@@ -78,6 +85,7 @@ private:
     int selected_cdf_rows = 0;
     int selected_unknown_cdf_rows = 0;
     int selected_occupied_cdf_rows = 0;
+    int selected_obligation_cdf_rows = 0;
     // Exact batch-pair identities that actually entered the hard QP as
     // UNKNOWN rows. Used to route local-GCDF blockers directly to sensing.
     std::vector<int> selected_unknown_pair_indices;
@@ -91,6 +99,10 @@ private:
     double mean_slack = 0.0;
     double slack_linear_weight_used = 0.0;
     double step_inf = 0.0;
+    Eigen::VectorXd recovery_frontier;
+    int recovery_normals = 0;
+    bool recovery_rejoining = false;
+    std::vector<Eigen::Vector3d> observation_dependency_points;
     Eigen::MatrixXd q;
     Eigen::MatrixXd u;
   };
@@ -100,6 +112,8 @@ private:
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void taskReferenceStatusCallback(const std_msgs::StringConstPtr& msg);
   void waypointScheduleCallback(
+      const std_msgs::Float64MultiArrayConstPtr& msg);
+  void vbcObligationPointsCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void visibilityFrontierCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
@@ -114,6 +128,7 @@ private:
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void executionSummaryCallback(const std_msgs::StringConstPtr& msg);
   void finalVerificationCallback(const std_msgs::StringConstPtr& msg);
+  void candidateReplacementCallback(const std_msgs::StringConstPtr& msg);
   void cdfConstraintBatchCallback(
       const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg);
   void updateRepairWitnessesLocked(
@@ -171,11 +186,13 @@ private:
       const Eigen::VectorXd& previous_command,
       const std::vector<DeadlineWaypoint>& schedule,
       const FrontierObjective& frontier,
+      const std::vector<Eigen::Vector3d>& obligation_points,
       bool repair_mode,
       bool probe_mode,
       double trust_radius,
       double slack_linear_weight,
-      bool force_diagnostic_slack = false) const;
+      bool force_diagnostic_slack = false,
+      bool previous_vbc_margins = false) const;
 
   ros::Time publishQueryTrajectory(
       const Eigen::MatrixXd& q,
@@ -215,6 +232,7 @@ private:
   ros::Subscriber reference_sub_;
   ros::Subscriber task_reference_status_sub_;
   ros::Subscriber waypoint_schedule_sub_;
+  ros::Subscriber vbc_obligation_points_sub_;
   ros::Subscriber visibility_frontier_sub_;
   ros::Subscriber single_waypoint_active_sub_;
   ros::Subscriber single_waypoint_q_sub_;
@@ -234,6 +252,31 @@ private:
   bool witness_response_required_ = false;
   ros::Publisher candidate_trajectory_pub_;
   ros::Publisher observation_identity_pub_;
+  ros::Publisher observation_dependency_pub_;
+  ros::Subscriber candidate_replacement_sub_;
+  ros::Publisher candidate_replacement_grant_pub_;
+  ros::Publisher candidate_replacement_trigger_pub_;
+  bool requestQpReplacementLocked(const std::string& reason);
+  std::string repair_candidate_failed_key_;
+  unsigned long long repair_candidate_failed_epoch_ = 0, repair_candidate_failed_progress_ = 0;
+  std::string candidate_replacement_trigger_reason_ = "final_vbc_repeat";
+  bool candidate_replacement_enabled_ = false;
+  bool candidate_replacement_pending_ = false;
+  bool candidate_replacement_trigger_pending_ = false;
+  bool candidate_replacement_trigger_direction_advanced_ = false;
+  unsigned long long candidate_replacement_id_ = 0;
+  unsigned long long candidate_replacement_last_id_ = 0;
+  unsigned long long candidate_replacement_epoch_ = 0;
+  unsigned long long candidate_replacement_trigger_raw_ = 0;
+  unsigned long long candidate_replacement_trigger_count_ = 0;
+  long long candidate_replacement_trigger_obligation_id_ = -1;
+  ros::Time candidate_replacement_deadline_;
+  ros::WallTime candidate_replacement_wall_deadline_;
+  ros::Time candidate_replacement_trigger_deadline_;
+  ros::WallTime candidate_replacement_trigger_wall_deadline_;
+  std::string candidate_replacement_new_token_;
+  std::string final_vbc_repeat_target_key_ = "none";
+  std::vector<Eigen::Vector3d> final_vbc_previous_points_;
   ros::Publisher summary_pub_;
   ros::Publisher task_infeasible_pub_;
   ros::Publisher task_obstacle_blocked_pub_;
@@ -258,10 +301,21 @@ private:
   sensor_msgs::JointState latest_joint_state_;
   trajectory_msgs::JointTrajectory latest_reference_;
   std::vector<DeadlineWaypoint> latest_schedule_;
+  // Current blocker-aware visibility target. This is deliberately separate
+  // from local GCDF witnesses: queued obligations must not preempt the active
+  // target. Its points receive only the configured near-term CDF guard;
+  // confirmed GCDF witnesses are carried separately in repair_unknown_witnesses_.
+  std::vector<Eigen::Vector3d> latest_vbc_obligation_points_;
+  unsigned long long latest_vbc_obligation_points_seq_ = 0;
+  long long latest_vbc_obligation_id_ = -1;
   FrontierObjective latest_frontier_;
+  bool safe_frontier_recovery_enabled_ = false;
+  SafeFrontierRecovery safe_frontier_recovery_;
+  std::string safe_frontier_margin_geometry_key_;
   bool latest_single_waypoint_active_ = false;
   bool has_single_waypoint_q_ = false;
   Eigen::VectorXd latest_single_waypoint_q_;
+  Eigen::VectorXd latest_single_waypoint_joint_mask_;
   std::string latest_observation_token_ = "none";
   std::string plan_observation_token_ = "none";
   Eigen::VectorXd latest_executed_command_;
@@ -330,6 +384,12 @@ private:
   Eigen::MatrixXd plan_q_ref_;
   Eigen::MatrixXd plan_u_ref_;
   Eigen::MatrixXd plan_q_bar_;
+  // The last accepted hard-SCP center is retained so a CDF point-set change
+  // that makes the next hard QP fail can be retried once from a known center.
+  Eigen::MatrixXd plan_previous_q_bar_;
+  Eigen::MatrixXd plan_previous_u_bar_;
+  bool plan_has_hard_solution_ = false;
+  QPBacktrackPolicy plan_qp_backtrack_policy_;
   bool plan_normal_reseed_used_ = false;
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
@@ -341,7 +401,18 @@ private:
   bool plan_repair_observation_phase_ = true;
   struct RepairWitness {
     Eigen::Vector3d point;
+    // Diagnostic anchor only. Persistent identity is point-scoped; every
+    // current trajectory knot is re-queried at its own q linearization.
     int timestep;
+    // The guard is always expressed in native CDF units. A point's VBC
+    // rejection may advance this local CDF ladder, but cannot derive its
+    // value from the VBC's meter-valued result.
+    double safety_margin = 0.0;
+    // VBC feedback uses the same point identity, with its independently
+    // elevated native-CDF margin retained across fresh queries.
+    bool vbc_feedback = false;
+    double previous_margin = -1.;
+    double margin_ceiling = 0.30;
   };
   std::vector<RepairWitness> repair_unknown_witnesses_;
   bool repair_witness_requires_reobserve_ = false;
@@ -415,6 +486,23 @@ private:
   int visibility_frontier_horizon_step_ = 2;
 
   double cdf_safety_margin_ = 0.0;
+  // Active visibility targets use a margin in the learned CDF output units.
+  // This is deliberately separate from the primitive VBC margin in meters;
+  // no meter-to-CDF/radian conversion is attempted. Ordinary CDF rows keep
+  // cdf_safety_margin_ unchanged. The numeric value has no physical-clearance
+  // interpretation without independent CDF-side calibration.
+  double visibility_obligation_cdf_margin_ = 0.05;
+  // VBC increments only the rejected point's RepairWitness::safety_margin.
+  // The shared observation margin remains the configured base. All values
+  // are native CDF units, never converted from VBC meter-valued distances.
+  double visibility_obligation_cdf_margin_base_ = 0.05;
+  std::atomic<double> visibility_obligation_cdf_margin_effective_{0.05};
+  double vbc_feedback_cdf_margin_step_ = 0.15;
+  double vbc_feedback_cdf_margin_max_ = 0.30;
+  std::string vbc_feedback_target_key_ = "none";
+  int vbc_feedback_rejection_count_ = 0;
+  int vbc_feedback_matched_point_count_ = 0;
+  int vbc_feedback_repair_witness_count_ = 0;
   double cdf_slack_linear_weight_ = 500.0;
   double cdf_slack_quadratic_weight_ = 1e-3;
   double cdf_slack_upper_bound_ = 2.0;
@@ -442,6 +530,11 @@ private:
   // Unknown/low-confidence CDF is enforced over the actually executable
   // prefix in REPAIR/PROBE. NORMAL keeps the full planning horizon.
   int cdf_constraint_horizon_steps_ = 20;
+  // An active visibility target is not a confirmed collision witness. Keep its
+  // identity over the configured receding-horizon guard while the visibility
+  // objective moves toward q_vis. Confirmed GCDF repair witnesses retain their
+  // existing hard horizon.
+  int visibility_obligation_cdf_horizon_steps_ = 2;
 
   int piqp_max_iterations_ = 100;
   double piqp_eps_abs_ = 1e-5;
@@ -458,6 +551,8 @@ private:
   std::string reference_topic_ = "/care_planner/task_trajectory";
   std::string waypoint_schedule_topic_ =
       "/care_planner/active_sensing/visibility_waypoint_schedule";
+  std::string vbc_obligation_points_topic_ =
+      "/care_planner/active_sensing/current_visibility_obligation_points";
   std::string visibility_frontier_topic_ =
       "/care_planner/active_sensing/visibility_frontier_target";
   std::string single_waypoint_active_topic_ =
@@ -505,6 +600,7 @@ private:
   unsigned long long cdf_stamp_miss_ = 0;
   unsigned long long solve_count_ = 0;
   unsigned long long solve_failure_count_ = 0;
+  unsigned long long normal_qp_backtrack_count_ = 0;
   unsigned long long probe_feasibility_restore_count_ = 0;
   unsigned long long probe_feasibility_restore_success_count_ = 0;
   unsigned long long local_gcdf_recovery_event_count_ = 0;
