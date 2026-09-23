@@ -58,6 +58,9 @@ def main():
       fast_p95_s=float(np.quantile(fast_ms,.95)/1000)),
     attempts=dict(old=sum(r["old_attempts"] for r in rows),fast=sum(r["fast_attempts"] for r in rows),
       fast_fallback_tasks=sum(bool(r["fallback_planes"]) for r in rows)),
+    extrapolation_550k=dict(fast_worker_hours=float(fast_ms.sum()/1000/len(rows)*550000/3600),
+      fast_wall_hours_16_workers=float(fast_ms.sum()/1000/len(rows)*550000/3600/16),
+      old_wall_hours_4_workers=float(old_ms.sum()/1000/len(rows)*550000/3600/4)),
     by_sensor={})
   for s in range(8):
    rr=[r for r in rows if r["sensor"]==s]
@@ -68,7 +71,8 @@ def main():
     f"Both-valid value |diff| median={rep['value_abs_diff']['median']}, p95={rep['value_abs_diff']['p95']}, max={rep['value_abs_diff']['max']}.",
     f"Old worker time={rep['timing']['old_worker_s']:.1f}s; fast={rep['timing']['fast_worker_s']:.1f}s; total speedup={rep['timing']['speedup_total']:.2f}x.",
     f"Median/task old={rep['timing']['old_median_s']:.2f}s; fast={rep['timing']['fast_median_s']:.2f}s; fast p95={rep['timing']['fast_p95_s']:.2f}s.",
-    f"Attempts old={rep['attempts']['old']}; fast={rep['attempts']['fast']}; fallback tasks={rep['attempts']['fast_fallback_tasks']}.","",
+    f"Attempts old={rep['attempts']['old']}; fast={rep['attempts']['fast']}; fallback tasks={rep['attempts']['fast_fallback_tasks']}.",
+    f"550k extrapolation: fast worker-hours={rep['extrapolation_550k']['fast_worker_hours']:.1f}, fast wall-hours@16={rep['extrapolation_550k']['fast_wall_hours_16_workers']:.1f}, old wall-hours@4={rep['extrapolation_550k']['old_wall_hours_4_workers']:.1f}.","",
     "| sensor | n | validity agreement | speedup |","|---|---:|---:|---:|"]
   for s,z in rep["by_sensor"].items():lines.append(f"| {s} | {z['n']} | {z['validity_agreement']:.6f} | {z['speedup']:.2f}x |")
   (out/"summary.md").write_text("\n".join(lines)+"\n");print((out/"summary.md").read_text());return
