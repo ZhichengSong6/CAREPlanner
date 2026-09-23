@@ -34,8 +34,26 @@ def history_stats(m):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument("--input",type=Path,required=True);ap.add_argument("--output",type=Path,required=True);a=ap.parse_args()
-    rows=[json.loads(x) for x in a.input.read_text().splitlines() if x.strip()]
-    out={"status":"COMPLETE","input":str(a.input.resolve()),"count":len(rows),"sets":{}}
+    src=a.input.resolve()
+    if src.is_dir():
+        parts=sorted(src.glob("solves.rank*.jsonl"))
+        if not parts: raise FileNotFoundError(f"No solves.rank*.jsonl in {src}")
+        rows=[]
+        for p in parts:
+            rows.extend(json.loads(x) for x in p.read_text().splitlines() if x.strip())
+        rows.sort(key=lambda r:int(r["case_id"]))
+        ids=[int(r["case_id"]) for r in rows]
+        if ids!=list(range(len(rows))):
+            raise ValueError("Rank shards are incomplete, duplicated, or non-contiguous")
+        input_desc=[str(p) for p in parts]
+    else:
+        rows=[json.loads(x) for x in src.read_text().splitlines() if x.strip()]
+        rows.sort(key=lambda r:int(r["case_id"]))
+        ids=[int(r["case_id"]) for r in rows]
+        if ids!=list(range(len(rows))):
+            raise ValueError("Input rows are incomplete, duplicated, or non-contiguous")
+        input_desc=[str(src)]
+    out={"status":"COMPLETE","input":input_desc,"count":len(rows),"sets":{}}
     for k in SETS:
         rr=[r for r in rows if kind(r)==k]
         block={"count":len(rr),"by_sensor":dict(Counter(f"S{r['sensor']}" for r in rr)),"by_cohort":dict(Counter("local" if "/local_" in r["group"] else "uniform" for r in rr)),"models":{}}
