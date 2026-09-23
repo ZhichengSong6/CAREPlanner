@@ -16,6 +16,7 @@ for p in (PAIR,AUDIT,SCRIPTS,R012):
     if str(p) not in sys.path:sys.path.insert(0,str(p))
 import common as pair_common
 import runtime_probe
+import core as audit_core
 import model as r012_model
 from hierarchical_visibility_cdf_model import HierarchicalSensorView
 from train_signed_visibility_cdf_pairwise_replace import VisibilityQ0Dataset,DEFAULT_JOINT_NAMES,DEFAULT_SENSOR_FRAMES
@@ -105,7 +106,7 @@ def main():
    row={**spec,"case_id":i,"models":{}}
    order=NAMES if i%2==0 else NAMES[::-1]
    for n in order:row["models"][n]=runtime_probe.run_probe(probes[n],oracle,x,q,s)
-   f.write(json.dumps(row,allow_nan=False)+"\n");f.flush()
+   f.write(json.dumps(audit_core.json_safe(row),allow_nan=False)+"\n");f.flush()
    if ((i-a.rank)//a.world+1)%100==0:print(f"[rank{a.rank}] cases={(i-a.rank)//a.world+1}",flush=True)
  print(f"[done] rank={a.rank} shard={p}",flush=True)
 if __name__=="__main__":main()
