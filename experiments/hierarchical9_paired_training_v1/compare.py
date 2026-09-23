@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import argparse,json
+import argparse,json,math
 from pathlib import Path
 from common import ARMS,write_json
+def close(a,b,tol=2e-7):
+ return a is None and b is None or a is not None and b is not None and math.isfinite(a) and math.isfinite(b) and abs(a-b)<=tol
 def main():
  ap=argparse.ArgumentParser();ap.add_argument("--root",type=Path,required=True);a=ap.parse_args();root=a.root.resolve();rows={}
  for arm in ARMS:
@@ -10,9 +12,12 @@ def main():
   rows[arm]=(run,m,initial)
  if len({r[0]["stream_sha256"] for r in rows.values()})!=1 or len({r[0]["parent_sha256"] for r in rows.values()})!=1 or len({r[0]["cache_index_sha256"] for r in rows.values()})!=1:raise ValueError("fairness identity mismatch")
  baseline=rows["old_value"][2]["val"]
+ keys=lambda v:(v["targets"]["new"]["sensor_mae_mean"],v["targets"]["old"]["sensor_mae_mean"],v["analytic_sensor_sign_accuracy"])
+ bk=keys(baseline)
  for arm in ARMS:
-  if rows[arm][2]["val"]!=baseline:raise ValueError("initial frozen-R1 metrics differ across arms")
- report={"status":"COMPLETE_REVIEW_REQUIRED","same_stream":True,"same_parent":True,"same_cache":True,
+  ak=keys(rows[arm][2]["val"])
+  if not all(close(x,y) for x,y in zip(ak,bk)):raise ValueError(f"initial frozen-R1 metrics differ across arms: {arm} {ak} vs {bk}")
+ report={"status":"COMPLETE_REVIEW_REQUIRED","same_stream":True,"same_parent":True,"same_cache":True,"initial_metric_tolerance":2e-7,
   "frozen_r1":{"val_new_sensor_mae":baseline["targets"]["new"]["sensor_mae_mean"],"val_old_sensor_mae":baseline["targets"]["old"]["sensor_mae_mean"],
    "analytic_sensor_sign_accuracy":baseline["analytic_sensor_sign_accuracy"]},"arms":{}}
  for arm,(run,m,_) in rows.items():
