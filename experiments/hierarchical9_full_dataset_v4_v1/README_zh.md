@@ -12,3 +12,14 @@ Frozen design:
 
 Stages: prepare_full.sh -> submit_global.sh -> submit_v3.sh; submit_v4.sh is independent after prepare.
 Every compute stage is sharded, checksum-verified, resumable, and never overwrites a completed shard.
+
+
+## Two-node production allocation
+
+Default production uses both `3090node1` and `3090node3`.
+
+- global pool: 2 nodes x 4 GPUs, 4 local GPU workers/node, global world=8;
+- V3: 2 nodes x 16 CPU workers, global world=32. One GPU/node is requested only to place the job on the GPU partition; the validated analytic V3 solver is CPU-side;
+- V4: same 2-node/32-CPU-worker layout.
+
+The two-node runners use `srun` with one launcher task per node. Global ranks are deterministic and shard ownership remains disjoint, so the same checksum/resume rules apply.
