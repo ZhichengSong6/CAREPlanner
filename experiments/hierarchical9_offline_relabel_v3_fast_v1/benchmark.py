@@ -99,3 +99,6 @@ def main():
      fallback_planes=new["fast_diagnostics"]["fallback_planes"],memo_calls=new["fast_diagnostics"]["memo_geometry_calls"],memo_hits=new["fast_diagnostics"]["memo_hits"])
    f.write(json.dumps(v3.old_io.clean_json(row),allow_nan=False)+"\n");f.flush()
    print(f"[rank{a.rank}] {bid+1}/{len(tasks)} fast={elapsed/1000:.2f}s attempts={len(attempts)} fallback={row['fallback_planes']}",flush=True)
+
+if __name__=="__main__":
+ main()
