@@ -118,7 +118,10 @@ def main():
     r1,rcp,rsha=pair_common.load_r1(a.r012_root,device,False);cand,csha,crun=load_v2(a.candidate,device)
     data=Path(rcp["args"]["data"]);urdf=Path(rcp["args"]["urdf"]);dataset=VisibilityQ0Dataset(str(data),val_count=int(rcp["args"].get("val_count",1000)),seed=int(rcp["args"].get("seed",0)))
     lo,hi=dataset.q_limits(device);masks=dataset.sensor_masks(device);oracle=SensorOracle(urdf,device,DEFAULT_JOINT_NAMES,DEFAULT_SENSOR_FRAMES)
-    probes={"R1":runtime_probe.make_probe(HierarchicalSensorView(r1),masks,lo,hi),"V2_50K":runtime_probe.make_probe(HierarchicalSensorView(cand),masks,lo,hi)}\n    # V2 is trained in continuous signed-distance units; use the existing root tolerance\n    # as the projection stopping tolerance instead of the legacy R1 score-scale epsilon.\n    probes["V2_50K"].projection_epsilon_f=probes["V2_50K"].root_tolerance_f
+    probes={"R1":runtime_probe.make_probe(HierarchicalSensorView(r1),masks,lo,hi),"V2_50K":runtime_probe.make_probe(HierarchicalSensorView(cand),masks,lo,hi)}
+    # V2 is trained in continuous signed-distance units; use the existing root tolerance
+    # as the projection stopping tolerance instead of the legacy R1 score-scale epsilon.
+    probes["V2_50K"].projection_epsilon_f=probes["V2_50K"].root_tolerance_f
     starts_text=a.starts.read_text();starts=[json.loads(x) for x in starts_text.splitlines() if x.strip()];starts_sha=hashlib.sha256(starts_text.encode()).hexdigest()
     old_manifest=json.loads((a.starts.parent/"manifest.json").read_text())
     if starts_sha!=old_manifest.get("starts_sha256"):raise ValueError("starts hash differs from original fresh holdout")
