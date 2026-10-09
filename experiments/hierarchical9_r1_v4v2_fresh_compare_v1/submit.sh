@@ -7,8 +7,12 @@ R012_ROOT="${R012_ROOT:-/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/ou
 CANDIDATE="${CANDIDATE:-/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_v4_scratch_v2/formal/final.pt}"
 STARTS="${STARTS:-$R012_ROOT/evaluation_fresh_holdout_v1/starts.jsonl}"
 BASE="${COMPARE_BASE:-/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/r1_v4v2_fresh_compare_v1}"
-OUT="$BASE/run_$(date +%Y%m%d_%H%M%S)_$$"
-[[ -x "$VIS_PYTHON" && -f "$CANDIDATE" && -f "$CANDIDATE/../run.json" && -f "$STARTS" ]] || { echo "[STOP] python/candidate/starts missing";exit 2; }
+OUT="$BASE/run_$(date +%Y%m%d_%H%M%S)_$"
+CANDIDATE_RUN="$(dirname "$CANDIDATE")/run.json"
+[[ -x "$VIS_PYTHON" ]] || { echo "[STOP] python missing: $VIS_PYTHON"; exit 2; }
+[[ -f "$CANDIDATE" ]] || { echo "[STOP] candidate missing: $CANDIDATE"; exit 2; }
+[[ -f "$CANDIDATE_RUN" ]] || { echo "[STOP] candidate run.json missing: $CANDIDATE_RUN"; exit 2; }
+[[ -f "$STARTS" ]] || { echo "[STOP] frozen starts missing: $STARTS"; exit 2; }
 cd "$REPO"
 git diff --quiet && git diff --cached --quiet || { echo "[STOP] tracked working tree changes";exit 2; }
 HEAD="$(git rev-parse HEAD)"
