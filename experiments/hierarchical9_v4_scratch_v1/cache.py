@@ -153,10 +153,10 @@ def build(source,out):
           source_manifest_sha256=sha256_file(source/"manifest.json"),
           source_summaries_sha256={n:sha256_file(source/n) for n in summaries},
           counts=counts,files=files,
-          semantics=dict(global="all-8 analytic signs + exact union sign",
-            v3="grouped selected arbitrary q; per-sensor continuous values only where V3 value_valid; union value only when all 8 values valid",
-            v4="sensor-specific local signed normal-offset values",
-            boundary="V4 zero-offset rows only; analytic positive-side normal"),
+          semantics={"global":"all-8 analytic signs + exact union sign",
+            "v3":"grouped selected arbitrary q; per-sensor continuous values only where V3 value_valid; union value only when all 8 values valid",
+            "v4":"sensor-specific local signed normal-offset values",
+            "boundary":"V4 zero-offset rows only; analytic positive-side normal"},
           training_ready=True)
         write_json(tmp/"manifest.json",cache_manifest)
         out.parent.mkdir(parents=True,exist_ok=True);os.rename(tmp,out)
