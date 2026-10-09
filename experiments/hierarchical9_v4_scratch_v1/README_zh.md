@@ -10,3 +10,5 @@ Supervision semantics:
 - Union consistency uses union ~= max(sensor outputs) on the global-sign batch.
 
 Architecture is exactly R1 private-tail H9 and starts from random initialization. Default formal training is 50k optimizer updates on four GPUs.
+
+Numerics: v1 intentionally uses one combined FP32 forward/backward per update. This keeps the zero-offset boundary input-gradient/Hessian supervision in FP32 and avoids multi-forward DDP unused-parameter ambiguity. The smoke uses the exact formal batch sizes before code is frozen for 50k.

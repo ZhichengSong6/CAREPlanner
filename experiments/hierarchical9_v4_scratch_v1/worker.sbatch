@@ -54,7 +54,7 @@ echo "[launch] mode=$V4TR_MODE steps=$STEPS out=$OUT code=$V4TR_CODE_SHA host=$(
 nvidia-smi
 python -m torch.distributed.run --standalone --nproc_per_node=4 "$DIR/train.py" \
   --cache "$CACHE_ROOT" --out "$OUT" --code-sha "$V4TR_CODE_SHA" --steps "$STEPS" \
-  --seed 0 --stream-seed 261009 --lr 1e-3 --amp fp16 \
+  --seed 0 --stream-seed 261009 --lr 1e-3 \
   --batch-global 8192 --batch-v3 512 --batch-v4 8192 --batch-boundary 2048 \
   --val-batch-global 8192 --val-batch-v3 2048 --val-batch-v4 8192 --val-batch-boundary 2048 \
   --log-every "$LOG" --val-every "$VAL" --save-every "$SAVE" "${EXTRA[@]}"
