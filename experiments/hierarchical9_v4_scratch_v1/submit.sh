@@ -42,7 +42,7 @@ mkdir "$LOCK"
 MODE="$STAGE";[[ "$STAGE" == resume ]]&&MODE=resume
 EXPORT="ALL,V4TR_ROOT=$ROOT,V4TR_REPO=$REPO,V4TR_CODE_SHA=$HEAD,V4TR_MODE=$MODE"
 NODE="${NODE:-3090node1}"
-if [[ "$STAGE" == cache ]]; then GRES="gpu:1";CPUS=8;LIMIT="${TIME_LIMIT:-04:00:00}";else GRES="gpu:4";CPUS=16;LIMIT="${TIME_LIMIT:-3-00:00:00}";fi
+if [[ "$STAGE" == cache ]]; then GRES="gpu:3090:1";CPUS=8;LIMIT="${TIME_LIMIT:-04:00:00}";else GRES="gpu:3090:4";CPUS=16;LIMIT="${TIME_LIMIT:-3-00:00:00}";fi
 ERR=$(mktemp);trap 'rm -f "$ERR"' EXIT;set +e
 JOB=$(sbatch --parsable --partition=GPU --nodelist="$NODE" --nodes=1 --ntasks=1 --gres="$GRES" --cpus-per-task="$CPUS" --time="$LIMIT" --job-name="h9_v4tr_$STAGE" --chdir="$REPO" --output="$ROOT/logs/${STAGE}_%j.out" --error="$ROOT/logs/${STAGE}_%j.out" --export="$EXPORT" "$REPO/$DIR/worker.sbatch" 2>"$ERR")
 RC=$?;set -e
