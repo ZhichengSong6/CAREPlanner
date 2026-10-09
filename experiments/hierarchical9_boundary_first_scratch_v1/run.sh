@@ -11,6 +11,14 @@ STATE="$ROOT/latest.env"
 
 if [[ "$MODE" == _worker ]]; then
   : "${BF_CODE_ID:?}" "${BF_MODE:?}"
+  # sbatch copies this shell script to /var/lib/slurm/slurmd/job*/.
+  # BASH_SOURCE therefore names the Slurm spool, not the immutable source snapshot.
+  # Recover the pinned snapshot by its pre-submission content identity.
+  HERE="$ROOT/sources/$BF_CODE_ID"
+  [[ -f "$HERE/train.py" && -f "$HERE/protocol.json" ]] || {
+    echo "[STOP] pinned training source snapshot missing: $HERE"
+    exit 2
+  }
   [[ -x "$PY" ]] || { echo "[STOP] Python unavailable: $PY"; exit 2; }
   trap 'rc=$?; printf "exit_code=%s\njob_id=%s\n" "$rc" "${SLURM_JOB_ID:-unknown}" > "$ROOT/worker_exit.txt"' EXIT
   exec 8>"$ROOT/writer.lock"
