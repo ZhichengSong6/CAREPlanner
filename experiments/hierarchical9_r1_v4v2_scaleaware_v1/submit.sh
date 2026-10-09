@@ -16,6 +16,8 @@ CANDIDATE_RUN="$(dirname "$CANDIDATE")/run.json"
 cd "$REPO"
 git diff --quiet && git diff --cached --quiet || { echo "[STOP] tracked working tree changes";exit 2; }
 HEAD="$(git rev-parse HEAD)"
+"$VIS_PYTHON" -m py_compile "$HERE/evaluate.py" "$HERE/diagnose.py"
+bash -n "$HERE/run.sh" "$HERE/worker.sbatch" "$HERE/watch.sh"
 "$VIS_PYTHON" - "$CANDIDATE" "$STARTS" <<'PY'
 import hashlib,json,sys,torch
 from pathlib import Path
