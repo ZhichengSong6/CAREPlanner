@@ -42,7 +42,7 @@ class Tests(unittest.TestCase):
 
     def test_evaluator_imports_this_experiment_not_r012_train(self):
         source=(train.HERE/"evaluate.py").read_text()
-        self.assertIn("sys.path.insert(0,str(HERE))\\nfrom train import FORMAT", source)
+        self.assertIn("sys.path.insert(0,str(HERE))\nfrom train import FORMAT", source)
 
     def test_original_r1_model_is_unmodified(self):
         mod=train.load_r012_module()
