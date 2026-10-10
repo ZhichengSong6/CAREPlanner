@@ -1,0 +1,44 @@
+{
+  "format": "care_r1_ps_joint_audit_v1",
+  "seed": 26101019,
+  "world": 4,
+  "solver_cases": 1963,
+  "starts_sha256": "0e4711fc21628fdbb341191ec634415781696800a2386a4ad48e592c34f3198c",
+  "r1_sha256": "4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002",
+  "ps_final_sha256": "4872dc937224a1c20962d03388809e5f8e8436f90e0d2f00516f0b7bfda84dee",
+  "ps_best_sha256": "01087285114e2252361adafacf8a1a9e8ffb01d3d3e3e52cb8ad3bdcb0fe341f",
+  "cache_identity": "060eef93a0030800c8ef2265258c7dff850944ab9c5df52382adb98cb506f7cc",
+  "pairs_per_split_sensor_radius": 128,
+  "radii_rad": [
+    0.005,
+    0.01,
+    0.02
+  ],
+  "gradient_replicates": 4,
+  "gradient_draw_step_start": 60001,
+  "finite_difference_steps_rad": [
+    0.001,
+    0.0005
+  ],
+  "finite_difference_jacobian_atol": 0.0005,
+  "finite_difference_jacobian_rtol": 0.005,
+  "normal_cosine_min": 0.999,
+  "margin_tolerance_m": 3e-06,
+  "inactive_joint_tolerance_rad": 2e-06,
+  "diagnostic_ascent_step_rad": 0.01,
+  "small_gradient_norm": 1e-08,
+  "solver_settings": {
+    "projection_iters": 10,
+    "projection_damping": 0.5,
+    "projection_epsilon_f": 0.03,
+    "projection_max_step_norm": 0.25,
+    "root_refine_iters": 12,
+    "root_tolerance_f": 0.002,
+    "branch_ascent_steps": 1,
+    "branch_step_size": 0.05,
+    "branch_max_step_norm": 0.25,
+    "branch_fallback_ascent_steps": 8
+  },
+  "scope": "One read-only job. All solver starts, prespecified stratified boundary samples and four global training-batch gradient diagnostics. No optimizer step, no relabeling, no threshold sweep.",
+  "inactive_jacobian_tolerance_m_per_rad": 1e-06
+}
