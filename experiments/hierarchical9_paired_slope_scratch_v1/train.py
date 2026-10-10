@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from data import Cache, EXPECTED_CACHE, FIELDS, sha, source_identity, write_json
-from pairdata import PairCache, build_pairs, production_shards
+from pairdata import PairCache, build_pairs, production_shards, _pairs
 from objective import loss_and_metrics, average_parameter_gradients
 
 HERE = Path(__file__).resolve().parent
@@ -102,6 +102,10 @@ def preflight(cache_root: Path):
     c = config()
     cache = Cache(cache_root, verify=True)
     production, shards, msha = production_shards(cache)
+    # Check the REAL production schema, not only fabricated unit-test fixtures.
+    with np.load(shards[0], allow_pickle=False) as stage:
+        validated_pairs = sum(len(x[0]) for x in _pairs(stage))
+    print(f"[preflight] real V4 shard schema/pair geometry OK; pairs_in_first_shard={validated_pairs}", flush=True)
     print(f"[preflight] existing original V4 tubes={len(shards)} production={production}", flush=True)
     print(f"[preflight] cache={cache.identity}", flush=True)
     print(f"[preflight] package={source_identity(HERE)}; scratch updates={c['steps']}", flush=True)
