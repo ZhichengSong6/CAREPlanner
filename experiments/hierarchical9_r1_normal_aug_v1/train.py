@@ -29,11 +29,21 @@ from boundary_aug import BoundaryDirection, attach_to_original_r1
 
 
 def sha(path):
+    """SHA-256 for checkpoint and dataset/file integrity (64 hex chars)."""
     h=hashlib.sha256()
     with Path(path).open("rb") as f:
         for b in iter(lambda:f.read(8<<20),b""):
             h.update(b)
     return h.hexdigest()
+
+
+def git_blob_sha(path):
+    """Git blob object ID (SHA-1 over Git's blob header + bytes; 40 hex chars).
+
+    Git file/blob IDs are not plain-file SHA-256 fingerprints.
+    """
+    data=Path(path).read_bytes()
+    return hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()
 
 
 def json_read(path):
@@ -88,8 +98,7 @@ def verify_original_r1_code():
         "scratch/model.py": SCRATCH/"model.py",
     }
     for key, path in mapping.items():
-        data=path.read_bytes()
-        gitsha=hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()
+        gitsha=git_blob_sha(path)
         if gitsha!=R1_ORIGINAL_SOURCE_GIT_BLOBS[key]:
             raise ValueError(f"Original R1 source changed: {key} ({gitsha})")
 
@@ -258,6 +267,10 @@ def train(args):
         argv.extend(["--resume-training",str(args.resume)])
     sys.argv=argv
     trainer.main()
+    # The R012 upstream trainer exits its NCCL process group before returning.
+    # Never let all four torchrun ranks race on the SAME run.json.tmp path.
+    if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+        return
     if not (out/"final.pt").is_file():
         raise RuntimeError("R1 augmented loop returned without final checkpoint")
     run=json_read(out/"run.json")
