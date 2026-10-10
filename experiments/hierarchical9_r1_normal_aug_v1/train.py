@@ -62,10 +62,36 @@ def protocol():
 def dependency_fingerprints():
     paths=list(HERE.glob("*.py"))+list(HERE.glob("*.sh"))+[HERE/"protocol.json",
         R012/"train.py",R012/"model.py",SCRATCH/"train.py",
-        SCRATCH/"objective.py",V4DATA]
+        SCRATCH/"objective.py",SCRATCH/"model.py",V4DATA]
     return {("experiments/hierarchical9_r1_normal_aug_v1/"+p.name)
                 if p.parent.resolve()==HERE.resolve() else str(p.resolve().relative_to(REPO)):
             sha(p) for p in sorted(paths)}
+
+
+# Freeze the actual source code used by the historical R1 baseline. Git blob
+# hashes are content-addressed and independent of checkout directory paths.
+R1_ORIGINAL_SOURCE_GIT_BLOBS = {
+    "r012/train.py": "8092a791585dff8ac6ab5e562d158450b1095df4",
+    "r012/model.py": "0b9dab1986114d4b95b33bb0fa01fd8e0c68e53b",
+    "scratch/train.py": "88d365045bb1c53cf71f5b8fbd9f8db74a5c2ae9",
+    "scratch/objective.py": "a53539d27fb003d6b06d46da80ca0c7a93b1230c",
+    "scratch/model.py": "33580154af2e9cda22f9c64f15cd5b4f5417a86f",
+}
+
+
+def verify_original_r1_code():
+    mapping = {
+        "r012/train.py": R012/"train.py",
+        "r012/model.py": R012/"model.py",
+        "scratch/train.py": SCRATCH/"train.py",
+        "scratch/objective.py": SCRATCH/"objective.py",
+        "scratch/model.py": SCRATCH/"model.py",
+    }
+    for key, path in mapping.items():
+        data=path.read_bytes()
+        gitsha=hashlib.sha1(b"blob "+str(len(data)).encode()+b"\\0"+data).hexdigest()
+        if gitsha!=R1_ORIGINAL_SOURCE_GIT_BLOBS[key]:
+            raise ValueError(f"Original R1 source changed: {key} ({gitsha})")
 
 
 def baseline(r012_root):
@@ -84,6 +110,7 @@ def baseline(r012_root):
 
 
 def preflight(args):
+    verify_original_r1_code()
     p=protocol()
     base=baseline(args.r012_root)
     if not Path(args.data).is_file() or not Path(args.urdf).is_file():
