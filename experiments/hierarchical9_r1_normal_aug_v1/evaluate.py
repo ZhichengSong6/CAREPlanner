@@ -30,6 +30,11 @@ import model as r012_model
 from hierarchical_visibility_cdf_model import HierarchicalSensorView
 from train_signed_visibility_cdf_pairwise_replace import VisibilityQ0Dataset,DEFAULT_JOINT_NAMES,DEFAULT_SENSOR_FRAMES
 from oracle import SensorOracle
+# Imported R012/model and PAIR/common above, then restore THIS experiment's
+# script directory to the front so 'train' cannot resolve R012/train.py.
+if str(HERE) in sys.path:
+    sys.path.remove(str(HERE))
+sys.path.insert(0,str(HERE))
 from train import FORMAT, baseline, dependency_fingerprints, sha, json_read, json_atomic
 
 NAMES=("R1","R1_AUG")
