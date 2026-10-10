@@ -23,16 +23,17 @@ FIELDS = {"x_index": (np.int32, ()), "sensor": (np.uint8, ()),
 
 def _pairs(z) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
     """Return (plus indices, minus indices, zero indices, radius id) per shard."""
-    mandatory = ("x_index", "split", "sensor", "source_slot", "offset", "q", "normal", "g_m")
-    if any(k not in z for k in mandatory):
-        raise ValueError("Original V4 stage lacks anchor identity or geometry")
-    n = len(z["offset"])
+    mandatory = ("x_index", "split", "sensor", "source_slot", "value", "q", "grad", "g_m")
+    missing = [k for k in mandatory if k not in z]
+    if missing:
+        raise ValueError(f"Original V4 tube shard is missing production fields: {missing}")
+    n = len(z["value"])
     if not n:
         return []
     if any(len(z[k]) != n for k in mandatory):
         raise ValueError("V4 arrays have different lengths")
     q = np.asarray(z["q"], dtype=np.float32)
-    normal = np.asarray(z["normal"], dtype=np.float32)
+    normal = np.asarray(z["grad"], dtype=np.float32)
     margin = np.asarray(z["g_m"], dtype=np.float32)
     if q.shape != (n, 7) or normal.shape != (n, 7) or not np.isfinite(q).all() or not np.isfinite(normal).all() or not np.isfinite(margin).all():
         raise ValueError("Invalid V4 q/normal/margin")
@@ -42,7 +43,7 @@ def _pairs(z) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, int]]:
     sensor = np.asarray(z["sensor"], np.uint8)
     if not np.isin(split, [0, 1]).all() or np.any(sensor >= 8):
         raise ValueError("Invalid split or sensor")
-    codes = offset_codes(np.asarray(z["offset"], np.float32)).astype(np.int64)
+    codes = offset_codes(np.asarray(z["value"], np.float32)).astype(np.int64)
     ids = np.stack((np.asarray(z["x_index"], np.int64), sensor.astype(np.int64),
                     np.asarray(z["source_slot"], np.int64)), axis=1)
     unique, group = np.unique(ids, axis=0, return_inverse=True)
