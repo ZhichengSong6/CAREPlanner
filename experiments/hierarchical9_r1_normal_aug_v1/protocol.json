@@ -1,0 +1,44 @@
+{
+  "format": "care_h9_r1_boundary_direction_aug_v1",
+  "name": "R1 plus analytic boundary normal direction only",
+  "steps": 50000,
+  "normal_direction_weight": 0.01,
+  "anchors_per_sensor_per_rank": 32,
+  "aux_stream_seed": 261013,
+  "v4_cache_sha256": "060eef93a0030800c8ef2265258c7dff850944ab9c5df52382adb98cb506f7cc",
+  "baseline": {
+    "arm": "R1",
+    "seed": 0,
+    "stream_seed": 190915,
+    "lr": 0.001,
+    "amp": "fp16",
+    "global_batch_x": 4000,
+    "batch_q": 100,
+    "microbatch_x": 250,
+    "val_global_batch_x": 512,
+    "val_batch_q": 100,
+    "val_microbatch_x": 128,
+    "val_count": 1000,
+    "decode_x_chunk": 64,
+    "weight_sdf": 5,
+    "weight_grad": 0.1,
+    "weight_eikonal": 0.01,
+    "weight_tension": 0.01,
+    "weight_union_objective": 1,
+    "weight_sensor_objective": 1,
+    "weight_consistency": 0.1
+  },
+  "fairness": {
+    "original_R1_train_q_stream": "must match frozen 50k baseline SHA exactly",
+    "additional_boundary_rows_per_update": 1024,
+    "additional_boundary_rows_50k": 51200000,
+    "extra_compute": "not equal-GPU budget: 1024 extra directions and one gradient-reduction per update",
+    "optimizer": "original Adam 1e-3, unchanged ReduceLROnPlateau based on original R1 loss",
+    "no_training_from_old_checkpoint": true,
+    "no_runtime_change": true
+  },
+  "selection": {
+    "checkpoint": "final 50k, original R1 val unchanged",
+    "solver": "same fixed 1963 frozen starts epsilon 0.03 after training"
+  }
+}
