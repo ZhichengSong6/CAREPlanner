@@ -4,9 +4,9 @@
 
 ## 为什么引入成对监督
 
-Boundary-first v1 在 job 17438 的 50k 训练完成后表现出 near-zero field：局部两侧的正负符号识别和梯度大小明显不足。原 V4 training cache 只保留单点的 x、q、sensor、offset，缺失 anchor 身份。本版从冻结的原始 v4_tubes/shard_*.npz 恢复 (x_index, sensor, source_slot, offset)，只匹配同一 anchor 的正负偏移点。检查两侧原始 FOV g_m 符号、零偏移锚点残差、同一法向几何一致性与原分片 SHA256；缺少任何一侧则不配对。不会生成新 q 或复用标签给新 q。
+Boundary-first v1 在 job 17438 的 50k 训练完成后表现出 near-zero field：局部两侧的正负符号识别和梯度大小明显不足。原 V4 training cache 只保留单点的 x、q、sensor、value，缺失 anchor 身份。本版从冻结的原始 v4_tubes/shard_*.npz 读取真实字段 x_index、split、sensor、source_slot、value、q、grad、g_m；其中 value 是法向偏移，grad 是解析法向，只匹配同一 anchor 的正负偏移点。检查两侧原始 FOV g_m 符号、零偏移锚点残差、同一法向几何一致性与原分片 SHA256；缺少任何一侧则不配对。不会生成新 q 或复用标签给新 q。
 
-新训练作业在独立 formal/pairs 下建立已认证配对 mmap 与 24 分层索引（8 sensor × 3 radius），原 V4 文件及全量 training cache 保持只读。不会重新运行 V3/V4 标签生产。
+提交前在 CPU 上实际读取并检查一个原始 V4 分片的字段及配对几何，避免虚构的单测格式通过后 GPU 启动失败。新训练作业在独立 formal/pairs 下建立已认证配对 mmap 与 24 分层索引（8 sensor × 3 radius），原 V4 文件及全量 training cache 保持只读。不会重新运行 V3/V4 标签生产。
 
 ## 固定方案
 
