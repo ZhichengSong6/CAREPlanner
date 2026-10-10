@@ -46,9 +46,14 @@ class Tests(unittest.TestCase):
 
     def test_original_r1_model_is_unmodified(self):
         mod=train.load_r012_module()
-        import hashlib
-        self.assertEqual(train.sha(train.R012/"model.py"),
-                         "0b9dab1986114d4b95b33bb0fa01fd8e0c68e53b")
+        path = train.R012 / "model.py"
+        self.assertEqual(train.git_blob_sha(path),
+                         train.R1_ORIGINAL_SOURCE_GIT_BLOBS["r012/model.py"])
+        # Never compare plain SHA-256 and Git's SHA-1 blob object ID:
+        # Git prefixes the file bytes with the blob header before hashing.
+        self.assertEqual(len(train.sha(path)), 64)
+        self.assertEqual(len(train.git_blob_sha(path)), 40)
+        self.assertNotEqual(train.sha(path), train.git_blob_sha(path))
         model=mod.models.build_model("R1")
         self.assertEqual(model.parameter_count(),2184329)
         self.assertEqual(len(model.sensor_heads),8)
@@ -61,13 +66,13 @@ class Tests(unittest.TestCase):
         norm=torch.zeros((16,7));norm[:,0]=1
         sensor=torch.arange(8).repeat_interleave(2)
         loss,diag=BoundaryDirection.direction_loss(model,(x,q,norm,sensor),cfg,training=True,monitor=False)
-        self.assertAlmostEqual(float(loss),0.,places=6)
+        self.assertAlmostEqual(float(loss.detach()),0.,places=6)
         self.assertEqual(diag.shape,(8,5))
         loss.backward()
         self.assertTrue(torch.isfinite(model.weight.grad))
         reverse=-norm
         loss2,_=BoundaryDirection.direction_loss(model,(x,q,reverse,sensor),cfg,training=True,monitor=False)
-        self.assertAlmostEqual(float(loss2),.02,places=6)
+        self.assertAlmostEqual(float(loss2.detach()),.02,places=6)
         self.assertAlmostEqual(float(diag[:,0].mean()),1.,places=5)
 
     def test_sampler_stateless_and_never_uses_original_validation_x(self):
@@ -122,6 +127,11 @@ class Tests(unittest.TestCase):
         self.assertIn("experiments/hierarchical9_scratch_v1/objective.py",f)
         self.assertEqual(len(f),len(set(f)))
         self.assertEqual(len(set(f.values())),len(f))
+
+    def test_only_rank_zero_finalizes_run_json(self):
+        source = (train.HERE / "train.py").read_text()
+        self.assertIn('if int(os.environ.get("LOCAL_RANK", "0")) != 0:', source)
+        self.assertIn("    trainer.main()", source)
 
     def test_split_mismatch_fails_loudly(self):
         class FakeCache:
