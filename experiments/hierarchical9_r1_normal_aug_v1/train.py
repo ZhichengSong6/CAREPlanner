@@ -89,7 +89,7 @@ def verify_original_r1_code():
     }
     for key, path in mapping.items():
         data=path.read_bytes()
-        gitsha=hashlib.sha1(b"blob "+str(len(data)).encode()+b"\\0"+data).hexdigest()
+        gitsha=hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()
         if gitsha!=R1_ORIGINAL_SOURCE_GIT_BLOBS[key]:
             raise ValueError(f"Original R1 source changed: {key} ({gitsha})")
 
