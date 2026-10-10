@@ -149,11 +149,24 @@ class TrainingTests(unittest.TestCase):
                         "split":np.asarray([r[1] for r in items],np.uint8),
                         "sensor":np.asarray([r[2] for r in items],np.uint8),
                         "source_slot":np.asarray([r[3] for r in items],np.int32),
-                        "offset":np.asarray([r[4] for r in items],np.float32),
+                        "value":np.asarray([r[4] for r in items],np.float32),
                         "q":np.asarray([r[5] for r in items],np.float32),
-                        "normal":np.asarray([r[6] for r in items],np.float32),
+                        "grad":np.asarray([r[6] for r in items],np.float32),
                         "g_m":np.asarray([r[7] for r in items],np.float32)}
             vals=arrays(records)
+            # Match the ORIGINAL v4_tubes.py stage schema, not invented aliases.
+            self.assertIn("value", vals)
+            self.assertIn("grad", vals)
+            self.assertNotIn("offset", vals)
+            self.assertNotIn("normal", vals)
+            wrong={k:v.copy() for k,v in vals.items()}
+            wrong["normal"]=wrong.pop("grad")
+            with self.assertRaisesRegex(ValueError, "grad"):
+                _pairs(wrong)
+            wrong={k:v.copy() for k,v in vals.items()}
+            wrong["offset"]=wrong.pop("value")
+            with self.assertRaisesRegex(ValueError, "value"):
+                _pairs(wrong)
             results=_pairs(vals)
             self.assertEqual(sum(len(p) for p,_,_,_ in results),48)
             # A positive point moved off its source normal must be rejected.
