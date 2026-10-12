@@ -6,6 +6,8 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -142,6 +144,75 @@ class TestCore(unittest.TestCase):
             self.assertIn("136",summary)
             self.assertIn("82",summary)
             self.assertIn("EXACT SAME CPU BOUNDARY POINTS",summary)
+
+    def test_full_1963_readonly_input_schema_and_pair_guard(self):
+        rows=make_cases()
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            r1=root/"r012"
+            old=r1/"formal/R1"
+            aug=root/"aug"
+            new=aug/"formal"
+            solver=root/"eval"
+            starts_parent=r1/"evaluation_fresh_holdout_v1"
+            for p in (old,new,solver,starts_parent):
+                p.mkdir(parents=True,exist_ok=True)
+            frozen=[{k:entry[k] for k in ("group","x","q_init","sensor")}
+                    for entry in rows]
+            starts=starts_parent/"starts.jsonl"
+            starts.write_text("".join(json.dumps(x)+"\n" for x in frozen))
+            (starts_parent/"manifest.json").write_text(json.dumps({
+                "starts_sha256":diagnose.EXPECTED_STARTS}))
+            for f in (old/"final.pt",new/"final.pt",old/"metrics.jsonl",new/"metrics.jsonl"):
+                f.write_bytes(b"trusted test fixture placeholder")
+            (old/"run.json").write_text(json.dumps({
+                "status":"COMPLETE","arm":"R1","successful_updates":50000,
+                "training_stream_updates":50000,"training_stream_sha256":"abc",
+                "final_sha256":diagnose.EXPECTED_R1}))
+            (new/"run.json").write_text(json.dumps({
+                "status":"COMPLETE","variant":diagnose.VARIANT,"successful_updates":50000,
+                "baseline_stream_exact_match":True,"training_stream_sha256":"abc",
+                "original_r1_final_sha256":diagnose.EXPECTED_R1,
+                "final_sha256":"fake_aug_final_sha"}))
+            summary={"status":"COMPLETE","starts_sha256":diagnose.EXPECTED_STARTS,
+                     "count":1963,"eps_f":.03,"paired":{
+                         "aug_only":82,"R1_only":136,"net_gain":-54},
+                     "aggregate":{
+                         "local":{"R1":{"pass":618},"R1_AUG":{"pass":583}},
+                         "uniform":{"R1":{"pass":673},"R1_AUG":{"pass":654}},
+                         "all":{"R1":{"pass":1291},"R1_AUG":{"pass":1237}}}}
+            (solver/"report.json").write_text(json.dumps(summary))
+            (solver/"manifest.json").write_text(json.dumps({
+                "starts_sha256":diagnose.EXPECTED_STARTS,
+                "r1_sha256":diagnose.EXPECTED_R1,"aug_sha256":"fake_aug_final_sha"}))
+            (solver/"complete.json").write_text(json.dumps({
+                "status":"COMPLETE","rows":1963}))
+            for rank in range(4):
+                (solver/f"solves.rank{rank}.jsonl").write_text(
+                    "".join(json.dumps(x)+"\n" for x in rows[rank::4]))
+            args=SimpleNamespace(r012=r1,aug=aug,solver=solver,starts=starts)
+            true_sha=diagnose.sha
+            def digest(path):
+                path=Path(path)
+                if path == starts or path == old/"final.pt":
+                    return diagnose.EXPECTED_STARTS if path==starts else diagnose.EXPECTED_R1
+                if path == new/"final.pt":
+                    return "fake_aug_final_sha"
+                return true_sha(path)
+            with mock.patch.object(diagnose,"sha",side_effect=digest):
+                verified=diagnose.verify_inputs(args)
+            self.assertEqual(verified["paired"],
+                             {"aug_only":82,"R1_only":136,"net":-54})
+            self.assertEqual(len(verified["rows"]),1963)
+            self.assertEqual(verified["counts"]["all"]["R1_AUG"],1237)
+            # A source-row mismatch must NOT be silently reconciled.
+            corrupted=rows.copy()
+            corrupted[17]=dict(corrupted[17],sensor=7 if rows[17]["sensor"]!=7 else 6)
+            (solver/"solves.rank1.jsonl").write_text(
+                "".join(json.dumps(x)+"\n" for x in corrupted[1::4]))
+            with mock.patch.object(diagnose,"sha",side_effect=digest):
+                with self.assertRaisesRegex(ValueError,"Frozen case 17 mismatch"):
+                    diagnose.verify_inputs(args)
 
     def test_same_point_cpu_gradient_and_first_relu_probe(self):
         m=FakeHead().eval().requires_grad_(False)
