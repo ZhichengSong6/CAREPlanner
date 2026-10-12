@@ -1,0 +1,29 @@
+{
+  "name": "r1_solver_goal_v1",
+  "steps": 50000,
+  "warmup_updates": 10000,
+  "ramp_updates": 5000,
+  "weight": 0.01,
+  "projection_steps": 3,
+  "pairs_per_sensor_per_rank": 8,
+  "aux_seed": 2610127,
+  "geometry_scale_m": 0.01,
+  "target_cap_m": 0.005,
+  "witness_fraction": 0.5,
+  "baseline": {
+    "arm": "R1", "seed": 0, "stream_seed": 190915,
+    "lr": 0.001, "amp": "fp16", "max_amp_retries": 16,
+    "global_batch_x": 4000, "batch_q": 100, "microbatch_x": 250,
+    "val_global_batch_x": 512, "val_batch_q": 100, "val_microbatch_x": 128,
+    "val_count": 1000, "decode_x_chunk": 64,
+    "weight_sdf": 5.0, "weight_grad": 0.1,
+    "weight_eikonal": 0.01, "weight_tension": 0.01,
+    "weight_union_objective": 1.0, "weight_sensor_objective": 1.0,
+    "weight_consistency": 0.1,
+    "horizontal_fov_deg": 50.0, "vertical_fov_deg": 66.0,
+    "z_min": 0.2, "z_max": 0.7, "delta": 0.01,
+    "log_every": 100, "val_every": 1000, "save_every": 5000
+  },
+  "selection": "predeclared final_50000; validation diagnostic only; regression starts never read during training",
+  "scope": "same R1 architecture; short continuous surrogate NOT full branching solver; FOV only; no distance certificate"
+}
