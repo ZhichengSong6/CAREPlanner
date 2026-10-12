@@ -218,6 +218,10 @@ def extract_case(row):
     d = {
         "case_id": row["case_id"], "cohort": cohort(row["group"]), "group": row["group"],
         "sensor": row["sensor"], "outcome": category(row),
+        "x": row["x"], "q_init": row["q_init"],
+        "r1_q_start": old.get("q_start"), "aug_q_start": aug.get("q_start"),
+        "r1_q_zero": old.get("q_zero"), "aug_q_zero": aug.get("q_zero"),
+        "r1_q_candidate": old.get("q_candidate"), "aug_q_candidate": aug.get("q_candidate"),
         "r1_pass": old["fov_pass"], "aug_pass": aug["fov_pass"],
         "initial_analytic_g_m": initial_g,
         "r1_candidate_g_m": o_g, "aug_candidate_g_m": a_g,
@@ -235,6 +239,10 @@ def extract_case(row):
         "aug_projection_steps": max(0, len(aug.get("projection_history", []))-1),
         "r1_ascent_steps": len(old.get("ascent_history", [])),
         "aug_ascent_steps": len(aug.get("ascent_history", [])),
+        "r1_first_projection_gradient_norm": next((a.get("grad_norm") for a in old.get("projection_history", [])[1:] if finite(a.get("grad_norm"))), None),
+        "aug_first_projection_gradient_norm": next((a.get("grad_norm") for a in aug.get("projection_history", [])[1:] if finite(a.get("grad_norm"))), None),
+        "r1_first_ascent_gradient_norm": next((a.get("grad_norm") for a in old.get("ascent_history", []) if finite(a.get("grad_norm"))), None),
+        "aug_first_ascent_gradient_norm": next((a.get("grad_norm") for a in aug.get("ascent_history", []) if finite(a.get("grad_norm"))), None),
         "r1_joint_clamps": old.get("joint_clamp_events"),
         "aug_joint_clamps": aug.get("joint_clamp_events"),
         "r1_value_calls": old.get("value_calls"), "aug_value_calls": aug.get("value_calls"),
@@ -433,7 +441,7 @@ def markdown(case, metrics, boundary_note):
     ]
     for name,entry in [("local",case["cohorts"]["local"]),("uniform",case["cohorts"]["uniform"])]:
         table.append(f"| {name} | {entry['n']} | {entry['r1_pass']} | {entry['aug_pass']} | {entry['gained']} | {entry['lost']} | {entry['gained']-entry['lost']:+d} |")
-    table.append(f"| all | 1963 | 1291 | {1237 if c['lost']['count']==136 and c['gained']['count']==82 else 1291+c['gained']['count']-c['lost']['count']} | {c['gained']['count']} | {c['lost']['count']} | {c['gained']['count']-c['lost']['count']:+d} |")
+    table.append(f"| all | 1963 | 1291 | {1291+c['gained']['count']-c['lost']['count']} | {c['gained']['count']} | {c['lost']['count']} | {c['gained']['count']-c['lost']['count']:+d} |")
     table += ["", "## Per sensor paired outcomes","",
               "| Sensor | N | R1 | Aug | Aug-only | R1-only | Net |",
               "|---|---:|---:|---:|---:|---:|---:|"]
@@ -531,6 +539,8 @@ def main():
     write_json(a.out/"manifest.json",{
         "format":"care_h9_r1_normal_aug_case_diagnosis_v1","status":"COMPLETE",
         "source_hashes_sha256":values["files"],"output_hashes_sha256":outputfiles,
+        "diagnostic_code_sha256":{name:sha(Path(__file__).parent/name)
+            for name in ("diagnose.py","boundary_cpu.py","test_diagnosis.py","run.sh","README_zh.md")},
         "r1_training_stream":values["old_run"]["training_stream_sha256"],
         "aug_training_stream":values["new_run"]["training_stream_sha256"],
         "solver":"RECORDED; NOT RE-RUN","new_solver_calls":0,"optimizer_updates":0,
