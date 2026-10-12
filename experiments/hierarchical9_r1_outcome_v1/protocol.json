@@ -1,0 +1,12 @@
+{
+  "format": "care_h9_r1_outcome_v1",
+  "steps": 50000,
+  "warmup": 10000,
+  "ramp": 5000,
+  "weight": 0.01,
+  "pairs_per_sensor_per_rank": 4,
+  "world": 4,
+  "seed": 0,
+  "stream_seed": 190915,
+  "notes": "Original R1 objective retained. Added witness-conditioned terminal FOV loss. Both original minus and plus starts. Discrete branches stop-gradient; continuous updates differentiate through value/input-gradient. No runtime changes; no 1963-case selection."
+}
