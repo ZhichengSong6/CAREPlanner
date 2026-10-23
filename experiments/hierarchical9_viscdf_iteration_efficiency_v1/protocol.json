@@ -1,0 +1,18 @@
+{
+  "format": "care_viscdf_iteration_efficiency_v1",
+  "models": ["R1", "B_keep"],
+  "budgets": [1, 2, 3, 5, 10],
+  "world": 4,
+  "bootstrap_repeats": 4000,
+  "bootstrap_seed": 261023,
+  "point_count": 512,
+  "case_count": 22518,
+  "starts_sha256": "6d653a48f1e00805b64108a72a4d799153c5c476c3b55346c76230f326e451cc",
+  "r1_sha256": "4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002",
+  "b_sha256": "45730438eb9cdc29418a86e0d2f933595ce0626b4171b19144145141d72c2a93",
+  "parent_sha256": "5507b1d16c5d34f4a3e8c01526c7bf3f278a51c07df9f4d878aaee476cee48f5",
+  "margin_thresholds_m": [0.0, 0.005, 0.01, 0.02],
+  "minimum_free_gib": 6.0,
+  "semantics": "K counts gradient queries/update attempts; value-only bisection is retained and counted separately. Candidate at next blocked gradient request, or original final candidate after early completion. No oracle-based candidate selection.",
+  "data_role": "Reused 512-point Keep-v2 confirmation set: frozen descriptive convergence benchmark, NOT a new unseen test. No training or tuning. FOV only."
+}
