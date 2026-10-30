@@ -28,4 +28,4 @@ python3 -B outputs/my_demo/run.py --model new --case 007 --configuration nonbloc
 
 精确使用旧目标和旧校准输入时，可用 `--inputs-root` 替代 `--demo`。`input_assets.json` 只记录这些外置输入的路径和校验值；内容不在 Git 中。此模式供已有对应本地输入的研究者使用，默认演示不依赖它。
 
-`model_assets.json` 定义四份模型资产。每次准备使用新的输出目录，每次运行使用唯一 tag；源码、权重和运行配置在执行前后核对。原有封存研究不被修改。
+`model_assets.json` 将新碰撞 CDF、VisCDF R1 和标量 VisCDF 标为三份必需资产。默认准备和运行不依赖旧碰撞 CDF；做旧模型对照时，准备命令添加 `--include-legacy-models`，运行时选择 `--model old`。每次准备使用新的输出目录，每次运行使用唯一 tag；源码、选中的权重和运行配置在执行前后核对。原有封存研究不被修改。

@@ -36,6 +36,8 @@ def main():
     parser.add_argument('--assets-root',type=Path,default=ROOT,
                         help='Directory containing the src/... checkpoint paths in model_assets.json')
     parser.add_argument('--without-models',action='store_true',help='Prepare a source/build check only')
+    parser.add_argument('--include-legacy-models',action='store_true',
+                        help='Also attach the optional old collision CDF for --model old comparisons')
     mode=parser.add_mutually_exclusive_group()
     mode.add_argument('--inputs-root',type=Path,
                         help='Local study directory containing the external inputs in input_assets.json')
@@ -43,6 +45,7 @@ def main():
     args=parser.parse_args();out=args.output.resolve();assets=args.assets_root.resolve()
     if out.exists():raise FileExistsError('Choose a new output directory: '+str(out))
     models=json.loads((PACKAGE/'model_assets.json').read_text())['models']
+    models=[model for model in models if model['required'] or args.include_legacy_models]
     if not args.without_models:
         for model in models:
             p=assets/model['path']
@@ -109,6 +112,7 @@ def main():
     for name in ('runs','versions','evidence'):(out/name).mkdir()
     (out/'preparation.json').write_text(json.dumps(dict(status='PREPARED',source_manifest_sha256=digest(PACKAGE/'source_manifest.json'),
         files=len(manifest['files']),models_attached=not args.without_models,inputs_attached=input_root is not None,build_only_cmake_additions=build_edits,
+        model_paths=[model['path'] for model in models] if not args.without_models else [],
         portability_edits=portability_edits,mode='demo' if args.demo else 'study',selected_policy='current',new_windows=0),indent=2)+'\n')
     print(json.dumps(dict(status='PREPARED',runtime=str(runtime),new_windows=0)))
 

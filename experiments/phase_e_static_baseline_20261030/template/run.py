@@ -48,6 +48,7 @@ def main():
     m.environment=environment
     item=dict(model=a.model,configuration=a.configuration,tag=a.tag,batch='live_'+a.tag,case=a.case,role=a.role,repeat=a.repeat,policy=a.policy,refinement=a.refinement,handoff_retry=a.handoff_retry,discovery=a.discovery,reuse=a.reuse,ranking=a.ranking,view_selection=a.view_selection)
     env=m.environment(item)
+    m.active_model_binding=Path(env['CARE_CDF_MODEL_BINDING'])
     if a.preflight:
         import subprocess
         command=['/usr/bin/python3','-B',str(m.T/'run_case.py'),'--batch-id',item['batch'],'--case-ids',a.case,'--dry-run']

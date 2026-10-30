@@ -81,6 +81,8 @@ def main():
         check_environment(env)
         assets = json.loads((PACKAGE / 'model_assets.json').read_text())['models']
         for asset in assets:
+            if not asset['required']:
+                continue
             path = ROOT / asset['path']
             if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != asset['sha256']:
                 raise RuntimeError('Model missing or mismatched: ' + asset['path'] +

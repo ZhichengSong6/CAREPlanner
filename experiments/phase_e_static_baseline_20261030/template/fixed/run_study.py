@@ -2,6 +2,7 @@
 from pathlib import Path
 import argparse,hashlib,json,os,signal,socket,subprocess,sys,time,traceback,zipfile
 O=Path(__file__).resolve().parent;RT=O/'runtime';T=RT/'outputs/cdf_model_ab'
+active_model_binding=O/'old_model_binding.json'
 sys.path.insert(0,str(RT/'scripts'))
 from phase_e_owned_processes import identity,remember_descendants,reap_owned
 
@@ -20,12 +21,12 @@ def fingerprint():
     for folder in ('src','scripts'):
         files += [p for p in (RT/folder).rglob('*') if p.is_file() and p.suffix in suffixes and '__pycache__' not in p.parts]
     files += [p for p in (RT/'devel/lib').rglob('*') if p.is_file() and p.suffix!='.pyc' and '__pycache__' not in p.parts]
-    names=['plan.json','scenes.json','old_model_binding.json','bootstrap_gate.json']
+    names=['plan.json','scenes.json','bootstrap_gate.json']
     names += ['demo_configuration.json'] if (O/'demo_configuration.json').is_file() else ['mapping_gate.json','guard_qualification.json','detour_route.json']
     files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in names]
     files += [p for p in (O/'scenes').glob('*.world')]
-    binding=json.loads((O/'old_model_binding.json').read_text());files += [Path(binding['checkpoint']),RT/'src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt']
-    files += [O/'new_model_binding.json',RT/'src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt']
+    binding=json.loads(active_model_binding.read_text())
+    files += [active_model_binding,Path(binding['checkpoint']),RT/'src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt']
     files += [RT/'src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt']
     return {str(p.relative_to(O)):sha(p) for p in sorted(set(files))}
 

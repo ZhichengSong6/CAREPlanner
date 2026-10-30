@@ -8,7 +8,7 @@ CAREPlanner 模型资产（2026-10-30）
 SHA256 d153c5b08af0d2b8ce12da500fe13d5d0b04cfc0d9ce07a2e6ad4d2dfd93a4e6
 checkpoint key=5000，ReLU；10维输入，经input/sin/cos编码为30维，隐藏层1024/512/256/128/128，输出1维Signed C-space距离。约18000预训练后5000步微调。25mm是空间采样间距，输出是关节配置空间距离。
 
-旧碰撞 CDF控制：src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt
+旧碰撞 CDF控制（可选，默认演示不需要）：src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt
 SHA256 41a4228eee797971d56b46849e0f52c663eae79dc35667e8704c1bc3c8d72c70
 GELU。根工程的部分历史启动脚本仍默认使用它；最新复现入口通过--model new显式选择新权重与ReLU。
 
@@ -20,7 +20,7 @@ SHA256 4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002
 SHA256 fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df
 混合观察节点的基类先加载该标量模型作粗投影，再由八头 R1 处理分传感器候选；保留它才能复现当前流程。
 
-最新复现包目前校验这四份资产，包含旧碰撞模型控制。prepare.py默认只在重建工作区中建立指向指定资产的链接；不会修改权重。--without-models可准备纯源码构建，随后运行预检查仍需正确权重。
+默认运行只需要三份资产：新碰撞 CDF、VisCDF R1、标量 VisCDF。prepare.py默认只校验并链接这三份权重；运行校验仅包含选中的碰撞模型。进行旧碰撞 CDF 对照时，准备阶段显式添加--include-legacy-models，再运行--model old。不会修改权重。--without-models可准备纯源码构建，随后运行预检查仍需正确权重。
 
 输入统一采用机器人基坐标系xyz（米）和七关节角（弧度）。新碰撞CDF的训练侧完整前向实现、训练URDF/网格/RDF身份，以及实际数据边界仍有待训练侧逐项对账；本地已有ReLU前向/梯度和IPC核查，不能代替上述远端一致性证明。
 
