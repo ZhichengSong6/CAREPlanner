@@ -160,7 +160,7 @@ ENABLE_ORACLE_DIAGNOSTICS="${ENABLE_ORACLE_DIAGNOSTICS:-false}"
 # historical C4/C5 runs are unchanged.  Phase-E per-sensor experiments opt in.
 PER_SENSOR_HYBRID_ENABLED="${PER_SENSOR_HYBRID_ENABLED:-false}"
 FINAL_VBC_RECOVERY_ENABLED="${FINAL_VBC_RECOVERY_ENABLED:-false}"
-PER_SENSOR_CHECKPOINT="${PER_SENSOR_CHECKPOINT:-${REPO}/src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt}"
+PER_SENSOR_CHECKPOINT="${PER_SENSOR_CHECKPOINT:-${REPO}/src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt}"
 PER_SENSOR_SELF_FILTER_URDF="${PER_SENSOR_SELF_FILTER_URDF:-${REPO}/src/arm_description/urdf/Arm_with_self_filter_collision.urdf}"
 PER_SENSOR_BRANCH_ASCENT_STEPS="${PER_SENSOR_BRANCH_ASCENT_STEPS:-1}"
 PER_SENSOR_BRANCH_STEP_SIZE="${PER_SENSOR_BRANCH_STEP_SIZE:-0.05}"

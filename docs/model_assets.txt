@@ -12,15 +12,13 @@ checkpoint key=5000，ReLU；10维输入，经input/sin/cos编码为30维，隐�
 SHA256 41a4228eee797971d56b46849e0f52c663eae79dc35667e8704c1bc3c8d72c70
 GELU。根工程的部分历史启动脚本仍默认使用它；最新复现入口通过--model new显式选择新权重与ReLU。
 
-当前 VisCDF R1：src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt
+统一 VisCDF R1：src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt
 SHA256 4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002
-八个传感器head。实际数据网格30×30×24，空间间距65.517/65.517/50mm，x/y±0.95m、z0..1.15m。FOV-only标签，FOV50°/66°，传感器前向深度0.2..0.7m，delta=0.01m。5mm的历史说法已由用户更正为约5cm空间采样；它不是已验证的预测误差上界。
+一个整体head与八个传感器head，共享一个网络实例；整体投影、回退、分支求解及引导均来自此权重。实际数据网格30×30×24，空间间距65.517/65.517/50mm，x/y±0.95m、z0..1.15m。FOV-only标签，FOV50°/66°，传感器前向深度0.2..0.7m，delta=0.01m。5mm的历史说法已由用户更正为约5cm空间采样；它不是已验证的预测误差上界。
 
-标量 VisCDF 粗投影：src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt
-SHA256 fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df
-混合观察节点的基类先加载该标量模型作粗投影，再由八头 R1 处理分传感器候选；保留它才能复现当前流程。
+旧标量 VisCDF exp1_yiming_k500_fov_signed/final.pt 已从当前运行依赖移除。历史文件可保留用于旧版本对照，当前节点不加载、不自动回退到该模型。
 
-默认运行只需要三份资产：新碰撞 CDF、VisCDF R1、标量 VisCDF。prepare.py默认只校验并链接这三份权重；运行校验仅包含选中的碰撞模型。进行旧碰撞 CDF 对照时，准备阶段显式添加--include-legacy-models，再运行--model old。不会修改权重。--without-models可准备纯源码构建，随后运行预检查仍需正确权重。
+默认运行只需要两份资产：新碰撞 CDF、VisCDF R1。prepare.py默认只校验并链接这两份权重；运行校验仅包含选中的碰撞模型和 R1。进行旧碰撞 CDF 对照时，准备阶段显式添加--include-legacy-models，再运行--model old，VisCDF 仍为统一 R1。不会修改权重。--without-models可准备纯源码构建，随后运行预检查仍需正确权重。
 
 输入统一采用机器人基坐标系xyz（米）和七关节角（弧度）。新碰撞CDF的训练侧完整前向实现、训练URDF/网格/RDF身份，以及实际数据边界仍有待训练侧逐项对账；本地已有ReLU前向/梯度和IPC核查，不能代替上述远端一致性证明。
 

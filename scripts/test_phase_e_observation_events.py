@@ -15,6 +15,29 @@ from analyze_phase_e_observation_events import exact_raw_map, analyze, string_ro
 
 
 class EventTests(unittest.TestCase):
+    def test_simulated_clock_preamble_keeps_real_records_and_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'execution.csv'
+            path.write_text('WARNING: no messages received and simulated time is active.\n'
+                            'Is /clock being published?\n%time,field.data\n'
+                            '500000000,vbc success=1 has_violation=0\n'
+                            '2000000000,vbc success=1 has_violation=0 xyz=1,2,3\n')
+            rows=string_rows(path,dict(start_ros_s=1,end_ros_s=5))
+            self.assertEqual(len(rows),1)
+            self.assertEqual(rows[0]['success'],'1')
+            self.assertEqual(rows[0]['xyz'],'1,2,3')
+            self.assertEqual(rows[0]['ros_s'],2.)
+
+    def test_clock_warning_without_messages_is_empty_but_bad_header_is_not(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'optional.csv'
+            preamble='WARNING: no messages received and simulated time is active.\nIs /clock being published?\n'
+            path.write_text(preamble)
+            window=dict(start_ros_s=1,end_ros_s=5)
+            self.assertEqual(string_rows(path,window),[])
+            path.write_text(preamble+'wrong,header\n')
+            with self.assertRaises(ValueError):string_rows(path,window)
+
     def test_silent_ros_string_recorder_is_empty_not_malformed(self):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'optional.csv'

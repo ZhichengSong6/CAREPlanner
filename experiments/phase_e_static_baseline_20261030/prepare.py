@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconstruct the completed study in a NEW directory; never starts a run."""
+"""Prepare the current runtime in a NEW directory; never starts a run."""
 import argparse
 import hashlib
 import json
@@ -113,6 +113,7 @@ def main():
     (out/'preparation.json').write_text(json.dumps(dict(status='PREPARED',source_manifest_sha256=digest(PACKAGE/'source_manifest.json'),
         files=len(manifest['files']),models_attached=not args.without_models,inputs_attached=input_root is not None,build_only_cmake_additions=build_edits,
         model_paths=[model['path'] for model in models] if not args.without_models else [],
+        visibility_backend='r1_shared_union_sensors',
         portability_edits=portability_edits,mode='demo' if args.demo else 'study',selected_policy='current',new_windows=0),indent=2)+'\n')
     print(json.dumps(dict(status='PREPARED',runtime=str(runtime),new_windows=0)))
 

@@ -52,17 +52,18 @@ from evaluate_direct_vs_projection_ascent import (  # noqa: E402
     DEFAULT_JOINT_NAMES,
     DEFAULT_SENSOR_FRAMES,
     PinocchioFOVOracle,
-    build_model_from_checkpoint,
     learned_ascent_step,
     learned_projection_step,
     model_value_and_grad_q,
     oracle_visibility_g,
-    torch_load_checkpoint,
+)
+from r1_visibility_model import (  # noqa: E402
+    HierarchicalUnionView, R1_SHA256, load_r1_checkpoint,
 )
 
 
 DEFAULT_CHECKPOINT = (
-    PACKAGE_DIR / "checkpoints" / "exp1_yiming_k500_fov_signed" / "final.pt"
+    PACKAGE_DIR / "checkpoints" / "hierarchical9_r1_scratch50k" / "final.pt"
 )
 DEFAULT_URDF = Path(rospkg.RosPack().get_path("arm_description")) / "urdf" / "Arm.urdf"
 DEFAULT_OUTPUT_ROOT = (
@@ -161,13 +162,20 @@ class VbcDeadlineWaypointNode:
         self.output_root.mkdir(parents=True, exist_ok=True)
 
         self.device = torch.device(self.device_name)
-        rospy.loginfo("[vbc_waypoint] loading frozen VisCDF model...")
-        checkpoint = torch_load_checkpoint(str(self.checkpoint_path), self.device)
-        self.model, self.checkpoint_args = build_model_from_checkpoint(checkpoint, self.device)
+        rospy.loginfo("[vbc_waypoint] loading shared R1 union/sensor model...")
+        self.r1_sensor_model, self.r1_checkpoint = load_r1_checkpoint(
+            self.checkpoint_path, self.device)
+        self.model = HierarchicalUnionView(
+            self.r1_sensor_model.full_model).eval()
+        self.checkpoint_args = dict(self.r1_checkpoint["args"])
+        self.visibility_model_metadata = dict(
+            backend="r1_shared_union_sensors", checkpoint=str(self.checkpoint_path),
+            checkpoint_sha256=R1_SHA256, union_output=0, sensor_outputs=list(range(1, 9)))
         self.q_min = torch.tensor(self.q_min_list, device=self.device, dtype=torch.float32)
         self.q_max = torch.tensor(self.q_max_list, device=self.device, dtype=torch.float32)
         self._initialize_optional_oracles()
-        rospy.logwarn("[vbc_waypoint] frozen model READY: %s", self.checkpoint_path)
+        rospy.logwarn("[vbc_waypoint] R1 MODEL READY: %s sha256=%s union=0 sensors=1..8",
+                      self.checkpoint_path, R1_SHA256)
 
         self._target: Optional[PointStamped] = None
         self._target_xyz: Optional[np.ndarray] = None

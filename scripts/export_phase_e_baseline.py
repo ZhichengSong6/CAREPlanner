@@ -20,8 +20,8 @@ def external_runtime_input(rel):
     return str(rel).startswith('scripts/fixtures/') or str(rel) in RECORDED_CASES
 
 
-def portable_case_runner(text):
-    """Fingerprint the study's actual models, including its scalar projector."""
+def portable_case_runner(text, *, r1_shared=False):
+    """Fingerprint the source study's models without changing its semantics."""
     text = text.replace('from run_phase_e_repeatability import fingerprint as base_fingerprint\n', '')
     old = '    result=base_fingerprint()'
     replacement = '''    suffixes = {'.cpp', '.hpp', '.h', '.py', '.yaml', '.yml', '.launch',
@@ -35,6 +35,9 @@ def portable_case_runner(text):
     result = {os.path.relpath(p, REPO): hashlib.sha256(p.read_bytes()).hexdigest()
               for p in sorted(paths)}'''
     if old not in text:
+        assets = 'R1, GCDF' if r1_shared else 'R1, SCALAR, GCDF'
+        if f'    paths.update(({assets}, CASES, MODEL_BINDING_PATH))' in text:
+            return text  # Re-export of an already portable runtime.
         raise ValueError('Unrecognized case runner fingerprint implementation')
     text = text.replace(old, replacement, 1)
     text = text.replace('MODEL_BINDING_PATH = ',
@@ -49,6 +52,11 @@ def portable_case_runner(text):
     text = text.replace('    assert ids == [f"phase_e_goal_{i:03d}" for i in range(30)], "not original ordered 30"',
         '    expected = DEMO[\'case_ids\'] if DEMO else [f"phase_e_goal_{i:03d}" for i in range(30)]\n'
         '    assert ids == expected, "unexpected task configuration"', 1)
+    if r1_shared:
+        text = text.replace('paths.update((R1, SCALAR, GCDF, CASES, MODEL_BINDING_PATH))',
+                            'paths.update((R1, GCDF, CASES, MODEL_BINDING_PATH))')
+        text = text.replace('SCALAR = REPO / "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt"\n', '')
+        text = text.replace('    assert sha(SCALAR) == "fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df", "scalar projector SHA changed"\n', '')
     return text
 
 
@@ -69,6 +77,9 @@ def export(study, destination):
     if (destination / 'source_manifest.json').exists():
         raise FileExistsError('A baseline export already exists at this destination')
     runtime = study / 'fixed/runtime'
+    # Historical exports retain their original model dependencies. The current
+    # package uses shared R1; exporting an older study must not silently claim it did.
+    r1_shared = 'r1_shared_union_sensors' in (runtime / 'src/care_visibility_cdf/scripts/vbc_deadline_waypoint_node.py').read_text()
     destination.mkdir(parents=True, exist_ok=True)
     entries = []
     inputs = []
@@ -119,15 +130,20 @@ def export(study, destination):
         text = source.read_text()
         text = text.replace(str(study), '@BASELINE_RUN@').replace(str(ROOT), '@REPO_ROOT@')
         if str(relative) == 'fixed/runtime_inputs/cdf_model_ab/run_case.py':
-            text = portable_case_runner(text)
+            text = portable_case_runner(text, r1_shared=r1_shared)
+        elif str(relative) == 'fixed/runtime_inputs/cdf_model_ab/analyze.py':
+            text = text.replace("return string_rows(p,w) if p.is_file() and p.read_text().startswith('%time,field.data') else []", "return string_rows(p,w)")
         elif str(relative) == 'run.py':
-            text = text.replace('    env=m.environment(item)\n',
-                "    env=m.environment(item)\n    m.active_model_binding=Path(env['CARE_CDF_MODEL_BINDING'])\n", 1)
+            if 'm.active_model_binding=' not in text:
+                text = text.replace('    env=m.environment(item)\n',
+                    "    env=m.environment(item)\n    m.active_model_binding=Path(env['CARE_CDF_MODEL_BINDING'])\n", 1)
         elif str(relative) == 'fixed/run_study.py':
-            text = text.replace("O=Path(__file__).resolve().parent;RT=O/'runtime';T=RT/'outputs/cdf_model_ab'\n",
-                "O=Path(__file__).resolve().parent;RT=O/'runtime';T=RT/'outputs/cdf_model_ab'\nactive_model_binding=O/'old_model_binding.json'\n", 1)
-            text = text.replace('    return {str(p.relative_to(O)):sha(p)',
-                "    files += [RT/'src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt']\n    return {str(p.relative_to(O)):sha(p)", 1)
+            if 'active_model_binding=' not in text:
+                text = text.replace("O=Path(__file__).resolve().parent;RT=O/'runtime';T=RT/'outputs/cdf_model_ab'\n",
+                    "O=Path(__file__).resolve().parent;RT=O/'runtime';T=RT/'outputs/cdf_model_ab'\nactive_model_binding=O/'old_model_binding.json'\n", 1)
+            if not r1_shared and 'exp1_yiming_k500_fov_signed/final.pt' not in text:
+                text = text.replace('    return {str(p.relative_to(O)):sha(p)',
+                    "    files += [RT/'src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt']\n    return {str(p.relative_to(O)):sha(p)", 1)
             text = text.replace("    files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in ('plan.json','scenes.json','old_model_binding.json','mapping_gate.json','bootstrap_gate.json','guard_qualification.json','detour_route.json')]",
                 "    names=['plan.json','scenes.json','bootstrap_gate.json']\n"
                 "    names += ['demo_configuration.json'] if (O/'demo_configuration.json').is_file() else ['mapping_gate.json','guard_qualification.json','detour_route.json']\n"
@@ -162,11 +178,16 @@ def export(study, destination):
     save(destination/'input_assets.json',dict(schema=1,files=inputs,
         path_replacements={str(study):'@BASELINE_RUN@',str(ROOT):'@REPO_ROOT@'},
         note='Paths and checksums only. Recorded inputs stay local and are supplied with prepare.py --inputs-root.'))
-    save(destination/'model_assets.json',dict(models=[
+    models=[
         dict(path='src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt',required=True,role='current collision CDF',sha256='d153c5b08af0d2b8ce12da500fe13d5d0b04cfc0d9ce07a2e6ad4d2dfd93a4e6',activation='relu',checkpoint_key='5000'),
         dict(path='src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt',required=False,role='optional legacy collision CDF comparison',sha256='41a4228eee797971d56b46849e0f52c663eae79dc35667e8704c1bc3c8d72c70',activation='gelu',checkpoint_key='latest'),
-        dict(path='src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt',required=True,role='current per-sensor VisCDF R1',sha256='4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002'),
-        dict(path='src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt',required=True,sha256='fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df',role='scalar VisCDF coarse projector used by the hybrid runtime')]))
+        dict(path='src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt',required=True,
+             role='shared VisCDF R1 union and eight sensor branches' if r1_shared else 'current per-sensor VisCDF R1',
+             sha256='4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002')]
+    if not r1_shared:
+        models.append(dict(path='src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt',required=True,
+            sha256='fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df',role='scalar VisCDF coarse projector used by the historical hybrid runtime'))
+    save(destination/'model_assets.json',dict(models=models))
     print(json.dumps(dict(files=len(entries),overlays=sum(e.get('source')=='overlay' for e in entries),destination=str(destination))))
 
 

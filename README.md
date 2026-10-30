@@ -16,7 +16,7 @@ bash scripts/setup_runtime.sh
 
 安装脚本要求已安装 ROS Noetic 和 Conda；会安装构建依赖，并创建 `careplanner` Python 3.10 环境。PyTorch 固定为 2.11.0，使用 [官方 CUDA 12.8 wheel 索引](https://download.pytorch.org/whl/cu128/torch/)。不修改显卡驱动。
 
-运行前需要三份指定推理权重：新碰撞 CDF、VisCDF R1 和仍参与观察位姿求解的标量 VisCDF。旧碰撞 CDF 仅供可选对照，默认演示不需要。路径与校验值见 [模型资产说明](docs/model_assets.txt)。
+运行前需要两份指定推理权重：新碰撞 CDF 和 VisCDF R1。整体可见性与八个传感器分支共享同一个 R1 网络实例，不加载旧标量 VisCDF。旧碰撞 CDF 仅供可选对照，默认演示不需要。路径与校验值见 [模型资产说明](docs/model_assets.txt)。
 
 ## 运行
 

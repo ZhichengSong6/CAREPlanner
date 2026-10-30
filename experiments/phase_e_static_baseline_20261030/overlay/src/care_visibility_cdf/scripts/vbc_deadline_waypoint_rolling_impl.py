@@ -76,8 +76,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         self._shared_min_f = math.nan
         self._shared_solution_mode = "single_target"
 
-        # Experimental hybrid runtime.  Scalar VisCDF remains the coarse
-        # projector; the 8-head model is consulted only after scalar q_zero.
+        # One R1 instance supplies both the union projector and sensor branches.
         self.per_sensor_hybrid_enabled = False
         self._per_sensor_runtime = None
 
@@ -106,9 +105,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
         self.per_sensor_hybrid_enabled = bool(rospy.get_param(
             "~per_sensor_hybrid_enabled", False))
-        default_per_sensor_checkpoint = (
-            Path(__file__).resolve().parent.parent
-            / "checkpoints" / "per_sensor_e2e_fullbatch_seed0" / "final.pt")
+        default_per_sensor_checkpoint = self.checkpoint_path
         self.per_sensor_checkpoint_path = Path(rospy.get_param(
             "~per_sensor_checkpoint",
             str(default_per_sensor_checkpoint))).expanduser().resolve()
@@ -156,6 +153,8 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             raise ValueError("~per_sensor_replacement_min_conservative_g must be in [-0.02,0]")
 
         if self.per_sensor_hybrid_enabled:
+            if self.per_sensor_checkpoint_path != self.checkpoint_path:
+                raise ValueError("Union and sensor branches must use the same R1 checkpoint")
             if not self.per_sensor_checkpoint_path.is_file():
                 raise FileNotFoundError(
                     "per-sensor checkpoint not found: {}".format(
@@ -185,7 +184,10 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 min_conservative_g=self.per_sensor_min_conservative_g,
                 require_primitive_los=self.per_sensor_require_primitive_los,
                 allow_nominal_proposals=self.per_sensor_allow_nominal_proposals,
+                r1_bundle=(self.r1_sensor_model, self.r1_checkpoint),
             )
+            assert self._per_sensor_runtime.model.full_model is self.model.full_model
+            rospy.logwarn("[vbc_waypoint_rolling] R1 SHARED INSTANCE: union and sensors use one loaded model")
             rospy.logwarn(
                 "[vbc_waypoint_rolling] PER-SENSOR HYBRID ENABLED "
                 "checkpoint=%s solver=projection_root_ascent "
@@ -202,7 +204,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         else:
             rospy.loginfo(
                 "[vbc_waypoint_rolling] per-sensor hybrid disabled; "
-                "frozen scalar runtime unchanged")
+                "R1 union-only projection enabled")
 
         self.selection_active_sub = rospy.Subscriber(
             self.selection_active_topic, Bool,
@@ -306,13 +308,11 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
     def _apply_per_sensor_hybrid_impl(
             self, points_np: np.ndarray, result: Dict[str, object]):
-        """Post-process scalar q_zero with mode-preserving 8-head fallback.
+        """Refine the shared R1 union proposal using its sensor outputs.
 
-        Ranking is evaluated at scalar q_zero, but every sensor branch is solved
-        independently from q_deadline_nominal using the SAME
-        projection -> root-refinement -> ascent semantics as the frozen scalar
-        VisCDF.  In Phase-E obligation generation q_deadline_nominal is the
-        measured-q seed.  The scalar q_vis remains the fail-soft fallback.
+        Sensor ranking and solving both start at q_deadline_nominal (the
+        measured-q seed in Phase-E). The R1 union q_vis is the fallback.
+        Legacy scalar-named trace fields below now refer to that union output.
         """
         # Scalar/fallback q_vis is a seven-joint target.  A successful
         # per-sensor branch replaces this with that sensor's kinematic mask.
@@ -323,7 +323,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             rospy.logerr_throttle(
                 1.0,
                 "[vbc_waypoint_rolling] per-sensor hybrid enabled but runtime "
-                "helper is unavailable; preserving scalar q_vis")
+                "helper is unavailable; preserving R1 union q_vis")
             result["per_sensor_hybrid"] = dict(enabled=True, accepted=False,
                 runtime_error="runtime_unavailable", compute_ms=0.0,
                 scalar_q_vis_preserved=True)
@@ -370,7 +370,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         except Exception as exc:
             rospy.logerr(
                 "[vbc_waypoint_rolling] per-sensor branch generation failed; "
-                "preserving scalar q_vis: %s", exc)
+                "preserving R1 union q_vis: %s", exc)
             result["per_sensor_hybrid"] = {
                 "enabled": True,
                 "accepted": False,
@@ -393,7 +393,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         if not hybrid["accepted"]:
             rospy.logwarn(
                 "[vbc_waypoint_rolling] per-sensor branches all rejected "
-                "(ranking=%s rejected=%s); preserving scalar q_vis",
+                "(ranking=%s rejected=%s); preserving R1 union q_vis",
                 hybrid.get("ranking"), hybrid.get("rejected_sensor_ids"))
             return result
 
@@ -406,8 +406,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             q_vis_np.reshape(1, 7),
             device=self.device, dtype=torch.float32)
 
-        # Keep legacy scalar result fields internally coherent even though the
-        # branch candidate was chosen by the per-sensor model.
+        # Overall diagnostic values come from the same R1 model's union head.
         final_values = self._per_point_values(x, q_vis)
         result["q_vis"] = q_vis_np.astype(float).tolist()
         result["final_f_min"] = float(np.min(final_values))

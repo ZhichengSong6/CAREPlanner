@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""Runtime helper for hybrid scalar + per-sensor Visibility CDF steering.
+"""Sensor-branch steering; the current node shares one R1 with its union head.
 
-The frozen scalar VisCDF remains the coarse union/manifold projector.  After the
-scalar q_zero is available, an 8-output sensor view (legacy 8-head, or H9
-output[1:9]) preserves sensor modes:
+The current node provides the R1 sensor view already loaded for union projection.
+Historical eight-head/H9 loaders remain available to offline comparison tools.
+Each branch preserves its sensor identity:
 
-    scalar q_zero
+    measured branch seed
         -> rank the 8 learned sensor heads
         -> for each sensor, solve its OWN field exactly like the legacy scalar:
              projection -> sign-crossing root refinement -> small ascent
         -> conservative analytic FOV check
         -> zero-padding primitive self-occlusion check
-        -> accept first certified branch, or fall back to scalar q_vis
+        -> select a certified branch, or keep the R1 union proposal
 
 Important runtime semantic:
-  * ranking is evaluated at scalar q_zero;
+  * ranking is evaluated at the branch seed;
   * each sensor branch is solved from the branch seed (Phase-E uses the current
-    measured q through q_deadline_nominal), NOT from the S4-dominated scalar
-    q_zero;
+    measured q through q_deadline_nominal), not from the union q_zero;
   * self-occlusion is checked only on the final branch candidate, never inside
     learned projection/ascent iterations;
   * final GCDF / exact VBC remain the execution safety authorities.
@@ -44,7 +43,7 @@ from evaluate_direct_vs_projection_ascent import (
     torch_load_checkpoint,
 )
 from hierarchical_visibility_cdf_model import build_from_checkpoint_args
-from r1_visibility_model import R1_SHA256, load_r1_checkpoint
+from r1_visibility_model import HierarchicalSensorView, R1_SHA256, load_r1_checkpoint
 from validate_visibility_oracle import (
     find_chain_joints,
     fk_transform,
@@ -247,14 +246,23 @@ def _parse_skips(raw) -> Tuple[int, ...]:
     return ()
 
 
-def build_per_sensor_model(checkpoint_path: str, device: torch.device):
+def build_per_sensor_model(checkpoint_path: str, device: torch.device, r1_bundle=None):
     # Hash before unpickling.  H9 V1 is a fixed runtime artifact and must match
     # the reviewed final.pt byte-for-byte regardless of its filename.
     checkpoint_sha256 = _checkpoint_sha256(checkpoint_path)
+    if r1_bundle is not None and checkpoint_sha256 != R1_SHA256:
+        raise ValueError("Shared R1 runtime requires the same R1 checkpoint")
     # Dispatch the pinned R1 before the generic loader: deserialize only once,
     # using its independent private-tail definition (never the V1 constructor).
     if checkpoint_sha256 == R1_SHA256:
-        model, ckpt = load_r1_checkpoint(checkpoint_path, device)
+        if r1_bundle is None:
+            model, ckpt = load_r1_checkpoint(checkpoint_path, device)
+        else:
+            model, ckpt = r1_bundle
+            if not isinstance(model, HierarchicalSensorView):
+                raise TypeError("Shared R1 requires a HierarchicalSensorView")
+            if next(model.parameters()).device != torch.empty(0, device=device).device:
+                raise ValueError("Shared R1 device differs from the branch device")
         _record_runtime_model_metadata(
             ckpt, checkpoint_sha256, "hierarchical9_r1_sensor_view"
         )
@@ -383,6 +391,7 @@ class PerSensorVisibilityRuntime:
         nominal_z_max: float = 0.75,
         require_primitive_los: bool = True,
         allow_nominal_proposals: bool = False,
+        r1_bundle=None,
     ) -> None:
         if projection_iters < 1:
             raise ValueError("projection_iters must be >= 1")
@@ -456,7 +465,7 @@ class PerSensorVisibilityRuntime:
         )
 
         self.model, self.checkpoint = build_per_sensor_model(
-            self.checkpoint_path, self.device
+            self.checkpoint_path, self.device, r1_bundle=r1_bundle
         )
         self.ray_args = _RayArgs()
 
@@ -1353,6 +1362,8 @@ class PerSensorVisibilityRuntime:
                 if selected is not None else None
             ),
             "scalar_q_zero": q_zero_np.astype(float).tolist(),
+            "union_q_zero": q_zero_np.astype(float).tolist(),
+            "ranking_source": "branch_seed",
             "branch_seed_q": branch_seed_np.astype(float).tolist(),
             "scores_at_scalar_q_zero": [float(v) for v in scores.tolist()],
             "scores_at_branch_seed": [float(v) for v in seed_scores.tolist()],

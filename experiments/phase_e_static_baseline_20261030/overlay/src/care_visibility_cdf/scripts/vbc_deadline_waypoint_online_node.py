@@ -67,7 +67,7 @@ class _OnlineRuntimeMixin:
                 model_value_and_grad_q(x, q, self.model)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
-        scalar_ms = (time.perf_counter() - tic) * 1000.0
+        union_ms = (time.perf_counter() - tic) * 1000.0
         branch_ms = math.nan
         if (getattr(self, "per_sensor_hybrid_enabled", False) and
                 getattr(self, "_per_sensor_runtime", None) is not None):
@@ -83,9 +83,9 @@ class _OnlineRuntimeMixin:
             if no_target:
                 self.waypoint_pub.publish(Float64MultiArray())
         rospy.logwarn(
-            "[vbc_waypoint_online] ONLINE WARMUP READY: scalar=%.2f ms "
+            "[vbc_waypoint_online] ONLINE WARMUP READY: r1_union=%.2f ms "
             "per_sensor=%s device=%s batch=8 passes=2",
-            scalar_ms,
+            union_ms,
             ("{:.2f}ms".format(branch_ms)
              if math.isfinite(branch_ms) else "disabled"),
             str(self.device))

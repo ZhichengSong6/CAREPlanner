@@ -1738,16 +1738,16 @@
     {
       "path": "src/care_visibility_cdf/scripts/per_sensor_visibility_runtime.py",
       "kind": "file",
-      "sha256": "9358e6374b053537ea03a783bcd7a5931194d36a43df56f027150c5319016d16",
-      "git_blob": "f156a9288cc3288cc8f4973c5cd58697a3723dd9",
+      "sha256": "ca0fc9af79f8925acde9f5d5da263a198ba46e406eb925d7d00d462a691e82de",
+      "git_blob": "6a9def925a761b2c782afccbe33056a98d416dc9",
       "mode": 436,
       "source": "overlay"
     },
     {
       "path": "src/care_visibility_cdf/scripts/r1_visibility_model.py",
       "kind": "file",
-      "sha256": "a228150233e74869bbe552b0512ae0a1e43928d7e028f6a19b147062f3c450b1",
-      "git_blob": "fd173704a006a6db9a55e27ab7e629fb8c919305",
+      "sha256": "9b9c90a8d9acd424e14395f8bbc28095e225e92394ff12039d7ffa134d564e10",
+      "git_blob": "2424646fbbf388ddd00b6c6de8de89fc57da062f",
       "mode": 436,
       "source": "repository"
     },
@@ -1906,24 +1906,24 @@
     {
       "path": "src/care_visibility_cdf/scripts/vbc_deadline_waypoint_node.py",
       "kind": "file",
-      "sha256": "75ed4f13a1302628e61314e8c38dff3096c7753c198c294bcd3361a89da0fbfe",
-      "git_blob": "2c08c661855fd8d00b0d6f4946b422ea8a5c7046",
+      "sha256": "1544eae8d27bf0dd6e196a8cc57325a331e45dfdc8c2593c685ddcf65b76e1c9",
+      "git_blob": "d3929b9fcba715da2d3c9bf7a3b34c6409a2db67",
       "mode": 436,
       "source": "repository"
     },
     {
       "path": "src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py",
       "kind": "file",
-      "sha256": "ea27f8c5b6e466e6e000aa2cb363fb271f2ba3e6722c1e92e3fcf472cd9553d1",
-      "git_blob": "c806ecab48169bc52949e7b84f04442d45023077",
+      "sha256": "60d8b0791279a6bf2caa12576cc582ea812eb9bb4931fb19caa097ccf7a34f56",
+      "git_blob": "000448beba292a339b9185d82b4c8d91954cebd4",
       "mode": 436,
       "source": "overlay"
     },
     {
       "path": "src/care_visibility_cdf/scripts/vbc_deadline_waypoint_rolling_impl.py",
       "kind": "file",
-      "sha256": "93018e0de4c42007a6e47c69395ec10bb3d5365b3b22593fd67579f25b1ac305",
-      "git_blob": "182d3c025f75a17ec468d248b2669735f59b17ce",
+      "sha256": "688d316f9b146be4d9a2ce4912a8f953e8aab2073cf4a548e0091fedc99b9e2a",
+      "git_blob": "4e39117e37255f933e20636de79c2db94bba3559",
       "mode": 436,
       "source": "overlay"
     },
@@ -1962,8 +1962,8 @@
     {
       "path": "src/care_visibility_cdf/scripts/vbc_multi_deadline_obligation_impl.py",
       "kind": "file",
-      "sha256": "8c4ab19eb12a13e90dd8292399bd3a64264d3974054dbf03dbeb4aef5a351bf0",
-      "git_blob": "683114069107390b8a8aa3395be09a8c9f6774d3",
+      "sha256": "2faef0302a8e5163988952c89e6098074471c1274920b2f06af29d8ed2c97837",
+      "git_blob": "5e67419d788b3dd037eba777b9ad214c8f0af7a4",
       "mode": 436,
       "source": "overlay"
     },
@@ -4730,8 +4730,8 @@
     {
       "path": "scripts/analyze_phase_e_observation_events.py",
       "kind": "file",
-      "sha256": "3ace84e3bdc39730737685ababc556cd80cd70137ee3cf9014cbdf7fdd88edb2",
-      "git_blob": "6292df26fd8441513dcab48d572ecc42fec9a32b",
+      "sha256": "59f8e0c87c5484a98d497d70aa2824cc679cb59f5dbe25008e6242a9f4c8d491",
+      "git_blob": "53bcda915272e2f02a5b4dbff0d92dbed40b8149",
       "mode": 436,
       "source": "repository"
     },
@@ -5842,8 +5842,8 @@
     {
       "path": "scripts/run_phase_c4_4_verified_regime_smoke.sh",
       "kind": "file",
-      "sha256": "3151a115dd875f7c8f500669321ddb732f38ae775077ab68c1f2f7895b358ae0",
-      "git_blob": "fb149a2e6f3e3adeaa18792addadaaa57be7d357",
+      "sha256": "bcec80608836b26f970c9774ee090552605ad862631255ac12a468b32da11e00",
+      "git_blob": "b5f69d628b5d463ffc45c957ce8d144fddaa4e5a",
       "mode": 436,
       "source": "overlay"
     },
@@ -7146,8 +7146,8 @@
     {
       "path": "scripts/test_phase_e_observation_events.py",
       "kind": "file",
-      "sha256": "ee0bd2fe11818de51b84b37fe4ed9e441846e6cdaed6530d511f5d369ab13ae7",
-      "git_blob": "48d7dcdd15032ee71f490437bb33356f345c6f7a",
+      "sha256": "a042dc6ef1dec51f9efe94db485ca648a6119c700c0b5f73f6ae9b7e7d836ab6",
+      "git_blob": "c07694d3f8a92b5276737a93b1ca8f8929d518af",
       "mode": 436,
       "source": "repository"
     },
@@ -7930,8 +7930,8 @@
     {
       "path": "scripts/test_r1_runtime_integration.py",
       "kind": "file",
-      "sha256": "3ca871d02318a4e6dc7b8d5b1b754edb6fe75ca817e49206987d6baa24d3ba4c",
-      "git_blob": "4a9e69719356caa7ed46891488140e3fc873af04",
+      "sha256": "e95ae56ddcaaa50dd859da05c4760bcd870d9877a29d878973ab97033695f80f",
+      "git_blob": "2b9132e52d0696768c0c4eda1460f367168b2f26",
       "mode": 436,
       "source": "repository"
     },
@@ -8424,5 +8424,7 @@
       "source": "repository"
     }
   ],
-  "scope": "Source and build/runtime configuration only; recorded fixtures, qualifications, calibration data and results are external."
+  "scope": "Source and build/runtime configuration only; recorded fixtures, qualifications, calibration data and results are external.",
+  "runtime_revision": "r1_shared_union_sensors_20261030",
+  "runtime_change": "Use one R1 model instance for union projection, sensor branches and fallback; original sealed study is unchanged. Analysis accepts the rostopic simulated-clock warning before a valid CSV header."
 }

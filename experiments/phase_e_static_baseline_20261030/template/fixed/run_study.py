@@ -27,7 +27,6 @@ def fingerprint():
     files += [p for p in (O/'scenes').glob('*.world')]
     binding=json.loads(active_model_binding.read_text())
     files += [active_model_binding,Path(binding['checkpoint']),RT/'src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt']
-    files += [RT/'src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt']
     return {str(p.relative_to(O)):sha(p) for p in sorted(set(files))}
 
 def freeze_check():

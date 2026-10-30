@@ -64,6 +64,17 @@ def run(checkpoint, device):
             "Wrong parameter count")
     require(not model.training and not model.full_model.training, "Not eval")
     require(all(not p.requires_grad for p in model.parameters()), "Not frozen")
+    union = r1.HierarchicalUnionView(model.full_model).eval()
+    with patch.object(torch, "load", side_effect=AssertionError("R1 loaded twice")):
+        shared, shared_ckpt = runtime.build_per_sensor_model(
+            str(checkpoint), device, r1_bundle=(model, ckpt))
+    require(shared is model and shared.full_model is union.full_model and shared_ckpt is ckpt,
+            "Union and sensor branches must share one network instance")
+    with patch.object(runtime, "_checkpoint_sha256", return_value="0" * 64), \
+            patch.object(torch, "load", side_effect=AssertionError("Unpickled mismatched model")):
+        expect_error(lambda: runtime.build_per_sensor_model(
+            str(checkpoint), device, r1_bundle=(model, ckpt)),
+            ValueError, "same R1 checkpoint")
     require(ckpt["runtime_adapter"] == {
         "model_type": "hierarchical9_r1_sensor_view",
         "checkpoint_sha256": r1.R1_SHA256,
@@ -92,6 +103,14 @@ def run(checkpoint, device):
         torch.testing.assert_close(model(inp), eight, rtol=0, atol=0)
         value_error = (full - full_ref).abs().max().item()
         view_error = (eight - full_ref[:, 1:9]).abs().max().item()
+        require(union(inp).shape == (17, 1), "Union view must preserve scalar solver shape")
+        union_error = (union(inp)[:, 0] - full_ref[:, 0]).abs().max().item()
+        vr, gr = value_gradient(ref, x, q, 0)
+        vu, gu = value_gradient(union, x, q, 0)
+        union_gradient_error = (gr - gu).abs().max().item()
+        require(union_error <= 2e-6 and union_gradient_error <= 3e-6
+                and (vr-vu).abs().item() <= 2e-6 and torch.isfinite(gu).all().item(),
+                "R1 union value/input-gradient differs from training reference")
         sensors = []
         for sensor in range(8):
             vr, gr = value_gradient(ref, x, q, sensor + 1)
@@ -112,6 +131,8 @@ def run(checkpoint, device):
                 "Runtime output/recompute check failed")
         cases.append({"seed": seed, "full_output_max_abs_error": value_error,
                       "view_max_abs_error": view_error, "q_recompute_delta": delta,
+                      "union_max_abs_error": union_error,
+                      "union_q_gradient_max_abs_error": union_gradient_error,
                       "sensors": sensors})
 
     # Metadata/hash failures and missing weights must not be silently repaired.
@@ -151,6 +172,7 @@ def run(checkpoint, device):
         "tf32": False, "amp": False, "dtype": "float32",
         "standalone_reference_checks": definition,
         "production_loader": {"metadata": ckpt["runtime_adapter"],
+                              "union_sensor_shared_instance": True,
                               "deserialization_count": load.call_count,
                               "state_dict_tensor_count": len(ref.state_dict()),
                               "parameter_count": r1.R1_PARAMETERS, "cases": cases},

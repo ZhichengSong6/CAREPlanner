@@ -14,7 +14,7 @@ summary_path=ROOT/'outputs/phase_e_r1_mainline_30'/BATCH/'case_summaries'/('phas
 summary=json.loads(summary_path.read_text());w=summary['benchmark_window']
 def rows(name):
     p=RUN/(name+'.csv')
-    return string_rows(p,w) if p.is_file() and p.read_text().startswith('%time,field.data') else []
+    return string_rows(p,w)
 def number(value):
     v=float(value)
     return v if math.isfinite(v) else None

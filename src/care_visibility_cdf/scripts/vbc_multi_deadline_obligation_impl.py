@@ -565,6 +565,8 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             compute_ms=float(q_vis_generation_ms),
             per_sensor_hybrid=result.get("per_sensor_hybrid", {"enabled": False}),
             scalar_final_f=float(result["final_f_min"]),
+            union_final_f=float(result["final_f_min"]),
+            visibility_model=getattr(self, "visibility_model_metadata", None),
             oracle=result.get("final_oracle_diagnostic"))
 
         # Save a compact per-obligation trace alongside existing projector traces.

@@ -27,13 +27,18 @@ def string_rows(path, window):
     if not path.exists(): return []
     out=[]
     with path.open() as stream:
-        first_line = stream.readline()
         # rostopic writes its header only after the first message. A recorder
-        # for an optional, silent diagnostic topic therefore produces zero bytes.
-        if first_line == '': return []
-        header = first_line.strip()
-        if header != '%time,field.data':
-            raise ValueError('Expected a two-column ROS String trace: ' + str(path))
+        # may emit simulated-clock warnings while waiting for that message.
+        preamble = {'WARNING: no messages received and simulated time is active.',
+                    'Is /clock being published?'}
+        for first_line in stream:
+            header = first_line.strip()
+            if header in preamble: continue
+            if header != '%time,field.data':
+                raise ValueError('Expected a two-column ROS String trace: ' + str(path))
+            break
+        else:
+            return []
         for line in stream:
             stamp_text, separator, payload = line.rstrip('\r\n').partition(',')
             if not separator: continue

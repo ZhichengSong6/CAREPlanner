@@ -21,7 +21,7 @@ def fingerprint():
     paths = {p for root in ('src', 'scripts') for p in (REPO / root).rglob('*')
              if p.is_file() and (p.suffix in suffixes or p.name == 'CMakeLists.txt')
              and not any(x in p.parts for x in ('third_party', '__pycache__'))}
-    paths.update((R1, SCALAR, GCDF, CASES, MODEL_BINDING_PATH))
+    paths.update((R1, GCDF, CASES, MODEL_BINDING_PATH))
     paths.update(p for p in (REPO / 'devel/lib').rglob('*') if p.is_file()
                  and p.suffix != '.pyc' and '__pycache__' not in p.parts)
     result = {os.path.relpath(p, REPO): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -36,7 +36,6 @@ REPO = Path(__file__).resolve().parents[2]
 CASES = REPO / "outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json"
 PRIOR = REPO / "src/care_confidence_map/config/confidence_map_case001_motion_prior.yaml"
 R1 = REPO / "src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt"
-SCALAR = REPO / "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt"
 MODEL_BINDING_PATH = Path(os.environ["CARE_CDF_MODEL_BINDING"]).resolve()
 MODEL_BINDING = json.loads(MODEL_BINDING_PATH.read_text())
 GCDF = Path(MODEL_BINDING["checkpoint"]).resolve()
@@ -75,7 +74,6 @@ def validate():
     assert all(len(c.get("initial_q", [])) == 7 and
                max(abs(float(q)) for q in c["initial_q"]) < 1e-4
                for c in data["cases"]), "initial q differs from home-pose experiment"
-    assert sha(SCALAR) == "fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df", "scalar projector SHA changed"
     assert PRIOR.is_file() and MAINLINE.is_file()
     return ids
 

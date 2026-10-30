@@ -6,7 +6,7 @@ Source of the architecture and state_dict names:
   experiments/hierarchical9_scratch50k_r012_v1/model.py: PrivateTailCDF
 
 This is an inference-only extraction, not a training/routing implementation.
-It preserves all 9 branches. Runtime exposes S0..S7 using a shape-only view.
+It preserves all 9 branches. Union and sensor views share one full model.
 No ROS, Gazebo, checkpoint download, repository mutation, or execution at import.
 """
 from __future__ import annotations
@@ -88,6 +88,17 @@ class PrivateTailCDF(nn.Module):
 
     def parameter_count(self) -> int:
         return sum(p.numel() for p in self.parameters())
+
+
+class HierarchicalUnionView(nn.Module):
+    """Expose the R1 union as [N,1], preserving input-q autograd."""
+
+    def __init__(self, full_model: PrivateTailCDF) -> None:
+        super().__init__()
+        self.full_model = full_model
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.full_model.forward_union(inputs).unsqueeze(-1)
 
 
 class HierarchicalSensorView(nn.Module):
