@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""25 mm Q0 acquisition coordinator. Two single-node jobs share immutable shards."""
+"""25 mm Q0 acquisition coordinator. One single-node four-GPU job only."""
 from __future__ import annotations
 import argparse
 import json
@@ -107,14 +107,24 @@ def ensure_idle(root):
         require(a.returncode==0 and any(state.startswith(s) for s in terminal),f'Cannot confirm terminal Slurm state for {j["id"]}: {state!r}')
 
 
+def ensure_account_idle():
+    import pwd
+    user=pwd.getpwuid(os.getuid()).pw_name
+    q=subprocess.run(['squeue','-h','-u',user,'-o','%i %T %j'],capture_output=True,text=True)
+    require(q.returncode==0,'Cannot confirm account queue; no job submitted')
+    require(not q.stdout.strip(),f'Account already has queued/running jobs; no new job submitted: {q.stdout.strip()}')
+
+
 def submit(root,repo,nodes,action):
-    root,repo=Path(root).resolve(),Path(repo).resolve();parse_nodes(nodes)
+    root,repo=Path(root).resolve(),Path(repo).resolve();selected=parse_nodes(nodes)
+    require(len(selected)==1,'Single job only: choose exactly one node, 3090node2 or 3090node3')
+    ensure_account_idle()
     ensure_idle(root);require(not (root/'formal/dataset/complete.json').exists(),'Dataset complete; use verify/summary, not submit')
     require((root/'formal/job.json').is_file(),'Prepare data protocol first')
     verify_job(read(root/'formal/job.json'))
     stamp=time.time_ns();record={'action':action,'jobs':[],'submitted_ns':stamp,'nodes_requested':nodes}
     env=os.environ.copy();env.update(G25_CODE=str(HERE),G25_ROOT=str(root),G25_JOB=str(root/'formal/job.json'))
-    for idx,node in enumerate(parse_nodes(nodes)):
+    for idx,node in enumerate(selected):
         env['G25_SLOT_BASE']=str(4*idx)
         try:
             r=subprocess.run(sbatch_args(root,repo,node,HERE,os.environ.get('TIME_LIMIT','3-00:00:00')),
@@ -186,7 +196,7 @@ def node(job,slotbase):
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=('prepare','submit','resume','node','worker','admission','merge','verify','summary','status','log','ranks','pack'))
     p.add_argument('--repo',type=Path);p.add_argument('--root',type=Path);p.add_argument('--reference',type=Path)
-    p.add_argument('--nodes',default='3090node2,3090node3');p.add_argument('--job',type=Path);p.add_argument('--slot',type=int,default=0)
+    p.add_argument('--nodes',default='3090node2');p.add_argument('--job',type=Path);p.add_argument('--slot',type=int,default=0)
     a=p.parse_args()
     if a.mode=='prepare':prepare(a.repo,a.root,a.reference);return
     if a.mode in ('submit','resume'):submit(a.root,a.repo,a.nodes,a.mode);return
