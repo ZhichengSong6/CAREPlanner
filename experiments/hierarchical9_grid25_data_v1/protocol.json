@@ -1,0 +1,20 @@
+{
+  "format": "care_viscdf_grid25_q0_v1",
+  "workspace_mm": [[-800, 800], [-800, 800], [0, 1000]],
+  "spacing_mm": 25,
+  "grid_shape": [65, 65, 41],
+  "grid_points": 173225,
+  "frame": "base_link",
+  "joint_names": ["joint1", "joint2", "joint3", "joint4", "wrist_joint1", "wrist_joint2", "wrist_joint3"],
+  "sensor_frames": ["link2_sensor1_tof_link", "link2_sensor2_tof_link", "link3_sensor1_tof_link", "link3_sensor2_tof_link", "link4_sensor1_tof_link", "link4_sensor2_tof_link", "EE_sensor1_tof_link", "EE_sensor2_tof_link"],
+  "q_min": [-3.14, -2.30, -3.14, -2.65, -3.14, -3.14, -1.20],
+  "q_max": [3.14, 2.30, 3.14, 2.65, 3.14, 3.14, 1.20],
+  "fov": {"horizontal_fov_deg": 50.0, "vertical_fov_deg": 66.0, "z_min": 0.2, "z_max": 0.7, "delta": 0.01},
+  "points_per_shard": 64,
+  "gpus_per_node": 4,
+  "min_free_gpu_gib": 6,
+  "reference_sha256": "47a55543870ab86e01424ba3d0d3acadf1d86d7bf9b3781b4beab8d29b8f9172",
+  "point_rng": "SeedSequence([inherited_seed, global_grid_index]); independent of worker count",
+  "label_scope": "original per-sensor Q0 FOV-only bank; not a new distance oracle, not exact roots, not LOS",
+  "training_ready": false
+}
