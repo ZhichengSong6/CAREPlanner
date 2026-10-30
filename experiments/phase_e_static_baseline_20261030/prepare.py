@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from runtime_portability import apply as apply_portability
 
 PACKAGE=Path(__file__).resolve().parent
 ROOT=PACKAGE.parents[1]
@@ -35,8 +36,10 @@ def main():
     parser.add_argument('--assets-root',type=Path,default=ROOT,
                         help='Directory containing the src/... checkpoint paths in model_assets.json')
     parser.add_argument('--without-models',action='store_true',help='Prepare a source/build check only')
-    parser.add_argument('--inputs-root',type=Path,
+    mode=parser.add_mutually_exclusive_group()
+    mode.add_argument('--inputs-root',type=Path,
                         help='Local study directory containing the external inputs in input_assets.json')
+    mode.add_argument('--demo',action='store_true',help='Generate a demo from source configuration; no past experiment inputs')
     args=parser.parse_args();out=args.output.resolve();assets=args.assets_root.resolve()
     if out.exists():raise FileExistsError('Choose a new output directory: '+str(out))
     models=json.loads((PACKAGE/'model_assets.json').read_text())['models']
@@ -47,7 +50,7 @@ def main():
                 raise RuntimeError('Missing or different model asset: '+str(p))
     input_manifest=json.loads((PACKAGE/'input_assets.json').read_text())
     input_root=args.inputs_root.resolve() if args.inputs_root else None
-    if input_root is None and not args.without_models:
+    if input_root is None and not args.without_models and not args.demo:
         raise ValueError('Simulation inputs are external; supply --inputs-root, or use --without-models for a source-only build')
     if input_root is not None:
         for entry in input_manifest['files']:
@@ -86,6 +89,10 @@ def main():
                     data=data.replace(os.fsencode(original),os.fsencode(destination))
             target=out/entry['path'];target.parent.mkdir(parents=True,exist_ok=True)
             target.write_bytes(data)
+    portability_edits=apply_portability(runtime)
+    if args.demo:
+        from demo_inputs import generate
+        generate(out,json.loads((PACKAGE/'demo/task.json').read_text()))
     build_edits=[]
     for package in ('egocentric_arm_planner','care_confidence_map'):
         cmake=runtime/'src'/package/'CMakeLists.txt';original=digest(cmake)
@@ -102,7 +109,7 @@ def main():
     for name in ('runs','versions','evidence'):(out/name).mkdir()
     (out/'preparation.json').write_text(json.dumps(dict(status='PREPARED',source_manifest_sha256=digest(PACKAGE/'source_manifest.json'),
         files=len(manifest['files']),models_attached=not args.without_models,inputs_attached=input_root is not None,build_only_cmake_additions=build_edits,
-        selected_policy='current',new_windows=0),indent=2)+'\n')
+        portability_edits=portability_edits,mode='demo' if args.demo else 'study',selected_policy='current',new_windows=0),indent=2)+'\n')
     print(json.dumps(dict(status='PREPARED',runtime=str(runtime),new_windows=0)))
 
 

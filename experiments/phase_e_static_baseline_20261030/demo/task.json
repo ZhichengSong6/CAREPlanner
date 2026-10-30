@@ -1,0 +1,9 @@
+{
+  "case_id": "phase_e_goal_007",
+  "goal_position": [0.3032, -0.2192, 0.7475],
+  "goal_orientation": [0.0, 0.0, 0.7071067811865476, 0.7071067811865476],
+  "initial_q": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "joint_names": ["joint1", "joint2", "joint3", "joint4", "wrist_joint1", "wrist_joint2", "wrist_joint3"],
+  "maximum_prearm_joint_deviation_rad": 0.001,
+  "scenes": ["baseline", "nonblocking_box", "detour_box"]
+}

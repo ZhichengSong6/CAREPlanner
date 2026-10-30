@@ -20,7 +20,9 @@ def fingerprint():
     for folder in ('src','scripts'):
         files += [p for p in (RT/folder).rglob('*') if p.is_file() and p.suffix in suffixes and '__pycache__' not in p.parts]
     files += [p for p in (RT/'devel/lib').rglob('*') if p.is_file() and p.suffix!='.pyc' and '__pycache__' not in p.parts]
-    files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in ('plan.json','scenes.json','old_model_binding.json','mapping_gate.json','bootstrap_gate.json','guard_qualification.json','detour_route.json')]
+    names=['plan.json','scenes.json','old_model_binding.json','bootstrap_gate.json']
+    names += ['demo_configuration.json'] if (O/'demo_configuration.json').is_file() else ['mapping_gate.json','guard_qualification.json','detour_route.json']
+    files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in names]
     files += [p for p in (O/'scenes').glob('*.world')]
     binding=json.loads((O/'old_model_binding.json').read_text());files += [Path(binding['checkpoint']),RT/'src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt']
     files += [O/'new_model_binding.json',RT/'src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt']

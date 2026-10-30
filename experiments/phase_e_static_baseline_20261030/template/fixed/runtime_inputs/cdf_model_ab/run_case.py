@@ -46,6 +46,10 @@ MAINLINE = REPO / "scripts/run_phase_e_case001_r1_mainline.sh"
 CASE_SHA = "fbcd2816f594e1970f59e4aae2183f14a9764e623d80b86b2d37cf3a4cad1d45"
 R1_SHA = "4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002"
 GCDF_SHA = MODEL_BINDING["checkpoint_sha256"]
+DEMO_PATH = REPO.parent / 'demo_configuration.json'
+DEMO = json.loads(DEMO_PATH.read_text()) if DEMO_PATH.is_file() else None
+if DEMO:
+    CASE_SHA = DEMO['cases_sha256']
 
 
 def sha(path):
@@ -66,7 +70,8 @@ def validate():
     assert sha(R1) == R1_SHA and sha(GCDF) == GCDF_SHA, "mainline checkpoint SHA changed"
     data = json.loads(CASES.read_text())
     ids = [c["case_id"] for c in data["cases"]]
-    assert ids == [f"phase_e_goal_{i:03d}" for i in range(30)], "not original ordered 30"
+    expected = DEMO['case_ids'] if DEMO else [f"phase_e_goal_{i:03d}" for i in range(30)]
+    assert ids == expected, "unexpected task configuration"
     assert all(len(c.get("initial_q", [])) == 7 and
                max(abs(float(q)) for q in c["initial_q"]) < 1e-4
                for c in data["cases"]), "initial q differs from home-pose experiment"

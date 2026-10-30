@@ -1,35 +1,56 @@
 # CAREPlanner
 
-七自由度机械臂的可见性约束运动规划研究，结合 ToF 建图、碰撞 CDF、分传感器 VisCDF、局部 SCP/QP 规划和执行审核，使用 ROS Noetic 与 Gazebo。
+七自由度机械臂的可见性约束运动规划，结合 ToF 建图、碰撞 CDF、VisCDF、局部 SCP/QP 规划和执行审核。
 
-本仓库发布源码、构建脚本、运行配置和机器人 URDF/STL。模型权重、训练数据、采集记录、分析报告、实验结果及编译产物均在本地单独管理。
+默认入口运行一个静态箱体仿真。目标与场景由源码配置提供，启动几何检查在本机计算，不需要此前的实验输出、采集记录或分析报告。
 
-## 构建
+## 准备环境
 
-依赖 ROS Noetic、Gazebo Classic、catkin_tools、Eigen3、Pinocchio/hpp-fcl 和 OpenSSL 开发库。推理使用 `viscdf`、`ncdf_l4c` Python 环境。
+支持环境：Ubuntu 20.04、ROS Noetic、Gazebo Classic、NVIDIA GPU 和可用的 CUDA 驱动，以及 Conda。请将仓库放在不含空格或引号的路径中。
 
 ```bash
-git submodule update --init --recursive
-python3 experiments/phase_e_static_baseline_20261030/prepare.py --output outputs/source_build --without-models
-bash experiments/phase_e_static_baseline_20261030/build.sh outputs/source_build
+git clone --branch research/phase-e-static-baseline-20261030 --recurse-submodules git@github.com:ZhichengSong6/CAREPlanner.git
+cd CAREPlanner
+bash scripts/setup_runtime.sh
 ```
 
-该入口在独立工作区恢复静态障碍物版本的源码。准备与构建均不启动仿真。根目录历史集成工程的构建入口为 `scripts/build_phase_e_primitive_release.sh`；部分旧启动脚本仍默认使用旧碰撞模型。
+安装脚本要求已安装 ROS Noetic 和 Conda；会安装构建依赖，并创建 `careplanner` Python 3.10 环境。PyTorch 固定为 2.11.0，使用 [官方 CUDA 12.8 wheel 索引](https://download.pytorch.org/whl/cu128/torch/)。不修改显卡驱动。
 
-## 仿真与外部资产
+运行前还需四份指定推理权重，路径与校验值见 [模型资产说明](docs/model_assets.txt)。缺少权重时入口会明确报错，不会用空模型替代。
 
-仿真另需模型权重和本地实验输入。路径及 SHA 清单仅用于匹配外部文件，本仓库不携带这些文件的内容。
+## 运行
 
-- [模型文件与接口](docs/model_assets.txt)
-- [静态障碍物源码入口及运行方法](experiments/phase_e_static_baseline_20261030/README.md)
+```bash
+bash scripts/run_demo.sh
+```
 
-运行使用显式的新 CDF/ReLU、现有 VisCDF R1 与标量粗投影模型，保留物理地面及解析地面处理。原有目标、标定及验证输入通过 `prepare.py --inputs-root` 从本地提供。
+入口依次检查环境与权重、准备独立工作区、从源码编译、预检查并运行仿真。无显示器时使用 Xvfb。输出写入新的 `outputs/demo_时间戳/`，包括本次运行生成的日志和审核结果。
 
-## 目录
+可选命令：
 
-- `src/`：ROS 包、机器人描述、规划器、建图和推理接口。
-- `scripts/`：构建、测试、训练、实验启动及分析程序；程序产生的结果不入库。
-- `experiments/`：训练程序和独立运行入口源码。
-- `patches/piqp/`：PIQP 有限边界索引修复及版本校验。
+```bash
+bash scripts/run_demo.sh --scene detour_box
+bash scripts/run_demo.sh --preflight-only
+bash scripts/run_demo.sh --build-only
+```
 
-PIQP 保持固定的上游 submodule 提交。根工程构建时，`scripts/prepare_piqp.py` 在构建目录生成打补丁后的头文件副本。
+`--build-only` 不需要权重或 GPU。重复运行会使用新的输出目录；也可以用 `--output` 指定一个尚不存在的目录。
+
+已有项目 Python 环境可以直接使用：
+
+```bash
+bash scripts/run_demo.sh --env viscdf --visibility-env ncdf_l4c
+```
+
+Conda 不在常见安装位置时，通过 `CONDA_SH` 指定其 `etc/profile.d/conda.sh` 文件。
+
+## 代码与本地产物
+
+Git 保存源码、构建脚本、运行配置、机器人 URDF/STL 和必要说明。编译产物、训练数据、采集记录、分析报告与实验结果不纳入源码提交。
+
+- `src/`：ROS 包及机器人描述；保留历史集成入口。
+- `scripts/run_demo.sh`：推荐的当前静态仿真入口。
+- `experiments/phase_e_static_baseline_20261030/`：当前运行源码、演示配置与构建支持。
+- `patches/piqp/`：固定上游版本的索引修复补丁。
+
+历史研究重建入口和默认演示的区别见 [运行源码说明](experiments/phase_e_static_baseline_20261030/README.md)。本示例不用于复述历史 30-case 实验成绩。

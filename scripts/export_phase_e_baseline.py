@@ -41,6 +41,14 @@ def portable_case_runner(text):
         'SCALAR = REPO / "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt"\nMODEL_BINDING_PATH = ', 1)
     text = text.replace('    assert PRIOR.is_file() and MAINLINE.is_file()',
         '    assert sha(SCALAR) == "fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df", "scalar projector SHA changed"\n    assert PRIOR.is_file() and MAINLINE.is_file()', 1)
+    text = text.replace('GCDF_SHA = MODEL_BINDING["checkpoint_sha256"]',
+        'GCDF_SHA = MODEL_BINDING["checkpoint_sha256"]\n'
+        "DEMO_PATH = REPO.parent / 'demo_configuration.json'\n"
+        'DEMO = json.loads(DEMO_PATH.read_text()) if DEMO_PATH.is_file() else None\n'
+        "if DEMO:\n    CASE_SHA = DEMO['cases_sha256']", 1)
+    text = text.replace('    assert ids == [f"phase_e_goal_{i:03d}" for i in range(30)], "not original ordered 30"',
+        '    expected = DEMO[\'case_ids\'] if DEMO else [f"phase_e_goal_{i:03d}" for i in range(30)]\n'
+        '    assert ids == expected, "unexpected task configuration"', 1)
     return text
 
 
@@ -115,6 +123,10 @@ def export(study, destination):
         elif str(relative) == 'fixed/run_study.py':
             text = text.replace('    return {str(p.relative_to(O)):sha(p)',
                 "    files += [RT/'src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt']\n    return {str(p.relative_to(O)):sha(p)", 1)
+            text = text.replace("    files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in ('plan.json','scenes.json','old_model_binding.json','mapping_gate.json','bootstrap_gate.json','guard_qualification.json','detour_route.json')]",
+                "    names=['plan.json','scenes.json','old_model_binding.json','bootstrap_gate.json']\n"
+                "    names += ['demo_configuration.json'] if (O/'demo_configuration.json').is_file() else ['mapping_gate.json','guard_qualification.json','detour_route.json']\n"
+                "    files += list(T.glob('*.py'))+list(O.glob('*.py'))+[O/n for n in names]", 1)
         target = destination / 'template' / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text)

@@ -30,4 +30,4 @@ SHA256 fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df
 src/care_collision_cdf/config/collision_cdf_25mm_v2.yaml
 experiments/phase_e_static_baseline_20261030/model_assets.json
 
-原任务、标定、验证与回归记录也保持外置；仿真准备使用 --inputs-root 指定本地输入目录，文件清单见 experiments/phase_e_static_baseline_20261030/input_assets.json。
+默认演示使用 --demo 从源码配置生成任务和几何检查，不需要历史记录。只有精确重建历史研究时才使用 --inputs-root；历史任务、标定、验证与回归记录保持外置，清单见 experiments/phase_e_static_baseline_20261030/input_assets.json。
