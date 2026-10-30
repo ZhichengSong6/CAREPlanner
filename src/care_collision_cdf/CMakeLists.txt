@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(care_collision_cdf)
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 
 add_compile_options(-std=c++14)
 
@@ -33,16 +34,23 @@ generate_messages(
   std_msgs
 )
 
+find_package(Eigen3 REQUIRED)
+
 catkin_package(
+  INCLUDE_DIRS include
   CATKIN_DEPENDS geometry_msgs message_runtime roscpp rospy std_msgs sensor_msgs care_confidence_map
 )
 
 include_directories(
+  include
+  ${EIGEN3_INCLUDE_DIRS}
   ${catkin_INCLUDE_DIRS}
 )
 
 catkin_install_python(PROGRAMS
   scripts/collision_cdf_model.py
+  scripts/rdf_model.py
+  scripts/export_distance_field_casadi.py
   scripts/collision_cdf_server_node.py
   scripts/inspect_collision_cdf_checkpoint.py
   scripts/evaluate_collision_cdf_gradient.py
@@ -57,6 +65,16 @@ catkin_install_python(PROGRAMS
 install(DIRECTORY config launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
+
+install(DIRECTORY include/${PROJECT_NAME}/
+  DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+)
+
+# Offline common-ABI reader for locally exported CDF/RDF libraries. The
+# existing online IPC worker/selector remains the default runtime path.
+add_executable(query_shared_distance_field ../../scripts/query_shared_distance_field.cpp)
+target_link_libraries(query_shared_distance_field ${CMAKE_DL_LIBS})
+install(TARGETS query_shared_distance_field RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 # Preserve historical packaging unless the deployment build explicitly opts out.
 # Release acceptance supplies an external, SHA-bound checkpoint instead.
 option(CARE_INSTALL_CHECKPOINTS "Bundle collision checkpoints in install space" ON)

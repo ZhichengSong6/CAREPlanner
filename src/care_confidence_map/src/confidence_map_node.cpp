@@ -8,6 +8,8 @@
 #include <XmlRpcValue.h>
 
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/QueryConfidenceSnapshot.h>
+#include <unistd.h>
 #include <care_confidence_map/body_sample_model.hpp>
 #include <care_confidence_map/legacy_body_backend.hpp>
 
@@ -30,8 +32,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -95,6 +100,7 @@ public:
   {
     // Stop the reader before grid/member destruction, including on shutdown
     // with a request in flight. The default ROS queue remains single-threaded.
+    snapshot_service_.shutdown();
     query_service_.shutdown();
     if (query_spinner_) query_spinner_->stop();
   }
@@ -160,6 +166,12 @@ public:
                              &ConfidenceMapNode::handleQueryConfidence,
                              this);
 
+    std::string snapshot_service_name;
+    pnh_.param<std::string>("confidence_map/snapshot_service", snapshot_service_name,
+                           query_service_name_ + "_snapshot");
+    snapshot_service_ = query_nh_.advertiseService(snapshot_service_name,
+                             &ConfidenceMapNode::handleQuerySnapshot, this);
+
     refresh_body_prior_service_ =
         nh_.advertiseService(refresh_body_prior_service_name_,
                              &ConfidenceMapNode::handleRefreshBodyPrior,
@@ -190,6 +202,9 @@ public:
                       << refresh_msg);
     }
 
+    snapshot_instance_ = std::to_string(ros::WallTime::now().toNSec()) + ":" + std::to_string(getpid());
+    snapshot_update_stamp_ = snapshot_clock_stamp_ = ros::Time::now();
+    if (!initializeObservationTrace()) return false;
     // All initialization (including optional prior refresh) precedes readers.
     if (dedicated_queries) {
       query_spinner_.reset(new ros::AsyncSpinner(1, &query_queue_));
@@ -685,6 +700,11 @@ private:
     nh.param("sensor_model/horizontal_fov_deg", horizontal_fov_deg_, 55.0);
     nh.param("sensor_model/vertical_fov_deg", vertical_fov_deg_, 72.0);
     nh.param("sensor_model/local_resolution", local_resolution_, resolution_);
+    nh.param("sensor_model/max_tf_age_s", sensor_max_tf_age_s_, 0.05);
+    if (!std::isfinite(sensor_max_tf_age_s_) || sensor_max_tf_age_s_ <= 0.) {
+      ROS_ERROR("sensor_model/max_tf_age_s must be finite and positive");
+      return false;
+    }
 
     if (local_resolution_ <= 0.0)
     {
@@ -1293,12 +1313,21 @@ private:
 
   void updateConfidenceMapSensorCentric(
       const std::vector<tf2::Transform>& T_map_sensors,
-      const ros::Time& now)
+      const std::vector<geometry_msgs::TransformStamped>& sources,
+      const ros::Time& now,
+      std::vector<std::set<int>>* watched_hits = nullptr)
   {
     resetCurrentVisibility();
 
-    for (const auto& T_map_sensor : T_map_sensors)
+    for (size_t sensor_index = 0; sensor_index < T_map_sensors.size(); ++sensor_index)
     {
+      const auto& stamp = sources[sensor_index].header.stamp;
+      if (!sensorTransformUsable(stamp, now)) continue;
+      // A repeated cached transform is the SAME pose observation. Advancing
+      // the timer must never renew its evidence. Timeless static chains have
+      // no moving joint pose and remain current in this ideal-FOV model.
+      const double observed_s = stamp.isZero() ? now.toSec() : stamp.toSec();
+      const auto& T_map_sensor = T_map_sensors[sensor_index];
       for (const auto& local_point : local_visible_points_)
       {
         const tf2::Vector3 p_map =
@@ -1311,6 +1340,10 @@ private:
         }
 
         grid_points_[index].current_visibility = 1.0f;
+        grid_points_[index].last_seen_time =
+            std::max(grid_points_[index].last_seen_time, observed_s);
+        if (watched_hits && observation_trace_watch_indices_.count(index))
+          (*watched_hits)[sensor_index].insert(index);
       }
     }
 
@@ -1318,24 +1351,12 @@ private:
 
     for (auto& p : grid_points_)
     {
-      if (p.current_visibility > 0.5f)
+      if (p.last_seen_time >= 0.0)
       {
-        p.confidence = 1.0f;
-        p.last_seen_time = now_sec;
+        const double dt = std::max(0.0, now_sec - p.last_seen_time);
+        p.confidence = static_cast<float>(std::exp(-dt / temporal_decay_time_));
       }
-      else
-      {
-        if (p.last_seen_time >= 0.0)
-        {
-          const double dt = std::max(0.0, now_sec - p.last_seen_time);
-          p.confidence =
-              static_cast<float>(std::exp(-dt / temporal_decay_time_));
-        }
-        else
-        {
-          p.confidence = 0.0f;
-        }
-      }
+      else p.confidence = 0.0f;
     }
 
     printConfidenceStatsThrottled();
@@ -1368,6 +1389,7 @@ private:
       const sensor_msgs::PointCloud2ConstPtr& msg)
   {
     std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
     if (!msg || observation_mode_ != "tof_ray")
     {
       return;
@@ -1581,6 +1603,13 @@ private:
 
     const ros::Time stamp =
         msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+    // Legacy map integration is unchanged. New snapshot evidence fails closed
+    // after invalid event time until node restart; a later clock catch-up does
+    // not retroactively make a future or reordered observation trustworthy.
+    if (stamp > ros::Time::now() ||
+        (!last_ray_observation_stamp_.isZero() && stamp < last_ray_observation_stamp_))
+      snapshot_evidence_fault_ = true;
+
     const double stamp_sec = stamp.toSec();
 
     std::size_t free_cells = 0;
@@ -1927,6 +1956,95 @@ private:
     return msg;
   }
 
+  void observeSnapshotClock(const ros::Time& now)
+  {
+    if (now < snapshot_clock_stamp_) {
+      ++snapshot_epoch_;
+      snapshot_clock_fault_ = true;  // Sticky; old grid belongs to the old clock.
+    }
+    snapshot_clock_stamp_ = now;
+  }
+
+  void markSnapshotWrite(const ros::Time& now)
+  {
+    observeSnapshotClock(now);
+    ++snapshot_revision_;
+    snapshot_update_stamp_ = now;
+    if (observation_trace_.is_open()) {
+      observation_trace_ << "{\"event\":\"map_write\",\"instance\":"
+          << traceString(snapshot_instance_) << ",\"epoch\":" << snapshot_epoch_
+          << ",\"revision\":" << snapshot_revision_ << ",\"map_update_ns\":"
+          << snapshot_update_stamp_.toNSec() << "}" << std::endl;
+    }
+  }
+
+  bool handleQuerySnapshot(
+      care_confidence_map::QueryConfidenceSnapshot::Request& req,
+      care_confidence_map::QueryConfidenceSnapshot::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    const ros::Time now = ros::Time::now();
+    observeSnapshotClock(now);
+    res.instance = snapshot_instance_; res.epoch = snapshot_epoch_;
+    res.revision = snapshot_revision_; res.snapshot_stamp = now;
+    res.map_update_stamp = snapshot_update_stamp_; res.frame = map_frame_;
+    res.resolution = resolution_;
+    res.map_min.x = x_min_; res.map_min.y = y_min_; res.map_min.z = z_min_;
+    res.map_max.x = x_max_; res.map_max.y = y_max_; res.map_max.z = z_max_;
+    res.grid_size[0] = nx_; res.grid_size[1] = ny_; res.grid_size[2] = nz_;
+    res.observation_mode = observation_mode_; res.clock_fault = snapshot_clock_fault_;
+    res.future_free_space_guaranteed = false;
+    res.horizon_s = req.horizon_s; res.temporal_decay_time = temporal_decay_time_;
+    const auto n = req.points.size();
+    res.inside_map.assign(n, 0); res.confidence_now.assign(n, 0.);
+    res.confidence_at_horizon.assign(n, 0.); res.occupancy.assign(n, 0.);
+    res.last_seen_s.assign(n, -1.); res.provenance.assign(n, 0);
+    res.model_free_at_horizon.assign(n, 0);
+    res.valid = false;
+    if (!std::isfinite(req.horizon_s) || req.horizon_s < 0. ||
+        !std::isfinite(now.toSec() + req.horizon_s) ||
+        !std::isfinite(req.minimum_confidence) || req.minimum_confidence <= 0. ||
+        req.minimum_confidence > 1.) { res.reason = "invalid_request"; return true; }
+    if (now.isZero() || snapshot_clock_fault_ || snapshot_evidence_fault_ ||
+        !std::isfinite(temporal_decay_time_) || temporal_decay_time_ <= 0.) {
+      res.reason = "invalid_evidence_time_restart_required"; return true;
+    }
+    if (!req.expected_instance.empty() &&
+        (req.expected_instance != res.instance || req.expected_epoch != res.epoch ||
+         req.expected_revision != res.revision)) {
+      res.reason = "version_mismatch"; return true;
+    }
+    for (size_t i=0; i<n; ++i) {
+      const auto& p = req.points[i];
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+      // Bound finite coordinates before llround/integer conversion. This API
+      // treats the configured map bounds strictly; never certify a clipped box.
+      if (p.x < x_min_ || p.x > x_max_ || p.y < y_min_ || p.y > y_max_ ||
+          p.z < z_min_ || p.z > z_max_) continue;
+      int index = -1;
+      if (!positionToGridIndex(tf2::Vector3(p.x,p.y,p.z), index)) continue;
+      const auto& v = grid_points_[index];
+      res.inside_map[i] = 1; res.occupancy[i] = v.occupancy;
+      res.last_seen_s[i] = v.last_seen_time;
+      // Recompute decay at the query time, even if cached visibility is stale.
+      const bool sensor = v.last_seen_time >= 0. && v.last_seen_time <= now.toSec();
+      const double age = sensor ? now.toSec()-v.last_seen_time : 0.;
+      const double sensor_now = sensor ? std::exp(-age/temporal_decay_time_) : 0.;
+      const double sensor_end = sensor ? std::exp(-(age+req.horizon_s)/temporal_decay_time_) : 0.;
+      const double bootstrap = current_body_prior_active_ ? v.bootstrap_confidence : 0.;
+      const double prior = std::max(bootstrap, static_cast<double>(v.test_known_free_confidence));
+      res.provenance[i] = (sensor ? 1 : 0) | (bootstrap > 0. ? 2 : 0) |
+                          (v.test_known_free_confidence > 0. ? 4 : 0);
+      res.confidence_now[i] = std::max(sensor_now, prior);
+      res.confidence_at_horizon[i] = std::max(sensor_end, prior);
+      res.model_free_at_horizon[i] = v.occupancy <= .5f &&
+          std::max(sensor_end, prior) >= req.minimum_confidence;
+    }
+    res.valid = true;
+    res.reason = "conditional_projection_no_future_lease";
+    return true;
+  }
+
   bool handleQueryConfidence(
       care_confidence_map::QueryConfidence::Request& req,
       care_confidence_map::QueryConfidence::Response& res)
@@ -2117,6 +2235,7 @@ private:
       std_srvs::Trigger::Response& res)
   {
     std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
     std::string message;
     const bool ok = refreshCurrentBodyPrior(
         ros::Time::now(), "service", &message);
@@ -2131,6 +2250,7 @@ private:
       std_srvs::Trigger::Response& res)
   {
     std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
     std::size_t cleared_cells = 0;
     std::size_t preserved_sensor_cells = 0;
     for (auto& gp : grid_points_)
@@ -2628,7 +2748,8 @@ private:
 
   bool getSensorTransforms(
       std::vector<tf2::Transform>& T_map_sensors,
-      visualization_msgs::MarkerArray* marker_array)
+      visualization_msgs::MarkerArray* marker_array,
+      std::vector<geometry_msgs::TransformStamped>* source_transforms = nullptr)
   {
     T_map_sensors.clear();
 
@@ -2662,6 +2783,7 @@ private:
 
       const tf2::Transform T_map_sensor = transformMsgToTf2(tf_msg);
       T_map_sensors.push_back(T_map_sensor);
+      if (source_transforms) source_transforms->push_back(tf_msg);
 
       if (marker_array != nullptr)
       {
@@ -2684,18 +2806,146 @@ private:
     return ready_count > 0;
   }
 
+  static std::string traceString(const std::string& value)
+  {
+    std::ostringstream out;
+    out << '"';
+    for (unsigned char c : value) {
+      if (c == '"' || c == '\\') out << '\\' << c;
+      else if (c < 0x20) out << "\\u" << std::hex << std::setw(4)
+                            << std::setfill('0') << static_cast<unsigned>(c) << std::dec;
+      else out << c;
+    }
+    out << '"';
+    return out.str();
+  }
+
+  bool sensorTransformUsable(const ros::Time& stamp, const ros::Time& now) const
+  {
+    return stamp.isZero() ||
+        (stamp <= now && (now-stamp).toSec() <= sensor_max_tf_age_s_);
+  }
+
+  bool initializeObservationTrace()
+  {
+    std::string filename;
+    pnh_.param<std::string>("confidence_map/observation_trace_file", filename, "");
+    if (filename.empty()) return true;
+    std::vector<int> watched;
+    pnh_.getParam("confidence_map/observation_trace_watch_grid_indices", watched);
+    for (int index : watched) {
+      if (index < 0 || static_cast<size_t>(index) >= grid_points_.size()) {
+        ROS_ERROR("Invalid observation trace watch index"); return false;
+      }
+      observation_trace_watch_indices_.insert(index);
+    }
+    // A trace is a new experiment artifact; never append to an earlier run.
+    if (std::ifstream(filename).good()) {
+      ROS_ERROR("Observation trace already exists"); return false;
+    }
+    observation_trace_.open(filename);
+    if (!observation_trace_) {
+      ROS_ERROR("Cannot open observation trace"); return false;
+    }
+    observation_trace_ << std::setprecision(17)
+        << "{\"event\":\"model\",\"instance\":" << traceString(snapshot_instance_)
+        << ",\"observation_mode\":" << traceString(observation_mode_)
+        << ",\"runtime_admission\":false,\"frame\":" << traceString(map_frame_)
+        << ",\"map_min\":[" << x_min_ << ',' << y_min_ << ',' << z_min_
+        << "],\"map_max\":[" << x_max_ << ',' << y_max_ << ',' << z_max_
+        << "],\"grid_size\":[" << nx_ << ',' << ny_ << ',' << nz_
+        << "],\"resolution\":" << resolution_
+        << ",\"temporal_decay_time\":" << temporal_decay_time_
+        << ",\"forward_axis\":" << traceString(forward_axis_)
+        << ",\"min_range\":" << tof_min_range_ << ",\"max_range\":" << tof_max_range_
+        << ",\"horizontal_fov_deg\":" << horizontal_fov_deg_
+        << ",\"vertical_fov_deg\":" << vertical_fov_deg_
+        << ",\"local_resolution\":" << local_resolution_
+        << ",\"max_tf_age_s\":" << sensor_max_tf_age_s_
+        << ",\"observation_timestamp_policy\":\"tf_source_time\""
+        << ",\"local_sample_count\":" << local_visible_points_.size()
+        << ",\"expected_sensor_count\":" << sensors_.size() << ",\"watched\":[";
+    bool first = true;
+    for (int index : observation_trace_watch_indices_) {
+      const auto& p = grid_points_[index];
+      if (!first) observation_trace_ << ',';
+      first = false;
+      observation_trace_ << "{\"grid_index\":" << index << ",\"point\":["
+                         << p.x << ',' << p.y << ',' << p.z << "]}";
+    }
+    observation_trace_ << "]}" << std::endl;
+    return static_cast<bool>(observation_trace_);
+  }
+
+  void writeObservationTrace(const ros::Time& now,
+      const std::vector<geometry_msgs::TransformStamped>& transforms,
+      const std::vector<std::set<int>>& watched_hits)
+  {
+    if (!observation_trace_.is_open()) return;
+    observation_trace_ << "{\"event\":\"ideal_fov_update\",\"instance\":"
+        << traceString(snapshot_instance_) << ",\"epoch\":" << snapshot_epoch_
+        << ",\"revision\":" << snapshot_revision_ << ",\"observation_ns\":" << now.toNSec()
+        << ",\"map_update_ns\":" << snapshot_update_stamp_.toNSec() << ",\"sensors\":[";
+    for (size_t i = 0; i < transforms.size(); ++i) {
+      const auto& t = transforms[i];
+      if (i) observation_trace_ << ',';
+      observation_trace_ << "{\"frame\":" << traceString(t.child_frame_id)
+          << ",\"tf_stamp_ns\":" << t.header.stamp.toNSec()
+          << ",\"applied_to_map\":" << (sensorTransformUsable(t.header.stamp, now) ? "true" : "false")
+          << ",\"tf_time_reason\":" << traceString(t.header.stamp.isZero() ? "timeless_static_chain" :
+              t.header.stamp > now ? "future_tf" :
+              (now-t.header.stamp).toSec() > sensor_max_tf_age_s_ ? "stale_tf" : "valid_source_time")
+          << ",\"translation\":[" << t.transform.translation.x << ','
+          << t.transform.translation.y << ',' << t.transform.translation.z
+          << "],\"quaternion_xyzw\":[" << t.transform.rotation.x << ','
+          << t.transform.rotation.y << ',' << t.transform.rotation.z << ','
+          << t.transform.rotation.w << "],\"hit_watch_grid_indices\":[";
+      bool first = true;
+      for (int index : watched_hits[i]) {
+        if (!first) observation_trace_ << ',';
+        first = false; observation_trace_ << index;
+      }
+      observation_trace_ << "]}";
+    }
+    observation_trace_ << "],\"watched\":[";
+    bool first = true;
+    for (int index : observation_trace_watch_indices_) {
+      const auto& p = grid_points_[index];
+      if (!first) observation_trace_ << ',';
+      first = false;
+      observation_trace_ << "{\"grid_index\":" << index << ",\"last_seen_s\":"
+          << p.last_seen_time << ",\"sensor_confidence\":" << p.confidence
+          << ",\"bootstrap_confidence\":" << p.bootstrap_confidence
+          << ",\"occupancy\":" << p.occupancy << '}';
+    }
+    observation_trace_ << "]}" << std::endl;
+    if (!observation_trace_) ROS_ERROR_THROTTLE(1., "Observation trace write failed");
+  }
+
   void updateTimerCallback(const ros::TimerEvent&)
   {
     std::lock_guard<std::mutex> lock(map_query_mutex_);
-    const ros::Time now = ros::Time::now();
 
     if (observation_mode_ == "ideal_fov")
     {
       std::vector<tf2::Transform> T_map_sensors;
-      getSensorTransforms(T_map_sensors, nullptr);
-      updateConfidenceMapSensorCentric(T_map_sensors, now);
+      std::vector<geometry_msgs::TransformStamped> sources;
+      getSensorTransforms(T_map_sensors, nullptr, &sources);
+      // TF lookups can wait. Timestamp the mutation after obtaining them,
+      // and reject poses from beyond this actual update time.
+      const ros::Time now = ros::Time::now();
+      markSnapshotWrite(now);
+      if (observation_trace_.is_open()) {
+        std::vector<std::set<int>> watched_hits(sources.size());
+        updateConfidenceMapSensorCentric(T_map_sensors, sources, now, &watched_hits);
+        writeObservationTrace(now, sources, watched_hits);
+      } else {
+        updateConfidenceMapSensorCentric(T_map_sensors, sources, now);
+      }
       return;
     }
+    const ros::Time now = ros::Time::now();
+    markSnapshotWrite(now);
 
     // In tof_ray mode the observation callback owns the current visible set.
     // Only clear it when the entire E2 observation stream has gone stale;
@@ -2824,6 +3074,11 @@ private:
   ros::Publisher e3_summary_pub_;
   ros::Subscriber ray_observation_sub_;
   ros::ServiceServer query_service_;
+  ros::ServiceServer snapshot_service_;
+  std::string snapshot_instance_;
+  uint64_t snapshot_epoch_ = 0, snapshot_revision_ = 1;
+  ros::Time snapshot_update_stamp_, snapshot_clock_stamp_;
+  bool snapshot_clock_fault_ = false, snapshot_evidence_fault_ = false;
   ros::ServiceServer refresh_body_prior_service_;
   ros::ServiceServer deactivate_body_prior_service_;
 
@@ -2938,6 +3193,7 @@ private:
   double horizontal_fov_deg_ = 55.0;
   double vertical_fov_deg_ = 72.0;
   double local_resolution_ = 0.05;
+  double sensor_max_tf_age_s_ = 0.05;
 
   double half_h_fov_rad_ = 0.0;
   double half_v_fov_rad_ = 0.0;
@@ -2949,6 +3205,8 @@ private:
   std::vector<LocalVisiblePoint> local_visible_points_;
 
   int last_ready_count_ = -1;
+  std::ofstream observation_trace_;
+  std::set<int> observation_trace_watch_indices_;
 };
 
 int main(int argc, char** argv)

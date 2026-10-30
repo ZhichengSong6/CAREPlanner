@@ -26,5 +26,10 @@ struct QPNoProgress {
     if (!blocked()) ++failures;
     return blocked();
   }
+  void block(const Eigen::VectorXd& measured) {
+    if (!measured.size() || !measured.allFinite()) return;
+    anchor = measured;
+    failures = max_failures;
+  }
 };
 }  // namespace egocentric_arm_planner

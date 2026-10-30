@@ -1,0 +1,16 @@
+<launch>
+  <!-- Staging and shadow qualification only; this node has no lease publisher. -->
+  <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_c5_5_vbc_gcdf_regime.yaml" />
+  <arg name="prepared_topic" default="/care_planner/execution/prepared_trajectory" />
+  <arg name="staged_topic" default="/care_planner/execution/staged_trajectory" />
+  <arg name="controller_state_topic" default="/care_arm/arm_group_velocity_controller/state" />
+  <arg name="runtime_sha256" default="" />
+  <node pkg="egocentric_arm_planner" type="execution_preparation_handoff_node.py"
+        name="execution_preparation_handoff" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="prepared_topic" value="$(arg prepared_topic)" />
+    <param name="staged_topic" value="$(arg staged_topic)" />
+    <param name="controller_state_topic" value="$(arg controller_state_topic)" />
+    <param name="runtime_sha256" value="$(arg runtime_sha256)" />
+  </node>
+</launch>

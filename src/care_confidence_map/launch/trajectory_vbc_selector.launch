@@ -47,8 +47,11 @@
        resolution.  Keep the optional analytic enclosure disabled by default:
        it is a conservative inflation on top of the discrete swept-volume
        check, not a required sample. -->
-  <arg name="continuous_motion_bound_enabled" default="false" />
+  <arg name="continuous_motion_bound_enabled" default="true" />
   <arg name="include_measured_body" default="false" />
+  <arg name="initial_shell_recovery_enabled" default="false" />
+  <arg name="initial_shell_execution_margin_m" default="0.0" />
+  <arg name="initial_shell_occupied_margin_m" default="0.0" />
 
   <!-- The controlled C4.3 path already sets prefer_predicted_trajectory=true;
        the frozen C4.2 path leaves it false. Use that existing routing signal so
@@ -125,6 +128,9 @@
     <param name="trajectory_vbc/swept_volume_margin_m" value="$(arg swept_volume_margin_m)" />
     <param name="trajectory_vbc/continuous_motion_bound_enabled" value="$(arg continuous_motion_bound_enabled)" />
     <param name="trajectory_vbc/include_measured_body" value="$(arg include_measured_body)" />
+    <param name="trajectory_vbc/initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="trajectory_vbc/initial_shell_execution_margin_m" value="$(arg initial_shell_execution_margin_m)" />
+    <param name="trajectory_vbc/initial_shell_occupied_margin_m" value="$(arg initial_shell_occupied_margin_m)" />
     <param name="trajectory_vbc/temporal_layer_mpc_steps" value="$(arg temporal_layer_mpc_steps)" />
     <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
     <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />

@@ -1,0 +1,3341 @@
+#include <cstring>
+#include <cstdlib>
+#include <array>
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/analytic_ground_support.hpp>
+#include <care_confidence_map/gcdf_primitive_anchors.hpp>
+#include <ros/ros.h>
+#include <ros/callback_queue.h>
+#include <mutex>
+#include <memory>
+
+#include <XmlRpcValue.h>
+
+#include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/QueryConfidenceSnapshot.h>
+#include <unistd.h>
+#include <care_confidence_map/body_sample_model.hpp>
+#include <care_confidence_map/legacy_body_backend.hpp>
+
+#include <std_srvs/Trigger.h>
+#include <std_msgs/String.h>
+
+#include <geometry_msgs/Point.h>
+#include <geometry_msgs/TransformStamped.h>
+#include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/point_cloud2_iterator.h>
+#include <visualization_msgs/Marker.h>
+#include <visualization_msgs/MarkerArray.h>
+
+#include <tf2/LinearMath/Transform.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+struct SensorConfig
+{
+  int id = -1;
+  std::string name;
+  std::string frame;
+};
+
+struct GridPoint
+{
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+
+  // Sensor-derived confidence only. The cold-start bootstrap is stored in a
+  // separate provenance layer so it can be removed without erasing genuine
+  // ToF observations acquired during the first task.
+  float confidence = 0.0f;
+  float bootstrap_confidence = 0.0f;
+  // Optional test-only oracle layer.  It is deliberately kept separate from
+  // sensor/bootstrap provenance so a diagnostic known-free injection cannot
+  // be erased by the next perception update or body-prior refresh.
+  float test_known_free_confidence = 0.0f;
+  float current_visibility = 0.0f;
+  // Phase E3 semantic state. 0 = not occupied / unknown-or-free,
+  // 1 = most recently observed as occupied. Confidence distinguishes
+  // UNKNOWN (low confidence) from observed FREE (high confidence).
+  float occupancy = 0.0f; // Raw legacy evidence, retained for diagnostics.
+  uint32_t plane_candidate_hits=0,plane_compatible_hits=0,plane_generic_hits=0;
+  float residual_confidence=0.,residual_visibility=0.,residual_occupancy=0.;
+  double residual_last_seen=-1.;
+  std::array<double,8> residual_child_seen{{-1.,-1.,-1.,-1.,-1.,-1.,-1.,-1.}};
+  uint8_t residual_seen_mask=0,residual_required_mask=255;
+  double last_seen_time = -1.0;
+  // Passive provenance for the current occupied lifetime. Near-plane means
+  // compatible endpoints only; it never certifies ground-only geometry.
+  uint32_t hit_count = 0, near_ground_hit_count = 0, other_hit_count = 0;
+  uint32_t hit_sensor_mask = 0;
+  float hit_z_min = 0, hit_z_max = 0;
+  float last_hit_x = 0, last_hit_y = 0, last_hit_z = 0;
+  double last_hit_stamp_s = -1.;
+  uint32_t source_time_valid_count=0,source_time_invalid_count=0;
+  uint32_t last_source_stamp_sec=0,last_source_stamp_nsec=0;
+  double source_stamp_min_s=-1.,source_stamp_max_s=-1.,max_fusion_skew_s=0.;
+};
+
+struct LocalVisiblePoint
+{
+  tf2::Vector3 p_sensor;
+};
+
+struct CurrentBodyPriorSphere
+{
+  std::string link_name;
+  tf2::Vector3 center_map;
+  double radius = 0.0;
+};
+
+class ConfidenceMapNode
+{
+public:
+  ConfidenceMapNode()
+    : nh_()
+    , pnh_("~")
+    , query_nh_(nh_)
+    , tf_buffer_()
+    , tf_listener_(tf_buffer_)
+  {
+  }
+
+  ~ConfidenceMapNode()
+  {
+    // Stop the reader before grid/member destruction, including on shutdown
+    // with a request in flight. The default ROS queue remains single-threaded.
+    snapshot_service_.shutdown();
+    query_service_.shutdown();
+    if (query_spinner_) query_spinner_->stop();
+  }
+
+  bool initialize()
+  {
+    if (!loadConfidenceMapParams())
+    {
+      ROS_ERROR("[confidence_map_node] Failed to load confidence_map params.");
+      return false;
+    }
+
+    if (!loadSensorModelParams())
+    {
+      ROS_ERROR("[confidence_map_node] Failed to load sensor_model params.");
+      return false;
+    }
+
+    if (!loadCurrentBodyPriorParams())
+    {
+      ROS_ERROR("[confidence_map_node] Failed to load current_body_prior params.");
+      return false;
+    }
+
+    const char* plane_file=std::getenv("CARE_ANALYTIC_GROUND_FILE");
+    if(plane_file && *plane_file) {
+      try {ground_support_=care_confidence_map::AnalyticGroundSupport::load(plane_file);ground_support_loaded_=true;}
+      catch(const std::exception& e){ROS_ERROR_STREAM("[confidence_map_node] "<<e.what());return false;}
+      const char* apply=std::getenv("CARE_ANALYTIC_GROUND_APPLY");
+      ground_partition_applied_=apply && std::string(apply)=="true";
+      if(ground_partition_applied_ && !ground_support_.association_enabled) {
+        ROS_ERROR("Analytic ground application requires an established source-bound contract");return false;
+      }
+    }
+    generateGlobalGrid();
+    if(ground_partition_applied_)for(auto& point:grid_points_) {
+      point.residual_required_mask=0;
+      for(int child=0;child<8;++child) {
+        Eigen::Vector3d center(point.x,point.y,point.z);
+        for(int axis=0;axis<3;++axis)center[axis]+=((child&(1<<axis))?.25:-.25)*resolution_;
+        if(!ground_support_.residual(center,resolution_/2.,ground_support_.supportUpper()).empty)
+          point.residual_required_mask|=uint8_t(1<<child);
+      }
+    }
+    applyConfiguredTestKnownFreePoints();
+    if (observation_mode_ == "ideal_fov")
+    {
+      generateSensorLocalVisiblePoints();
+    }
+    else
+    {
+      local_visible_points_.clear();
+    }
+
+    fov_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(fov_marker_topic_, 1, true);
+
+    current_body_prior_marker_pub_ =
+        nh_.advertise<visualization_msgs::MarkerArray>(
+            current_body_prior_marker_topic_, 1, true);
+
+    pointcloud_pub_ =
+        nh_.advertise<sensor_msgs::PointCloud2>(pointcloud_topic_, 1, true);
+    e3_summary_pub_ =
+        nh_.advertise<std_msgs::String>(e3_summary_topic_, 1, true);
+
+    if (observation_mode_ == "tof_ray")
+    {
+      ray_observation_sub_ =
+          nh_.subscribe(
+              ray_observation_topic_,
+              1,
+              &ConfidenceMapNode::rayObservationCallback,
+              this);
+    }
+
+    bool dedicated_queries = true;
+    pnh_.param("confidence_map/query_dedicated_queue", dedicated_queries, true);
+    if (dedicated_queries) query_nh_.setCallbackQueue(&query_queue_);
+    query_service_ =
+        query_nh_.advertiseService(query_service_name_,
+                             &ConfidenceMapNode::handleQueryConfidence,
+                             this);
+
+    std::string snapshot_service_name;
+    pnh_.param<std::string>("confidence_map/snapshot_service", snapshot_service_name,
+                           query_service_name_ + "_snapshot");
+    snapshot_service_ = query_nh_.advertiseService(snapshot_service_name,
+                             &ConfidenceMapNode::handleQuerySnapshot, this);
+
+    refresh_body_prior_service_ =
+        nh_.advertiseService(refresh_body_prior_service_name_,
+                             &ConfidenceMapNode::handleRefreshBodyPrior,
+                             this);
+    deactivate_body_prior_service_ =
+        nh_.advertiseService(deactivate_body_prior_service_name_,
+                             &ConfidenceMapNode::handleDeactivateBodyPrior,
+                             this);
+
+    const double update_period = 1.0 / std::max(0.1, update_rate_);
+    const double publish_period = 1.0 / std::max(0.1, publish_rate_);
+
+    update_timer_ =
+        nh_.createTimer(ros::Duration(update_period),
+                        &ConfidenceMapNode::updateTimerCallback,
+                        this);
+
+    publish_timer_ =
+        nh_.createTimer(ros::Duration(publish_period),
+                        &ConfidenceMapNode::publishTimerCallback,
+                        this);
+
+    if (current_body_prior_enabled_ && current_body_prior_refresh_on_startup_)
+    {
+      std::string refresh_msg;
+      refreshCurrentBodyPrior(ros::Time::now(), "startup", &refresh_msg);
+      ROS_INFO_STREAM("[confidence_map_node] startup current-body prior refresh: "
+                      << refresh_msg);
+    }
+
+    snapshot_instance_ = std::to_string(ros::WallTime::now().toNSec()) + ":" + std::to_string(getpid());
+    snapshot_update_stamp_ = snapshot_clock_stamp_ = ros::Time::now();
+    // All initialization (including optional prior refresh) precedes readers.
+    if (dedicated_queries) {
+      query_spinner_.reset(new ros::AsyncSpinner(1, &query_queue_));
+      query_spinner_->start();
+    }
+    ROS_INFO_STREAM("[confidence_map_node] query_dedicated_queue=" << dedicated_queries);
+    printSummary();
+    return true;
+  }
+
+private:
+  friend struct ColdStartPrimitiveTest;
+  bool loadConfidenceMapParams()
+  {
+    ros::NodeHandle& nh = pnh_;
+
+    if (!nh.getParam("confidence_map/frame", map_frame_))
+    {
+      ROS_ERROR("[confidence_map_node] Missing param: confidence_map/frame");
+      return false;
+    }
+
+    nh.param("confidence_map/x_min", x_min_, -0.9);
+    nh.param("confidence_map/x_max", x_max_,  0.9);
+    nh.param("confidence_map/y_min", y_min_, -0.9);
+    nh.param("confidence_map/y_max", y_max_,  0.9);
+    nh.param("confidence_map/z_min", z_min_,  0.0);
+    nh.param("confidence_map/z_max", z_max_,  1.10);
+
+    nh.param("confidence_map/resolution", resolution_, 0.05);
+    nh.param("confidence_map/update_rate", update_rate_, 30.0);
+    nh.param("confidence_map/publish_rate", publish_rate_, 10.0);
+    nh.param("confidence_map/temporal_decay_time", temporal_decay_time_, 2.0);
+
+    // Test-only diagnostic oracle.  Empty/default configuration has no effect
+    // on production semantics.  Points are interpreted in map_frame and
+    // snapped to the nearest confidence-map voxel; an optional radius can be
+    // used to mark a small neighborhood for controlled sensitivity tests.
+    nh.param(
+        "confidence_map/test_known_free/enabled",
+        test_known_free_enabled_,
+        false);
+    nh.param(
+        "confidence_map/test_known_free/inflation_radius",
+        test_known_free_inflation_radius_,
+        0.0);
+    XmlRpc::XmlRpcValue test_points;
+    if (nh.getParam("confidence_map/test_known_free/points", test_points))
+    {
+      if (test_points.getType() != XmlRpc::XmlRpcValue::TypeArray)
+      {
+        ROS_ERROR("[confidence_map_node] confidence_map/test_known_free/points must be an array.");
+        return false;
+      }
+      for (int i = 0; i < test_points.size(); ++i)
+      {
+        const XmlRpc::XmlRpcValue& item = test_points[i];
+        double x = 0.0, y = 0.0, z = 0.0;
+        bool valid = false;
+        if (item.getType() == XmlRpc::XmlRpcValue::TypeArray && item.size() == 3)
+        {
+          auto number = [](const XmlRpc::XmlRpcValue& value, double* out) {
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+            {
+              *out = static_cast<int>(value);
+              return true;
+            }
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+            {
+              *out = static_cast<double>(value);
+              return true;
+            }
+            return false;
+          };
+          valid = number(item[0], &x) && number(item[1], &y) && number(item[2], &z);
+        }
+        else if (item.getType() == XmlRpc::XmlRpcValue::TypeStruct)
+        {
+          auto numberField = [&item](const char* key, double* out) {
+            if (!item.hasMember(key)) return false;
+            const XmlRpc::XmlRpcValue& value = item[key];
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+            {
+              *out = static_cast<int>(value);
+              return true;
+            }
+            if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+            {
+              *out = static_cast<double>(value);
+              return true;
+            }
+            return false;
+          };
+          valid = numberField("x", &x) && numberField("y", &y) && numberField("z", &z);
+        }
+        if (!valid || !std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid test known-free point at index " << i);
+          return false;
+        }
+        test_known_free_points_.emplace_back(x, y, z);
+      }
+    }
+    if (test_known_free_inflation_radius_ < 0.0 ||
+        !std::isfinite(test_known_free_inflation_radius_))
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] invalid test_known_free/inflation_radius: "
+                       << test_known_free_inflation_radius_);
+      return false;
+    }
+
+    nh.param<std::string>(
+        "confidence_map/observation_mode",
+        observation_mode_,
+        "ideal_fov");
+    nh.param<std::string>(
+        "confidence_map/ray_observation_topic",
+        ray_observation_topic_,
+        "/care_planner/perception/tof_ray_observations");
+    nh.param<std::string>(
+        "confidence_map/e3_summary_topic",
+        e3_summary_topic_,
+        "/care_planner/confidence_map/e3_summary");
+    nh.param(
+        "confidence_map/ray_observation_timeout",
+        ray_observation_timeout_,
+        0.25);
+    nh.param(
+        "confidence_map/ray_free_start_range",
+        ray_free_start_range_,
+        0.15);
+    nh.param(
+        "confidence_map/ray_endpoint_guard_distance",
+        ray_endpoint_guard_distance_,
+        0.5 * resolution_);
+    nh.param(
+        "confidence_map/ray_step",
+        ray_step_,
+        0.5 * resolution_);
+    nh.param(
+        "confidence_map/ray_min_valid_range",
+        ray_min_valid_range_,
+        0.10);
+    nh.param(
+        "confidence_map/ray_max_valid_range",
+        ray_max_valid_range_,
+        1.50);
+
+    // Phase E5 safety semantics for the current static-obstacle world.
+    // Once a voxel is positively observed occupied, a later free traversal
+    // must not erase it in one packet. Coarse 5-cm ray rounding and multiple
+    // sensors otherwise create false-free holes directly through obstacles.
+    nh.param(
+        "confidence_map/ray_persistent_occupied",
+        ray_persistent_occupied_,
+        false);
+
+    // Diagnostic-only watched voxel provenance. This does not change mapping
+    // semantics; it records which sensor hit/free rays touch one configured
+    // coarse-grid voxel so false OCCUPIED cells can be traced to their source.
+    nh.param(
+        "confidence_map/debug_occupancy_watch_enabled",
+        debug_occupancy_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_x",
+        debug_occupancy_watch_x_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_y",
+        debug_occupancy_watch_y_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_occupancy_watch_z",
+        debug_occupancy_watch_z_,
+        0.0);
+
+    // Diagnostic-only 3x3x3 neighborhood snapshot around one watched voxel.
+    // A snapshot is emitted only when that voxel is actually queried by a
+    // planner/selector client, so the log captures the map state relevant to
+    // the blocker without changing any confidence/occupancy semantics.
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_enabled",
+        debug_neighborhood_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_x",
+        debug_neighborhood_watch_x_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_y",
+        debug_neighborhood_watch_y_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_z",
+        debug_neighborhood_watch_z_,
+        0.0);
+    nh.param(
+        "confidence_map/debug_neighborhood_watch_period_s",
+        debug_neighborhood_watch_period_s_,
+        1.0);
+
+    // Diagnostic-only occupancy hotspot provenance. This records hit/free
+    // evidence for a small base-frame box without changing mapping semantics.
+    nh.param(
+        "confidence_map/debug_hotspot_watch_enabled",
+        debug_hotspot_watch_enabled_,
+        false);
+    nh.param(
+        "confidence_map/debug_hotspot_x_min",
+        debug_hotspot_x_min_,
+        -0.025);
+    nh.param(
+        "confidence_map/debug_hotspot_x_max",
+        debug_hotspot_x_max_,
+        0.075);
+    nh.param(
+        "confidence_map/debug_hotspot_y_min",
+        debug_hotspot_y_min_,
+        0.025);
+    nh.param(
+        "confidence_map/debug_hotspot_y_max",
+        debug_hotspot_y_max_,
+        0.125);
+    nh.param(
+        "confidence_map/debug_hotspot_z_min",
+        debug_hotspot_z_min_,
+        0.225);
+    nh.param(
+        "confidence_map/debug_hotspot_z_max",
+        debug_hotspot_z_max_,
+        0.425);
+
+    nh.param<std::string>(
+        "confidence_map/marker_topic",
+        marker_topic_,
+        "/care_planner/confidence_map/markers");
+
+    nh.param<std::string>(
+        "confidence_map/pointcloud_topic",
+        pointcloud_topic_,
+        "/care_planner/confidence_map/points");
+
+    nh.param<std::string>(
+        "confidence_map/fov_marker_topic",
+        fov_marker_topic_,
+        "/care_planner/confidence_map/fov_markers");
+
+    nh.param<std::string>(
+        "confidence_map/query_service",
+        query_service_name_,
+        "/care_planner/confidence_map/query");
+
+    if (resolution_ <= 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid resolution: "
+                       << resolution_ << ". It must be positive.");
+      return false;
+    }
+
+    if (update_rate_ <= 0.0 || publish_rate_ <= 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid rates. update_rate="
+                       << update_rate_ << ", publish_rate=" << publish_rate_);
+      return false;
+    }
+
+    if (temporal_decay_time_ <= 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid temporal_decay_time: "
+                       << temporal_decay_time_);
+      return false;
+    }
+
+    if (observation_mode_ != "ideal_fov" &&
+        observation_mode_ != "tof_ray")
+    {
+      ROS_ERROR_STREAM(
+          "[confidence_map_node] Invalid observation_mode='"
+          << observation_mode_ << "'. Expected ideal_fov or tof_ray.");
+      return false;
+    }
+
+    if (ray_observation_timeout_ <= 0.0 ||
+        ray_free_start_range_ < 0.0 ||
+        ray_endpoint_guard_distance_ < 0.0 ||
+        ray_step_ <= 0.0 ||
+        ray_min_valid_range_ < 0.0 ||
+        ray_max_valid_range_ <= ray_min_valid_range_)
+    {
+      ROS_ERROR("[confidence_map_node] Invalid Phase E3 ray parameters.");
+      return false;
+    }
+
+    if (x_max_ <= x_min_ || y_max_ <= y_min_ || z_max_ <= z_min_)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid map bounds.");
+      return false;
+    }
+
+    nx_ = static_cast<int>(std::floor((x_max_ - x_min_) / resolution_)) + 1;
+    ny_ = static_cast<int>(std::floor((y_max_ - y_min_) / resolution_)) + 1;
+    nz_ = static_cast<int>(std::floor((z_max_ - z_min_) / resolution_)) + 1;
+
+    if (nx_ <= 0 || ny_ <= 0 || nz_ <= 0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid grid size: "
+                       << nx_ << " x " << ny_ << " x " << nz_);
+      return false;
+    }
+
+    return true;
+  }
+
+  bool loadCurrentBodyPriorParams()
+  {
+    ros::NodeHandle& nh = pnh_;
+
+    nh.param<std::string>("current_body_prior/geometry_backend", current_body_prior_geometry_backend_, "samples");
+    if (current_body_prior_geometry_backend_ != "samples" && current_body_prior_geometry_backend_ != "primitive")
+    {
+      ROS_ERROR("[confidence_map_node] Unknown body prior geometry_backend (no fallback).");
+      return false;
+    }
+
+    nh.param("current_body_prior/enabled",
+             current_body_prior_enabled_,
+             true);
+
+    nh.param("current_body_prior/refresh_on_startup",
+             current_body_prior_refresh_on_startup_,
+             true);
+
+    nh.param("current_body_prior/lock_after_complete_refresh",
+             current_body_prior_lock_after_complete_refresh_,
+             false);
+
+    nh.param("current_body_prior/risk_samples_only",
+             current_body_prior_risk_samples_only_,
+             false);
+
+    // Legacy scalar remains as a fallback for links not listed below. Phase-E
+    // now uses per-link cold-start envelopes derived from the 50-ms MAX
+    // Cartesian motion of each link under the planner velocity limits.
+    nh.param("current_body_prior/inflation_radius",
+             current_body_prior_inflation_radius_,
+             0.0);
+
+    current_body_prior_link_inflation_radius_.clear();
+    XmlRpc::XmlRpcValue link_inflation_xml;
+    if (nh.getParam("current_body_prior/link_inflation_radius", link_inflation_xml))
+    {
+      if (link_inflation_xml.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+      {
+        ROS_ERROR("[confidence_map_node] current_body_prior/link_inflation_radius must be a map.");
+        return false;
+      }
+
+      for (auto it = link_inflation_xml.begin(); it != link_inflation_xml.end(); ++it)
+      {
+        const std::string link_name = it->first;
+        const XmlRpc::XmlRpcValue& value = it->second;
+        double inflation = 0.0;
+        if (value.getType() == XmlRpc::XmlRpcValue::TypeDouble)
+        {
+          inflation = static_cast<double>(value);
+        }
+        else if (value.getType() == XmlRpc::XmlRpcValue::TypeInt)
+        {
+          inflation = static_cast<int>(value);
+        }
+        else
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid inflation for link "
+                           << link_name << ": expected numeric value");
+          return false;
+        }
+        if (!std::isfinite(inflation) || inflation < 0.0)
+        {
+          ROS_ERROR_STREAM("[confidence_map_node] invalid inflation for link "
+                           << link_name << ": " << inflation);
+          return false;
+        }
+        current_body_prior_link_inflation_radius_[link_name] = inflation;
+      }
+    }
+
+    nh.param("current_body_prior/tf_timeout",
+             current_body_prior_tf_timeout_,
+             0.05);
+
+    nh.param<std::string>(
+        "current_body_prior/body_samples_file",
+        current_body_prior_body_samples_file_,
+        "");
+
+    nh.param<std::string>(
+        "current_body_prior/refresh_service",
+        refresh_body_prior_service_name_,
+        "/care_planner/confidence_map/refresh_body_prior");
+
+    nh.param<std::string>(
+        "current_body_prior/marker_topic",
+        current_body_prior_marker_topic_,
+        "/care_planner/confidence_map/current_body_prior_markers");
+
+    nh.param<std::string>(
+        "current_body_prior/deactivate_service",
+        deactivate_body_prior_service_name_,
+        "/care_planner/confidence_map/deactivate_body_prior");
+
+    if (!current_body_prior_enabled_)
+    {
+      return true;
+    }
+
+    if (!std::isfinite(current_body_prior_inflation_radius_) || current_body_prior_inflation_radius_ < 0.0 ||
+        !std::isfinite(current_body_prior_tf_timeout_) || current_body_prior_tf_timeout_ < 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid current_body_prior/inflation_radius: "
+                       << current_body_prior_inflation_radius_);
+      return false;
+    }
+
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      std::string urdf_file, error;
+      nh.param<std::string>("current_body_prior/primitive_urdf_file", urdf_file, "");
+      // Do not silently reinterpret arbitrary YAML risk flags as URDF link roles.
+      // Explicit exclusions are required only for the optional risk-only mode.
+      std::vector<std::string> ignored;
+      if (current_body_prior_risk_samples_only_ &&
+          !nh.getParam("current_body_prior/primitive_risk_excluded_links", ignored))
+      {
+        ROS_ERROR("[confidence_map_node] primitive risk-only mode requires explicit primitive_risk_excluded_links.");
+        return false;
+      }
+      if (!current_body_primitive_model_.load(urdf_file, ignored, &error))
+      {
+        ROS_ERROR_STREAM("[confidence_map_node] Cannot load primitive prior: " << error);
+        return false;
+      }
+      if (!ignored.empty())
+      {
+        care_confidence_map::VbcPrimitiveModel all_links;
+        if (!all_links.load(urdf_file, {}, &error)) return false;
+        std::set<std::string> seen;
+        for (const auto& link : ignored)
+          if (std::find(all_links.frames().begin(), all_links.frames().end(), link) == all_links.frames().end() ||
+              !seen.insert(link).second)
+          {
+            ROS_ERROR_STREAM("[confidence_map_node] Unknown/duplicate primitive risk exclusion: " << link);
+            return false;
+          }
+      }
+      ROS_INFO_STREAM("[confidence_map_node] primitive prior: "
+                      << current_body_primitive_model_.primitives().size()
+                      << " solids; no body_samples.yaml loaded; URDF=" << urdf_file);
+      return true;
+    }
+
+    if (current_body_prior_body_samples_file_.empty())
+    {
+      ROS_ERROR("[confidence_map_node] current_body_prior/body_samples_file is empty.");
+      return false;
+    }
+
+    std::string error_msg;
+    if (!care_confidence_map::loadLegacyBodySamples(&current_body_sample_model_,
+            current_body_prior_body_samples_file_, &error_msg))
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Failed to load body samples for current_body_prior: "
+                       << error_msg);
+      return false;
+    }
+
+    ROS_INFO_STREAM("[confidence_map_node] Loaded "
+                    << current_body_sample_model_.size()
+                    << " body samples for current_body_prior from "
+                    << current_body_prior_body_samples_file_);
+
+    return true;
+  }
+
+  bool loadSensorModelParams()
+  {
+    ros::NodeHandle& nh = pnh_;
+
+    nh.param<std::string>("sensor_model/forward_axis", forward_axis_, "z");
+
+    nh.param("sensor_model/tof_min_range", tof_min_range_, 0.05);
+    nh.param("sensor_model/tof_max_range", tof_max_range_, 0.75);
+    nh.param("sensor_model/horizontal_fov_deg", horizontal_fov_deg_, 55.0);
+    nh.param("sensor_model/vertical_fov_deg", vertical_fov_deg_, 72.0);
+    nh.param("sensor_model/local_resolution", local_resolution_, resolution_);
+
+    if (local_resolution_ <= 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid sensor_model/local_resolution: "
+                       << local_resolution_);
+      return false;
+    }
+
+    if (tof_max_range_ <= tof_min_range_)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid ToF range: ["
+                       << tof_min_range_ << ", " << tof_max_range_ << "]");
+      return false;
+    }
+
+    if (horizontal_fov_deg_ <= 0.0 || vertical_fov_deg_ <= 0.0)
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid FOV: horizontal="
+                       << horizontal_fov_deg_
+                       << ", vertical=" << vertical_fov_deg_);
+      return false;
+    }
+
+    if (!parseForwardAxis(forward_axis_, forward_dir_))
+    {
+      ROS_ERROR_STREAM("[confidence_map_node] Invalid sensor_model/forward_axis: "
+                       << forward_axis_
+                       << ". Expected one of: x, y, z, -x, -y, -z.");
+      return false;
+    }
+
+    buildSensorBasis();
+
+    half_h_fov_rad_ = 0.5 * degToRad(horizontal_fov_deg_);
+    half_v_fov_rad_ = 0.5 * degToRad(vertical_fov_deg_);
+    tan_half_h_fov_ = std::tan(half_h_fov_rad_);
+    tan_half_v_fov_ = std::tan(half_v_fov_rad_);
+
+    XmlRpc::XmlRpcValue sensors_xml;
+    if (!nh.getParam("sensor_model/sensors", sensors_xml))
+    {
+      ROS_ERROR("[confidence_map_node] Missing param: sensor_model/sensors");
+      return false;
+    }
+
+    if (sensors_xml.getType() != XmlRpc::XmlRpcValue::TypeArray)
+    {
+      ROS_ERROR("[confidence_map_node] sensor_model/sensors must be a list.");
+      return false;
+    }
+
+    sensors_.clear();
+
+    for (int i = 0; i < sensors_xml.size(); ++i)
+    {
+      if (sensors_xml[i].getType() != XmlRpc::XmlRpcValue::TypeStruct)
+      {
+        ROS_WARN("[confidence_map_node] Skip invalid sensor entry %d because it is not a struct.", i);
+        continue;
+      }
+
+      SensorConfig sensor;
+
+      if (sensors_xml[i].hasMember("id"))
+      {
+        sensor.id = static_cast<int>(sensors_xml[i]["id"]);
+      }
+
+      if (sensors_xml[i].hasMember("name"))
+      {
+        sensor.name = static_cast<std::string>(sensors_xml[i]["name"]);
+      }
+
+      if (sensors_xml[i].hasMember("frame"))
+      {
+        sensor.frame = static_cast<std::string>(sensors_xml[i]["frame"]);
+      }
+
+      if (sensor.frame.empty())
+      {
+        ROS_WARN("[confidence_map_node] Skip sensor entry %d because frame is empty.", i);
+        continue;
+      }
+
+      if (sensor.name.empty())
+      {
+        sensor.name = sensor.frame;
+      }
+
+      sensors_.push_back(sensor);
+    }
+
+    if (sensors_.empty())
+    {
+      ROS_ERROR("[confidence_map_node] No valid sensors loaded.");
+      return false;
+    }
+
+    return true;
+  }
+
+  void generateGlobalGrid()
+  {
+    grid_points_.clear();
+    grid_points_.reserve(static_cast<size_t>(nx_) *
+                         static_cast<size_t>(ny_) *
+                         static_cast<size_t>(nz_));
+
+    for (int ix = 0; ix < nx_; ++ix)
+    {
+      const double x = x_min_ + static_cast<double>(ix) * resolution_;
+
+      for (int iy = 0; iy < ny_; ++iy)
+      {
+        const double y = y_min_ + static_cast<double>(iy) * resolution_;
+
+        for (int iz = 0; iz < nz_; ++iz)
+        {
+          const double z = z_min_ + static_cast<double>(iz) * resolution_;
+
+          GridPoint p;
+          p.x = static_cast<float>(x);
+          p.y = static_cast<float>(y);
+          p.z = static_cast<float>(z);
+          p.confidence = 0.0f;
+          p.bootstrap_confidence = 0.0f;
+          p.test_known_free_confidence = 0.0f;
+          p.current_visibility = 0.0f;
+          p.occupancy = 0.0f;
+          p.last_seen_time = -1.0;
+
+          grid_points_.push_back(p);
+        }
+      }
+    }
+
+    ROS_INFO_STREAM("[confidence_map_node] Generated global confidence grid with "
+                    << grid_points_.size() << " points.");
+  }
+
+  int gridLinearIndex(int ix, int iy, int iz) const
+  {
+    return ix * ny_ * nz_ + iy * nz_ + iz;
+  }
+
+  float residualConfidence(const GridPoint& p) const {
+    if(!ground_partition_applied_)return p.confidence;
+    const double age=ros::Time::now().toSec()-p.residual_last_seen;
+    if(p.residual_last_seen<0. || !std::isfinite(age) || age<0.)return 0.f;
+    return static_cast<float>(p.residual_confidence*std::exp(-age/temporal_decay_time_));
+  }
+  float effectiveOccupancy(const GridPoint& p) const {return ground_partition_applied_?p.residual_occupancy:p.occupancy;}
+  float effectiveVisibility(const GridPoint& p) const {return ground_partition_applied_?p.residual_visibility:p.current_visibility;}
+  double effectiveLastSeen(const GridPoint& p) const {return ground_partition_applied_?p.residual_last_seen:p.last_seen_time;}
+  float effectiveConfidence(const GridPoint& p) const
+  {
+    const float bootstrap = current_body_prior_active_
+        ? p.bootstrap_confidence
+        : 0.0f;
+    return std::max(std::max(residualConfidence(p), bootstrap),
+                    p.test_known_free_confidence);
+  }
+
+  void applyConfiguredTestKnownFreePoints()
+  {
+    if (!test_known_free_enabled_ || test_known_free_points_.empty())
+    {
+      return;
+    }
+
+    int updated_cells = 0;
+    for (const auto& point : test_known_free_points_)
+    {
+      const double radius = test_known_free_inflation_radius_;
+      if (radius <= 1e-12)
+      {
+        int index = -1;
+        if (!positionToGridIndex(point, index))
+        {
+          ROS_WARN_STREAM("[confidence_map_node] test known-free point outside map: ["
+                          << point.x() << "," << point.y() << "," << point.z() << "]");
+          continue;
+        }
+        GridPoint& gp = grid_points_[static_cast<std::size_t>(index)];
+        if (gp.test_known_free_confidence <= 0.5f) ++updated_cells;
+        gp.test_known_free_confidence = 1.0f;
+        continue;
+      }
+
+      const double r2 = radius * radius;
+      int ix_min = std::max(0, static_cast<int>(std::floor((point.x() - radius - x_min_) / resolution_)));
+      int ix_max = std::min(nx_ - 1, static_cast<int>(std::ceil((point.x() + radius - x_min_) / resolution_)));
+      int iy_min = std::max(0, static_cast<int>(std::floor((point.y() - radius - y_min_) / resolution_)));
+      int iy_max = std::min(ny_ - 1, static_cast<int>(std::ceil((point.y() + radius - y_min_) / resolution_)));
+      int iz_min = std::max(0, static_cast<int>(std::floor((point.z() - radius - z_min_) / resolution_)));
+      int iz_max = std::min(nz_ - 1, static_cast<int>(std::ceil((point.z() + radius - z_min_) / resolution_)));
+      for (int ix = ix_min; ix <= ix_max; ++ix)
+      for (int iy = iy_min; iy <= iy_max; ++iy)
+      for (int iz = iz_min; iz <= iz_max; ++iz)
+      {
+        const double gx = x_min_ + static_cast<double>(ix) * resolution_;
+        const double gy = y_min_ + static_cast<double>(iy) * resolution_;
+        const double gz = z_min_ + static_cast<double>(iz) * resolution_;
+        const double dx = gx - point.x();
+        const double dy = gy - point.y();
+        const double dz = gz - point.z();
+        if (dx * dx + dy * dy + dz * dz > r2) continue;
+        GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
+        if (gp.test_known_free_confidence <= 0.5f) ++updated_cells;
+        gp.test_known_free_confidence = 1.0f;
+      }
+    }
+    ROS_WARN_STREAM("[confidence_map_node] TEST known-free oracle enabled: points="
+                    << test_known_free_points_.size()
+                    << ", inflation_radius=" << test_known_free_inflation_radius_
+                    << ", marked_voxels=" << updated_cells);
+  }
+
+  void clearBootstrapConfidenceLayer()
+  {
+    for (auto& gp : grid_points_)
+    {
+      gp.bootstrap_confidence = 0.0f;
+    }
+    current_body_prior_active_ = false;
+  }
+
+  double currentBodyPriorInflationForLink(const std::string& link_name) const
+  {
+    const auto it = current_body_prior_link_inflation_radius_.find(link_name);
+    if (it != current_body_prior_link_inflation_radius_.end())
+    {
+      return it->second;
+    }
+    return current_body_prior_inflation_radius_;
+  }
+
+  void markSphereAsKnownClear(
+      const tf2::Vector3& center_map,
+      double radius,
+      const ros::Time& stamp,
+      int* updated_cells)
+  {
+    if (updated_cells == nullptr)
+    {
+      return;
+    }
+
+    const double r = std::max(0.0, radius);
+    const double r2 = r * r;
+
+    int ix_min = static_cast<int>(
+        std::floor((center_map.x() - r - x_min_) / resolution_));
+    int ix_max = static_cast<int>(
+        std::ceil((center_map.x() + r - x_min_) / resolution_));
+    int iy_min = static_cast<int>(
+        std::floor((center_map.y() - r - y_min_) / resolution_));
+    int iy_max = static_cast<int>(
+        std::ceil((center_map.y() + r - y_min_) / resolution_));
+    int iz_min = static_cast<int>(
+        std::floor((center_map.z() - r - z_min_) / resolution_));
+    int iz_max = static_cast<int>(
+        std::ceil((center_map.z() + r - z_min_) / resolution_));
+
+    ix_min = std::max(0, ix_min);
+    iy_min = std::max(0, iy_min);
+    iz_min = std::max(0, iz_min);
+    ix_max = std::min(nx_ - 1, ix_max);
+    iy_max = std::min(ny_ - 1, iy_max);
+    iz_max = std::min(nz_ - 1, iz_max);
+
+    (void)stamp;
+
+    for (int ix = ix_min; ix <= ix_max; ++ix)
+    {
+      const double x = x_min_ + static_cast<double>(ix) * resolution_;
+      for (int iy = iy_min; iy <= iy_max; ++iy)
+      {
+        const double y = y_min_ + static_cast<double>(iy) * resolution_;
+        for (int iz = iz_min; iz <= iz_max; ++iz)
+        {
+          const double z = z_min_ + static_cast<double>(iz) * resolution_;
+          const double dx = x - center_map.x();
+          const double dy = y - center_map.y();
+          const double dz = z - center_map.z();
+
+          if (dx * dx + dy * dy + dz * dz > r2)
+          {
+            continue;
+          }
+
+          GridPoint& gp = grid_points_[gridLinearIndex(ix, iy, iz)];
+
+          // Cold-start provenance only: do NOT overwrite sensor confidence,
+          // occupancy, or last_seen_time. A real ToF observation always remains
+          // independently preserved when this bootstrap layer is later removed.
+          gp.bootstrap_confidence = 1.0f;
+
+          // This is a robot-body known-clear prior, not a live sensor ray.
+          // Leave current_visibility untouched as well: a real ToF packet may
+          // already have arrived before the one-shot bootstrap refresh.
+
+          *updated_cells += 1;
+        }
+      }
+    }
+  }
+
+  void markPrimitiveAsKnownClear(const care_confidence_map::VbcPrimitive& primitive, double inflation)
+  {
+    GridPoint* const grid = grid_points_.data();
+    const int ny = ny_, nz = nz_;
+    care_confidence_map::visitPrimitiveProximity(primitive, inflation, 0.0,
+        Eigen::Vector3d(x_min_, y_min_, z_min_), Eigen::Vector3i(nx_, ny_, nz_), resolution_,
+        [&](int x, int y, int z, float) {
+          // Same provenance-only write as the legacy sphere path.
+          grid[(x*ny+y)*nz+z].bootstrap_confidence = 1.0f;
+          ++last_body_prior_updated_cells_;
+        }, [&](int x, int y, int z) {
+          // Union membership is already proven by a previous solid. Avoid
+          // another exact SDF evaluation; never skip an unclassified cell.
+          return grid[(x*ny+y)*nz+z].bootstrap_confidence == 0.0f;
+        });
+  }
+
+  bool refreshCurrentBodyPrior(
+      const ros::Time& now,
+      const std::string& reason,
+      std::string* message)
+  {
+    if (current_body_prior_locked_)
+    {
+      if (message)
+      {
+        *message = "current_body_prior locked after complete initial refresh";
+      }
+      ROS_WARN_STREAM_THROTTLE(
+          2.0,
+          "[confidence_map_node] rejecting body-prior refresh after lock; reason="
+              << reason);
+      return true;
+    }
+
+    // Retries must be atomic from the planner's perspective. Remove any
+    // incomplete bootstrap from the previous attempt before rebuilding it.
+    clearBootstrapConfidenceLayer();
+    last_body_prior_spheres_.clear();
+    last_body_prior_refresh_time_ = now;
+    last_body_prior_updated_cells_ = 0;
+    last_body_prior_transformed_samples_ = 0;
+    last_body_prior_skipped_samples_ = 0;
+
+    if (!current_body_prior_enabled_)
+    {
+      if (message)
+      {
+        *message = "current_body_prior disabled";
+      }
+      return true;
+    }
+
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      // All TFs/geometry must validate BEFORE any primitive becomes effective.
+      // Cache one latest transform per link, retaining the existing TF policy.
+      std::map<std::string, tf2::Transform> transforms;
+      for (const auto& frame : current_body_primitive_model_.frames())
+      {
+        try
+        {
+          const auto msg = tf_buffer_.lookupTransform(map_frame_, frame, ros::Time(0),
+              ros::Duration(current_body_prior_tf_timeout_));
+          transforms.emplace(frame, transformMsgToTf2(msg));
+        }
+        catch (const tf2::TransformException& ex)
+        {
+          ROS_WARN_STREAM_THROTTLE(2.0, "[confidence_map_node] primitive prior missing TF: " << ex.what());
+        }
+      }
+      std::vector<care_confidence_map::GcdfPrimitiveAnchor> pending;
+      pending.reserve(current_body_primitive_model_.primitives().size());
+      try
+      {
+        for (const auto& local : current_body_primitive_model_.primitives())
+        {
+          const auto it = transforms.find(local.link_name);
+          if (it == transforms.end()) { ++last_body_prior_skipped_samples_; continue; }
+          care_confidence_map::GcdfPrimitiveAnchor a;
+          a.eval_timestep = a.original_timestep = 0;
+          a.shape = local;
+          const auto& tf = it->second;
+          const auto c = tf * tf2::Vector3(local.center.x(), local.center.y(), local.center.z());
+          a.shape.center = Eigen::Vector3d(c.x(), c.y(), c.z());
+          // Same R_map_link * R_link_collision, without Eigen expression
+          // temporaries in the workspace's unoptimized build.
+          double* rotation = a.shape.rotation.data();
+          const double* local_rotation = local.rotation.data();
+          for (int r=0; r<3; ++r) for (int s=0; s<3; ++s)
+            rotation[3*s+r] = tf.getBasis()[r][0]*local_rotation[3*s] +
+                tf.getBasis()[r][1]*local_rotation[3*s+1] + tf.getBasis()[r][2]*local_rotation[3*s+2];
+          a.inflation = currentBodyPriorInflationForLink(local.link_name);
+          care_confidence_map::validatePrimitiveAnchor(a);
+          pending.push_back(std::move(a));
+          ++last_body_prior_transformed_samples_;
+        }
+        if (last_body_prior_skipped_samples_ == 0 && !pending.empty())
+        {
+          // Large startup envelopes first: overlapping cells need an exact
+          // containment test only until one solid proves union membership.
+          // This changes neither coverage nor confidence provenance.
+          std::stable_sort(pending.begin(), pending.end(), [](const auto& a, const auto& b) {
+            return a.inflation > b.inflation;
+          });
+          for (const auto& a : pending) markPrimitiveAsKnownClear(a.shape, a.inflation);
+        }
+      }
+      catch (const std::exception& ex)
+      {
+        clearBootstrapConfidenceLayer();
+        last_body_prior_updated_cells_ = 0;
+        if (message) *message = std::string("primitive prior rejected: ") + ex.what();
+        return false;
+      }
+    }
+    else
+    {
+    if (current_body_sample_model_.size() == 0)
+    {
+      if (message)
+      {
+        *message = "no body samples loaded";
+      }
+      return false;
+    }
+
+    const ros::Duration timeout(
+        std::max(0.0, current_body_prior_tf_timeout_));
+
+    for (const auto& sample : current_body_sample_model_.samples())
+    {
+      if (current_body_prior_risk_samples_only_ && !sample.include_for_risk)
+      {
+        continue;
+      }
+
+      geometry_msgs::TransformStamped tf_msg;
+      try
+      {
+        tf_msg = tf_buffer_.lookupTransform(
+            map_frame_,
+            sample.frame_name,
+            ros::Time(0),
+            timeout);
+      }
+      catch (const tf2::TransformException& ex)
+      {
+        ++last_body_prior_skipped_samples_;
+        ROS_WARN_THROTTLE(
+            2.0,
+            "[confidence_map_node] current_body_prior missing TF %s -> %s: %s",
+            map_frame_.c_str(),
+            sample.frame_name.c_str(),
+            ex.what());
+        continue;
+      }
+
+      const tf2::Transform T_map_link = transformMsgToTf2(tf_msg);
+      const tf2::Vector3 center_map = T_map_link * sample.center_link;
+      const double link_inflation =
+          currentBodyPriorInflationForLink(sample.link_name);
+      const double radius = sample.radius + link_inflation;
+
+      markSphereAsKnownClear(
+          center_map, radius, now, &last_body_prior_updated_cells_);
+
+      CurrentBodyPriorSphere sphere;
+      sphere.link_name = sample.link_name;
+      sphere.center_map = center_map;
+      sphere.radius = radius;
+      last_body_prior_spheres_.push_back(sphere);
+
+      ++last_body_prior_transformed_samples_;
+    }
+    }
+
+    std::ostringstream oss;
+    oss << "reason=" << reason
+        << ", geometry_backend=" << current_body_prior_geometry_backend_
+        << ", transformed_samples=" << last_body_prior_transformed_samples_
+        << ", skipped_samples=" << last_body_prior_skipped_samples_
+        << ", updated_cells=" << last_body_prior_updated_cells_
+        << ", inflation_radius=" << current_body_prior_inflation_radius_;
+
+    if (message)
+    {
+      *message = oss.str();
+    }
+
+    if (last_body_prior_transformed_samples_ <= 0)
+    {
+      ROS_WARN_STREAM("[confidence_map_node] current_body_prior refresh failed: "
+                      << oss.str());
+      return false;
+    }
+
+    // Only a complete TF refresh is allowed to become an effective FREE
+    // bootstrap. Partial attempts remain invisible to confidence queries and
+    // are cleared on the next retry.
+    current_body_prior_active_ =
+        (last_body_prior_transformed_samples_ > 0 &&
+         last_body_prior_skipped_samples_ == 0);
+
+    ROS_INFO_STREAM_THROTTLE(
+        1.0,
+        "[confidence_map_node] current_body_prior refreshed: "
+            << oss.str()
+            << ", active=" << static_cast<int>(current_body_prior_active_));
+
+    publishCurrentBodyPriorMarkers();
+
+    if (current_body_prior_lock_after_complete_refresh_ &&
+        last_body_prior_transformed_samples_ > 0 &&
+        last_body_prior_skipped_samples_ == 0)
+    {
+      current_body_prior_locked_ = true;
+      ROS_WARN(
+          "[confidence_map_node] initial trusted-free body prior LOCKED; "
+          "future refresh requests cannot move/clear the map.");
+    }
+
+    return true;
+  }
+
+  void generateSensorLocalVisiblePoints()
+  {
+    local_visible_points_.clear();
+
+    const int n_depth =
+        static_cast<int>(std::floor((tof_max_range_ - tof_min_range_) / local_resolution_)) + 1;
+
+    for (int id = 0; id < n_depth; ++id)
+    {
+      const double depth =
+          tof_min_range_ + static_cast<double>(id) * local_resolution_;
+
+      if (depth < tof_min_range_ || depth > tof_max_range_)
+      {
+        continue;
+      }
+
+      const double h_max = depth * tan_half_h_fov_;
+      const double v_max = depth * tan_half_v_fov_;
+
+      const int n_h =
+          static_cast<int>(std::floor((2.0 * h_max) / local_resolution_)) + 1;
+      const int n_v =
+          static_cast<int>(std::floor((2.0 * v_max) / local_resolution_)) + 1;
+
+      for (int ih = 0; ih < n_h; ++ih)
+      {
+        const double h =
+            -h_max + static_cast<double>(ih) * local_resolution_;
+
+        for (int iv = 0; iv < n_v; ++iv)
+        {
+          const double v =
+              -v_max + static_cast<double>(iv) * local_resolution_;
+
+          LocalVisiblePoint local_point;
+          local_point.p_sensor =
+              forward_dir_ * depth + right_dir_ * h + up_dir_ * v;
+
+          local_visible_points_.push_back(local_point);
+        }
+      }
+
+      LocalVisiblePoint center_point;
+      center_point.p_sensor = forward_dir_ * depth;
+      local_visible_points_.push_back(center_point);
+    }
+
+    ROS_INFO_STREAM("[confidence_map_node] Generated sensor-local visible points: "
+                    << local_visible_points_.size()
+                    << " per sensor at local_resolution="
+                    << local_resolution_);
+  }
+
+  void resetCurrentVisibility()
+  {
+    for (auto& p : grid_points_)
+    {
+      p.current_visibility = 0.0f;
+    }
+  }
+
+  bool positionToGridIndex(const tf2::Vector3& p_map, int& index) const
+  {
+    const int ix = static_cast<int>(
+        std::llround((p_map.x() - x_min_) / resolution_));
+    const int iy = static_cast<int>(
+        std::llround((p_map.y() - y_min_) / resolution_));
+    const int iz = static_cast<int>(
+        std::llround((p_map.z() - z_min_) / resolution_));
+
+    if (ix < 0 || ix >= nx_ ||
+        iy < 0 || iy >= ny_ ||
+        iz < 0 || iz >= nz_)
+    {
+      return false;
+    }
+
+    index = ix * ny_ * nz_ + iy * nz_ + iz;
+    return true;
+  }
+
+  void updateConfidenceMapSensorCentric(
+      const std::vector<tf2::Transform>& T_map_sensors,
+      const ros::Time& now)
+  {
+    resetCurrentVisibility();
+
+    for (const auto& T_map_sensor : T_map_sensors)
+    {
+      for (const auto& local_point : local_visible_points_)
+      {
+        const tf2::Vector3 p_map =
+            T_map_sensor * local_point.p_sensor;
+
+        int index = -1;
+        if (!positionToGridIndex(p_map, index))
+        {
+          continue;
+        }
+
+        grid_points_[index].current_visibility = 1.0f;
+      }
+    }
+
+    const double now_sec = now.toSec();
+
+    for (auto& p : grid_points_)
+    {
+      if (p.current_visibility > 0.5f)
+      {
+        p.confidence = 1.0f;
+        p.last_seen_time = now_sec;
+      }
+      else
+      {
+        if (p.last_seen_time >= 0.0)
+        {
+          const double dt = std::max(0.0, now_sec - p.last_seen_time);
+          p.confidence =
+              static_cast<float>(std::exp(-dt / temporal_decay_time_));
+        }
+        else
+        {
+          p.confidence = 0.0f;
+        }
+      }
+    }
+
+    printConfidenceStatsThrottled();
+  }
+
+  void applyTemporalDecay(const ros::Time& now)
+  {
+    const double now_sec = now.toSec();
+    for (auto& p : grid_points_)
+    {
+      if (p.current_visibility > 0.5f)
+      {
+        continue;
+      }
+
+      if (p.last_seen_time >= 0.0)
+      {
+        const double dt = std::max(0.0, now_sec - p.last_seen_time);
+        p.confidence =
+            static_cast<float>(std::exp(-dt / temporal_decay_time_));
+      }
+      else
+      {
+        p.confidence = 0.0f;
+      }
+    }
+  }
+
+  void rayObservationCallback(
+      const sensor_msgs::PointCloud2ConstPtr& msg)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
+    if (!msg || observation_mode_ != "tof_ray")
+    {
+      return;
+    }
+
+    if (!msg->header.frame_id.empty() &&
+        msg->header.frame_id != map_frame_)
+    {
+      ++ray_decode_failure_count_;
+      ROS_ERROR_STREAM_THROTTLE(
+          1.0,
+          "[confidence_map_node] Phase E3 ray frame mismatch: msg='"
+          << msg->header.frame_id << "' map='" << map_frame_
+          << "'. E2 ray observations must be expressed in the map frame.");
+      return;
+    }
+
+    std::vector<uint8_t> free_mask(grid_points_.size(), 0);
+    std::array<double,8> unseen;unseen.fill(-1.);
+    std::vector<std::array<double,8>> residual_free_source(grid_points_.size(),unseen);
+    const auto mark_residual_free=[&](int index,const tf2::Vector3& position,double source) {
+      if(!ground_partition_applied_)return;
+      const auto& cell=grid_points_[index];
+      const int child=(position.x()>=cell.x?1:0)|(position.y()>=cell.y?2:0)|(position.z()>=cell.z?4:0);
+      residual_free_source[index][child]=std::max(residual_free_source[index][child],source);
+    };
+    std::vector<uint8_t> occupied_mask(grid_points_.size(), 0);
+    struct PacketHit {
+      uint32_t count=0,near=0,other=0,sensors=0,candidate=0,compatible=0;
+      uint32_t generic_source_valid=0;
+      double generic_source_max=-1.;
+      float z_min=0,z_max=0; tf2::Vector3 endpoint;
+      uint32_t source_valid=0,source_invalid=0,source_sec=0,source_nsec=0;
+      double source_min=-1.,source_max=-1.,fusion_skew=0.;
+    };
+    std::map<int,PacketHit> packet_hits;
+
+    int watched_index = -1;
+    if (debug_occupancy_watch_enabled_)
+    {
+      const tf2::Vector3 watched_point(
+          debug_occupancy_watch_x_,
+          debug_occupancy_watch_y_,
+          debug_occupancy_watch_z_);
+      if (!positionToGridIndex(watched_point, watched_index))
+      {
+        watched_index = -1;
+      }
+    }
+    std::map<int, std::size_t> watched_hit_counts;
+    std::map<int, std::size_t> watched_free_counts;
+    std::map<int, tf2::Vector3> watched_last_hit_endpoint;
+    std::map<int, tf2::Vector3> watched_last_hit_origin;
+
+    // Hotspot provenance is indexed by confidence-map voxel index, then
+    // sensor id. It records only diagnostics; free/occupied masks below remain
+    // the sole mapping inputs.
+    std::map<int, std::map<int, std::size_t>> hotspot_hit_counts;
+    std::map<int, std::map<int, std::size_t>> hotspot_free_counts;
+    std::map<int, std::map<int, tf2::Vector3>> hotspot_last_hit_endpoint;
+    std::map<int, std::map<int, tf2::Vector3>> hotspot_last_hit_origin;
+
+    auto hotspotIndex = [this](int index) -> bool
+    {
+      if (!debug_hotspot_watch_enabled_ ||
+          index < 0 ||
+          index >= static_cast<int>(grid_points_.size()))
+      {
+        return false;
+      }
+      const GridPoint& gp =
+          grid_points_[static_cast<std::size_t>(index)];
+      return
+          gp.x >= debug_hotspot_x_min_ &&
+          gp.x <= debug_hotspot_x_max_ &&
+          gp.y >= debug_hotspot_y_min_ &&
+          gp.y <= debug_hotspot_y_max_ &&
+          gp.z >= debug_hotspot_z_min_ &&
+          gp.z <= debug_hotspot_z_max_;
+    };
+
+    std::size_t valid_rays = 0;
+    std::size_t hit_rays = 0;
+    std::size_t no_hit_rays = 0;
+    std::size_t invalid_range = 0;
+    std::size_t out_of_map_endpoints = 0;
+
+    try
+    {
+      sensor_msgs::PointCloud2ConstIterator<float> x_it(*msg, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> y_it(*msg, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> z_it(*msg, "z");
+      sensor_msgs::PointCloud2ConstIterator<float> ox_it(*msg, "origin_x");
+      sensor_msgs::PointCloud2ConstIterator<float> oy_it(*msg, "origin_y");
+      sensor_msgs::PointCloud2ConstIterator<float> oz_it(*msg, "origin_z");
+      sensor_msgs::PointCloud2ConstIterator<int32_t> sensor_it(
+          *msg, "sensor_id");
+      sensor_msgs::PointCloud2ConstIterator<uint8_t> hit_it(
+          *msg, "hit");
+
+      // Optional additive fields. Missing/malformed source time is recorded
+      // as invalid; it never changes preexisting occupancy/free semantics.
+      const sensor_msgs::PointField *sec_field=nullptr,*nsec_field=nullptr;
+      int sec_fields=0,nsec_fields=0;
+      for(const auto& f:msg->fields) {
+        if(f.name=="source_stamp_sec"){sec_field=&f;++sec_fields;}
+        if(f.name=="source_stamp_nsec"){nsec_field=&f;++nsec_fields;}
+      }
+      const bool source_layout=sec_fields==1 && nsec_fields==1 && !msg->is_bigendian &&
+          sec_field->datatype==sensor_msgs::PointField::UINT32 && nsec_field->datatype==sensor_msgs::PointField::UINT32 &&
+          sec_field->count==1 && nsec_field->count==1 && static_cast<std::size_t>(sec_field->offset)+4<=msg->point_step && static_cast<std::size_t>(nsec_field->offset)+4<=msg->point_step;
+      std::size_t ray_index=0;
+      for (; x_it != x_it.end();
+           ++x_it, ++y_it, ++z_it,
+           ++ox_it, ++oy_it, ++oz_it, ++sensor_it, ++hit_it,++ray_index)
+      {
+        const int sensor_id = static_cast<int>(*sensor_it);
+        const bool hit = (*hit_it != 0);
+
+        const tf2::Vector3 endpoint(
+            static_cast<double>(*x_it),
+            static_cast<double>(*y_it),
+            static_cast<double>(*z_it));
+        const tf2::Vector3 origin(
+            static_cast<double>(*ox_it),
+            static_cast<double>(*oy_it),
+            static_cast<double>(*oz_it));
+
+        if (!std::isfinite(endpoint.x()) ||
+            !std::isfinite(endpoint.y()) ||
+            !std::isfinite(endpoint.z()) ||
+            !std::isfinite(origin.x()) ||
+            !std::isfinite(origin.y()) ||
+            !std::isfinite(origin.z()))
+        {
+          ++invalid_range;
+          continue;
+        }
+
+        const tf2::Vector3 delta = endpoint - origin;
+        const double range = delta.length();
+        if (!std::isfinite(range) ||
+            range < ray_min_valid_range_ ||
+            range > ray_max_valid_range_)
+        {
+          ++invalid_range;
+          continue;
+        }
+
+        ++valid_rays;
+        if (hit)
+        {
+          ++hit_rays;
+        }
+        else
+        {
+          ++no_hit_rays;
+        }
+        const tf2::Vector3 direction = delta / range;
+
+        uint32_t source_sec_value=0,source_nsec_value=0;
+        const auto source_offset=msg->width ? (ray_index/msg->width)*msg->row_step+(ray_index%msg->width)*msg->point_step : 0;
+        bool plane_source_valid=source_layout && msg->width && source_offset+msg->point_step<=msg->data.size();
+        if(plane_source_valid) {
+          std::memcpy(&source_sec_value,msg->data.data()+source_offset+sec_field->offset,4);
+          std::memcpy(&source_nsec_value,msg->data.data()+source_offset+nsec_field->offset,4);
+          ros::Time source;source.sec=source_sec_value;source.nsec=source_nsec_value;
+          plane_source_valid=source_nsec_value<1000000000u && !source.isZero() && !msg->header.stamp.isZero() &&
+              source<=msg->header.stamp && source<=ros::Time::now() && msg->header.stamp<=ros::Time::now() &&
+              (last_ray_observation_stamp_.isZero() || msg->header.stamp>=last_ray_observation_stamp_) && msg->header.frame_id==map_frame_;
+        }
+        const Eigen::Vector3d endpoint_eigen(endpoint.x(),endpoint.y(),endpoint.z());
+        const bool plane_candidate=ground_support_loaded_ && std::abs(ground_support_.height(endpoint_eigen))<=ground_support_.association_band;
+        const bool plane_compatible=ground_support_loaded_ && ground_support_.compatibleEndpoint(endpoint_eigen,plane_source_valid);
+        double free_end =
+            hit
+                ? std::max(
+                      ray_free_start_range_,
+                      range - ray_endpoint_guard_distance_)
+                : range;
+
+        if(hit && plane_compatible && ground_partition_applied_) {
+          const Eigen::Vector3d o(origin.x(),origin.y(),origin.z()),v(direction.x(),direction.y(),direction.z());
+          const double derivative=ground_support_.normal.dot(v),height=ground_support_.height(o);
+          if(derivative<0. && height>ground_support_.supportUpper()) {
+            const double support_entry=(height-ground_support_.supportUpper())/(-derivative);
+            free_end=std::min(range,std::max(free_end,support_entry-1e-6));
+          }
+        }
+        if (free_end >= ray_free_start_range_)
+        {
+          for (double d = ray_free_start_range_;
+               d < free_end;
+               d += ray_step_)
+          {
+            const tf2::Vector3 p = origin + direction * d;
+            int index = -1;
+            if (positionToGridIndex(p, index))
+            {
+              free_mask[static_cast<std::size_t>(index)] = 1;
+              if(plane_source_valid)mark_residual_free(index,p,double(source_sec_value)+1e-9*double(source_nsec_value));
+              if (index == watched_index)
+              {
+                watched_free_counts[sensor_id] += 1;
+              }
+              if (hotspotIndex(index))
+              {
+                hotspot_free_counts[index][sensor_id] += 1;
+              }
+            }
+          }
+        }
+
+        // The fixed step lattice can stop just outside the last free cell.
+        // Include the conservative, plane-clipped free-segment endpoint itself;
+        // it remains above the support envelope and carries the original time.
+        if(hit && plane_compatible && ground_partition_applied_ && free_end>ray_free_start_range_) {
+          int index=-1;
+          if(positionToGridIndex(origin+direction*free_end,index)) {
+            free_mask[index]=1;
+            mark_residual_free(index,origin+direction*free_end,double(source_sec_value)+1e-9*double(source_nsec_value));
+          }
+        }
+        int endpoint_index = -1;
+        if (positionToGridIndex(endpoint, endpoint_index))
+        {
+          if (hit)
+          {
+            occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            auto& evidence=packet_hits[endpoint_index];
+            const float z=static_cast<float>(endpoint.z());
+            if (!evidence.count) evidence.z_min=evidence.z_max=z;
+            evidence.z_min=std::min(evidence.z_min,z);
+            evidence.z_max=std::max(evidence.z_max,z);
+            ++evidence.count;
+            if(plane_candidate)++evidence.candidate;
+            if(plane_compatible)++evidence.compatible;
+            if (std::abs(endpoint.z())<=0.0001) ++evidence.near;
+            else ++evidence.other;
+            if (sensor_id>=0 && sensor_id<32) evidence.sensors|=(uint32_t(1)<<sensor_id);
+            evidence.endpoint=endpoint;
+            uint32_t sec=0,nsec=0;
+            const auto offset=msg->width ? (ray_index/msg->width)*msg->row_step+(ray_index%msg->width)*msg->point_step : 0;
+            bool source_valid=source_layout && msg->width && offset+msg->point_step<=msg->data.size();
+            if(source_valid) {
+              std::memcpy(&sec,msg->data.data()+offset+sec_field->offset,4);
+              std::memcpy(&nsec,msg->data.data()+offset+nsec_field->offset,4);
+              ros::Time source;source.sec=sec;source.nsec=nsec;
+              source_valid=nsec<1000000000u && !source.isZero() && !msg->header.stamp.isZero() &&
+                  source<=msg->header.stamp && source<=ros::Time::now();
+              if(source_valid) {
+                const double value=source.toSec();
+                if(!evidence.source_valid)evidence.source_min=evidence.source_max=value;
+                evidence.source_min=std::min(evidence.source_min,value);evidence.source_max=std::max(evidence.source_max,value);
+                evidence.fusion_skew=std::max(evidence.fusion_skew,(msg->header.stamp-source).toSec());
+                evidence.source_sec=sec;evidence.source_nsec=nsec;++evidence.source_valid;
+                if(!plane_compatible){++evidence.generic_source_valid;evidence.generic_source_max=std::max(evidence.generic_source_max,value);}
+              }
+            }
+            if(!source_valid)++evidence.source_invalid;
+            if (endpoint_index == watched_index)
+            {
+              watched_hit_counts[sensor_id] += 1;
+              watched_last_hit_endpoint[sensor_id] = endpoint;
+              watched_last_hit_origin[sensor_id] = origin;
+            }
+            if (hotspotIndex(endpoint_index))
+            {
+              hotspot_hit_counts[endpoint_index][sensor_id] += 1;
+              hotspot_last_hit_endpoint[endpoint_index][sensor_id] = endpoint;
+              hotspot_last_hit_origin[endpoint_index][sensor_id] = origin;
+            }
+          }
+          else
+          {
+            free_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            if(plane_source_valid)mark_residual_free(endpoint_index,endpoint,double(source_sec_value)+1e-9*double(source_nsec_value));
+            if (endpoint_index == watched_index)
+            {
+              watched_free_counts[sensor_id] += 1;
+            }
+            if (hotspotIndex(endpoint_index))
+            {
+              hotspot_free_counts[endpoint_index][sensor_id] += 1;
+            }
+          }
+        }
+        else
+        {
+          ++out_of_map_endpoints;
+        }
+      }
+    }
+    catch (const std::runtime_error& ex)
+    {
+      ++ray_decode_failure_count_;
+      ROS_ERROR_STREAM_THROTTLE(
+          1.0,
+          "[confidence_map_node] Phase E3 ray observation decode failed: "
+          << ex.what());
+      return;
+    }
+
+    resetCurrentVisibility();
+
+    const ros::Time stamp =
+        msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+    // Legacy map integration is unchanged. New snapshot evidence fails closed
+    // after invalid event time until node restart; a later clock catch-up does
+    // not retroactively make a future or reordered observation trustworthy.
+    if (stamp > ros::Time::now() ||
+        (!last_ray_observation_stamp_.isZero() && stamp < last_ray_observation_stamp_))
+      snapshot_evidence_fault_ = true;
+
+    const double stamp_sec = stamp.toSec();
+
+    std::size_t free_cells = 0;
+    std::size_t occupied_cells = 0;
+    std::size_t occupied_free_clear_suppressed = 0;
+
+    const float watched_occupancy_before =
+        (watched_index >= 0)
+            ? grid_points_[static_cast<std::size_t>(watched_index)].occupancy
+            : 0.0f;
+
+    std::map<int, float> hotspot_occupancy_before;
+    for (const auto& kv : hotspot_hit_counts)
+    {
+      hotspot_occupancy_before[kv.first] =
+          grid_points_[static_cast<std::size_t>(kv.first)].occupancy;
+    }
+    for (const auto& kv : hotspot_free_counts)
+    {
+      if (hotspot_occupancy_before.find(kv.first) ==
+          hotspot_occupancy_before.end())
+      {
+        hotspot_occupancy_before[kv.first] =
+            grid_points_[static_cast<std::size_t>(kv.first)].occupancy;
+      }
+    }
+
+    for (std::size_t i = 0; i < grid_points_.size(); ++i)
+    {
+      GridPoint& gp = grid_points_[i];
+      gp.residual_visibility=0.f;
+      const auto packet=packet_hits.find(static_cast<int>(i));
+      if(packet!=packet_hits.end()) {
+        const auto& evidence=packet->second;
+        const auto saturate=[](uint32_t a,uint32_t b){return static_cast<uint32_t>(std::min<uint64_t>(uint64_t(a)+b,std::numeric_limits<uint32_t>::max()));};
+        gp.plane_candidate_hits=saturate(gp.plane_candidate_hits,evidence.candidate);
+        gp.plane_compatible_hits=saturate(gp.plane_compatible_hits,evidence.compatible);
+        gp.plane_generic_hits=saturate(gp.plane_generic_hits,evidence.count-evidence.compatible);
+      }
+      // A compatible endpoint contributes no residual FREE update. Only an
+      // actually traversed ray segment does. Generic/mixed hits persist.
+      if(gp.plane_generic_hits) {
+        gp.residual_occupancy=1.f;
+        if(packet!=packet_hits.end() && packet->second.generic_source_valid) {
+          gp.residual_confidence=1.f;gp.residual_visibility=1.f;
+          gp.residual_last_seen=std::max(gp.residual_last_seen,packet->second.generic_source_max);
+        }
+      } else if(ground_partition_applied_) {
+        uint8_t current_mask=0;gp.residual_seen_mask=0;
+        double oldest=std::numeric_limits<double>::infinity();
+        for(int child=0;child<8;++child) {
+          if(residual_free_source[i][child]>=0.)current_mask|=uint8_t(1<<child);
+          gp.residual_child_seen[child]=std::max(gp.residual_child_seen[child],residual_free_source[i][child]);
+          if(gp.residual_child_seen[child]>=0.)gp.residual_seen_mask|=uint8_t(1<<child);
+          if(gp.residual_required_mask&(1<<child))oldest=std::min(oldest,gp.residual_child_seen[child]);
+        }
+        // Keep unseen subcells UNKNOWN. A whole coarse cell becomes observed
+        // free only after each residual25mm subcell has actual ray evidence.
+        // This is a declared discrete observation model, not a continuum
+        // guarantee about subpixel or subcell objects.
+        const char* profile=std::getenv("CARE_RESEARCH_PROFILE");
+        const bool research=profile && std::string(profile)=="nominal_plane_point_v1";
+        bool complete=gp.residual_required_mask && (gp.residual_seen_mask&gp.residual_required_mask)==gp.residual_required_mask;
+        if(research) {
+          // Explicit original discrete ray-grid observation model. This does
+          // not claim that every physical point in a coarse voxel was observed.
+          complete=gp.residual_seen_mask!=0;
+          oldest=*std::max_element(gp.residual_child_seen.begin(),gp.residual_child_seen.end());
+        }
+        gp.residual_occupancy=0.f;gp.residual_confidence=complete?1.f:0.f;
+        gp.residual_last_seen=complete?oldest:-1.;
+        gp.residual_visibility=(research ? current_mask!=0 : gp.residual_required_mask && (current_mask&gp.residual_required_mask)==gp.residual_required_mask) ? 1.f:0.f;
+      }
+
+      // Occupied endpoint wins over free traversal if multiple sensors touch
+      // the same coarse voxel during one fused observation packet.
+      if (occupied_mask[i] != 0)
+      {
+        const auto& evidence=packet_hits.at(static_cast<int>(i));
+        if (!gp.hit_count) {gp.hit_z_min=evidence.z_min;gp.hit_z_max=evidence.z_max;}
+        gp.hit_z_min=std::min(gp.hit_z_min,evidence.z_min);
+        gp.hit_z_max=std::max(gp.hit_z_max,evidence.z_max);
+        auto add=[](uint32_t a,uint32_t b) {return static_cast<uint32_t>(
+            std::min<uint64_t>(uint64_t(a)+b,std::numeric_limits<uint32_t>::max()));};
+        gp.hit_count=add(gp.hit_count,evidence.count);
+        gp.near_ground_hit_count=add(gp.near_ground_hit_count,evidence.near);
+        gp.other_hit_count=add(gp.other_hit_count,evidence.other);
+        gp.hit_sensor_mask|=evidence.sensors;
+        gp.last_hit_x=evidence.endpoint.x();gp.last_hit_y=evidence.endpoint.y();gp.last_hit_z=evidence.endpoint.z();
+        gp.last_hit_stamp_s=stamp_sec;
+        if(evidence.source_valid) {
+          if(!gp.source_time_valid_count)gp.source_stamp_min_s=evidence.source_min;
+          gp.source_stamp_min_s=std::min(gp.source_stamp_min_s,evidence.source_min);
+          gp.source_stamp_max_s=std::max(gp.source_stamp_max_s,evidence.source_max);
+          gp.max_fusion_skew_s=std::max(gp.max_fusion_skew_s,evidence.fusion_skew);
+          gp.last_source_stamp_sec=evidence.source_sec;gp.last_source_stamp_nsec=evidence.source_nsec;
+        }
+        gp.source_time_valid_count=add(gp.source_time_valid_count,evidence.source_valid);
+        gp.source_time_invalid_count=add(gp.source_time_invalid_count,evidence.source_invalid);
+        gp.occupancy = 1.0f;
+        gp.current_visibility = 1.0f;
+        gp.confidence = 1.0f;
+        gp.last_seen_time = stamp_sec;
+        ++occupied_cells;
+      }
+      else if (free_mask[i] != 0)
+      {
+        // Static-world safety mode: free-space traversal may refresh
+        // visibility/confidence, but it cannot erase a previously observed
+        // occupied voxel. This prevents last-observation-wins false frees.
+        if (ray_persistent_occupied_ && gp.occupancy > 0.5f)
+        {
+          ++occupied_free_clear_suppressed;
+        }
+        else
+        {
+          gp.occupancy = 0.0f;
+          gp.hit_count=gp.near_ground_hit_count=gp.other_hit_count=gp.hit_sensor_mask=0;
+          gp.hit_z_min=gp.hit_z_max=gp.last_hit_x=gp.last_hit_y=gp.last_hit_z=0;
+          gp.last_hit_stamp_s=-1.;
+          gp.source_time_valid_count=gp.source_time_invalid_count=gp.last_source_stamp_sec=gp.last_source_stamp_nsec=0;
+          gp.source_stamp_min_s=gp.source_stamp_max_s=-1.;gp.max_fusion_skew_s=0.;
+        }
+        gp.current_visibility = 1.0f;
+        gp.confidence = 1.0f;
+        gp.last_seen_time = stamp_sec;
+        ++free_cells;
+      }
+    }
+
+    if (debug_hotspot_watch_enabled_ &&
+        (!hotspot_hit_counts.empty() || !hotspot_free_counts.empty()))
+    {
+      auto sensorNameForId = [this](int sensor_id) -> std::string
+      {
+        for (const auto& sensor : sensors_)
+        {
+          if (sensor.id == sensor_id)
+          {
+            return sensor.name;
+          }
+        }
+        return std::string("unknown");
+      };
+
+      std::map<int, bool> touched;
+      for (const auto& kv : hotspot_hit_counts) touched[kv.first] = true;
+      for (const auto& kv : hotspot_free_counts) touched[kv.first] = true;
+
+      for (const auto& item : touched)
+      {
+        const int index = item.first;
+        const GridPoint& gp =
+            grid_points_[static_cast<std::size_t>(index)];
+        const auto hit_it = hotspot_hit_counts.find(index);
+        const auto free_it = hotspot_free_counts.find(index);
+
+        std::ostringstream hit_oss;
+        bool first = true;
+        if (hit_it != hotspot_hit_counts.end())
+        {
+          for (const auto& kv : hit_it->second)
+          {
+            if (!first) hit_oss << ";";
+            first = false;
+            hit_oss << kv.first << ":" << sensorNameForId(kv.first)
+                    << "x" << kv.second;
+          }
+        }
+
+        std::ostringstream free_oss;
+        first = true;
+        if (free_it != hotspot_free_counts.end())
+        {
+          for (const auto& kv : free_it->second)
+          {
+            if (!first) free_oss << ";";
+            first = false;
+            free_oss << kv.first << ":" << sensorNameForId(kv.first)
+                     << "x" << kv.second;
+          }
+        }
+
+        const float before =
+            hotspot_occupancy_before.count(index)
+                ? hotspot_occupancy_before[index]
+                : 0.0f;
+        const bool has_hit =
+            hit_it != hotspot_hit_counts.end() && !hit_it->second.empty();
+        const bool has_free =
+            free_it != hotspot_free_counts.end() && !free_it->second.empty();
+        const bool transition =
+            before <= 0.5f && gp.occupancy > 0.5f;
+        const bool suppressed_free =
+            ray_persistent_occupied_ &&
+            before > 0.5f &&
+            !has_hit &&
+            has_free &&
+            gp.occupancy > 0.5f;
+
+        ROS_WARN_STREAM(
+            "[HOTSPOT_MAP_PACKET] stamp=" << stamp.toSec()
+            << " voxel=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+            << " hit_sensors={" << hit_oss.str() << "}"
+            << " free_sensors={" << free_oss.str() << "}"
+            << " occupancy_before=" << before
+            << " occupancy_after=" << gp.occupancy
+            << " transition_to_occupied="
+            << static_cast<int>(transition)
+            << " free_clear_suppressed="
+            << static_cast<int>(suppressed_free)
+            << " persistent_occupied="
+            << static_cast<int>(ray_persistent_occupied_));
+
+        if (hit_it != hotspot_hit_counts.end())
+        {
+          for (const auto& kv : hit_it->second)
+          {
+            const int sensor_id = kv.first;
+            const auto ep_outer =
+                hotspot_last_hit_endpoint.find(index);
+            const auto origin_outer =
+                hotspot_last_hit_origin.find(index);
+            if (ep_outer == hotspot_last_hit_endpoint.end() ||
+                origin_outer == hotspot_last_hit_origin.end())
+            {
+              continue;
+            }
+            const auto ep = ep_outer->second.find(sensor_id);
+            const auto origin = origin_outer->second.find(sensor_id);
+            if (ep == ep_outer->second.end() ||
+                origin == origin_outer->second.end())
+            {
+              continue;
+            }
+            ROS_WARN_STREAM(
+                "[HOTSPOT_MAP_HIT] stamp=" << stamp.toSec()
+                << " voxel=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+                << " sensor_id=" << sensor_id
+                << " sensor=" << sensorNameForId(sensor_id)
+                << " count=" << kv.second
+                << " endpoint=[" << ep->second.x() << ","
+                << ep->second.y() << "," << ep->second.z() << "]"
+                << " origin=[" << origin->second.x() << ","
+                << origin->second.y() << "," << origin->second.z() << "]"
+                << " range=" << (ep->second - origin->second).length()
+                << " transition_to_occupied="
+                << static_cast<int>(transition));
+          }
+        }
+      }
+    }
+
+    if (watched_index >= 0 &&
+        (!watched_hit_counts.empty() || !watched_free_counts.empty()))
+    {
+      auto sensorNameForId = [this](int sensor_id) -> std::string
+      {
+        for (const auto& sensor : sensors_)
+        {
+          if (sensor.id == sensor_id)
+          {
+            return sensor.name;
+          }
+        }
+        return std::string("unknown");
+      };
+
+      std::ostringstream hit_oss;
+      bool first = true;
+      for (const auto& kv : watched_hit_counts)
+      {
+        if (!first) hit_oss << ";";
+        first = false;
+        hit_oss << kv.first << ":" << sensorNameForId(kv.first)
+                << "x" << kv.second;
+      }
+
+      std::ostringstream free_oss;
+      first = true;
+      for (const auto& kv : watched_free_counts)
+      {
+        if (!first) free_oss << ";";
+        first = false;
+        free_oss << kv.first << ":" << sensorNameForId(kv.first)
+                 << "x" << kv.second;
+      }
+
+      const GridPoint& watched_gp =
+          grid_points_[static_cast<std::size_t>(watched_index)];
+      ROS_WARN_STREAM(
+          "[OCCUPANCY_WATCH_PACKET] stamp=" << stamp.toSec()
+          << " voxel=[" << watched_gp.x << ","
+          << watched_gp.y << "," << watched_gp.z << "]"
+          << " hit_sensors={" << hit_oss.str() << "}"
+          << " free_sensors={" << free_oss.str() << "}"
+          << " occupancy_before=" << watched_occupancy_before
+          << " occupancy_after=" << watched_gp.occupancy
+          << " persistent_occupied=" << static_cast<int>(ray_persistent_occupied_));
+
+      for (const auto& kv : watched_hit_counts)
+      {
+        const int sensor_id = kv.first;
+        const auto ep_it = watched_last_hit_endpoint.find(sensor_id);
+        const auto origin_it = watched_last_hit_origin.find(sensor_id);
+        if (ep_it == watched_last_hit_endpoint.end() ||
+            origin_it == watched_last_hit_origin.end())
+        {
+          continue;
+        }
+        const tf2::Vector3& endpoint = ep_it->second;
+        const tf2::Vector3& origin = origin_it->second;
+        ROS_WARN_STREAM(
+            "[OCCUPANCY_WATCH_HIT] stamp=" << stamp.toSec()
+            << " sensor_id=" << sensor_id
+            << " sensor=" << sensorNameForId(sensor_id)
+            << " count=" << kv.second
+            << " endpoint=[" << endpoint.x() << ","
+            << endpoint.y() << "," << endpoint.z() << "]"
+            << " origin=[" << origin.x() << ","
+            << origin.y() << "," << origin.z() << "]"
+            << " range=" << (endpoint - origin).length()
+            << " transition_to_occupied="
+            << static_cast<int>(
+                   watched_occupancy_before <= 0.5f &&
+                   watched_gp.occupancy > 0.5f));
+      }
+    }
+
+    applyTemporalDecay(stamp);
+
+    last_ray_observation_received_ = ros::Time::now();
+    last_ray_observation_stamp_ = stamp;
+    ++ray_packet_count_;
+    last_ray_count_ = valid_rays;
+    last_hit_ray_count_ = hit_rays;
+    last_no_hit_ray_count_ = no_hit_rays;
+    last_ray_free_cell_count_ = free_cells;
+    last_ray_occupied_cell_count_ = occupied_cells;
+    last_ray_occupied_free_clear_suppressed_count_ =
+        occupied_free_clear_suppressed;
+    total_ray_occupied_free_clear_suppressed_count_ +=
+        occupied_free_clear_suppressed;
+    last_ray_out_of_map_endpoint_count_ = out_of_map_endpoints;
+    last_ray_invalid_range_count_ = invalid_range;
+
+    printConfidenceStatsThrottled();
+  }
+
+  std_msgs::String makeE3SummaryMsg(const ros::Time& now) const
+  {
+    std::size_t visible_now = 0;
+    std::size_t known_free = 0;
+    std::size_t known_occupied = 0;
+    std::size_t unknown = 0;
+
+    for (const auto& gp : grid_points_)
+    {
+      if (gp.current_visibility > 0.5f)
+      {
+        ++visible_now;
+      }
+
+      const float effective_confidence = effectiveConfidence(gp);
+      if (effective_confidence <= 1e-4f)
+      {
+        ++unknown;
+      }
+      else if (gp.occupancy > 0.5f)
+      {
+        ++known_occupied;
+      }
+      else
+      {
+        ++known_free;
+      }
+    }
+
+    const double observation_age =
+        last_ray_observation_received_.isZero()
+            ? std::numeric_limits<double>::quiet_NaN()
+            : std::max(
+                  0.0,
+                  (now - last_ray_observation_received_).toSec());
+
+    std_msgs::String msg;
+    std::ostringstream oss;
+    oss << "phase=E3"
+        << " body_prior_geometry_backend=" << current_body_prior_geometry_backend_
+        << " observation_mode=" << observation_mode_
+        << " ray_packet_count=" << ray_packet_count_
+        << " ray_decode_failure_count=" << ray_decode_failure_count_
+        << " last_ray_count=" << last_ray_count_
+        << " last_hit_ray_count=" << last_hit_ray_count_
+        << " last_no_hit_ray_count=" << last_no_hit_ray_count_
+        << " last_free_cell_count=" << last_ray_free_cell_count_
+        << " last_occupied_cell_count=" << last_ray_occupied_cell_count_
+        << " persistent_occupied=" << static_cast<int>(ray_persistent_occupied_)
+        << " last_occupied_free_clear_suppressed_count="
+        << last_ray_occupied_free_clear_suppressed_count_
+        << " total_occupied_free_clear_suppressed_count="
+        << total_ray_occupied_free_clear_suppressed_count_
+        << " last_out_of_map_endpoint_count="
+        << last_ray_out_of_map_endpoint_count_
+        << " last_invalid_range_count=" << last_ray_invalid_range_count_
+        << " visible_now=" << visible_now
+        << " known_free=" << known_free
+        << " known_occupied=" << known_occupied
+        << " unknown=" << unknown
+        << " bootstrap_active=" << static_cast<int>(current_body_prior_active_)
+        << " observation_age_s=" << observation_age;
+    msg.data = oss.str();
+    return msg;
+  }
+
+  void observeSnapshotClock(const ros::Time& now)
+  {
+    if (now < snapshot_clock_stamp_) {
+      ++snapshot_epoch_;
+      snapshot_clock_fault_ = true;  // Sticky; old grid belongs to the old clock.
+    }
+    snapshot_clock_stamp_ = now;
+  }
+
+  void markSnapshotWrite(const ros::Time& now)
+  {
+    observeSnapshotClock(now);
+    ++snapshot_revision_;
+    snapshot_update_stamp_ = now;
+  }
+
+  bool handleQuerySnapshot(
+      care_confidence_map::QueryConfidenceSnapshot::Request& req,
+      care_confidence_map::QueryConfidenceSnapshot::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    const ros::Time now = ros::Time::now();
+    observeSnapshotClock(now);
+    res.instance = snapshot_instance_; res.epoch = snapshot_epoch_;
+    res.revision = snapshot_revision_; res.snapshot_stamp = now;
+    res.map_update_stamp = snapshot_update_stamp_; res.frame = map_frame_;
+    res.resolution = resolution_;
+    res.map_min.x = x_min_; res.map_min.y = y_min_; res.map_min.z = z_min_;
+    res.map_max.x = x_max_; res.map_max.y = y_max_; res.map_max.z = z_max_;
+    res.grid_size[0] = nx_; res.grid_size[1] = ny_; res.grid_size[2] = nz_;
+    res.observation_mode = observation_mode_; res.clock_fault = snapshot_clock_fault_;
+    res.future_free_space_guaranteed = false;
+    res.horizon_s = req.horizon_s; res.temporal_decay_time = temporal_decay_time_;
+    const auto n = req.points.size();
+    res.inside_map.assign(n, 0); res.confidence_now.assign(n, 0.);
+    res.confidence_at_horizon.assign(n, 0.); res.occupancy.assign(n, 0.);
+    res.last_seen_s.assign(n, -1.); res.provenance.assign(n, 0);
+    res.model_free_at_horizon.assign(n, 0);
+    res.valid = false;
+    if (!std::isfinite(req.horizon_s) || req.horizon_s < 0. ||
+        !std::isfinite(now.toSec() + req.horizon_s) ||
+        !std::isfinite(req.minimum_confidence) || req.minimum_confidence <= 0. ||
+        req.minimum_confidence > 1.) { res.reason = "invalid_request"; return true; }
+    if (now.isZero() || snapshot_clock_fault_ || snapshot_evidence_fault_ ||
+        !std::isfinite(temporal_decay_time_) || temporal_decay_time_ <= 0.) {
+      res.reason = "invalid_evidence_time_restart_required"; return true;
+    }
+    if (!req.expected_instance.empty() &&
+        (req.expected_instance != res.instance || req.expected_epoch != res.epoch ||
+         req.expected_revision != res.revision)) {
+      res.reason = "version_mismatch"; return true;
+    }
+    for (size_t i=0; i<n; ++i) {
+      const auto& p = req.points[i];
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+      // Bound finite coordinates before llround/integer conversion. This API
+      // treats the configured map bounds strictly; never certify a clipped box.
+      if (p.x < x_min_ || p.x > x_max_ || p.y < y_min_ || p.y > y_max_ ||
+          p.z < z_min_ || p.z > z_max_) continue;
+      int index = -1;
+      if (!positionToGridIndex(tf2::Vector3(p.x,p.y,p.z), index)) continue;
+      const auto& v = grid_points_[index];
+      res.inside_map[i] = 1; res.occupancy[i] = effectiveOccupancy(v);
+      const double last_seen=effectiveLastSeen(v);
+      res.last_seen_s[i] = last_seen;
+      // Recompute decay at the query time, even if cached visibility is stale.
+      const bool sensor = last_seen >= 0. && last_seen <= now.toSec();
+      const double age = sensor ? now.toSec()-last_seen : 0.;
+      const double sensor_now = sensor ? std::exp(-age/temporal_decay_time_) : 0.;
+      const double sensor_end = sensor ? std::exp(-(age+req.horizon_s)/temporal_decay_time_) : 0.;
+      const double bootstrap = current_body_prior_active_ ? v.bootstrap_confidence : 0.;
+      const double prior = std::max(bootstrap, static_cast<double>(v.test_known_free_confidence));
+      res.provenance[i] = (sensor ? 1 : 0) | (bootstrap > 0. ? 2 : 0) |
+                          (v.test_known_free_confidence > 0. ? 4 : 0);
+      res.confidence_now[i] = std::max(sensor_now, prior);
+      res.confidence_at_horizon[i] = std::max(sensor_end, prior);
+      res.model_free_at_horizon[i] = effectiveOccupancy(v) <= .5f &&
+          std::max(sensor_end, prior) >= req.minimum_confidence;
+    }
+    res.valid = true;
+    res.reason = "conditional_projection_no_future_lease";
+    return true;
+  }
+
+  bool handleQueryConfidence(
+      care_confidence_map::QueryConfidence::Request& req,
+      care_confidence_map::QueryConfidence::Response& res)
+  {
+    // One current, coherent map version per response; no cached SAFE answer.
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    res.confidence.clear();
+    res.current_visibility.clear();
+    res.inside_map.clear();
+
+    res.confidence.reserve(req.points.size());
+    res.current_visibility.reserve(req.points.size());
+    res.inside_map.reserve(req.points.size());
+
+    for (const auto& point : req.points)
+    {
+      const tf2::Vector3 p_map(point.x, point.y, point.z);
+
+      int index = -1;
+      if (!positionToGridIndex(p_map, index))
+      {
+        res.confidence.push_back(0.0f);
+        res.current_visibility.push_back(0.0f);
+        res.inside_map.push_back(0);
+        continue;
+      }
+
+      const GridPoint& voxel = grid_points_[index];
+
+      res.confidence.push_back(effectiveConfidence(voxel));
+      res.current_visibility.push_back(effectiveVisibility(voxel));
+      res.inside_map.push_back(1);
+    }
+
+    maybeLogDebugNeighborhood(req);
+    return true;
+  }
+
+  void maybeLogDebugNeighborhood(
+      const care_confidence_map::QueryConfidence::Request& req)
+  {
+    if (!debug_neighborhood_watch_enabled_ || grid_points_.empty())
+    {
+      return;
+    }
+
+    const tf2::Vector3 watch(
+        debug_neighborhood_watch_x_,
+        debug_neighborhood_watch_y_,
+        debug_neighborhood_watch_z_);
+    int watch_index = -1;
+    if (!positionToGridIndex(watch, watch_index))
+    {
+      return;
+    }
+
+    bool queried = false;
+    for (const auto& point : req.points)
+    {
+      int idx = -1;
+      if (positionToGridIndex(
+              tf2::Vector3(point.x, point.y, point.z), idx) &&
+          idx == watch_index)
+      {
+        queried = true;
+        break;
+      }
+    }
+    if (!queried)
+    {
+      return;
+    }
+
+    const ros::WallTime now = ros::WallTime::now();
+    if (!last_debug_neighborhood_log_wall_.isZero() &&
+        (now - last_debug_neighborhood_log_wall_).toSec() <
+            std::max(0.0, debug_neighborhood_watch_period_s_))
+    {
+      return;
+    }
+    last_debug_neighborhood_log_wall_ = now;
+
+    const int cx = watch_index / (ny_ * nz_);
+    const int rem = watch_index % (ny_ * nz_);
+    const int cy = rem / nz_;
+    const int cz = rem % nz_;
+
+    int inside_count = 0;
+    int unknown_count = 0;
+    int known_free_count = 0;
+    int occupied_count = 0;
+    int visible_now_count = 0;
+    int bootstrap_count = 0;
+
+    const GridPoint& center =
+        grid_points_[static_cast<std::size_t>(watch_index)];
+
+    ROS_WARN_STREAM(
+        "[CONFIDENCE_NEIGHBORHOOD_SUMMARY]"
+        << " center=[" << center.x << "," << center.y << "," << center.z << "]"
+        << " resolution=" << resolution_
+        << " sensor_conf=" << center.confidence
+        << " bootstrap_conf=" << center.bootstrap_confidence
+        << " effective_conf=" << effectiveConfidence(center)
+        << " occupancy=" << center.occupancy
+        << " visible_now=" << center.current_visibility
+        << " bootstrap_active=" << static_cast<int>(current_body_prior_active_));
+
+    for (int dx = -1; dx <= 1; ++dx)
+    {
+      for (int dy = -1; dy <= 1; ++dy)
+      {
+        for (int dz = -1; dz <= 1; ++dz)
+        {
+          const int ix = cx + dx;
+          const int iy = cy + dy;
+          const int iz = cz + dz;
+          if (ix < 0 || ix >= nx_ ||
+              iy < 0 || iy >= ny_ ||
+              iz < 0 || iz >= nz_)
+          {
+            ROS_WARN_STREAM(
+                "[CONFIDENCE_NEIGHBORHOOD_CELL]"
+                << " offset=[" << dx << "," << dy << "," << dz << "]"
+                << " inside_map=0");
+            continue;
+          }
+
+          const int idx = ix * ny_ * nz_ + iy * nz_ + iz;
+          const GridPoint& gp =
+              grid_points_[static_cast<std::size_t>(idx)];
+          const float effective = effectiveConfidence(gp);
+          ++inside_count;
+
+          std::string state = "UNKNOWN";
+          if (gp.occupancy > 0.5f)
+          {
+            state = "OCCUPIED";
+            ++occupied_count;
+          }
+          else if (effective >= 0.5f)
+          {
+            state = "KNOWN_FREE";
+            ++known_free_count;
+          }
+          else
+          {
+            ++unknown_count;
+          }
+          if (gp.current_visibility > 0.5f)
+          {
+            ++visible_now_count;
+          }
+          if (current_body_prior_active_ &&
+              gp.bootstrap_confidence > 0.5f)
+          {
+            ++bootstrap_count;
+          }
+
+          ROS_WARN_STREAM(
+              "[CONFIDENCE_NEIGHBORHOOD_CELL]"
+              << " offset=[" << dx << "," << dy << "," << dz << "]"
+              << " point=[" << gp.x << "," << gp.y << "," << gp.z << "]"
+              << " state=" << state
+              << " sensor_conf=" << gp.confidence
+              << " bootstrap_conf=" << gp.bootstrap_confidence
+              << " effective_conf=" << effective
+              << " occupancy=" << gp.occupancy
+              << " visible_now=" << gp.current_visibility
+              << " last_seen_time=" << gp.last_seen_time);
+        }
+      }
+    }
+
+    ROS_WARN_STREAM(
+        "[CONFIDENCE_NEIGHBORHOOD_COUNTS]"
+        << " center=[" << center.x << "," << center.y << "," << center.z << "]"
+        << " inside=" << inside_count
+        << " known_free=" << known_free_count
+        << " unknown=" << unknown_count
+        << " occupied=" << occupied_count
+        << " visible_now=" << visible_now_count
+        << " bootstrap_cells=" << bootstrap_count);
+  }
+
+  bool handleRefreshBodyPrior(
+      std_srvs::Trigger::Request&,
+      std_srvs::Trigger::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
+    std::string message;
+    const bool ok = refreshCurrentBodyPrior(
+        ros::Time::now(), "service", &message);
+
+    res.success = ok;
+    res.message = message;
+    return true;
+  }
+
+  bool handleDeactivateBodyPrior(
+      std_srvs::Trigger::Request&,
+      std_srvs::Trigger::Response& res)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
+    std::size_t cleared_cells = 0;
+    std::size_t preserved_sensor_cells = 0;
+    for (auto& gp : grid_points_)
+    {
+      if (gp.bootstrap_confidence > 1e-4f)
+      {
+        ++cleared_cells;
+        if (gp.confidence > 1e-4f)
+        {
+          ++preserved_sensor_cells;
+        }
+        gp.bootstrap_confidence = 0.0f;
+      }
+    }
+
+    current_body_prior_active_ = false;
+    last_body_prior_spheres_.clear();
+    publishCurrentBodyPriorMarkers();
+
+    std::ostringstream oss;
+    oss << "bootstrap_deactivated=1"
+        << ", cleared_cells=" << cleared_cells
+        << ", preserved_sensor_cells=" << preserved_sensor_cells;
+    res.success = true;
+    res.message = oss.str();
+
+    ROS_WARN_STREAM("[confidence_map_node] COLD-START BOOTSTRAP REMOVED: "
+                    << oss.str()
+                    << ". Sensor-derived confidence/occupancy is preserved.");
+    return true;
+  }
+
+  void printConfidenceStatsThrottled() const
+  {
+    int currently_visible_count = 0;
+    int confident_count = 0;
+    int occupied_count = 0;
+    int ever_seen_count = 0;
+
+    double min_conf = 1.0;
+    double max_conf = 0.0;
+    double sum_conf = 0.0;
+
+    for (const auto& p : grid_points_)
+    {
+      const double c = static_cast<double>(effectiveConfidence(p));
+      min_conf = std::min(min_conf, c);
+      max_conf = std::max(max_conf, c);
+      sum_conf += c;
+
+      if (p.current_visibility > 0.5f)
+      {
+        ++currently_visible_count;
+      }
+
+      if (c > 1e-4)
+      {
+        ++confident_count;
+        if (p.occupancy > 0.5f)
+        {
+          ++occupied_count;
+        }
+      }
+
+      if (p.last_seen_time >= 0.0)
+      {
+        ++ever_seen_count;
+      }
+    }
+
+    if (grid_points_.empty())
+    {
+      min_conf = 0.0;
+    }
+
+    const double mean_conf =
+        grid_points_.empty()
+            ? 0.0
+            : sum_conf / static_cast<double>(grid_points_.size());
+
+    ROS_INFO_THROTTLE(
+        2.0,
+        "[confidence_map_node] confidence stats: visible_now=%d / %zu, confident=%d, occupied=%d, ever_seen=%d, min=%.3f, max=%.3f, mean=%.3f",
+        currently_visible_count,
+        grid_points_.size(),
+        confident_count,
+        occupied_count,
+        ever_seen_count,
+        min_conf,
+        max_conf,
+        mean_conf);
+  }
+
+  sensor_msgs::PointCloud2 makeGridPointCloudMsg() const
+  {
+    sensor_msgs::PointCloud2 cloud;
+
+    cloud.header.frame_id = map_frame_;
+    cloud.header.stamp = ros::Time::now();
+
+    cloud.height = 1;
+    cloud.width = static_cast<uint32_t>(grid_points_.size());
+
+    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    modifier.setPointCloud2Fields(
+        34,
+        "x", 1, sensor_msgs::PointField::FLOAT32,
+        "y", 1, sensor_msgs::PointField::FLOAT32,
+        "z", 1, sensor_msgs::PointField::FLOAT32,
+        "confidence", 1, sensor_msgs::PointField::FLOAT32,
+        "current_visibility", 1, sensor_msgs::PointField::FLOAT32,
+        "occupancy", 1, sensor_msgs::PointField::FLOAT32,
+        "intensity", 1, sensor_msgs::PointField::FLOAT32,
+        "hit_count", 1, sensor_msgs::PointField::UINT32,
+        "near_ground_hit_count", 1, sensor_msgs::PointField::UINT32,
+        "other_hit_count", 1, sensor_msgs::PointField::UINT32,
+        "hit_sensor_mask", 1, sensor_msgs::PointField::UINT32,
+        "hit_z_min", 1, sensor_msgs::PointField::FLOAT32,
+        "hit_z_max", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_x", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_y", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_z", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_stamp_s", 1, sensor_msgs::PointField::FLOAT64,
+        "source_time_valid_count",1,sensor_msgs::PointField::UINT32,
+        "source_time_invalid_count",1,sensor_msgs::PointField::UINT32,
+        "last_source_stamp_sec",1,sensor_msgs::PointField::UINT32,
+        "last_source_stamp_nsec",1,sensor_msgs::PointField::UINT32,
+        "source_stamp_min_s",1,sensor_msgs::PointField::FLOAT64,
+        "source_stamp_max_s",1,sensor_msgs::PointField::FLOAT64,
+        "max_fusion_skew_s",1,sensor_msgs::PointField::FLOAT64,
+        "plane_candidate_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_compatible_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_generic_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_partition_applied",1,sensor_msgs::PointField::UINT8,
+        "raw_occupancy",1,sensor_msgs::PointField::FLOAT32,
+        "residual_confidence",1,sensor_msgs::PointField::FLOAT32,
+        "residual_current_visibility",1,sensor_msgs::PointField::FLOAT32,
+        "residual_occupancy",1,sensor_msgs::PointField::FLOAT32,
+        "residual_seen_mask",1,sensor_msgs::PointField::UINT8,
+        "residual_required_mask",1,sensor_msgs::PointField::UINT8);
+
+    modifier.resize(grid_points_.size());
+
+    sensor_msgs::PointCloud2Iterator<float> iter_x(cloud, "x");
+    sensor_msgs::PointCloud2Iterator<float> iter_y(cloud, "y");
+    sensor_msgs::PointCloud2Iterator<float> iter_z(cloud, "z");
+    sensor_msgs::PointCloud2Iterator<float> iter_conf(cloud, "confidence");
+    sensor_msgs::PointCloud2Iterator<float> iter_vis(cloud, "current_visibility");
+    sensor_msgs::PointCloud2Iterator<float> iter_occ(cloud, "occupancy");
+    sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud, "intensity");
+
+    sensor_msgs::PointCloud2Iterator<uint32_t> count(cloud,"hit_count"),near(cloud,"near_ground_hit_count"),
+        other(cloud,"other_hit_count"),sensors(cloud,"hit_sensor_mask");
+    sensor_msgs::PointCloud2Iterator<float> zmin(cloud,"hit_z_min"),zmax(cloud,"hit_z_max"),
+        hx(cloud,"last_hit_x"),hy(cloud,"last_hit_y"),hz(cloud,"last_hit_z");
+    sensor_msgs::PointCloud2Iterator<double> hit_stamp(cloud,"last_hit_stamp_s");
+    sensor_msgs::PointCloud2Iterator<uint32_t> source_valid(cloud,"source_time_valid_count"),source_invalid(cloud,"source_time_invalid_count"),
+        source_sec(cloud,"last_source_stamp_sec"),source_nsec(cloud,"last_source_stamp_nsec");
+    sensor_msgs::PointCloud2Iterator<double> source_min(cloud,"source_stamp_min_s"),source_max(cloud,"source_stamp_max_s"),fusion_skew(cloud,"max_fusion_skew_s");
+    sensor_msgs::PointCloud2Iterator<uint32_t> plane_candidate(cloud,"plane_candidate_hits"),plane_compatible(cloud,"plane_compatible_hits"),plane_generic(cloud,"plane_generic_hits");
+    sensor_msgs::PointCloud2Iterator<uint8_t> plane_applied(cloud,"plane_partition_applied");
+    sensor_msgs::PointCloud2Iterator<uint8_t> residual_seen(cloud,"residual_seen_mask"),residual_required(cloud,"residual_required_mask");
+    sensor_msgs::PointCloud2Iterator<float> raw_occupancy(cloud,"raw_occupancy"),residual_conf(cloud,"residual_confidence"),residual_vis(cloud,"residual_current_visibility"),residual_occ(cloud,"residual_occupancy");
+    for (const auto& p : grid_points_)
+    {
+      *plane_candidate=p.plane_candidate_hits;*plane_compatible=p.plane_compatible_hits;*plane_generic=p.plane_generic_hits;
+      *plane_applied=ground_partition_applied_?1:0;*raw_occupancy=p.occupancy;
+      *residual_seen=p.residual_seen_mask;*residual_required=p.residual_required_mask;++residual_seen;++residual_required;
+      *residual_conf=residualConfidence(p);*residual_vis=effectiveVisibility(p);*residual_occ=effectiveOccupancy(p);
+      ++plane_candidate;++plane_compatible;++plane_generic;++plane_applied;++raw_occupancy;++residual_conf;++residual_vis;++residual_occ;
+      *count=p.hit_count;*near=p.near_ground_hit_count;*other=p.other_hit_count;*sensors=p.hit_sensor_mask;
+      *source_valid=p.source_time_valid_count;*source_invalid=p.source_time_invalid_count;
+      *source_sec=p.last_source_stamp_sec;*source_nsec=p.last_source_stamp_nsec;
+      *source_min=p.source_stamp_min_s;*source_max=p.source_stamp_max_s;*fusion_skew=p.max_fusion_skew_s;
+      ++source_valid;++source_invalid;++source_sec;++source_nsec;++source_min;++source_max;++fusion_skew;
+      *zmin=p.hit_z_min;*zmax=p.hit_z_max;*hx=p.last_hit_x;*hy=p.last_hit_y;*hz=p.last_hit_z;*hit_stamp=p.last_hit_stamp_s;
+      ++count;++near;++other;++sensors;++zmin;++zmax;++hx;++hy;++hz;++hit_stamp;
+      *iter_x = p.x;
+      *iter_y = p.y;
+      *iter_z = p.z;
+      const float effective_confidence = effectiveConfidence(p);
+      *iter_conf = effective_confidence;
+      *iter_vis = effectiveVisibility(p);
+      *iter_occ = effectiveOccupancy(p);
+      // RViz-compatible intensity: occupied known cells appear stronger than
+      // free known cells while unknown remains near zero.
+      *iter_intensity =
+          effectiveOccupancy(p) > 0.5f ? 2.0f : effective_confidence;
+
+      ++iter_x;
+      ++iter_y;
+      ++iter_z;
+      ++iter_conf;
+      ++iter_vis;
+      ++iter_occ;
+      ++iter_intensity;
+    }
+
+    return cloud;
+  }
+
+  static bool parseForwardAxis(const std::string& axis_name, tf2::Vector3& axis)
+  {
+    if (axis_name == "x")
+    {
+      axis = tf2::Vector3(1.0, 0.0, 0.0);
+      return true;
+    }
+    if (axis_name == "-x")
+    {
+      axis = tf2::Vector3(-1.0, 0.0, 0.0);
+      return true;
+    }
+    if (axis_name == "y")
+    {
+      axis = tf2::Vector3(0.0, 1.0, 0.0);
+      return true;
+    }
+    if (axis_name == "-y")
+    {
+      axis = tf2::Vector3(0.0, -1.0, 0.0);
+      return true;
+    }
+    if (axis_name == "z")
+    {
+      axis = tf2::Vector3(0.0, 0.0, 1.0);
+      return true;
+    }
+    if (axis_name == "-z")
+    {
+      axis = tf2::Vector3(0.0, 0.0, -1.0);
+      return true;
+    }
+
+    return false;
+  }
+
+  void buildSensorBasis()
+  {
+    if (forward_axis_ == "x" || forward_axis_ == "-x")
+    {
+      right_dir_ = tf2::Vector3(0.0, 1.0, 0.0);
+      up_dir_    = tf2::Vector3(0.0, 0.0, 1.0);
+    }
+    else if (forward_axis_ == "y" || forward_axis_ == "-y")
+    {
+      right_dir_ = tf2::Vector3(1.0, 0.0, 0.0);
+      up_dir_    = tf2::Vector3(0.0, 0.0, 1.0);
+    }
+    else
+    {
+      right_dir_ = tf2::Vector3(1.0, 0.0, 0.0);
+      up_dir_    = tf2::Vector3(0.0, 1.0, 0.0);
+    }
+  }
+
+  tf2::Transform transformMsgToTf2(
+      const geometry_msgs::TransformStamped& msg) const
+  {
+    tf2::Transform T;
+    tf2::fromMsg(msg.transform, T);
+    return T;
+  }
+
+  geometry_msgs::Point toPointMsg(const tf2::Vector3& p) const
+  {
+    geometry_msgs::Point out;
+    out.x = p.x();
+    out.y = p.y();
+    out.z = p.z();
+    return out;
+  }
+
+  std::vector<tf2::Vector3> computeFrustumCornersInSensorFrame() const
+  {
+    const double range = tof_max_range_;
+    const double half_h = range * tan_half_h_fov_;
+    const double half_v = range * tan_half_v_fov_;
+
+    const tf2::Vector3 center = forward_dir_ * range;
+
+    std::vector<tf2::Vector3> corners;
+    corners.reserve(4);
+
+    corners.push_back(center + right_dir_ * half_h + up_dir_ * half_v);
+    corners.push_back(center + right_dir_ * half_h - up_dir_ * half_v);
+    corners.push_back(center - right_dir_ * half_h - up_dir_ * half_v);
+    corners.push_back(center - right_dir_ * half_h + up_dir_ * half_v);
+
+    return corners;
+  }
+
+  double degToRad(double deg) const
+  {
+    return deg * M_PI / 180.0;
+  }
+
+  visualization_msgs::Marker makeSensorFovMarker(
+      const SensorConfig& sensor,
+      const tf2::Transform& T_map_sensor,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+
+    marker.ns = "sensor_fov";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::LINE_LIST;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 0.006;
+
+    marker.color.r = 0.0f;
+    marker.color.g = 0.8f;
+    marker.color.b = 1.0f;
+    marker.color.a = 0.9f;
+
+    marker.lifetime = ros::Duration(1.0 / std::max(0.1, publish_rate_) * 2.5);
+
+    const tf2::Vector3 origin_sensor(0.0, 0.0, 0.0);
+    const tf2::Vector3 origin_map = T_map_sensor * origin_sensor;
+
+    const auto corners_sensor = computeFrustumCornersInSensorFrame();
+
+    std::vector<tf2::Vector3> corners_map;
+    corners_map.reserve(4);
+    for (const auto& c_sensor : corners_sensor)
+    {
+      corners_map.push_back(T_map_sensor * c_sensor);
+    }
+
+    auto addLine = [&](const tf2::Vector3& a, const tf2::Vector3& b)
+    {
+      marker.points.push_back(toPointMsg(a));
+      marker.points.push_back(toPointMsg(b));
+    };
+
+    for (const auto& c_map : corners_map)
+    {
+      addLine(origin_map, c_map);
+    }
+
+    addLine(corners_map[0], corners_map[1]);
+    addLine(corners_map[1], corners_map[2]);
+    addLine(corners_map[2], corners_map[3]);
+    addLine(corners_map[3], corners_map[0]);
+
+    const tf2::Vector3 center_sensor = forward_dir_ * tof_max_range_;
+    const tf2::Vector3 center_map = T_map_sensor * center_sensor;
+    addLine(origin_map, center_map);
+
+    return marker;
+  }
+
+  visualization_msgs::Marker makeSensorOriginMarker(
+      const SensorConfig& sensor,
+      const tf2::Transform& T_map_sensor,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+
+    marker.ns = "sensor_origin";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    const tf2::Vector3 p = T_map_sensor.getOrigin();
+    marker.pose.position.x = p.x();
+    marker.pose.position.y = p.y();
+    marker.pose.position.z = p.z();
+    marker.pose.orientation.w = 1.0;
+
+    marker.scale.x = 0.025;
+    marker.scale.y = 0.025;
+    marker.scale.z = 0.025;
+
+    marker.color.r = 1.0f;
+    marker.color.g = 0.4f;
+    marker.color.b = 0.0f;
+    marker.color.a = 0.9f;
+
+    marker.lifetime = ros::Duration(1.0 / std::max(0.1, publish_rate_) * 2.5);
+
+    return marker;
+  }
+
+  visualization_msgs::Marker makeSensorTextMarker(
+      const SensorConfig& sensor,
+      const tf2::Transform& T_map_sensor,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+
+    marker.ns = "sensor_label";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    const tf2::Vector3 p = T_map_sensor.getOrigin();
+    marker.pose.position.x = p.x();
+    marker.pose.position.y = p.y();
+    marker.pose.position.z = p.z() + 0.04;
+    marker.pose.orientation.w = 1.0;
+
+    marker.scale.z = 0.035;
+
+    marker.color.r = 1.0f;
+    marker.color.g = 1.0f;
+    marker.color.b = 1.0f;
+    marker.color.a = 0.9f;
+
+    marker.text = sensor.name;
+    marker.lifetime = ros::Duration(1.0 / std::max(0.1, publish_rate_) * 2.5);
+
+    return marker;
+  }
+
+  visualization_msgs::Marker makeCurrentBodyPriorSphereMarker(
+      const CurrentBodyPriorSphere& sphere,
+      int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "current_body_prior_spheres";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::SPHERE;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position.x = sphere.center_map.x();
+    marker.pose.position.y = sphere.center_map.y();
+    marker.pose.position.z = sphere.center_map.z();
+    marker.pose.orientation.w = 1.0;
+
+    marker.scale.x = 2.0 * sphere.radius;
+    marker.scale.y = 2.0 * sphere.radius;
+    marker.scale.z = 2.0 * sphere.radius;
+
+    marker.color.r = 0.2f;
+    marker.color.g = 1.0f;
+    marker.color.b = 0.2f;
+    marker.color.a = 0.12f;
+
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::Marker makeCurrentBodyPriorTextMarker(int marker_id) const
+  {
+    visualization_msgs::Marker marker;
+
+    marker.header.frame_id = map_frame_;
+    marker.header.stamp = ros::Time::now();
+    marker.ns = "current_body_prior_label";
+    marker.id = marker_id;
+    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    marker.pose.position.x = 0.45;
+    marker.pose.position.y = 0.45;
+    marker.pose.position.z = 1.15;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.z = 0.04;
+
+    marker.color.r = 0.7f;
+    marker.color.g = 1.0f;
+    marker.color.b = 0.7f;
+    marker.color.a = 1.0f;
+
+    std::ostringstream oss;
+    oss << "cold-start body bootstrap"
+        << "\nbackend=" << current_body_prior_geometry_backend_
+        << "\nper-link kinematic inflation (fallback="
+        << current_body_prior_inflation_radius_ << " m)"
+        << "\nbootstrap confidence=1; sensor visibility preserved"
+        << "\ngeometry elements=" << last_body_prior_transformed_samples_
+        << ", cells=" << last_body_prior_updated_cells_;
+
+    marker.text = oss.str();
+    marker.lifetime = ros::Duration(0.0);
+    return marker;
+  }
+
+  visualization_msgs::MarkerArray makeCurrentBodyPriorMarkerArray() const
+  {
+    visualization_msgs::MarkerArray array;
+
+    visualization_msgs::Marker delete_marker;
+    delete_marker.header.frame_id = map_frame_;
+    delete_marker.header.stamp = ros::Time::now();
+    delete_marker.action = visualization_msgs::Marker::DELETEALL;
+    array.markers.push_back(delete_marker);
+
+    if (!current_body_prior_enabled_ || !current_body_prior_active_)
+    {
+      return array;
+    }
+
+    int marker_id = 0;
+    if (current_body_prior_geometry_backend_ == "primitive")
+    {
+      // Show exactly the trusted grid centres, not axis-expanded boxes/cylinders
+      // that would misrepresent rounded Minkowski dilation as extra FREE space.
+      visualization_msgs::Marker m;
+      m.header = delete_marker.header;
+      m.ns = "current_body_prior_grid_centres"; m.id = marker_id++;
+      m.type = visualization_msgs::Marker::POINTS; m.action = visualization_msgs::Marker::ADD;
+      m.pose.orientation.w = 1.0;
+      m.scale.x = m.scale.y = resolution_ * 0.25;
+      m.color.g = 1.0; m.color.b = 0.7; m.color.a = 0.6;
+      for (const auto& gp : grid_points_) if (gp.bootstrap_confidence > 0.5f)
+      {
+        geometry_msgs::Point p; p.x=gp.x; p.y=gp.y; p.z=gp.z; m.points.push_back(p);
+      }
+      array.markers.push_back(std::move(m));
+    }
+    for (const auto& sphere : last_body_prior_spheres_)
+    {
+      array.markers.push_back(
+          makeCurrentBodyPriorSphereMarker(sphere, marker_id++));
+    }
+
+    array.markers.push_back(makeCurrentBodyPriorTextMarker(marker_id++));
+    return array;
+  }
+
+  void publishCurrentBodyPriorMarkers() const
+  {
+    if (!current_body_prior_marker_pub_)
+    {
+      return;
+    }
+    current_body_prior_marker_pub_.publish(
+        makeCurrentBodyPriorMarkerArray());
+  }
+
+  bool getSensorTransforms(
+      std::vector<tf2::Transform>& T_map_sensors,
+      visualization_msgs::MarkerArray* marker_array)
+  {
+    T_map_sensors.clear();
+
+    int ready_count = 0;
+    int marker_id = 0;
+
+    for (const auto& sensor : sensors_)
+    {
+      geometry_msgs::TransformStamped tf_msg;
+
+      try
+      {
+        tf_msg = tf_buffer_.lookupTransform(
+            map_frame_,
+            sensor.frame,
+            ros::Time(0),
+            ros::Duration(0.002));
+      }
+      catch (const tf2::TransformException& ex)
+      {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "[confidence_map_node] Missing TF %s -> %s: %s",
+            map_frame_.c_str(),
+            sensor.frame.c_str(),
+            ex.what());
+        continue;
+      }
+
+      ++ready_count;
+
+      const tf2::Transform T_map_sensor = transformMsgToTf2(tf_msg);
+      T_map_sensors.push_back(T_map_sensor);
+
+      if (marker_array != nullptr)
+      {
+        marker_array->markers.push_back(
+            makeSensorFovMarker(sensor, T_map_sensor, marker_id++));
+        marker_array->markers.push_back(
+            makeSensorOriginMarker(sensor, T_map_sensor, marker_id++));
+        marker_array->markers.push_back(
+            makeSensorTextMarker(sensor, T_map_sensor, marker_id++));
+      }
+    }
+
+    if (ready_count != last_ready_count_)
+    {
+      ROS_INFO_STREAM("[confidence_map_node] Sensor TF ready: "
+                      << ready_count << " / " << sensors_.size());
+      last_ready_count_ = ready_count;
+    }
+
+    return ready_count > 0;
+  }
+
+  void updateTimerCallback(const ros::TimerEvent&)
+  {
+    std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
+    const ros::Time now = ros::Time::now();
+
+    if (observation_mode_ == "ideal_fov")
+    {
+      std::vector<tf2::Transform> T_map_sensors;
+      getSensorTransforms(T_map_sensors, nullptr);
+      updateConfidenceMapSensorCentric(T_map_sensors, now);
+      return;
+    }
+
+    // In tof_ray mode the observation callback owns the current visible set.
+    // Only clear it when the entire E2 observation stream has gone stale;
+    // otherwise a 30-Hz timer would flicker visibility between 15-Hz packets.
+    if (last_ray_observation_received_.isZero() ||
+        (now - last_ray_observation_received_).toSec() >
+            ray_observation_timeout_)
+    {
+      resetCurrentVisibility();
+    }
+
+    applyTemporalDecay(now);
+    printConfidenceStatsThrottled();
+  }
+
+  void publishTimerCallback(const ros::TimerEvent&)
+  {
+    // This callback and all writers still use the same single default queue.
+    // It only READS map state, so can run alongside the dedicated query reader.
+    // In particular, marker TF waits and cloud publication never hold the map
+    // write/query mutex. No publication or map update is skipped.
+    visualization_msgs::MarkerArray marker_array;
+    std::vector<tf2::Transform> T_map_sensors_unused;
+    getSensorTransforms(T_map_sensors_unused, &marker_array);
+
+    fov_marker_pub_.publish(marker_array);
+    publishCurrentBodyPriorMarkers();
+
+    sensor_msgs::PointCloud2 cloud = makeGridPointCloudMsg();
+    pointcloud_pub_.publish(cloud);
+
+    e3_summary_pub_.publish(makeE3SummaryMsg(ros::Time::now()));
+  }
+
+  void printSummary() const
+  {
+    const long long total_points =
+        static_cast<long long>(nx_) *
+        static_cast<long long>(ny_) *
+        static_cast<long long>(nz_);
+
+    ROS_INFO_STREAM("");
+    ROS_INFO_STREAM("========== care_confidence_map ==========");
+    ROS_INFO_STREAM("map frame: " << map_frame_);
+    ROS_INFO_STREAM("bounds:");
+    ROS_INFO_STREAM("  x: [" << x_min_ << ", " << x_max_ << "]");
+    ROS_INFO_STREAM("  y: [" << y_min_ << ", " << y_max_ << "]");
+    ROS_INFO_STREAM("  z: [" << z_min_ << ", " << z_max_ << "]");
+    ROS_INFO_STREAM("global resolution: " << resolution_);
+    ROS_INFO_STREAM("grid size: "
+                    << nx_ << " x "
+                    << ny_ << " x "
+                    << nz_ << " = "
+                    << total_points << " points");
+    ROS_INFO_STREAM("update_rate: " << update_rate_);
+    ROS_INFO_STREAM("publish_rate: " << publish_rate_);
+    ROS_INFO_STREAM("temporal_decay_time: " << temporal_decay_time_);
+    ROS_INFO_STREAM("observation_mode: " << observation_mode_);
+    ROS_INFO_STREAM("test_known_free_oracle: " << test_known_free_enabled_
+                    << ", configured_points=" << test_known_free_points_.size()
+                    << ", inflation_radius=" << test_known_free_inflation_radius_);
+    ROS_INFO_STREAM("ray_observation_topic: " << ray_observation_topic_);
+    ROS_INFO_STREAM("e3_summary_topic: " << e3_summary_topic_);
+    ROS_INFO_STREAM("query_service: " << query_service_name_);
+    ROS_INFO_STREAM("marker_topic: " << marker_topic_);
+    ROS_INFO_STREAM("pointcloud_topic: " << pointcloud_topic_);
+    ROS_INFO_STREAM("fov_marker_topic: " << fov_marker_topic_);
+
+    ROS_INFO_STREAM("");
+    ROS_INFO_STREAM("current_body_prior:");
+    ROS_INFO_STREAM("  geometry_backend: " << current_body_prior_geometry_backend_);
+    ROS_INFO_STREAM("  enabled: " << current_body_prior_enabled_);
+    ROS_INFO_STREAM("  body_samples_file: " << current_body_prior_body_samples_file_);
+    ROS_INFO_STREAM("  fallback_inflation_radius: " << current_body_prior_inflation_radius_);
+    ROS_INFO_STREAM("  link_inflation_radius entries: "
+                    << current_body_prior_link_inflation_radius_.size());
+    for (const auto& kv : current_body_prior_link_inflation_radius_)
+    {
+      ROS_INFO_STREAM("    " << kv.first << ": " << kv.second);
+    }
+    ROS_INFO_STREAM("  active: " << current_body_prior_active_);
+    ROS_INFO_STREAM("  refresh_on_startup: " << current_body_prior_refresh_on_startup_);
+    ROS_INFO_STREAM("  risk_samples_only: " << current_body_prior_risk_samples_only_);
+    ROS_INFO_STREAM("  refresh_service: " << refresh_body_prior_service_name_);
+    ROS_INFO_STREAM("  deactivate_service: " << deactivate_body_prior_service_name_);
+    ROS_INFO_STREAM("  marker_topic: " << current_body_prior_marker_topic_);
+    ROS_INFO_STREAM("  last_transformed_samples: " << last_body_prior_transformed_samples_);
+    ROS_INFO_STREAM("  last_updated_cells: " << last_body_prior_updated_cells_);
+
+    ROS_INFO_STREAM("");
+    ROS_INFO_STREAM("sensor model:");
+    ROS_INFO_STREAM("  forward_axis: " << forward_axis_);
+    ROS_INFO_STREAM("  range: [" << tof_min_range_ << ", " << tof_max_range_ << "]");
+    ROS_INFO_STREAM("  horizontal_fov_deg: " << horizontal_fov_deg_);
+    ROS_INFO_STREAM("  vertical_fov_deg: " << vertical_fov_deg_);
+    ROS_INFO_STREAM("  local_resolution: " << local_resolution_);
+    ROS_INFO_STREAM("  local visible points per sensor: "
+                    << local_visible_points_.size());
+
+    ROS_INFO_STREAM("");
+    ROS_INFO_STREAM("sensors:");
+    for (const auto& sensor : sensors_)
+    {
+      ROS_INFO_STREAM("  id=" << sensor.id
+                      << ", name=" << sensor.name
+                      << ", frame=" << sensor.frame);
+    }
+
+    ROS_INFO_STREAM("=========================================");
+  }
+
+private:
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+  ros::NodeHandle query_nh_;
+  ros::CallbackQueue query_queue_;
+  std::unique_ptr<ros::AsyncSpinner> query_spinner_;
+  std::mutex map_query_mutex_;
+
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  ros::Publisher fov_marker_pub_;
+  ros::Publisher current_body_prior_marker_pub_;
+  ros::Publisher pointcloud_pub_;
+  ros::Publisher e3_summary_pub_;
+  ros::Subscriber ray_observation_sub_;
+  ros::ServiceServer query_service_;
+  ros::ServiceServer snapshot_service_;
+  std::string snapshot_instance_;
+  uint64_t snapshot_epoch_ = 0, snapshot_revision_ = 1;
+  ros::Time snapshot_update_stamp_, snapshot_clock_stamp_;
+  bool snapshot_clock_fault_ = false, snapshot_evidence_fault_ = false;
+  ros::ServiceServer refresh_body_prior_service_;
+  ros::ServiceServer deactivate_body_prior_service_;
+
+  ros::Timer update_timer_;
+  ros::Timer publish_timer_;
+
+  std::string map_frame_;
+
+  double x_min_ = -0.9;
+  double x_max_ =  0.9;
+  double y_min_ = -0.9;
+  double y_max_ =  0.9;
+  double z_min_ =  0.0;
+  double z_max_ =  1.10;
+
+  double resolution_ = 0.05;
+  double update_rate_ = 30.0;
+  double publish_rate_ = 10.0;
+  double temporal_decay_time_ = 2.0;
+
+  bool test_known_free_enabled_ = false;
+  double test_known_free_inflation_radius_ = 0.0;
+  std::vector<tf2::Vector3> test_known_free_points_;
+
+  std::string observation_mode_ = "ideal_fov";
+  std::string ray_observation_topic_ =
+      "/care_planner/perception/tof_ray_observations";
+  std::string e3_summary_topic_ =
+      "/care_planner/confidence_map/e3_summary";
+  double ray_observation_timeout_ = 0.25;
+  double ray_free_start_range_ = 0.15;
+  care_confidence_map::AnalyticGroundSupport ground_support_;
+  bool ground_support_loaded_=false,ground_partition_applied_=false;
+  double ray_endpoint_guard_distance_ = 0.025;
+  double ray_step_ = 0.025;
+  double ray_min_valid_range_ = 0.10;
+  double ray_max_valid_range_ = 1.50;
+  bool ray_persistent_occupied_ = false;
+  bool debug_occupancy_watch_enabled_ = false;
+  double debug_occupancy_watch_x_ = 0.0;
+  double debug_occupancy_watch_y_ = 0.0;
+  double debug_occupancy_watch_z_ = 0.0;
+
+  bool debug_neighborhood_watch_enabled_ = false;
+  double debug_neighborhood_watch_x_ = 0.0;
+  double debug_neighborhood_watch_y_ = 0.0;
+  double debug_neighborhood_watch_z_ = 0.0;
+  double debug_neighborhood_watch_period_s_ = 1.0;
+  ros::WallTime last_debug_neighborhood_log_wall_;
+
+  bool debug_hotspot_watch_enabled_ = false;
+  double debug_hotspot_x_min_ = -0.025;
+  double debug_hotspot_x_max_ = 0.075;
+  double debug_hotspot_y_min_ = 0.025;
+  double debug_hotspot_y_max_ = 0.125;
+  double debug_hotspot_z_min_ = 0.225;
+  double debug_hotspot_z_max_ = 0.425;
+
+  ros::Time last_ray_observation_received_;
+  ros::Time last_ray_observation_stamp_;
+  std::size_t ray_packet_count_ = 0;
+  std::size_t ray_decode_failure_count_ = 0;
+  std::size_t last_ray_count_ = 0;
+  std::size_t last_hit_ray_count_ = 0;
+  std::size_t last_no_hit_ray_count_ = 0;
+  std::size_t last_ray_free_cell_count_ = 0;
+  std::size_t last_ray_occupied_cell_count_ = 0;
+  std::size_t last_ray_occupied_free_clear_suppressed_count_ = 0;
+  std::size_t total_ray_occupied_free_clear_suppressed_count_ = 0;
+  std::size_t last_ray_out_of_map_endpoint_count_ = 0;
+  std::size_t last_ray_invalid_range_count_ = 0;
+
+  int nx_ = 0;
+  int ny_ = 0;
+  int nz_ = 0;
+
+  std::string marker_topic_;
+  std::string pointcloud_topic_;
+  std::string fov_marker_topic_;
+  std::string query_service_name_;
+
+  bool current_body_prior_enabled_ = true;
+  bool current_body_prior_refresh_on_startup_ = true;
+  bool current_body_prior_lock_after_complete_refresh_ = false;
+  bool current_body_prior_locked_ = false;
+  bool current_body_prior_risk_samples_only_ = false;
+  bool current_body_prior_active_ = false;
+  double current_body_prior_inflation_radius_ = 0.0;
+  std::map<std::string, double> current_body_prior_link_inflation_radius_;
+  double current_body_prior_tf_timeout_ = 0.05;
+  std::string current_body_prior_body_samples_file_;
+  std::string refresh_body_prior_service_name_ =
+      "/care_planner/confidence_map/refresh_body_prior";
+  std::string deactivate_body_prior_service_name_ =
+      "/care_planner/confidence_map/deactivate_body_prior";
+  std::string current_body_prior_marker_topic_ =
+      "/care_planner/confidence_map/current_body_prior_markers";
+  care_confidence_map::BodySampleModel current_body_sample_model_;
+  std::string current_body_prior_geometry_backend_ = "samples";
+  care_confidence_map::VbcPrimitiveModel current_body_primitive_model_;
+  std::vector<CurrentBodyPriorSphere> last_body_prior_spheres_;
+  ros::Time last_body_prior_refresh_time_;
+  int last_body_prior_updated_cells_ = 0;
+  int last_body_prior_transformed_samples_ = 0;
+  int last_body_prior_skipped_samples_ = 0;
+
+  std::string forward_axis_;
+  tf2::Vector3 forward_dir_;
+  tf2::Vector3 right_dir_;
+  tf2::Vector3 up_dir_;
+
+  double tof_min_range_ = 0.05;
+  double tof_max_range_ = 0.75;
+  double horizontal_fov_deg_ = 55.0;
+  double vertical_fov_deg_ = 72.0;
+  double local_resolution_ = 0.05;
+
+  double half_h_fov_rad_ = 0.0;
+  double half_v_fov_rad_ = 0.0;
+  double tan_half_h_fov_ = 0.0;
+  double tan_half_v_fov_ = 0.0;
+
+  std::vector<SensorConfig> sensors_;
+  std::vector<GridPoint> grid_points_;
+  std::vector<LocalVisiblePoint> local_visible_points_;
+
+  int last_ready_count_ = -1;
+};
+
+int main(int argc, char** argv)
+{
+  ros::init(argc, argv, "confidence_map_node");
+
+  ConfidenceMapNode node;
+  if (!node.initialize())
+  {
+    ROS_ERROR("[confidence_map_node] Initialization failed.");
+    return 1;
+  }
+
+  ros::spin();
+  return 0;
+}

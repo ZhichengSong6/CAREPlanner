@@ -51,9 +51,9 @@ task_generator:
     joint2: 2.0
     joint3: 2.0
     joint4: 2.0
-    wrist_joint1: 2.5
-    wrist_joint2: 2.5
-    wrist_joint3: 2.5
+    wrist_joint1: 2.0
+    wrist_joint2: 2.0
+    wrist_joint3: 2.0
   nominal_max_joint_acceleration: 10.0
   joint_acceleration_limits:
     joint1: 3.0
@@ -80,6 +80,8 @@ receding_horizon:
   mpc_command_timeout: 0.20
 
 local_planner:
+  terminal_retention:
+    enabled: true
   num_intervals: 20
   horizon_duration: 1.0
 
@@ -87,11 +89,18 @@ local_planner:
   # task reference advances. The remaining optimization tail holds the step-5
   # target. NORMAL still uses all 20 task-reference steps; REPAIR is unchanged.
   probe_task_horizon_steps: 5
+  # Match the executable PROBE cap, preserving the three-prefix protocol.
+  probe_velocity_cap: 0.50
 
   poll_rate: 50.0
   min_replan_interval: 0.10
   cdf_wait_timeout: 0.50
   cdf_stamp_tolerance: 0.000001
+  # Distinct active certified executions can replace one another before a
+  # tracker completion. Require both a sustained stationary interval and five
+  # execution identities before the existing exact-VBC task-stall route.
+  normal_active_no_progress_duration_s: 8.0
+  normal_active_no_progress_min_executions: 5
 
   # GCDF-aligned objective:
   # weak intermediate state tracking + stronger terminal tracking.
@@ -124,6 +133,10 @@ local_planner:
   # uses q_vis as the active-sensing objective.
   repair_hold_initialization_enabled: true
   repair_task_tracking_scale: 0.0
+  # One optional secondary hard QP, charged to the original six iterations.
+  # Only sensor-independent joints receive a <=.05rad task target. Retain it
+  # only when all observation-joint knots match the primary solution.
+  repair_free_joint_task_tracking_scale: 1.0
   visibility_waypoint_weight: 3000.0
 
   # The formal full-q_vis experiment disables the external frontier producer.
@@ -287,9 +300,9 @@ mpc:
     joint2: 2.0
     joint3: 2.0
     joint4: 2.0
-    wrist_joint1: 2.5
-    wrist_joint2: 2.5
-    wrist_joint3: 2.5
+    wrist_joint1: 2.0
+    wrist_joint2: 2.0
+    wrist_joint3: 2.0
   joint_acceleration_limits:
     joint1: 3.0
     joint2: 3.0
@@ -373,3 +386,5 @@ execution:
   replan_request_topic: /care_planner/local_planner/replan_request
   position_feedback_gain: 2.5
   max_command_velocity: 2.0
+  # Reject incompatible continuous curves before GCDF/VBC and at the tracker.
+  enforce_motion_limits: true

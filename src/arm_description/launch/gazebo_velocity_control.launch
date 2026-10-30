@@ -5,6 +5,8 @@
   <arg name="paused" default="false" />
   <arg name="use_sim_time" default="true" />
   <arg name="gazebo_gui" default="true" />
+  <arg name="use_command_watchdog" default="false" />
+  <arg name="require_execution_lease" default="false" />
 
   <!-- RViz remains part of the normal simulation startup from the user's
        perspective, but it runs in its own session after the simulation/control
@@ -89,7 +91,11 @@
               -P 0.0
               -Y 0.0" />
 
-  <rosparam file="$(find arm_description)/config/controllers.yaml" command="load" />
+  <rosparam unless="$(arg use_command_watchdog)" file="$(find arm_description)/config/controllers.yaml" command="load" />
+  <rosparam if="$(arg use_command_watchdog)" file="$(find arm_description)/config/controllers_watchdog.yaml" command="load" />
+  <group if="$(arg use_command_watchdog)">
+    <param name="/care_arm/arm_group_velocity_controller/require_execution_lease" value="$(arg require_execution_lease)" />
+  </group>
 
   <node pkg="controller_manager"
         type="spawner"

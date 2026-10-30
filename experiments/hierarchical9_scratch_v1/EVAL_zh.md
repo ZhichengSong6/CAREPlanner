@@ -93,11 +93,3 @@ mask 来自离线 q0 库覆盖，不是运行时感知可见性或安全证书�
 第一轮结果之后再适配并跑原 Case026 targeted self-occlusion/fallback 检查。
 当前没有修改旧8-head runtime loader，不能直接把新checkpoint路径塞进去。
 继续保持 PER_SENSOR_HYBRID_ENABLED=false；本次不跑完整Phase-E，不产生安全合格结论。
-
-## 本地测试范围
-
-已通过 Python编译、Shell语法及 test_evaluate.py 的6项CPU合成测试：
-head输出/7D梯度等价、masked-max梯度等价、ranking/fallback掩码、
-field统计分块一致性、样本与模型初始化解耦、final checkpoint guard/序列化。
-没有在此环境读取服务器真实final.pt或7.4GB数据，也没有执行CUDA评估。
-服务器 evaluator smoke 是真实环境验证，不是已完成的测量。

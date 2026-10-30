@@ -1,4 +1,6 @@
 #include "egocentric_arm_planner/trajectory_execution_manager.hpp"
+#include <care_confidence_map/trajectory_motion.hpp>
+#include "egocentric_arm_planner/execution_motion_contract.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +25,18 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
   }
 
   const int dof = static_cast<int>(joint_names_.size());
+  pnh_.param("execution/enforce_motion_limits", enforce_motion_limits_, false);
+  if(enforce_motion_limits_) {
+    for(const auto& name:joint_names_) {
+      double v=0.,a=0.;
+      if(!pnh_.getParam("mpc/joint_velocity_limits/"+name,v) ||
+          !pnh_.getParam("mpc/joint_acceleration_limits/"+name,a) ||
+          !std::isfinite(v) || v<=0. || v>max_command_velocity_ || !std::isfinite(a) || a<=0.) {
+        ROS_ERROR_STREAM("Execution motion contract mismatch for "<<name);return false;
+      }
+      reference_velocity_limits_.push_back(v);reference_acceleration_limits_.push_back(a);
+    }
+  }
   pnh_.param("execution/primitive_tracking_guard", primitive_tracking_guard_, false);
   pnh_.param("execution/primitive_tracking_relative_fk",
              primitive_tracking_relative_fk_, false);
@@ -52,6 +66,10 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1,
       &TrajectoryExecutionManager::jointStateCallback, this);
+  std::string limiter_topic;
+  pnh_.param<std::string>("execution/limiter_output_command",limiter_topic,
+      "/care_arm/arm_group_velocity_controller/command");
+  limiter_output_sub_=nh_.subscribe(limiter_topic,1,&TrajectoryExecutionManager::limiterOutputCallback,this);
 
   trajectory_sub_ = nh_.subscribe(
       input_trajectory_topic_, 1,
@@ -60,9 +78,43 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
   safety_hold_sub_ = nh_.subscribe(
       external_safety_hold_topic_, 1,
       &TrajectoryExecutionManager::safetyHoldCallback, this);
+  vbc_safety_hold_sub_ = nh_.subscribe(
+      vbc_safety_hold_topic_, 1,
+      &TrajectoryExecutionManager::vbcSafetyHoldCallback, this);
+  execution_vbc_stop_sub_ = nh_.subscribe(
+      "/care_planner/execution/vbc_stop_request", 20,
+      &TrajectoryExecutionManager::executionVbcStopCallback, this);
 
   velocity_command_pub_ = nh_.advertise<std_msgs::Float64MultiArray>(
       output_velocity_command_topic_, 1);
+  pnh_.param("execution/require_command_lease",require_command_lease_,false);
+  pnh_.param("execution/require_prepared_execution",require_prepared_execution_,false);
+  if(require_prepared_execution_ && !require_command_lease_) {
+    ROS_ERROR("Prepared execution requires command leases");return false;
+  }
+  if(require_command_lease_) {
+    if(!enforce_motion_limits_ || joint_names_.size()!=7) {
+      ROS_ERROR("Execution lease mode requires the seven-joint motion contract");return false;
+    }
+    std::string lease_topic,command_topic,state_topic;
+    pnh_.param<std::string>("execution/lease_topic",lease_topic,"/care_arm/arm_group_velocity_controller/execution_lease");
+    pnh_.param<std::string>("execution/leased_command_topic",command_topic,"/care_planner/execution/leased_velocity_desired");
+    pnh_.param<std::string>("execution/controller_state_topic",state_topic,"/care_arm/arm_group_velocity_controller/state");
+    execution_lease_sub_=nh_.subscribe(lease_topic,10,&TrajectoryExecutionManager::executionLeaseCallback,this);
+    controller_state_sub_=nh_.subscribe(state_topic,10,&TrajectoryExecutionManager::controllerStateCallback,this);
+    leased_velocity_command_pub_=nh_.advertise<care_velocity_controller::LeasedVelocityCommand>(command_topic,1);
+  }
+  if(require_prepared_execution_) {
+    std::string topic,context_topic,control_topic,status_topic;
+    pnh_.param<std::string>("execution/prepared_trajectory_topic",topic,"/care_planner/execution/staged_trajectory");
+    pnh_.param<std::string>("execution/task_context_topic",context_topic,"/care_planner/active_sensing/observation_context");
+    pnh_.param<std::string>("execution/task_control_topic",control_topic,"/care_planner/c4_4/task_control");
+    pnh_.param<std::string>("execution/prepared_status_topic",status_topic,"/care_planner/execution/tracker_preparation_status");
+    preparation_sub_=nh_.subscribe(topic,1,&TrajectoryExecutionManager::preparationCallback,this);
+    preparation_context_sub_=nh_.subscribe(context_topic,10,&TrajectoryExecutionManager::preparationContextCallback,this);
+    preparation_control_sub_=nh_.subscribe(control_topic,10,&TrajectoryExecutionManager::preparationControlCallback,this);
+    preparation_status_pub_=nh_.advertise<std_msgs::String>(status_topic,10);
+  }
 
   reference_state_pub_ = nh_.advertise<sensor_msgs::JointState>(
       reference_state_topic_, 1);
@@ -102,6 +154,9 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
   ROS_INFO_STREAM(
       "[TrajectoryExecutionManager] Phase E5 external safety hold topic="
       << external_safety_hold_topic_);
+  ROS_INFO_STREAM(
+      "[TrajectoryExecutionManager] VBC verification hold topic="
+      << vbc_safety_hold_topic_);
   ROS_INFO_STREAM(
       "[TrajectoryExecutionManager] phase-aligned spatial tracking="
       << static_cast<int>(tracking_phase_alignment_enabled_)
@@ -190,6 +245,8 @@ bool TrajectoryExecutionManager::loadConfig() {
   pnh_.param<std::string>("execution/external_safety_hold_topic",
                           external_safety_hold_topic_,
                           external_safety_hold_topic_);
+  pnh_.param<std::string>("execution/vbc_safety_hold_topic",
+                          vbc_safety_hold_topic_, vbc_safety_hold_topic_);
 
   if (!pnh_.getParam("joint_names", joint_names_)) {
     ROS_ERROR("[TrajectoryExecutionManager] Missing param: joint_names");
@@ -253,32 +310,150 @@ void TrajectoryExecutionManager::safetyHoldCallback(
   std::lock_guard<std::mutex> lock(data_mutex_);
   const bool requested = msg->data;
   if (requested == external_safety_hold_) return;
-
+  const bool was_held = external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
+  external_safety_hold_ = requested;
+  const bool held = external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
   if (requested) {
-    external_safety_hold_ = true;
-    external_safety_hold_start_time_ = now;
     ++external_safety_hold_event_count_;
     ROS_ERROR_STREAM(
         "[TrajectoryExecutionManager] Phase E5 external GCDF HARD HOLD engaged"
         << " count=" << external_safety_hold_event_count_);
   } else {
-    if (external_safety_hold_ &&
-        !external_safety_hold_start_time_.isZero() &&
-        has_active_trajectory_) {
-      // Freeze trajectory phase while externally held so release never jumps
-      // forward along an unexecuted reference segment.
-      active_trajectory_start_time_ +=
-          (now - external_safety_hold_start_time_);
-    }
-    external_safety_hold_ = false;
-    external_safety_hold_start_time_ = ros::Time(0);
     ROS_WARN(
         "[TrajectoryExecutionManager] Phase E5 external GCDF hold released");
   }
+  if (!was_held && held) external_safety_hold_start_time_ = now;
+  if (was_held && !held) {
+    if (!external_safety_hold_start_time_.isZero() &&
+        has_active_trajectory_ &&
+        now > std::max(external_safety_hold_start_time_,
+                       active_trajectory_start_time_))
+      active_trajectory_start_time_ +=
+          (now - std::max(external_safety_hold_start_time_,
+                          active_trajectory_start_time_));
+    external_safety_hold_start_time_ = ros::Time(0);
+  }
+}
+
+void TrajectoryExecutionManager::vbcSafetyHoldCallback(
+    const std_msgs::BoolConstPtr& msg) {
+  if (!msg) return;
+  const ros::Time now = ros::Time::now();
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  const bool requested = msg->data;
+  if (requested == vbc_safety_hold_) return;
+  const bool was_held = external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
+  vbc_safety_hold_ = requested;
+  const bool held = external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
+  ROS_WARN_STREAM("[TrajectoryExecutionManager] VBC verification hold="
+                  << static_cast<int>(requested));
+  if (!was_held && held) external_safety_hold_start_time_ = now;
+  if (was_held && !held) {
+    if (!external_safety_hold_start_time_.isZero() &&
+        has_active_trajectory_ &&
+        now > std::max(external_safety_hold_start_time_,
+                       active_trajectory_start_time_))
+      active_trajectory_start_time_ +=
+          (now - std::max(external_safety_hold_start_time_,
+                          active_trajectory_start_time_));
+    external_safety_hold_start_time_ = ros::Time(0);
+  }
+}
+
+void TrajectoryExecutionManager::executionVbcStopCallback(
+    const std_msgs::StringConstPtr& msg) {
+  if (!msg) return;
+  const std::string prefix = "execution_stamp_ns=";
+  if (msg->data.compare(0,prefix.size(),prefix) != 0) return;
+  const std::string value = msg->data.substr(prefix.size());
+  if (value.empty() || value.find_first_not_of("0123456789") != std::string::npos) return;
+  uint64_t stamp = 0;
+  try { stamp = std::stoull(value); } catch (...) { return; }
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  // Token matching happens at the actuator-facing owner, under the same lock
+  // as trajectory replacement. Delayed old requests cannot stop a new token.
+  if (!stamp || !has_active_trajectory_ || stamp != active_execution_stamp_ns_ ||
+      stamp == execution_vbc_stop_stamp_ns_) return;
+  if (!external_safety_hold_ && !vbc_safety_hold_)
+    external_safety_hold_start_time_ = ros::Time::now();
+  execution_vbc_stop_stamp_ns_ = stamp;
+  ROS_ERROR_STREAM("[TrajectoryExecutionManager] execution VBC stop token=" << stamp);
+}
+
+void TrajectoryExecutionManager::limiterOutputCallback(
+    const std_msgs::Float64MultiArrayConstPtr& msg) {
+  if(require_command_lease_)return; // Only a matching controller application receipt counts.
+  if(!msg || msg->data.size()!=joint_names_.size())return;
+  const Eigen::Map<const Eigen::VectorXd> value(msg->data.data(),msg->data.size());
+  if(!value.allFinite())return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  latest_limiter_output_=value;latest_limiter_output_received_=ros::Time::now();
+}
+
+void TrajectoryExecutionManager::controllerStateCallback(
+    const care_velocity_controller::CommandStatusConstPtr& msg) {
+  if(!msg || !msg->execution_lease_required || !msg->controller_session)return;
+  const auto now=ros::Time::now();
+  if(msg->header.stamp.isZero() || msg->header.stamp>now || (now-msg->header.stamp).toSec()>.05)return;
+  for(double v:msg->applied_velocity)if(!std::isfinite(v))return;
+  for(size_t j=0;j<joint_names_.size();++j) {
+    if(!std::isfinite(msg->velocity_limits[j]) || !std::isfinite(msg->acceleration_limits[j]) ||
+        std::abs(msg->velocity_limits[j]-reference_velocity_limits_[j])>1e-12 ||
+        std::abs(msg->acceleration_limits[j]-reference_acceleration_limits_[j])>1e-12)return;
+  }
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  if(require_prepared_execution_)prepared_execution_.observe(*msg,now,reference_velocity_limits_,reference_acceleration_limits_);
+  if(msg->header.stamp<=controller_state_.header.stamp)return;
+  if(msg->controller_session!=controller_state_.controller_session) {
+    command_lease_=care_velocity_controller::ExecutionLease(); last_lease_sequence_=0;
+    latest_limiter_output_received_=ros::Time(0);
+  }
+  controller_state_=*msg;
+  if(has_active_trajectory_ && msg->execution_stamp_ns==active_execution_stamp_ns_ &&
+      (msg->clock_fault || msg->mode==care_velocity_controller::CommandStatus::BRAKING ||
+       msg->mode==care_velocity_controller::CommandStatus::LATCHED)) {
+    const double phase=std::max(0.,(now-active_trajectory_start_time_).toSec());
+    stop_state_.begin(active_execution_stamp_ns_,active_trajectory_seq_,phase,
+        std::max(0.,active_trajectory_duration_s_-phase),now.toSec(),"controller_lease_stop");
+    aborted_execution_stamps_.insert(active_execution_stamp_ns_);
+    has_active_trajectory_=false;has_last_reference_=false;last_dq_ref_.setZero();
+    replan_request_pending_=true;replan_request_pending_time_=now;
+    replan_request_pending_execution_stamp_ns_=active_execution_stamp_ns_;
+  }
+  if(stop_state_.token && msg->execution_stamp_ns==stop_state_.token) {
+    latest_limiter_output_=Eigen::Map<const Eigen::VectorXd>(msg->applied_velocity.data(),7);
+    latest_limiter_output_received_=msg->header.stamp;
+  }
+}
+
+void TrajectoryExecutionManager::executionLeaseCallback(
+    const care_velocity_controller::ExecutionLeaseConstPtr& msg) {
+  if(!msg)return;
+  const auto now=ros::Time::now();
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  if(require_prepared_execution_) {prepared_execution_.lease(*msg,now);return;}
+  if(msg->controller_session!=controller_state_.controller_session || !msg->controller_session)return;
+  if(msg->revoke) {
+    if(msg->execution_stamp_ns==command_lease_.execution_stamp_ns)
+      command_lease_=care_velocity_controller::ExecutionLease();
+    return;
+  }
+  if(!msg->execution_stamp_ns || msg->execution_stamp_ns<=controller_state_.retired_execution_through_ns ||
+      msg->lease_sequence<=last_lease_sequence_ || msg->issued_at.isZero() || msg->issued_at>now ||
+      msg->valid_until<=now || msg->valid_until<=msg->issued_at ||
+      (msg->valid_until-msg->issued_at).toSec()>.1+1e-12 ||
+      msg->certificate_sha256.size()!=64 ||
+      msg->certificate_sha256.find_first_not_of("0123456789abcdef")!=std::string::npos ||
+      (now-controller_state_.header.stamp).toSec()>.05)return;
+  for(size_t j=0;j<7;++j)
+    if(!std::isfinite(msg->target_abs_velocity[j]) || msg->target_abs_velocity[j]<0. ||
+        msg->target_abs_velocity[j]>controller_state_.velocity_limits[j])return;
+  command_lease_=*msg;last_lease_sequence_=msg->lease_sequence;
 }
 
 void TrajectoryExecutionManager::trajectoryCallback(
     const trajectory_msgs::JointTrajectoryConstPtr& msg) {
+  if(require_prepared_execution_)return; // Bare commit cannot bypass staging.
   if (!msg || msg->points.empty()) {
     ROS_WARN_THROTTLE(
         1.0, "[TrajectoryExecutionManager] Received empty trajectory.");
@@ -300,6 +475,12 @@ void TrajectoryExecutionManager::trajectoryCallback(
   }
 
   const double duration = getTrajectoryEndTime(*msg);
+  if(enforce_motion_limits_) {
+    const auto failure=executionMotionViolation(*msg,mapping,reference_velocity_limits_,reference_acceleration_limits_);
+    if(!failure.empty()) {
+      ROS_ERROR_STREAM_THROTTLE(.5,"Reject committed execution motion: "<<failure);return;
+    }
+  }
   if (!std::isfinite(duration) || duration < 0.0) {
     ROS_WARN_THROTTLE(
         1.0, "[TrajectoryExecutionManager] Invalid trajectory duration.");
@@ -315,10 +496,24 @@ void TrajectoryExecutionManager::trajectoryCallback(
   }
 
   const ros::Time now = ros::Time::now();
+  const uint64_t execution_stamp_ns = msg->header.stamp.toNSec();
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
-
-    const uint64_t execution_stamp_ns = msg->header.stamp.toNSec();
+    if(require_command_lease_ && (command_lease_.execution_stamp_ns!=execution_stamp_ns ||
+        command_lease_.valid_until<=now || controller_state_.clock_fault ||
+        controller_state_.mode==care_velocity_controller::CommandStatus::BRAKING ||
+        controller_state_.mode==care_velocity_controller::CommandStatus::LATCHED ||
+        (now-controller_state_.header.stamp).toSec()>.05)) {
+      ROS_WARN_STREAM_THROTTLE(.5,"Reject trajectory without a matching live execution lease");return;
+    }
+    if (external_safety_hold_) {
+      ROS_WARN_STREAM_THROTTLE(.5, "Reject new execution during external safety hold");
+      return;
+    }
+    if(stop_state_.token && !stop_state_.settled) {
+      ROS_WARN_STREAM_THROTTLE(.5,"Reject new execution while stopping token="<<stop_state_.token);
+      return;
+    }
     if (execution_stamp_ns > 0 &&
         aborted_execution_stamps_.count(execution_stamp_ns) != 0) {
       ROS_WARN_STREAM_THROTTLE(
@@ -341,12 +536,18 @@ void TrajectoryExecutionManager::trajectoryCallback(
     }
 
     active_trajectory_ = *msg;
+    stop_state_=ExecutionStopState{};
     active_trajectory_mapping_ = mapping;
     active_trajectory_start_time_ = now;
     active_trajectory_received_time_ = now;
     active_trajectory_duration_s_ = duration;
     active_trajectory_seq_ = msg->header.seq;
     active_execution_stamp_ns_ = execution_stamp_ns;
+    if (execution_vbc_stop_stamp_ns_ != execution_stamp_ns) {
+      execution_vbc_stop_stamp_ns_ = 0;
+      external_safety_hold_start_time_ = (external_safety_hold_ || vbc_safety_hold_)
+          ? now : ros::Time(0);
+    }
     has_active_trajectory_ = true;
     has_received_trajectory_ = true;
 
@@ -355,17 +556,71 @@ void TrajectoryExecutionManager::trajectoryCallback(
     has_last_reference_ = true;
   }
 
-  ROS_INFO_STREAM_THROTTLE(
-      0.5,
+  ROS_INFO_STREAM(
       "[TrajectoryExecutionManager] accepted committed trajectory seq="
           << msg->header.seq
-          << " execution_stamp_ns=" << active_execution_stamp_ns_
+          << " execution_stamp_ns=" << execution_stamp_ns
           << " duration="
           << duration << " s points=" << msg->points.size());
 }
 
+void TrajectoryExecutionManager::preparationContextCallback(const std_msgs::StringConstPtr& msg) {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  try {prepared_execution_.updateContext(msg->data,ros::Time::now());}
+  catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,"Prepared context rejected: "<<e.what());}
+}
+
+void TrajectoryExecutionManager::preparationControlCallback(const std_msgs::StringConstPtr& msg) {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  try {prepared_execution_.updateControl(msg->data,ros::Time::now());}
+  catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,"Prepared control rejected: "<<e.what());}
+}
+
+void TrajectoryExecutionManager::preparationCallback(const CandidateTransferConstPtr& msg) {
+  if(!msg)return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  try {
+    const auto now=ros::Time::now();const auto& curve=msg->trajectory;
+    std::vector<int> mapping;
+    if(!trajectoryHasExpectedJoints(curve) || !buildTrajectoryJointIndexMap(curve,mapping) ||
+       !executionMotionViolation(curve,mapping,reference_velocity_limits_,reference_acceleration_limits_).empty())
+      throw std::runtime_error("invalid_prepared_motion");
+    int64_t previous=-1;
+    for(const auto& point:curve.points) {
+      const auto t=point.time_from_start.toNSec();
+      if(t<0 || t<=previous || point.positions.size()!=7)throw std::runtime_error("invalid_prepared_curve");
+      for(const auto* field:{&point.positions,&point.velocities,&point.accelerations,&point.effort}) {
+        if(!field->empty() && field->size()!=7)throw std::runtime_error("invalid_prepared_dimensions");
+        for(double v:*field)if(!std::isfinite(v))throw std::runtime_error("nonfinite_prepared_curve");
+      }
+      previous=t;
+    }
+    if(curve.points.empty() || !curve.points.front().time_from_start.isZero() ||
+       !has_joint_state_ || latest_joint_state_.header.stamp>now ||
+       (now-latest_joint_state_.header.stamp).toSec()>.05)
+      throw std::runtime_error("prepared_start_state_unavailable");
+    for(size_t j=0;j<7;++j)
+      if(std::abs(curve.points.front().positions[mapping[j]]-q_measured_[j])>max_start_error_)
+        throw std::runtime_error("prepared_start_error");
+    prepared_execution_.offer(*msg,now);
+  } catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(.2,"Prepared trajectory rejected: "<<e.what());}
+}
+
+void TrajectoryExecutionManager::preparedExecutionTick() {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  const auto now=ros::Time::now();prepared_execution_.fresh(now);
+  if(external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_)
+    prepared_execution_.cancel("prepared_safety_hold");
+  care_velocity_controller::LeasedVelocityCommand zero;
+  if(prepared_execution_.zero(now,command_source_sequence_+1,joint_names_,zero)) {
+    ++command_source_sequence_;leased_velocity_command_pub_.publish(zero);
+  }
+  std_msgs::String status;status.data=prepared_execution_.status();preparation_status_pub_.publish(status);
+}
+
 void TrajectoryExecutionManager::executionTimerCallback(
     const ros::TimerEvent&) {
+  if(require_prepared_execution_) {preparedExecutionTick();return;}
   const ros::Time now = ros::Time::now();
 
   // These diagnostics describe the current timer tick. Reset them before any
@@ -395,6 +650,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
   bool has_joint_state = false;
   bool has_received_trajectory = false;
   bool external_safety_hold = false;
+  bool vbc_safety_hold = false;
   ros::Time external_safety_hold_start;
   unsigned long long external_safety_hold_event_count = 0;
   bool active = false;
@@ -402,6 +658,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
   uint32_t trajectory_seq = 0;
   uint64_t execution_stamp_ns = 0;
   bool have_reference = false;
+  bool stopping = false;
   double measured_age_s = std::numeric_limits<double>::infinity();
   double phase_s = 0.0;
   double remaining_s = 0.0;
@@ -415,7 +672,8 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
     has_joint_state = has_joint_state_;
     has_received_trajectory = has_received_trajectory_;
-    external_safety_hold = external_safety_hold_;
+    external_safety_hold = external_safety_hold_ || vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
+    vbc_safety_hold = vbc_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0;
     external_safety_hold_start = external_safety_hold_start_time_;
     external_safety_hold_event_count = external_safety_hold_event_count_;
     if (has_joint_state) {
@@ -424,6 +682,31 @@ void TrajectoryExecutionManager::executionTimerCallback(
         measured_age_s =
             (now - latest_joint_state_.header.stamp).toSec();
       }
+    }
+    // A genuine execution safety stop retires its reference; it is not a
+    // paused trajectory which may resume after a later clear message.
+    if ((external_safety_hold_ || execution_vbc_stop_stamp_ns_ != 0) &&
+        has_active_trajectory_ && active_execution_stamp_ns_ > 0 && !stop_state_.token) {
+      const double stopped_phase = std::max(0.0, (now-active_trajectory_start_time_).toSec());
+      aborted_execution_stamps_.insert(active_execution_stamp_ns_);
+      if (aborted_execution_stamps_.size() > 128)
+        aborted_execution_stamps_.erase(aborted_execution_stamps_.begin());
+      stop_state_.begin(active_execution_stamp_ns_, active_trajectory_seq_, stopped_phase,
+          std::max(0.0, active_trajectory_duration_s_-stopped_phase), now.toSec(),
+          external_safety_hold_ ? "external_gcdf_hard_hold" : "execution_vbc_stop");
+      has_active_trajectory_ = false;
+      has_last_reference_ = false;
+      last_dq_ref_.setZero();
+    }
+    if(stop_state_.token) {
+      const double output_age=(now-latest_limiter_output_received_).toSec();
+      stop_state_.observe(now.toSec(),latest_joint_state_.header.stamp.toSec(),dq_measured_,
+          latest_limiter_output_,has_joint_state && measured_age_s>=0. && measured_age_s<=.05,
+          !latest_limiter_output_received_.isZero() && output_age>=0. && output_age<=.05 &&
+          latest_limiter_output_received_.toSec()>=stop_state_.started);
+      stopping=true;execution_stamp_ns=stop_state_.token;trajectory_seq=stop_state_.seq;
+      phase_s=stop_state_.phase;remaining_s=stop_state_.remaining;
+      source=stop_state_.settled?"stopped_safety_hold":"stopping_hold";
     }
 
     if (has_active_trajectory_) {
@@ -493,16 +776,24 @@ void TrajectoryExecutionManager::executionTimerCallback(
     return;
   }
 
+  if(stopping) {
+    const auto zero=makeZeroVelocityCommand();
+    publishVelocityCommand(zero,true);publishReferenceState(q_measured,zero);
+    publishSummary(false,false,trajectory_seq,execution_stamp_ns,phase_s,remaining_s,0.,
+        -1,std::numeric_limits<double>::quiet_NaN(),std::numeric_limits<double>::quiet_NaN(),source,now);
+    return;
+  }
+
   if (external_safety_hold) {
     const Eigen::VectorXd dq_zero = makeZeroVelocityCommand();
-    publishVelocityCommand(dq_zero);
+    publishVelocityCommand(dq_zero,true);
     publishReferenceState(q_measured, dq_zero);
     publishSummary(
         active, complete, trajectory_seq, execution_stamp_ns,
         phase_s, remaining_s, 0.0,
         -1, std::numeric_limits<double>::quiet_NaN(),
         std::numeric_limits<double>::quiet_NaN(),
-        "external_gcdf_hard_hold");
+        vbc_safety_hold ? "external_vbc_hold" : "external_gcdf_hard_hold", now);
     ROS_ERROR_STREAM_THROTTLE(
         0.5,
         "[TrajectoryExecutionManager] Phase E5 HARD HOLD active"
@@ -527,7 +818,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
           false, false, 0, 0, 0.0, 0.0, 0.0,
           -1, std::numeric_limits<double>::quiet_NaN(),
           std::numeric_limits<double>::quiet_NaN(),
-          "zero_velocity_hold");
+          "zero_velocity_hold", now);
       return;
     }
   }
@@ -630,6 +921,8 @@ void TrajectoryExecutionManager::executionTimerCallback(
           }
         }
         has_active_trajectory_ = false;
+        stop_state_.begin(execution_stamp_ns,trajectory_seq,phase_s,remaining_s,
+                          now.toSec(),"primitive_tracking_envelope");
         // Do not let a protected trajectory become the fallback reference.
         // The next timer tick must issue a zero-velocity hold until a fresh,
         // newly certified trajectory is accepted from the measured state.
@@ -638,14 +931,14 @@ void TrajectoryExecutionManager::executionTimerCallback(
         replan_request_pending_execution_stamp_ns_ = execution_stamp_ns;
       }
       const auto zero = makeZeroVelocityCommand();
-      publishVelocityCommand(zero);
+      publishVelocityCommand(zero,true);
       publishReferenceState(q_measured, zero);
       maybePublishReplanRequest(std::numeric_limits<double>::infinity());
       publishSummary(
           false, false, trajectory_seq, execution_stamp_ns, phase_s,
           remaining_s, tracking_error,
           static_cast<int>(tracking_error_joint_index), tracking_error_q_ref,
-          tracking_error_q_measured, "primitive_tracking_envelope_hold");
+          tracking_error_q_measured, "primitive_tracking_envelope_hold", now);
       return;
     }
   }
@@ -660,14 +953,14 @@ void TrajectoryExecutionManager::executionTimerCallback(
 
     if (hold_when_tracking_error_large_) {
       const Eigen::VectorXd dq_zero = makeZeroVelocityCommand();
-      publishVelocityCommand(dq_zero);
+      publishVelocityCommand(dq_zero,true);
       publishReferenceState(q_measured, dq_zero);
       publishSummary(
           active, complete, trajectory_seq, execution_stamp_ns,
           phase_s, remaining_s, tracking_error,
           static_cast<int>(tracking_error_joint_index),
           tracking_error_q_ref, tracking_error_q_measured,
-          "tracking_error_hold");
+          "tracking_error_hold", now);
       return;
     }
   }
@@ -682,7 +975,7 @@ void TrajectoryExecutionManager::executionTimerCallback(
       active, complete, trajectory_seq, execution_stamp_ns,
       phase_s, remaining_s, tracking_error,
       static_cast<int>(tracking_error_joint_index),
-      tracking_error_q_ref, tracking_error_q_measured, source);
+      tracking_error_q_ref, tracking_error_q_measured, source, now);
 }
 
 bool TrajectoryExecutionManager::extractMeasuredState(
@@ -814,9 +1107,10 @@ bool TrajectoryExecutionManager::sampleTrajectory(
   getPointVector(p0, p0.accelerations, mapping, a0, true);
   getPointVector(p1, p1.accelerations, mapping, a1, true);
 
-  q_ref = (1.0 - s) * q0 + s * q1;
-  dq_ref = (1.0 - s) * v0 + s * v1;
-  ddq_ref = (1.0 - s) * a0 + s * a1;
+  const auto curve=care_confidence_map::trajectoryCurvature(p0,p1,mapping);
+  q_ref = (1.0 - s) * q0 + s * q1 + 4.*s*(1.-s)*curve;
+  dq_ref = (q1-q0)/h + (4.-8.*s)*curve/h;
+  ddq_ref = -8.*curve/(h*h);
   return true;
 }
 
@@ -901,23 +1195,27 @@ bool TrajectoryExecutionManager::findNearestTrajectoryReference(
     const double lambda_lo = std::max(0.0, (segment_lo_t - t0) / h);
     const double lambda_hi = std::min(1.0, (segment_hi_t - t0) / h);
     const Eigen::VectorXd delta = q1 - q0;
+    const auto curve=care_confidence_map::trajectoryCurvature(p0,p1,mapping);
 
     auto considerLambda = [&](double lambda) {
       const double clipped = std::max(lambda_lo, std::min(lambda_hi, lambda));
-      const Eigen::VectorXd q = (1.0 - clipped) * q0 + clipped * q1;
+      const Eigen::VectorXd q = (1.0 - clipped) * q0 + clipped * q1 + 4.*clipped*(1.-clipped)*curve;
       consider(t0 + clipped * h, q);
     };
 
-    // The tracker itself linearly interpolates positions, so the closest
-    // point in Euclidean joint space on this segment has a closed form.
-    // Evaluate the overlap endpoints as well so a clipped local window is
-    // handled exactly.
+    // Endpoints and the chord projection seed a bounded search of the actual
+    // quadratic curve. The chord projection is exact only for a linear piece.
     considerLambda(lambda_lo);
     considerLambda(lambda_hi);
     const double denominator = delta.squaredNorm();
     if (std::isfinite(denominator) && denominator > 1e-18) {
       considerLambda((q_measured - q0).dot(delta) / denominator);
     }
+    // Every candidate is on the actual curve. A bounded approximate nearest
+    // search may overestimate tracking error, but cannot select a chord pose.
+    if(curve.cwiseAbs().maxCoeff()>0.)
+      for(int sample=1;sample<16;++sample)
+        considerLambda(lambda_lo+(lambda_hi-lambda_lo)*sample/16.);
   }
 
   if (!found) {
@@ -960,7 +1258,33 @@ Eigen::VectorXd TrajectoryExecutionManager::clampVelocityCommand(
 }
 
 void TrajectoryExecutionManager::publishVelocityCommand(
-    const Eigen::VectorXd& dq_cmd) {
+    const Eigen::VectorXd& dq_cmd, bool terminal_stop) {
+  if(require_command_lease_) {
+    if(dq_cmd.size()!=7 || !dq_cmd.allFinite())return;
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    const auto now=ros::Time::now();
+    const auto token=stop_state_.token ? stop_state_.token : active_execution_stamp_ns_;
+    const auto age=(now-controller_state_.header.stamp).toSec();
+    const auto measured_age=(now-latest_joint_state_.header.stamp).toSec();
+    if(!token || command_lease_.execution_stamp_ns!=token ||
+        command_lease_.controller_session!=controller_state_.controller_session ||
+        age<0. || age>.05 || controller_state_.clock_fault ||
+        (!terminal_stop && (command_lease_.valid_until<=now || measured_age<0. || measured_age>.05)))return;
+    care_velocity_controller::LeasedVelocityCommand msg;
+    msg.header.stamp=now; msg.source_sequence=++command_source_sequence_;
+    msg.controller_session=command_lease_.controller_session;msg.execution_stamp_ns=token;
+    msg.lease_sequence=command_lease_.lease_sequence;msg.valid_until=command_lease_.valid_until;
+    msg.certificate_sha256=command_lease_.certificate_sha256;msg.joint_names=joint_names_;
+    msg.target_range_enforced=command_lease_.target_range_enforced;
+    msg.target_abs_velocity=command_lease_.target_abs_velocity;
+    msg.stop=terminal_stop;msg.velocity.resize(dq_cmd.size());
+    for(int i=0;i<dq_cmd.size();++i) {
+      const double bound=command_lease_.target_abs_velocity[i];
+      msg.velocity[i]=terminal_stop?0.:(msg.target_range_enforced?
+          std::max(-bound,std::min(bound,dq_cmd[i])):dq_cmd[i]);
+    }
+    leased_velocity_command_pub_.publish(msg);return;
+  }
   std_msgs::Float64MultiArray msg;
   msg.data.resize(static_cast<std::size_t>(dq_cmd.size()));
   for (int i = 0; i < dq_cmd.size(); ++i) {
@@ -995,18 +1319,32 @@ void TrajectoryExecutionManager::publishSummary(
     int tracking_error_joint_index,
     double tracking_error_q_ref,
     double tracking_error_q_measured,
-    const std::string& source) {
+    const std::string& source,
+    const ros::Time& sample_time) {
   std_msgs::String msg;
   std::ostringstream oss;
-  const bool execution_aborted =
-      source == "primitive_tracking_envelope_hold" &&
-      !trajectory_active && execution_stamp_ns > 0;
+  std::string stop_status="NONE";
+  std::uint64_t stop_token=0;
+  std::uint64_t phase_origin_ns=0;
+  {
+    std::lock_guard<std::mutex> lock(data_mutex_);
+    stop_status=stop_state_.state();stop_token=stop_state_.token;
+    if (execution_stamp_ns == active_execution_stamp_ns_) {
+      phase_origin_ns=active_trajectory_start_time_.toNSec();
+    }
+  }
+  const bool execution_aborted = !trajectory_active && execution_stamp_ns>0 &&
+      (source=="primitive_tracking_envelope_hold" || stop_token==execution_stamp_ns);
   oss << "TRACKER"
       << " active=" << static_cast<int>(trajectory_active)
       << " complete=" << static_cast<int>(trajectory_complete)
       << " seq=" << trajectory_seq
       << " execution_stamp_ns=" << execution_stamp_ns
+      << " sample_ros_ns=" << sample_time.toNSec()
+      << " phase_origin_ros_ns=" << phase_origin_ns
       << " execution_aborted=" << static_cast<int>(execution_aborted)
+      << " execution_state=" << (stop_token?stop_status:(trajectory_active?"EXECUTING":"HOLD"))
+      << " stop_execution_stamp_ns=" << stop_token
       << " phase_s=" << phase_s
       << " remaining_s=" << remaining_s
       << " tracking_error_inf=" << tracking_error_inf

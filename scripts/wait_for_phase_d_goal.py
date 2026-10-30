@@ -69,6 +69,8 @@ def main():
     ap.add_argument("--settle-velocity-inf-rad-s", type=float, default=0.05)
     ap.add_argument("--settle-timeout-s", type=float, default=1.0)
     ap.add_argument("--post-success-record-s", type=float, default=0.0)
+    ap.add_argument("--observe-terminal-stop", action="store_true",
+                    help="After freezing the original score, observe a complete committed tail and measured stopped hold within the same watchdog")
     ap.add_argument("--goal-position", type=float, nargs=3, required=True)
     ap.add_argument("--goal-orientation", type=float, nargs=4, required=True)
     ap.add_argument("--status-json", default="")
@@ -101,6 +103,13 @@ def main():
     )
 
     arm_pub = None
+    terminal_observation = None
+    terminal_subscribers = []
+    if args.observe_terminal_stop:
+        from phase_e_terminal_stop_observation import TerminalStopObservation, subscribe_terminal_observation
+        terminal_observation = TerminalStopObservation(
+            seconds_to_ns(args.hold_s, duration=True), args.settle_velocity_inf_rad_s)
+        terminal_subscribers = subscribe_terminal_observation(rospy, terminal_observation)
     if args.arm_token:
         from phase_e_benchmark_arm import prepare_arm
         try:
@@ -122,6 +131,12 @@ def main():
               "end_ros_s": None, "end_ros_ns": None, "end_measured_q": None}
     window["protocol"] = "pre_goal_arm_v1" if arm_pub is not None else "legacy_post_gate_v2"
     window["required_recorders"] = list(args.required_recorder)
+    if arm_pub is not None and hasattr(arm_pub, 'care_actuator_readiness'):
+        window['actuator_readiness'] = arm_pub.care_actuator_readiness
+    if arm_pub is not None and hasattr(arm_pub, 'care_qp_retry_readiness'):
+        window['qp_retry_readiness'] = arm_pub.care_qp_retry_readiness
+    if arm_pub is not None and hasattr(arm_pub, 'care_observation_readiness'):
+        window['observation_readiness'] = arm_pub.care_observation_readiness
     previous_stamp = None
     inside_since_ros_ns = None
     success_hold_start_ns = None
@@ -133,6 +148,8 @@ def main():
     sample_count = 0
     goal_reached = False
     settled_before_exit = False
+    settled_since_ros_ns = None
+    terminal_observation_result = None
     last_log_wall = -math.inf
 
     print(
@@ -166,12 +183,16 @@ def main():
             break
 
         if len(msg.name) != len(msg.position):
+            if terminal_observation is not None:
+                terminal_observation.invalid_measured_sample()
             continue
         qmap = {
             str(name): float(value)
             for name, value in zip(msg.name, msg.position)
         }
         if not all(name in qmap and math.isfinite(qmap[name]) for name in JOINTS):
+            if terminal_observation is not None:
+                terminal_observation.invalid_measured_sample()
             continue
 
         stamp_ns = msg.header.stamp.to_nsec()
@@ -181,6 +202,9 @@ def main():
             continue
         if previous_stamp is not None and now_ros_ns <= previous_stamp:
             inside_since_ros_ns = None
+            settled_since_ros_ns = None
+            if terminal_observation is not None:
+                terminal_observation.sample(now_ros_ns,rospy.Time.now().to_nsec(),False,math.nan)
             continue
         previous_stamp = now_ros_ns
         if success_wall_s is None:
@@ -203,6 +227,12 @@ def main():
                     window["watchdog_start_monotonic_s"] = wall_start
                     window["watchdog_start_wall_unix_s"] = time.time()
                     window["arm_token"] = args.arm_token
+                    if os.environ.get('CARE_TASK_WINDOW_FILE'):
+                        from pathlib import Path
+                        import sys
+                        sys.path.insert(0, os.path.join(repo, 'src/care_visibility_cdf/scripts'))
+                        from observation_research_trace import publish_task_window
+                        publish_task_window(wall_start, args.timeout_s, now_ros_ns, args.arm_token)
                     arm_pub.publish(args.arm_token)
                     print("[GOAL WATCH] armed after measured q and recorder readiness")
             window.update(valid=True, end_ros_s=now_ros, end_ros_ns=now_ros_ns, end_measured_q=measured_q,
@@ -214,7 +244,7 @@ def main():
                 str(name): float(value)
                 for name, value in zip(msg.name, msg.velocity)
             }
-        if all(name in dqmap for name in JOINTS):
+        if all(name in dqmap and math.isfinite(dqmap[name]) for name in JOINTS):
             last_speed_inf = max(abs(dqmap[name]) for name in JOINTS)
         else:
             last_speed_inf = math.nan
@@ -250,7 +280,21 @@ def main():
                 math.isfinite(last_speed_inf)
                 and last_speed_inf <= args.settle_velocity_inf_rad_s
             )
-            if inside and speed_ok:
+            if terminal_observation is not None:
+                with terminal_observation.lock:
+                    stopped = terminal_observation.sample(
+                        now_ros_ns, rospy.Time.now().to_nsec(), inside, last_speed_inf)
+                    if stopped:
+                        terminal_observation_result = terminal_observation.snapshot()
+            else:
+                if inside and speed_ok:
+                    if settled_since_ros_ns is None:
+                        settled_since_ros_ns = now_ros_ns
+                else:
+                    settled_since_ros_ns = None
+                stopped = (settled_since_ros_ns is not None and
+                           now_ros_ns-settled_since_ros_ns >= required_hold_ns)
+            if stopped:
                 goal_reached = True
                 settled_before_exit = True
                 print(
@@ -258,7 +302,7 @@ def main():
                     "{:.6f}rad/s".format(last_speed_inf)
                 )
                 break
-            if (success_latched_wall is not None and
+            if (terminal_observation is None and success_latched_wall is not None and
                     time.monotonic() - success_latched_wall >=
                     args.settle_timeout_s):
                 goal_reached = True
@@ -305,6 +349,8 @@ def main():
         "settle_velocity_inf_rad_s": args.settle_velocity_inf_rad_s,
         "settle_timeout_s": args.settle_timeout_s,
         "settled_before_exit": bool(settled_before_exit),
+        "terminal_stop_observation": (terminal_observation_result or terminal_observation.snapshot()) if terminal_observation is not None else None,
+        "settle_wait_policy": "remaining_original_wall_budget" if terminal_observation is not None else "bounded_legacy_settle_wait",
         "post_success_record_s": args.post_success_record_s,
         "last_speed_inf_rad_s": (
             last_speed_inf if math.isfinite(last_speed_inf) else None),

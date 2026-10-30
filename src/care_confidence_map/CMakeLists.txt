@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.0.2)
 project(care_confidence_map)
 
 add_compile_options(-std=c++14)
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
@@ -23,11 +24,13 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(yaml-cpp REQUIRED)
+find_package(Eigen3 REQUIRED)
 find_package(pinocchio REQUIRED)
 
 add_service_files(
   FILES
   QueryConfidence.srv
+  QueryConfidenceSnapshot.srv
 )
 
 generate_messages(
@@ -60,6 +63,7 @@ catkin_package(
 )
 
 include_directories(
+  ${EIGEN3_INCLUDE_DIRS}
   include
   ${catkin_INCLUDE_DIRS}
   ${YAML_CPP_INCLUDE_DIRS}

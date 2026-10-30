@@ -1,0 +1,10 @@
+{
+  "checkpoint": "@BASELINE_RUN@/fixed/runtime/src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt",
+  "checkpoint_sha256": "d153c5b08af0d2b8ce12da500fe13d5d0b04cfc0d9ce07a2e6ad4d2dfd93a4e6",
+  "checkpoint_key": "5000",
+  "activation": "relu",
+  "model": "new",
+  "diagnostic_only": true,
+  "encoding_assumption": "concat(x,sin(x),cos(x)), full10 raw inputs; frequency1; no pi; linear output",
+  "training_forward_parity": "PENDING_REMOTE_MLP_IMPLEMENTATION_OR_FIXED_INPUT_OUTPUTS"
+}

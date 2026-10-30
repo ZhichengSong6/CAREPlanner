@@ -73,7 +73,8 @@ if [[ "${VBC_GEOMETRY_BACKEND:-${GEOMETRY_BACKEND:-primitive}}" == "primitive" ]
 else
   export VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
 fi
-export VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-false}"
+export EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M="${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M:-${VBC_SWEPT_VOLUME_MARGIN_M}}"
+export VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-true}"
 # The tracker guard is an execution tolerance, separate from VBC's certified
 # swept-volume margin. Keep VBC at 10 mm while allowing 20 mm tracker deviation.
 export TRACKER_CERTIFIED_MARGIN_M="${TRACKER_CERTIFIED_MARGIN_M:-0.020}"
@@ -130,7 +131,7 @@ echo "[C5.5] REPAIR exit: actual visibility/confidence acquisition gate"
 echo "[C5.5] REPAIR exact-VBC view: prefix=${REPAIR_PREFIX_S}s + brake=${REPAIR_BRAKE_DT_S}s + hold=${REPAIR_HOLD_S}s"
 echo "[CYCLE RECOVERY] enabled=${CYCLE_RECOVERY_ENABLED}; VBC-cycle prefix ladder=${REPAIR_PREFIX_S}->0.15->0.10->0.05 s; every step still final-GCDF + exact-VBC certified"
 echo "[BODY PRIOR] moving trusted-free refresh=OFF (startup-only prior)"
-echo "[MARGIN] VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity search band=${LOCAL_SCP_PROXIMITY_MARGIN} m"
+echo "[MARGIN] candidate VBC swept extra margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; execution VBC swept extra margin=${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity search band=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[VBC] continuous motion bound=${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}"
 echo "[MARGIN SPLIT] tracker certified body-envelope threshold=${TRACKER_CERTIFIED_MARGIN_M} m"
 echo "[BOUNDED Q_VIS REPAIR] frontier_steering=${FRONTIER_STEERING_ENABLED}; vbc_gated_local_step=${VBC_GATED_FRONTIER_STEP_ENABLED}"
@@ -144,7 +145,7 @@ echo "[C5.5] PROBE base prefix: ${PROBE_PREFIX_S}s (then existing probe time sca
 echo "[SMOOTH] certified look-ahead handoff=${SMOOTH_HANDOFF_ENABLED}; brake+hold retained as fail-safe tail"
 echo "[C5.5] NORMAL exact-VBC view: full horizon"
 echo "[C5.5] config: ${CONFIG_FILE}"
-echo "[MARGIN ALIGNMENT] local/final GCDF safety margin=${FINAL_GCDF_SAFETY_MARGIN} m"
+echo "[MARGIN ALIGNMENT] local/final GCDF safety margin=${FINAL_GCDF_SAFETY_MARGIN} configuration_space_model units"
 echo "[C5.5] startup gate wait is fail-fast (~25 s worst case)"
 
 CASE_ID="${CASE_ID}" RUN_SECONDS="${RUN_SECONDS}" \

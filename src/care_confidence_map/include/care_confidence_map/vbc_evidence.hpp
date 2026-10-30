@@ -35,7 +35,8 @@ template <class Candidates, class Layers>
 std::string vbcEvidence(unsigned long long stamp, unsigned long long bundle,
                         double required_margin, double resolution,
                         const Candidates& candidates, const Layers& layers,
-                        const std::string& geometry_backend = "samples") {
+                        const std::string& geometry_backend = "samples",
+                        bool continuous_motion_bounds = false) {
   std::ostringstream s;
   s.imbue(std::locale::classic());
   s << "{\"schema\":1,\"trajectory_stamp_ns\":\"" << stamp
@@ -43,7 +44,10 @@ std::string vbcEvidence(unsigned long long stamp, unsigned long long bundle,
     << ",\"required_margin_s\":" << evidenceNumber(required_margin)
     << ",\"voxel_resolution_m\":" << evidenceNumber(resolution)
     << ",\"geometry_backend\":" << evidenceString(geometry_backend)
-    << ",\"spatial_semantics\":\"voxel_centers_discrete_knots\""
+    << ",\"spatial_semantics\":" << evidenceString(geometry_backend == "primitive"
+        ? (continuous_motion_bounds ? "voxel_centers_piecewise_linear_enclosure"
+                                    : "voxel_centers_sampled_midpoints")
+        : "voxel_centers_discrete_knots")
     << ",\"violations\":[";
   bool first = true;
   for (std::size_t layer = 0; layer < layers.size(); ++layer) {
@@ -61,6 +65,12 @@ std::string vbcEvidence(unsigned long long stamp, unsigned long long bundle,
         << ",\"source_collision_index\":" << c.source_collision_index
         << ",\"source_collision_name\":" << evidenceString(c.source_collision_name)
         << ",\"primitive_signed_distance_m\":" << evidenceNumber(c.primitive_signed_distance_m)
+        << ",\"refinement_status\":" << evidenceString(c.refinement_status)
+        << ",\"refinement_fk_before\":" << c.refinement_fk_before
+        << ",\"refinement_fk_after\":" << c.refinement_fk_after
+        << ",\"candidate_margin_m\":" << evidenceNumber(c.candidate_margin_m)
+        << ",\"initial_support_distance_m\":" << evidenceNumber(c.initial_support_distance_m)
+        << ",\"initial_support_unknown\":" << (c.initial_support_unknown ? "true" : "false")
         << ",\"confidence\":" << evidenceNumber(c.confidence)
         << ",\"current_visibility\":" << evidenceNumber(c.current_visibility)
         << ",\"raw_radius_m\":" << evidenceNumber(c.raw_sample_radius_m)

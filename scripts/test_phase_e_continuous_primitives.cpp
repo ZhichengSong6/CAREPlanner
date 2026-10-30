@@ -28,8 +28,8 @@ int main(int argc,char**argv) {
    check(bool(file),"truncated saved fixture");
    std::vector<VbcPrimitiveFrame> discrete,bounded;std::vector<int> bi;std::vector<double> bt;
    check(model.computeTrajectory(fk,q,&discrete,&error),error);
-   // Exercise the optional analytic enclosure explicitly.  Runtime VBC
-   // defaults to midpoint sampling without this extra inflation.
+   // Live primitive verification requires this enclosure. Explicit false is
+   // retained only for offline comparison with the old sampled geometry.
    check(model.computeContinuousTrajectory(fk,q,indices,times,&bounded,&bi,&bt,&error,true),error);
    std::vector<VbcPrimitiveFrame> sampled;
    std::vector<int> si; std::vector<double> st;
@@ -42,6 +42,9 @@ int main(int argc,char**argv) {
    check(!includes(buildPrimitiveSweptVoxels<Voxel>(discrete,indices,times,grid,0)),"baseline no longer reproduces missed point");
    check(includes(buildPrimitiveSweptVoxels<Voxel>(bounded,bi,bt,grid,0)),"continuous enclosure missed real counterexample even without static margin");
    check(includes(buildPrimitiveSweptVoxels<Voxel>(bounded,bi,bt,grid,.010)),"10mm continuous enclosure missed real point");
+   int refinement_budget=256;
+   check(!model.provePointOutsideContinuousTrajectory(fk,q,point,0.,&refinement_budget),
+         "refinement erased a real between-knot counterexample");
    // Dense independent spot checks supplement the analytical radius proof:
    // actual solid centre/corners must lie inside their interval enclosure.
    for(std::size_t k=0;k+1<q.size();++k)for(int j=0;j<=10;++j) {

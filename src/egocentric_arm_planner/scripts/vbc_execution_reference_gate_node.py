@@ -20,6 +20,7 @@ import json
 import math
 import re
 import threading
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -27,6 +28,10 @@ from typing import Optional
 import rospy
 from std_msgs.msg import Bool, Float32, Float64, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+# This base is loaded by importlib from the progress gate. Catkin's devel
+# program relay is not an importable module; resolve helpers beside the source.
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from recovery_motion import interpolate_motion
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -354,6 +359,10 @@ class VBCExecutionReferenceGate:
         out.positions = cls._lerp_array(p0.positions, p1.positions, alpha)
         out.velocities = cls._lerp_array(p0.velocities, p1.velocities, alpha)
         out.accelerations = cls._lerp_array(p0.accelerations, p1.accelerations, alpha)
+        motion=interpolate_motion(p0.positions,p1.positions,p0.velocities,p1.velocities,
+            (p1.time_from_start-p0.time_from_start).to_sec(),alpha)
+        if motion is not None:
+            out.positions,out.velocities,out.accelerations=motion
         out.effort = cls._lerp_array(p0.effort, p1.effort, alpha)
         out.time_from_start = rospy.Duration(0.0)
         return out

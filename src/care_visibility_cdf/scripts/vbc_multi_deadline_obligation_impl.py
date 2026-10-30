@@ -16,9 +16,10 @@ C4.6 instead accumulates obligations across rejected candidates:
     O_r = (persistent spatial region, q_vis^(r), absolute VBC deadline_r)
 
 A newly observed region is appended; an old region is not removed merely because
-it disappears from one rejected hypothetical candidate.  The whole schedule is
-cleared only after the candidate VBC verifier reports a fresh predicted SAFE
-verdict.  The downstream MPC receives all obligations at once and adds one
+it disappears from one rejected hypothetical candidate. Legacy obligations
+clear after a fresh predicted SAFE verdict. Optional stopping-prefix requests
+remain until later real observations resolve them or their path is retired.
+The downstream MPC receives all obligations at once and adds one
 quadratic waypoint term per deadline.
 
 Reachability-aware seed
@@ -40,10 +41,18 @@ import json
 import math
 import os
 import re
+import copy
 import threading
 import time
 import uuid
-from observation_identity import observation_token
+from observation_identity import observation_token, observation_region_token
+from task_recovery_events import (RECOVERY_TOPIC, CONTROL_TOPIC, RecoverySnapshotSource,
+    TaskEventReceiver, validate_regime_control, canonical)
+from recovery_policy import build_policy
+from stopping_observation_demands import ObservationDemandQueue, validate_report, exact_region_owner
+from stopping_trajectory_prefix import trajectory_sha256, validate_trajectory_report, apply_absolute_observation_deadline
+from stopping_observation_context import (ObservationContext, ContextObservationDemandQueue,
+    context_key, context_path, validate_context_report)
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -79,6 +88,31 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
     """Accumulate spatial visibility obligations until exact VBC is globally safe."""
 
     def __init__(self) -> None:
+        self._stopping_prefix_lock = threading.RLock()
+        self._stopping_prefix_queue = ObservationDemandQueue()
+        self._stopping_prefix_pending = None
+        self._stopping_prefix_path = None
+        self._stopping_prefix_binding = None
+        from task_observation_binding import TaskContextReceiver
+        self._require_task_binding = bool(rospy.get_param("~require_task_binding", False))
+        self._stopping_task_receiver = TaskContextReceiver()
+        self._stopping_context = (self._stopping_task_receiver.context if getattr(self, "_require_task_binding", False)
+                                  else ObservationContext())
+        self._stopping_task_candidate = None
+        self._task_recovery_source = RecoverySnapshotSource()
+        self._task_policy_control = None
+        self._task_policy_events = TaskEventReceiver()
+        self._task_selected_obligations = None
+        self._task_recovery_pub = (rospy.Publisher(RECOVERY_TOPIC, String, queue_size=8, latch=True)
+                                   if self._require_task_binding else None)
+        self._stopping_context_queue = ContextObservationDemandQueue()
+        self._stopping_context_worker = threading.Lock()
+        self._stopping_context_key = None
+        if not hasattr(self, '_schedule_publish_lock'):
+            self._schedule_publish_lock = threading.RLock()
+        if self._require_task_binding:
+            self._task_policy_sub = rospy.Subscriber(CONTROL_TOPIC, String,
+                self._task_policy_control_cb, queue_size=8)
         # These fields must exist before the parent creates ROS subscribers.
         self._obligation_lock = threading.Lock()
         self._obligations: List[Dict[str, object]] = []
@@ -164,6 +198,24 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         self.candidate_vbc_sub_c46 = rospy.Subscriber(
             self.candidate_vbc_summary_topic, String,
             self._candidate_vbc_summary_callback, queue_size=20)
+        # Requests steer existing waypoint generation. They confer no execution
+        # authority; the candidate and complete stopping gates still apply.
+        self.stopping_prefix_sub = None
+        self._stopping_context_enabled = bool(rospy.get_param('~enable_observation_context', False))
+        if bool(rospy.get_param('~enable_stopping_observation_demands', False)):
+            self.stopping_prefix_sub = rospy.Subscriber(
+                '~stopping_observation_demands', String,
+                self._stopping_prefix_callback, queue_size=1)
+            if self._stopping_context_enabled:
+                self.stopping_context_sub = rospy.Subscriber(
+                    str(rospy.get_param('~observation_context_topic',
+                        '/care_planner/active_sensing/observation_context')),
+                    String, self._stopping_context_callback, queue_size=32)
+                if getattr(self, "_require_task_binding", False):
+                    from egocentric_arm_planner.msg import CandidateTransfer
+                    rospy.Subscriber(str(rospy.get_param("~task_candidate_topic",
+                        "/care_planner/local_planner/candidate_trajectory/planned")), CandidateTransfer,
+                        self._stopping_task_candidate_callback, queue_size=1)
 
         rospy.logwarn(
             "[vbc_multi_deadline] C4.6 ENABLED: accumulated obligations; "
@@ -190,11 +242,13 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             return
         self._latest_measured_q = q
         self._trace_measured = (q.copy(), msg.header.stamp.to_sec())
+        replacement = getattr(self, '_candidate_replacement', None)
+        if replacement is not None:
+            replacement.seed_gate.observe_measured(q, msg.header.stamp.to_sec())
 
     def _trace_observation(self, stage, **fields):
-        # Optional instrumentation hook; the mainline does not write debug
-        # traces. Target identities below remain part of runtime validation.
-        return None
+        from observation_research_trace import record_observation
+        record_observation(self, stage, fields)
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         if msg is None:
@@ -349,6 +403,7 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             result = RollingVbcDeadlineWaypointNode._generate_active_set_waypoint(
                 self, region["points"], trajectory, sweep_time_s,
                 trajectory_received)
+            result = apply_absolute_observation_deadline(result, region, trajectory_source)
         except Exception as exc:
             self._trace_observation("generation_failed", generation_event_id=generation_id,
                 error=str(exc), compute_ms=1000.0*(time.perf_counter()-t_generate_start))
@@ -590,8 +645,9 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         if fields.get("has_violation") != "0":
             return
         with self._obligation_lock:
-            had = len(self._obligations)
-            self._obligations = []
+            before = len(self._obligations)
+            self._obligations = [ob for ob in self._obligations if ob.get('stopping_prefix_request')]
+            had = before-len(self._obligations)
             self._schedule_clear_count += 1
             self._last_safe_verdict_time = rospy.Time.now().to_sec()
         if had:
@@ -665,6 +721,94 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                 key=lambda ob: (float(ob["deadline_abs_s"]), int(ob["id"])))
 
     def _publish_schedule(self) -> None:
+        # Use the same publication lock as acquisition subclasses and context
+        # cancellation; an old snapshot cannot publish after cancellation's clear.
+        with self._schedule_publish_lock:
+            if getattr(self, '_stopping_context_enabled', False):
+                self._expire_stopping_context()
+            self._publish_schedule_snapshot()
+            if getattr(self, '_require_task_binding', False):
+                self._publish_task_recovery_snapshot()
+
+    def _task_policy_control_cb(self, msg):
+        try:
+            with self._schedule_publish_lock, self._stopping_prefix_lock:
+                now = rospy.Time.now().to_nsec()
+                context = self._stopping_context.snapshot(now)
+                event = self._task_policy_events.parse(msg.data, context, now, 'regime_control')
+                validate_regime_control(event['payload'])
+                old = self._task_policy_control
+                if old is not None and old['task_context'] == event['task_context']:
+                    a,b = old['payload'],event['payload']
+                    if (old['source_session'] == event['source_session'] and
+                            (b['mode_revision'] < a['mode_revision'] or
+                             (b['mode_revision'] == a['mode_revision'] and
+                              (b['mode'] != a['mode'] or b.get('recovery_target_sha256','') !=
+                               a.get('recovery_target_sha256',''))))):
+                        raise ValueError('mutated_recovery_control')
+                self._task_policy_events.remember(event)
+                self._task_policy_control = event
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            self._task_policy_control_rejected=str(exc)
+            return
+
+    @staticmethod
+    def _task_target(first):
+        return dict(observation_token=observation_token(first),
+            region_token=observation_region_token(first), obligation_id=int(first['id']),
+            q_vis=np.asarray(first['q_vis']).tolist(), joint_mask=q_vis_joint_mask(first).tolist(),
+            sensor_id=int(first.get('per_sensor_selected_sensor_id', -1)),
+            points=np.asarray(first['points']).tolist(),
+            deadline_ns=round(float(first['deadline_abs_s'])*1e9))
+
+    def _task_current_obligations(self, obligations):
+        with self._stopping_prefix_lock:
+            context=self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+            if context is None:return []
+            key=list(context_key(context))
+            return [ob for ob in obligations if
+                    ob.get('stopping_prefix_request',{}).get('context_key')==key]
+
+    def _publish_task_recovery_snapshot(self, obligations=None, frontier=None):
+        """The exact current-task demand ledger owns completion, not SAFE/QP."""
+        if not getattr(self, '_require_task_binding', False):
+            return
+        with self._schedule_publish_lock, self._stopping_prefix_lock:
+            now = rospy.Time.now().to_nsec()
+            context = self._stopping_context.snapshot(now)
+            if context is None:
+                self._task_recovery_source.reset()
+                return
+            current_key = list(context_key(context))
+            frozen = obligations is not None
+            obligations = [ob for ob in (obligations if frozen else self._ordered_obligations())
+                           if ob.get('stopping_prefix_request', {}).get('context_key') == current_key]
+            pending_count = len(self._stopping_context_queue.pending)
+            target = None
+            if obligations and pending_count:
+                first = obligations[0]
+                target = self._task_target(first)
+                if frozen:
+                    with self._obligation_lock:
+                        current = next((ob for ob in self._obligations if int(ob['id']) == int(first['id'])), None)
+                        expected = first.get('_task_storage_target', target)
+                        if (current is None or canonical(self._task_target(current)) != canonical(expected) or
+                                ('_task_storage_stack' in first and first['_task_storage_stack'] != self._repair_stack) or
+                                current.get('stopping_prefix_request', {}).get('context_key') != current_key):
+                            return  # Computation cannot publish a replaced selection.
+            # An obligation still being retired cannot yield a completion.
+            count = max(pending_count, len(obligations))
+            diagnostic={}
+            policy = build_policy(target, frontier, context,
+                                  getattr(self, '_task_policy_control', None), now, diagnostic)
+            self._task_policy_last_reason=diagnostic['reason']
+            if frontier is not None and hasattr(rospy,'loginfo_throttle'):
+                rospy.loginfo_throttle(1.,'[recovery_policy] state=%s control_error=%s',
+                    diagnostic['reason'],getattr(self,'_task_policy_control_rejected','none'))
+            event = self._task_recovery_source.snapshot(context, count, target, now, policy=policy)
+            self._task_recovery_pub.publish(String(data=canonical(event)))
+
+    def _publish_schedule_snapshot(self) -> None:
         obligations = self._ordered_obligations()
         msg = Float64MultiArray()
         data = []
@@ -741,8 +885,269 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         )
         self.schedule_summary_pub.publish(s)
 
+    def _stopping_prefix_callback(self, msg):
+        try:
+            if len(msg.data) > 1000000:
+                return
+            report = json.loads(msg.data)
+            if (getattr(self, '_stopping_context_enabled', False) and
+                    report.get('kind') == 'observation_context_invalidated'):
+                with self._schedule_publish_lock, self._stopping_prefix_lock:
+                    current = self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+                    if current and context_key(report['observation_context']) == context_key(current):
+                        self._stopping_context.invalidate(report['reason'])
+                        self._clear_stopping_context()
+                self._publish_schedule()
+                return
+            validate_report(report, rospy.Time.now().to_sec())
+            with self._stopping_prefix_lock:
+                self._stopping_prefix_pending = report
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            return
+
+    def _process_stopping_prefix_demands(self):
+        if getattr(self, '_stopping_context_enabled', False):
+            self._process_context_observation_demands()
+            return
+        if not hasattr(self, '_stopping_prefix_lock'):
+            return
+        with self._stopping_prefix_lock:
+            report, self._stopping_prefix_pending = self._stopping_prefix_pending, None
+        if report is None and getattr(self, '_stopping_prefix_binding', None) is None:
+            return
+        with self._lock:
+            trajectory, received, source = self._preferred_trajectory_locked()
+        try:
+            binding = None if trajectory is None else (trajectory.header.stamp.to_nsec(), trajectory_sha256(trajectory))
+        except (ValueError, TypeError, AttributeError):
+            binding = None
+        # Retire immediately on replacement/staleness, even without a new map
+        # report. A shared stamp cannot transfer another path's obligations.
+        old_binding = getattr(self, '_stopping_prefix_binding', None)
+        if old_binding is not None and old_binding != binding:
+            with self._stopping_prefix_lock:
+                self._stopping_prefix_queue.retire(self._stopping_prefix_path)
+                self._stopping_prefix_path = None
+                self._stopping_prefix_binding = None
+            with self._obligation_lock:
+                kept = []
+                for ob in self._obligations:
+                    if ob.get('stopping_prefix_request'):
+                        if ob.get('stopping_prefix_owned'):
+                            continue
+                        ob.pop('stopping_prefix_request', None)
+                    kept.append(ob)
+                self._obligations = kept
+            self._publish_schedule()
+        if report is None or binding is None:
+            return
+        try:
+            with self._stopping_prefix_lock:
+                validate_trajectory_report(report, trajectory, rospy.Time.now().to_sec())
+                previous_path = self._stopping_prefix_path
+                if previous_path is not None and previous_path != report['path_id']:
+                    self._stopping_prefix_queue.retire(previous_path)
+                demands = self._stopping_prefix_queue.update(report, rospy.Time.now().to_sec(), trajectory.header.stamp.to_nsec())
+                self._stopping_prefix_path = report['path_id']
+                self._stopping_prefix_binding = binding
+        except (ValueError, TypeError, KeyError):
+            return
+        wanted = {tuple(d['point']) for d in demands}
+        with self._obligation_lock:
+            kept = []
+            for ob in self._obligations:
+                request = ob.get('stopping_prefix_request')
+                if request and (request['path_id'] != report['path_id'] or
+                        not any(tuple(p) in wanted for p in request['points'])):
+                    if ob.get('stopping_prefix_owned'):
+                        continue
+                    ob.pop('stopping_prefix_request', None)
+                kept.append(ob)
+            self._obligations = kept
+        actionable = [d for d in demands if d['action'] != 'blocked_occupied']
+        if not actionable:
+            self._publish_schedule()
+            return
+        for region in self._cluster_regions(np.asarray([d['point'] for d in actionable])):
+            members = [d for d in actionable if any(np.array_equal(d['point'], p) for p in region['points'])]
+            deadline = min(d['observation_deadline_s'] for d in members)
+            request = dict(path_id=report['path_id'], points=region['points'].tolist(),
+                           construction_sha256=report['construction_sha256'], map_identity=report['map_identity'])
+            with self._obligation_lock:
+                matched = exact_region_owner(self._obligations,region['points'])
+                if matched is not None:
+                    matched['deadline_abs_s'] = min(matched['deadline_abs_s'], deadline)
+                    previous_request=matched.get('stopping_prefix_request')
+                    if previous_request and previous_request['path_id']==report['path_id']:
+                        request['points']=[list(p) for p in sorted({tuple(p) for p in previous_request['points']+request['points']})]
+                    matched['stopping_prefix_request'] = request
+                    continue
+                if len(self._obligations) >= self.max_obligations:
+                    break
+            try:
+                window=report.get('trajectory_construction',{}).get('start_window_ns')
+                region=dict(region,stopping_observation_deadline_abs_s=deadline,
+                    stopping_observation_epoch_s=(window[0] if window else report['snapshot_ns'])*1e-9)
+                ob = self._generate_new_obligation(region, trajectory,
+                    max(.001, deadline-rospy.Time.now().to_sec()), received, 'stopping_prefix_lookahead')
+                with self._lock:
+                    current_trajectory, _, _ = self._preferred_trajectory_locked()
+                if current_trajectory is None:
+                    continue
+                validate_trajectory_report(report, current_trajectory, rospy.Time.now().to_sec())
+            except Exception as exc:
+                rospy.logwarn('stopping-prefix observation generation retained for retry: %s', exc)
+                continue
+            ob['deadline_abs_s'] = min(ob['deadline_abs_s'], deadline)
+            ob['stopping_prefix_request'] = request
+            ob['stopping_prefix_owned'] = True
+            with self._obligation_lock:
+                if exact_region_owner(self._obligations,region['points']) is None and len(self._obligations) < self.max_obligations:
+                    self._obligations.append(ob)
+        self._publish_schedule()
+
+    def _clear_stopping_context(self):
+        """Caller holds publication and prefix locks, in that order."""
+        self._stopping_context_queue.reset()
+        self._stopping_prefix_pending = None
+        self._stopping_context_key = None
+        if getattr(self, '_require_task_binding', False):
+            self._task_recovery_source.reset()
+        with self._obligation_lock:
+            kept = []
+            for ob in self._obligations:
+                if ob.get('stopping_prefix_request'):
+                    if ob.get('stopping_prefix_owned'):
+                        continue
+                    ob.pop('stopping_prefix_request', None)
+                kept.append(ob)
+            self._obligations = kept
+
+    def _expire_stopping_context(self):
+        with self._stopping_prefix_lock:
+            current = self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+            if self._stopping_context_key is not None and (
+                    current is None or context_key(current) != self._stopping_context_key):
+                self._clear_stopping_context()
+
+    def _stopping_task_candidate_callback(self, msg):
+        with self._stopping_prefix_lock:
+            if msg.action != 'planned':
+                return
+            try:
+                self._stopping_task_receiver.offer_candidate(msg.trajectory,msg.task_context,rospy.Time.now().to_nsec())
+            except (ValueError, KeyError, TypeError) as exc:
+                rospy.logwarn('task observation seed rejected: %s', exc)
+                return
+
+    def _stopping_context_callback(self, msg):
+        try:
+            if len(msg.data) > 32768:
+                return
+            event = json.loads(msg.data)
+            with self._schedule_publish_lock, self._stopping_prefix_lock:
+                before = self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+                after = (self._stopping_task_receiver.update(event, rospy.Time.now().to_nsec())
+                         if getattr(self, "_require_task_binding", False) else
+                         self._stopping_context.update(event, rospy.Time.now().to_nsec()))
+                changed = before is None or after is None or context_key(before) != context_key(after)
+                if changed:
+                    self._clear_stopping_context()
+            if changed:
+                self._publish_schedule()
+        except (ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            return
+
+    def _process_context_observation_demands(self):
+        if not self._stopping_context_worker.acquire(blocking=False):
+            return
+        try:
+            with self._schedule_publish_lock, self._stopping_prefix_lock:
+                self._expire_stopping_context()
+                context = self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+                report, self._stopping_prefix_pending = self._stopping_prefix_pending, None
+                if context is None or report is None:
+                    return
+                try:
+                    demands = self._stopping_context_queue.update(report, context, rospy.Time.now().to_sec())
+                except ValueError as exc:
+                    if str(exc) in ('observation_context_map_changed', 'task_observation_map_scope_changed'):
+                        self._stopping_context.invalidate(str(exc))
+                        self._clear_stopping_context()
+                    raise
+                self._stopping_context_key = context_key(context)
+                wanted = {tuple(d['point']) for d in demands}
+                with self._obligation_lock:
+                    kept = []
+                    for ob in self._obligations:
+                        request = ob.get('stopping_prefix_request')
+                        if request and not any(tuple(p) in wanted for p in request['points']):
+                            if ob.get('stopping_prefix_owned'):
+                                continue
+                            ob.pop('stopping_prefix_request', None)
+                        kept.append(ob)
+                    self._obligations = kept
+            if getattr(self, "_require_task_binding", False):
+                with self._stopping_prefix_lock:
+                    candidate = self._stopping_task_receiver.candidate(rospy.Time.now().to_nsec())
+                    if candidate is None:
+                        return
+                    trajectory, received = candidate[0], rospy.Time(0,candidate[2])
+            else:
+                with self._lock:
+                    trajectory, received, _ = self._preferred_trajectory_locked()
+            if trajectory is None:
+                return
+            actionable = [d for d in demands if d['action'] != 'blocked_occupied']
+            for region in self._cluster_regions(np.asarray([d['point'] for d in actionable])) if actionable else []:
+                members = [d for d in actionable if any(np.array_equal(d['point'], p) for p in region['points'])]
+                deadline = min(d['observation_deadline_s'] for d in members)
+                request = dict(path_id=context_path(context), points=region['points'].tolist(),
+                    context_key=list(context_key(context)), map_identity=report['map_identity'],
+                    execution_eligible=False)
+                with self._obligation_lock:
+                    matched = exact_region_owner(self._obligations, region['points'])
+                    full = len(self._obligations) >= self.max_obligations
+                if matched is None and not full:
+                    region = dict(region, stopping_observation_deadline_abs_s=deadline,
+                        stopping_observation_epoch_s=context['started_ns']*1e-9,
+                        stopping_observation_epoch_source='observation_context_started')
+                    ob = self._generate_new_obligation(region, trajectory,
+                        max(.001, deadline-rospy.Time.now().to_sec()), received, 'stopping_prefix_lookahead')
+                elif matched is None:
+                    break
+                with self._schedule_publish_lock, self._stopping_prefix_lock:
+                    current = self._stopping_context.snapshot(rospy.Time.now().to_nsec())
+                    if current is None or context_key(current) != context_key(context):
+                        return
+                    # A newer report can complete work while generation runs.
+                    pending = self._stopping_context_queue.pending
+                    if not any(d['grid_index'] in pending for d in members):
+                        continue
+                    with self._obligation_lock:
+                        existing = exact_region_owner(self._obligations, region['points'])
+                        if existing is None:
+                            if len(self._obligations) >= self.max_obligations:
+                                continue
+                            existing = ob
+                            existing['stopping_prefix_owned'] = True
+                            self._obligations.append(existing)
+                        existing['deadline_abs_s'] = min(existing['deadline_abs_s'], deadline)
+                        previous = existing.get('stopping_prefix_request')
+                        if previous and previous.get('context_key') == request['context_key']:
+                            request['points'] = [list(p) for p in sorted({tuple(p) for p in previous['points']+request['points']})]
+                        existing['stopping_prefix_request'] = request
+        except (ValueError, TypeError, KeyError) as exc:
+            rospy.logwarn('context observation demand rejected: %s', exc)
+        except Exception as exc:
+            rospy.logwarn('context observation generation retained for retry: %s', exc)
+        finally:
+            self._stopping_context_worker.release()
+            self._publish_schedule()
+
     # Parent timer calls these virtual methods.
     def _maybe_generate(self) -> None:
+        self._process_stopping_prefix_demands()
         self._process_new_active_set()
         self._publish_schedule()
 

@@ -1,0 +1,56 @@
+<?xml version='1.0' encoding='utf-8'?>
+<sdf version="1.6">
+  <world name="static_box_detour_box">
+    <physics type="ode">
+      <real_time_update_rate>1000.0</real_time_update_rate>
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <model name="care_static_box">
+      <static>true</static>
+      <pose>0.325 -0.05 0.375 0 0 0</pose>
+      <link name="box_link">
+        <collision name="collision">
+          <geometry>
+            <box>
+              <size>0.12 0.12 0.12</size>
+            </box>
+          </geometry>
+          <surface>
+            <contact>
+              <collide_without_contact>false</collide_without_contact>
+            </contact>
+          </surface>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box>
+              <size>0.12 0.12 0.12</size>
+            </box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.22 0.12 1</ambient>
+            <diffuse>0.8 0.22 0.12 1</diffuse>
+          </material>
+        </visual>
+        <sensor name="static_box_contacts" type="contact">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>collision</collision>
+          </contact>
+          <plugin name="box_contact_ros" filename="libgazebo_ros_bumper.so">
+            <bumperTopicName>/care_planner/static_box/contacts</bumperTopicName>
+            <frameName>world</frameName>
+          </plugin>
+        </sensor>
+      </link>
+    </model>
+  </world>
+</sdf>

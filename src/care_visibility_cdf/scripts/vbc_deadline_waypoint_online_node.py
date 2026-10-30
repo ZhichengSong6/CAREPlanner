@@ -72,6 +72,16 @@ class _OnlineRuntimeMixin:
         if (getattr(self, "per_sensor_hybrid_enabled", False) and
                 getattr(self, "_per_sensor_runtime", None) is not None):
             branch_ms = float(self._per_sensor_runtime.warmup())
+        # A neutral startup sample makes the real q topic observable before a
+        # task creates an obligation. All q consumers reject a non-seven-value
+        # sample. Do not replace a target that was already generated.
+        from contextlib import nullcontext
+        from std_msgs.msg import Float64MultiArray
+        with getattr(self, '_schedule_publish_lock', nullcontext()):
+            with self._lock:
+                no_target = self._q_vis is None
+            if no_target:
+                self.waypoint_pub.publish(Float64MultiArray())
         rospy.logwarn(
             "[vbc_waypoint_online] ONLINE WARMUP READY: scalar=%.2f ms "
             "per_sensor=%s device=%s batch=8 passes=2",
@@ -169,7 +179,7 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(_OnlineRuntimeMixin, Accumulate
 
     def _maybe_generate(self):
         if self._c46_ready:
-            self._process_new_active_set(); self._publish_schedule()
+            AccumulatedMultiDeadlineWaypointNode._maybe_generate(self)
 
     def _publish_state(self):
         if self._c46_ready:
@@ -276,6 +286,8 @@ def _configure_runtime_mode(mode: str) -> None:
 
 
 def main():
+    from bounded_tcpros import install_observation_tcp_admission
+    install_observation_tcp_admission()
     rospy.init_node("vbc_deadline_waypoint_rolling")
     if not rospy.has_param("~use_active_set"):
         rospy.set_param("~use_active_set", True)

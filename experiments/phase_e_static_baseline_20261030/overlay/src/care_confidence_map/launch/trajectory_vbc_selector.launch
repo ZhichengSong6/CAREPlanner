@@ -1,0 +1,142 @@
+<launch>
+  <arg name="geometry_backend" default="samples" />
+  <!-- VBC needs both robot body link frames and the eight ToF sensor frames. -->
+  <arg name="robot_urdf_file"
+       default="$(find arm_description)/urdf/Arm.urdf" />
+  <!-- Collision-only URDF has no ToF frames: keep the original FK URDF above. -->
+  <arg name="primitive_urdf_file"
+       default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+  <arg name="body_samples_file"
+       default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="config_file"
+       default="$(find care_confidence_map)/config/trajectory_risk.yaml" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="input_trajectory_topic"
+       default="/care_planner/task_trajectory" />
+  <arg name="predicted_trajectory_topic"
+       default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="prefer_predicted_trajectory" default="false" />
+  <arg name="predicted_trajectory_timeout" default="0.20" />
+  <!-- C5.34: temporal selector may evaluate a freshly-arrived trajectory
+       immediately; the periodic timer remains active for acquisition refresh
+       and as a fail-closed fallback. -->
+  <arg name="event_driven_eval" default="false" />
+  <arg name="tcp_nodelay" default="false" />
+  <arg name="confidence_query_persistent" default="false" />
+  <arg name="preserve_periodic_eval" default="false" />
+  <arg name="eval_rate" default="20.0" />
+  <arg name="predicted_periodic_refresh_rate" default="5.0" />
+  <!-- C5.30: optional, temporal-selector-only trajectory used while
+       force_bootstrap=true. Candidate VBC binds this to Sparse-SCP q_lin. -->
+  <arg name="rediscovery_trajectory_topic" default="" />
+  <arg name="rediscovery_trajectory_timeout" default="1.0" />
+
+  <arg name="output_target_topic"
+       default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_active_topic"
+       default="/care_planner/active_sensing/target_candidate_active" />
+  <arg name="confidence_query_service"
+       default="/care_planner/confidence_map/query" />
+  <arg name="min_visibility_before_sweep_margin_s" default="0.30" />
+  <!-- Visibility certification checks the selected body geometry itself.
+       Collision/GCDF clearance inflation is independent and must not
+       silently enlarge the set of mandatory visibility obligations. -->
+  <arg name="swept_volume_margin_m" default="0.0" />
+  <!-- The VBC runs adaptive midpoint samples at the configured temporal
+       resolution.  Keep the optional analytic enclosure disabled by default:
+       it is a conservative inflation on top of the discrete swept-volume
+       check, not a required sample. -->
+  <arg name="continuous_motion_bound_enabled" default="true" />
+  <arg name="include_measured_body" default="false" />
+  <arg name="initial_shell_recovery_enabled" default="false" />
+  <arg name="fixed_start_rebase_reaudit_enabled" default="false" />
+  <arg name="initial_shell_execution_margin_m" default="0.0" />
+  <arg name="initial_shell_occupied_margin_m" default="0.0" />
+
+  <!-- The controlled C4.3 path already sets prefer_predicted_trajectory=true;
+       the frozen C4.2 path leaves it false. Use that existing routing signal so
+       the parent launch does not need another compatibility argument. -->
+  <arg name="temporal_layer_mode" default="$(arg prefer_predicted_trajectory)" />
+
+  <!-- Frozen C4.2 point-selector parameters. -->
+  <arg name="primary_frontier_window_s" default="0.25" />
+  <arg name="target_switch_hysteresis_s" default="0.05" />
+
+  <!-- C4.3 bounded temporal clustering.  A value of 2 means one layer may
+       contain violations whose first sweep indices span at most two original
+       MPC prediction intervals (about 0.10 s for the current 0.05 s grid). -->
+  <arg name="temporal_layer_mpc_steps" default="2" />
+  <arg name="region_max_diameter_m" default="0.12" />
+  <arg name="active_set_points_topic"
+       default="/care_planner/trajectory_risk/vbc_active_set_points" />
+  <arg name="active_set_bundle_topic"
+       default="/care_planner/trajectory_risk/vbc_active_set_bundle" />
+  <arg name="force_bootstrap_topic"
+       default="/care_planner/trajectory_risk/force_bootstrap" />
+
+  <node unless="$(arg temporal_layer_mode)"
+        pkg="care_confidence_map"
+        type="trajectory_vbc_selector_legacy_node"
+        name="trajectory_vbc_selector_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="trajectory_vbc/geometry_backend" value="$(arg geometry_backend)" />
+    <param name="trajectory_vbc/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param name="trajectory_vbc/robot_urdf_file" value="$(arg robot_urdf_file)" />
+    <param if="$(eval arg('geometry_backend') == 'samples')" name="trajectory_vbc/body_samples_file" value="$(arg body_samples_file)" />
+    <param name="trajectory_vbc/base_frame" value="$(arg base_frame)" />
+    <param name="trajectory_vbc/input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="trajectory_vbc/predicted_trajectory_topic" value="$(arg predicted_trajectory_topic)" />
+    <param name="trajectory_vbc/prefer_predicted_trajectory" value="$(arg prefer_predicted_trajectory)" />
+    <param name="trajectory_vbc/predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+    <param name="trajectory_vbc/output_target_topic" value="$(arg output_target_topic)" />
+    <param name="trajectory_vbc/candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="trajectory_vbc/confidence_query_service" value="$(arg confidence_query_service)" />
+    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s" value="$(arg min_visibility_before_sweep_margin_s)" />
+    <param name="trajectory_vbc/primary_frontier_window_s" value="$(arg primary_frontier_window_s)" />
+    <param name="trajectory_vbc/target_switch_hysteresis_s" value="$(arg target_switch_hysteresis_s)" />
+  </node>
+
+  <node if="$(arg temporal_layer_mode)"
+        pkg="care_confidence_map"
+        type="trajectory_vbc_selector_temporal_cluster_node"
+        name="trajectory_vbc_selector_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="trajectory_vbc/geometry_backend" value="$(arg geometry_backend)" />
+    <param name="trajectory_vbc/primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <param name="trajectory_vbc/robot_urdf_file" value="$(arg robot_urdf_file)" />
+    <param if="$(eval arg('geometry_backend') == 'samples')" name="trajectory_vbc/body_samples_file" value="$(arg body_samples_file)" />
+    <param name="trajectory_vbc/base_frame" value="$(arg base_frame)" />
+    <param name="trajectory_vbc/input_trajectory_topic" value="$(arg input_trajectory_topic)" />
+    <param name="trajectory_vbc/predicted_trajectory_topic" value="$(arg predicted_trajectory_topic)" />
+    <param name="trajectory_vbc/prefer_predicted_trajectory" value="$(arg prefer_predicted_trajectory)" />
+    <param name="trajectory_vbc/predicted_trajectory_timeout" value="$(arg predicted_trajectory_timeout)" />
+    <param name="trajectory_vbc/event_driven_eval" value="$(arg event_driven_eval)" />
+    <param name="trajectory_vbc/tcp_nodelay" value="$(arg tcp_nodelay)" />
+    <param name="trajectory_vbc/confidence_query_persistent" value="$(arg confidence_query_persistent)" />
+    <param name="trajectory_vbc/preserve_periodic_eval" value="$(arg preserve_periodic_eval)" />
+    <param name="trajectory_vbc/eval_rate" value="$(arg eval_rate)" />
+    <param name="trajectory_vbc/predicted_periodic_refresh_rate"
+           value="$(arg predicted_periodic_refresh_rate)" />
+    <param name="trajectory_vbc/rediscovery_trajectory_topic" value="$(arg rediscovery_trajectory_topic)" />
+    <param name="trajectory_vbc/rediscovery_trajectory_timeout" value="$(arg rediscovery_trajectory_timeout)" />
+    <param name="trajectory_vbc/output_target_topic" value="$(arg output_target_topic)" />
+    <param name="trajectory_vbc/candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="trajectory_vbc/confidence_query_service" value="$(arg confidence_query_service)" />
+    <param name="trajectory_vbc/min_visibility_before_sweep_margin_s" value="$(arg min_visibility_before_sweep_margin_s)" />
+    <param name="trajectory_vbc/swept_volume_margin_m" value="$(arg swept_volume_margin_m)" />
+    <param name="trajectory_vbc/continuous_motion_bound_enabled" value="$(arg continuous_motion_bound_enabled)" />
+    <param name="trajectory_vbc/include_measured_body" value="$(arg include_measured_body)" />
+    <param name="trajectory_vbc/initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="trajectory_vbc/fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
+    <param name="trajectory_vbc/initial_shell_execution_margin_m" value="$(arg initial_shell_execution_margin_m)" />
+    <param name="trajectory_vbc/initial_shell_occupied_margin_m" value="$(arg initial_shell_occupied_margin_m)" />
+    <param name="trajectory_vbc/temporal_layer_mpc_steps" value="$(arg temporal_layer_mpc_steps)" />
+    <param name="trajectory_vbc/region_max_diameter_m" value="$(arg region_max_diameter_m)" />
+    <param name="trajectory_vbc/active_set_points_topic" value="$(arg active_set_points_topic)" />
+    <param name="trajectory_vbc/active_set_bundle_topic" value="$(arg active_set_bundle_topic)" />
+    <param name="trajectory_vbc/force_bootstrap_topic" value="$(arg force_bootstrap_topic)" />
+  </node>
+</launch>

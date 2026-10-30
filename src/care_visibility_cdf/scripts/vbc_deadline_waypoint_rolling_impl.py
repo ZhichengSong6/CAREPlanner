@@ -27,7 +27,8 @@ from pathlib import Path
 import numpy as np
 import rospy
 import torch
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, Point
+from care_confidence_map.srv import QueryConfidenceSnapshot, QueryConfidenceSnapshotRequest
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 
@@ -47,6 +48,8 @@ from evaluate_direct_vs_projection_ascent import (  # noqa: E402
     model_value_and_grad_q,
 )
 from per_sensor_visibility_runtime import PerSensorVisibilityRuntime  # noqa: E402
+from observation_task_rejoin import task_rejoin_context  # noqa: E402
+from observation_corridor_cost import BoundedCorridorQuery, body_path_probes, snapshot_cost
 from candidate_replacement_runtime import (  # noqa: E402
     high_witness_sensor_preference,
 )
@@ -122,10 +125,18 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
             "~per_sensor_replacement_min_conservative_g", -0.02))
         self.per_sensor_require_primitive_los = bool(rospy.get_param(
             "~per_sensor_require_primitive_los", True))
+        self.per_sensor_allow_nominal_proposals = bool(rospy.get_param(
+            '~per_sensor_allow_nominal_proposals', False))
         self.per_sensor_high_witness_priority_enabled = bool(rospy.get_param(
             "~per_sensor_high_witness_priority_enabled", False))
         self.per_sensor_high_witness_z_min = float(rospy.get_param(
             "~per_sensor_high_witness_z_min", 0.85))
+        self.task_rejoin_enabled = bool(rospy.get_param('~task_rejoin_enabled', True))
+        self.task_rejoin_limits_namespace = str(rospy.get_param(
+            '~task_rejoin_limits_namespace', '/local_sparse_scp_planner_node/mpc'))
+        self._corridor_query=BoundedCorridorQuery(rospy.ServiceProxy(
+            self.confidence_query_service+'_snapshot',QueryConfidenceSnapshot,persistent=False))
+        self._task_rejoin_clock=None;self._task_rejoin_clock_rate=1.
 
         if self.predicted_trajectory_timeout <= 0.0:
             raise ValueError("~predicted_trajectory_timeout must be positive")
@@ -168,6 +179,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 max_branch_attempts=self.per_sensor_max_branch_attempts,
                 min_conservative_g=self.per_sensor_min_conservative_g,
                 require_primitive_los=self.per_sensor_require_primitive_los,
+                allow_nominal_proposals=self.per_sensor_allow_nominal_proposals,
             )
             rospy.logwarn(
                 "[vbc_waypoint_rolling] PER-SENSOR HYBRID ENABLED "
@@ -222,6 +234,53 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                       branch_seed_q=result.get("q_deadline_nominal"),
                       hybrid=result.get("per_sensor_hybrid", {}))
 
+    def _task_rejoin_context(self, branch_seed):
+        if not getattr(self, 'task_rejoin_enabled', False):
+            return None
+        with self._lock:
+            trajectory = self._trajectory
+        if trajectory is None or not trajectory.points:
+            return None
+        try:
+            mapping = self._trajectory_mapping(trajectory)
+            q_task = [trajectory.points[-1].positions[j] for j in mapping]
+            ns = self.task_rejoin_limits_namespace
+            v = rospy.get_param(ns+'/joint_velocity_limits')
+            a = rospy.get_param(ns+'/joint_acceleration_limits')
+            names = ['joint1', 'joint2', 'joint3', 'joint4',
+                     'wrist_joint1', 'wrist_joint2', 'wrist_joint3']
+            context=task_rejoin_context(branch_seed, q_task,
+                [v[n] for n in names], [a[n] for n in names],
+                dict(topic=self.trajectory_topic, stamp_ns=trajectory.header.stamp.to_nsec()))
+            from observation_research_trace import completion_context
+            completion = completion_context()
+            if completion is not None:
+                context['completion'] = completion
+            if getattr(self,'_corridor_query',None) is not None and getattr(self,'_per_sensor_runtime',None) is not None:
+                pair=(rospy.Time.now().to_sec(),time.monotonic());old=self._task_rejoin_clock
+                if old is not None and pair[1]-old[1]>.1 and pair[0]>old[0]:
+                    rate=(pair[0]-old[0])/(pair[1]-old[1])
+                    if .05<=rate<=2.:self._task_rejoin_clock_rate=rate
+                self._task_rejoin_clock=pair
+                context['ros_per_wall_s']=self._task_rejoin_clock_rate
+                context['corridor_evaluator']=self._task_corridor_preview
+            return context
+        except (KeyError, ValueError, TypeError, IndexError):
+            return None
+
+    def _task_corridor_preview(self,q,context):
+        tic=time.monotonic();runtime=self._per_sensor_runtime
+        approach=body_path_probes(runtime,context['q_start'],q)
+        rejoin=body_path_probes(runtime,q,context['q_task'])
+        points=sorted(set(approach+rejoin))
+        req=QueryConfidenceSnapshotRequest();req.horizon_s=0.
+        req.minimum_confidence=float(getattr(self,'seen_threshold',.6))
+        req.points=[Point(*p) for p in points]
+        response=self._corridor_query(req)
+        result=snapshot_cost(response,points,approach,rejoin,rospy.Time.now().to_nsec(),req.minimum_confidence)
+        result['wall_ms']=1000.*(time.monotonic()-tic)
+        return result
+
     def _apply_per_sensor_hybrid_impl(
             self, points_np: np.ndarray, result: Dict[str, object]):
         """Post-process scalar q_zero with mode-preserving 8-head fallback.
@@ -257,6 +316,10 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         try:
             replacement = getattr(self, '_candidate_replacement_override', None)
             options = {} if replacement is None else {'replacement': replacement}
+            if replacement is None:
+                rejoin = self._task_rejoin_context(branch_seed)
+                if rejoin is not None:
+                    options['task_rejoin'] = rejoin
             preferred = high_witness_sensor_preference(
                 points_np,
                 getattr(self, 'per_sensor_high_witness_priority_enabled', False),

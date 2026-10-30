@@ -16,8 +16,8 @@ confidence_map:
   # Temporal memory of observed / initially trusted-clear space.
   # If a voxel is not currently visible, confidence decays as:
   # confidence = exp(-(now - last_seen_time) / temporal_decay_time)
-  # 100 s is intentionally very slow for current active-sensing debugging,
-  # so previously observed space is effectively remembered over a normal run.
+  # This is a time constant: at threshold 0.8, sensor evidence lasts only
+  # -100*ln(0.8) = 22.314 s, minus the required future stopping horizon.
   temporal_decay_time: 100.0
 
   # Frozen C5.41 baseline semantics. Phase E uses a separate config that
@@ -75,6 +75,8 @@ sensor_model:
   vertical_fov_deg: 72.0
 
   local_resolution: 0.05
+  # Reject stale/future dynamic poses; cached TF cannot renew sensor memory.
+  max_tf_age_s: 0.05
 
   sensors:
     - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}

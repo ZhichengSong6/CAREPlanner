@@ -1,0 +1,17 @@
+<launch>
+  <arg name="world_file" />
+  <arg name="gazebo_gui" default="true" />
+  <arg name="use_rviz" default="false" />
+  <arg name="map_config" />
+  <include file="$(find arm_description)/launch/gazebo_velocity_control.launch">
+    <arg name="world_file" value="$(arg world_file)" />
+    <arg name="gazebo_gui" value="$(arg gazebo_gui)" />
+    <arg name="use_rviz" value="$(arg use_rviz)" />
+    <arg name="apply_initial_joint_overrides" value="false" />
+  </include>
+  <include file="$(find care_confidence_map)/launch/tof_fusion_self_filter.launch" />
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="config_file" value="$(arg map_config)" />
+    <arg name="body_prior_geometry_backend" value="primitive" />
+  </include>
+</launch>

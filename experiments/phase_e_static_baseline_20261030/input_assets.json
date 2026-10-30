@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "files": [
+    {
+      "path": "fixed/runtime/src/egocentric_arm_planner/config/phase_c2_vbc_cases.json",
+      "sha256": "135620f34a225e1e7af95dd400d64063b1fefc97b42651f12aa11cd27a5c1bbb",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json",
+      "sha256": "63c3c51a5f32aac1c77794ce31aff0d9c3e576d407c9de6e97a700610c592746",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/scripts/fixtures/gcdf_case011.txt",
+      "sha256": "a96055d3666397b64f72a5fb5feb8d156eb669ad8d45feb9cf322b329b6d65ed",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/scripts/fixtures/phase_e_case007_candidate.json",
+      "sha256": "d8adc4137e161682034dcde68bb8fdafa81459ee0ecd618c4ced76489c9b17aa",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/scripts/fixtures/phase_e_case012_sweep_refinement.json",
+      "sha256": "7264caebed7fb6db6cc82538ad157dac3e8bb67e776db6d59b968340701663ee",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/scripts/fixtures/vbc_continuous_counterexamples.txt",
+      "sha256": "6aec99b2b7ec95d3456fc921bf595f2af0e146a46f9e2547698331734f2462fe",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/runtime/scripts/fixtures/vbc_primitive_sweep_reference.hpp",
+      "sha256": "e495d8073ba03c01643f3e46d433d587b3c3a3e586ccfd2f3a2914561d648557",
+      "relocate_paths": false
+    },
+    {
+      "path": "fixed/scenes.json",
+      "sha256": "d5c04b4a021a4700bc5e94f046f980d595aa82bc129ba739532411c8b0bba55f",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/mapping_gate.json",
+      "sha256": "e500592890584ac62dd7a276e27b27f840e5463eae526eb7aef310e55f92ae34",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/bootstrap_gate.json",
+      "sha256": "3dcaeb87b15d049c3f90a3bf5e3f806c2591a4ba02027620fcae901f953572f0",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/guard_qualification.json",
+      "sha256": "5de0be2cc3d952427f54c462f61bdf02384247ebb3cb5551aa411c333dff6eed",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/detour_route.json",
+      "sha256": "e5e88aff4e453d9b1269f2cf1580c1f91d00345fbef37649b2b9c91cda75fbc2",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/calibration_final/profile.json",
+      "sha256": "5ef4da25d18f36767271173252f1ce66095b6d1fad252720f35f8947ce93955b",
+      "relocate_paths": true
+    },
+    {
+      "path": "fixed/runtime/outputs/phase_e_goal_sampling/phase_e_obstacle_goal_pool_30.json",
+      "sha256": "fbcd2816f594e1970f59e4aae2183f14a9764e623d80b86b2d37cf3a4cad1d45",
+      "relocate_paths": false
+    }
+  ],
+  "path_replacements": {
+    "/home/zhicheng/Project/CAREPlanner/outputs/phase_e_executable_view_selection_r2_20261030": "@BASELINE_RUN@",
+    "/home/zhicheng/Project/CAREPlanner": "@REPO_ROOT@"
+  },
+  "note": "Paths and checksums only. Recorded inputs stay local and are supplied with prepare.py --inputs-root."
+}

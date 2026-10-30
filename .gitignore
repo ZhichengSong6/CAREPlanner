@@ -64,3 +64,48 @@ CAREPlanner_C5_RESULT_*.zip
 CAREPlanner_PHASE_E_EMPTY_QUALIFICATION_*.zip
 src/care_visibility_cdf/checkpoints/
 src/care_collision_cdf/checkpoints/
+
+# Local agent handoff and private credentials/configuration
+/NEXT_SESSION.md
+/.agents/
+/.codex/
+/.aws/
+.env
+.env.*
+!.env.example
+
+# Generated model/data/build payloads (keep manifests and source in Git)
+*.pt
+*.pth
+*.onnx
+*.npz
+*.npy
+*.so
+*.so.*
+*.o
+*.a
+*.pcd
+/bags/
+
+# Local maintenance receipts and original compressed handoff (expanded in docs)
+/docs/maintenance/outputs_cleanup_20261028/
+/docs/handoffs/R1_Model_Definition_Handoff.zip
+
+# Source-only publication: analysis reports and recorded inputs stay local.
+/docs/**
+!/docs/model_assets.txt
+!/docs/legacy_model_assets.json
+!/docs/handoffs/
+!/docs/handoffs/r1_model_definition/
+!/docs/handoffs/r1_model_definition/*.py
+/scripts/fixtures/
+/src/care_collision_cdf/config/*training_contract.json
+/src/care_visibility_cdf/config/*training_contract.json
+/src/egocentric_arm_planner/config/phase_c2_vbc_cases.json
+/src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json
+/experiments/hierarchical9_scratch_v1/TEST_RESULTS.md
+/experiments/phase_e_static_baseline_20261030/reference_results.json
+/experiments/phase_e_static_baseline_20261030/template/**/*.json
+!/experiments/phase_e_static_baseline_20261030/template/fixed/plan.json
+!/experiments/phase_e_static_baseline_20261030/template/fixed/old_model_binding.json
+!/experiments/phase_e_static_baseline_20261030/template/fixed/new_model_binding.json

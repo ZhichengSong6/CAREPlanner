@@ -1,0 +1,26 @@
+diff --git a/include/piqp/kkt_system.hpp b/include/piqp/kkt_system.hpp
+index b45e31c..fc6c51e 100644
+--- a/include/piqp/kkt_system.hpp
++++ b/include/piqp/kkt_system.hpp
+@@ -314,9 +314,19 @@ public:
+ 			isize i_u = 0;
+ 			for (isize i = 0; i < data.m; i++) {
+ 				Eigen::Index idx_l = i_l < data.n_h_l ? data.h_l_idx(i_l) : -1;
+-				while (idx_l < i && i_l < data.n_h_l) { idx_l = data.h_l_idx(++i_l); }
++				// The index vectors have capacity m, but only the first n_h_*
++				// entries are initialized. Do not read the unused tail when the
++				// final finite bound is passed: stale indices can activate an
++				// infinite bound and produce 0 * infinity in dual recovery.
++				while (idx_l < i && i_l < data.n_h_l) {
++					++i_l;
++					idx_l = i_l < data.n_h_l ? data.h_l_idx(i_l) : -1;
++				}
+ 				Eigen::Index idx_u = i_u < data.n_h_u ? data.h_u_idx(i_u) : -1;
+-				while (idx_u < i && i_u < data.n_h_u) { idx_u = data.h_u_idx(++i_u); }
++				while (idx_u < i && i_u < data.n_h_u) {
++					++i_u;
++					idx_u = i_u < data.n_h_u ? data.h_u_idx(i_u) : -1;
++				}
+ 
+ 				if (idx_l == i && idx_u == i) {
+ 					T rz_l_bar = rhs.z_l(i) - m_z_l_inv(i) * rhs.s_l(i);

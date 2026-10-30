@@ -1,0 +1,390 @@
+# C5.5: existing VBC/regime architecture + hard GCDF safety.
+# NORMAL = task objective under hard GCDF.
+# REPAIR = active-sensing q_vis objective under hard GCDF.
+# The blocker/q_vis/acquisition/probe logic is unchanged from the existing
+# VBC stack; only the local optimization mode semantics are made explicit.
+
+robot_description_param: /robot_description
+urdf_path: ""
+
+base_frame: base_link
+ee_frame: EE_link
+
+joint_names:
+  - joint1
+  - joint2
+  - joint3
+  - joint4
+  - wrist_joint1
+  - wrist_joint2
+  - wrist_joint3
+
+sensors:
+  - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
+  - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
+  - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
+  - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
+  - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
+  - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
+  - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
+  - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}
+
+ik:
+  position_weight: 1.0
+  orientation_weight: 0.5
+  damping: 0.001
+  step_size: 0.5
+  position_tolerance: 0.01
+  orientation_tolerance: 0.2
+  max_iterations: 100
+
+task_generator:
+  T_plan: 2.0
+  trajectory_dt: 0.02
+  use_quintic: true
+  enable_time_scaling: true
+  min_plan_duration: 0.05
+  max_plan_duration: 5.0
+  nominal_max_joint_velocity: 2.0
+  joint_velocity_limits:
+    joint1: 2.0
+    joint2: 2.0
+    joint3: 2.0
+    joint4: 2.0
+    wrist_joint1: 2.0
+    wrist_joint2: 2.0
+    wrist_joint3: 2.0
+  nominal_max_joint_acceleration: 10.0
+  joint_acceleration_limits:
+    joint1: 3.0
+    joint2: 3.0
+    joint3: 4.0
+    joint4: 4.0
+    wrist_joint1: 6.0
+    wrist_joint2: 6.0
+    wrist_joint3: 6.0
+  enforce_velocity_acceleration_limits: true
+  duration_limit_check_iterations: 6
+  duration_limit_check_margin: 1.02
+  reject_large_joint_jump: true
+  max_joint_jump_inf_norm: 3.0
+
+intervention:
+  T_cmd: 2.0
+  hold_duration: 0.5
+  command_dt: 0.02
+
+receding_horizon:
+  planning_rate: 20.0
+  mpc_command_topic: /care_arm/arm_group_velocity_controller/command
+  mpc_command_timeout: 0.20
+
+local_planner:
+  terminal_retention:
+    enabled: true
+  num_intervals: 20
+  horizon_duration: 1.0
+
+  # C5.24 PROBE semantics: only the first 5 x 0.05 s = 0.25 s of the nominal
+  # task reference advances. The remaining optimization tail holds the step-5
+  # target. NORMAL still uses all 20 task-reference steps; REPAIR is unchanged.
+  probe_task_horizon_steps: 5
+  # Match the executable PROBE cap, preserving the three-prefix protocol.
+  probe_velocity_cap: 0.50
+
+  poll_rate: 50.0
+  min_replan_interval: 0.10
+  cdf_wait_timeout: 0.50
+  cdf_stamp_tolerance: 0.000001
+  # Distinct active certified executions can replace one another before a
+  # tracker completion. Require both a sustained stationary interval and five
+  # execution identities before the existing exact-VBC task-stall route.
+  normal_active_no_progress_duration_s: 8.0
+  normal_active_no_progress_min_executions: 5
+
+  # GCDF-aligned objective:
+  # weak intermediate state tracking + stronger terminal tracking.
+  q_tracking_weight: 0.1
+  terminal_q_tracking_weight: 9.9
+
+  # GCDF penalizes control magnitude rather than tracking u_ref.
+  u_tracking_weight: 0.01
+  u_reference_tracking_enabled: false
+
+  # C5.38 smooth certified execution: softly penalize inter-stage velocity
+  # changes across the full local horizon. This preserves feasibility because
+  # it is an objective term only; hard acceleration rows remain disabled.
+  # Combined with the boundary handoff term below, this prevents each short
+  # certified segment from rebuilding an independent accel/decel profile.
+  u_smooth_weight: 1.0
+
+  # Replacement-boundary continuity against the actually rate-limited actuator
+  # command. With u_smooth_weight active, the first command and the following
+  # local velocity profile are both regularized continuously.
+  handoff_velocity_weight: 1.0
+
+  # Leave CARE acceleration/terminal-braking rows off for now; the previous G0
+  # diagnostics showed they are the dominant PIQP convergence failure source.
+  # The low-level tracker/rate limiter still enforces executable commands.
+  enforce_acceleration_constraints: false
+
+  # Critical C5.5 mode semantics.
+  # NORMAL keeps the task objective. REPAIR drops task tracking entirely and
+  # uses q_vis as the active-sensing objective.
+  repair_hold_initialization_enabled: true
+  repair_task_tracking_scale: 0.0
+  # One optional secondary hard QP, charged to the original six iterations.
+  # Only sensor-independent joints receive a <=.05rad task target. Retain it
+  # only when all observation-joint knots match the primary solution.
+  repair_free_joint_task_tracking_scale: 1.0
+  visibility_waypoint_weight: 3000.0
+
+  # The formal full-q_vis experiment disables the external frontier producer.
+  # In REPAIR the current active q_vis is therefore used directly as the
+  # synthetic terminal-horizon (1.0 s) visibility objective. This parameter is
+  # retained for legacy/diagnostic frontier modes only. Hard CDF constraints,
+  # final GCDF, and exact VBC remain the safety authorities.
+  visibility_frontier_horizon_step: 2
+  # Objective-only bounded tangent recovery after certified tiny executions.
+  safe_frontier_recovery_enabled: true
+  visibility_frontier_topic: /care_planner/active_sensing/visibility_frontier_target
+
+  scp:
+    max_iterations: 6
+    step_tolerance_inf: 0.01
+    # Small local steps are intentional in REPAIR: the current trusted-free
+    # envelope is tiny and should expand through repeated sense/replan cycles.
+    trust_region_initial: 0.15
+    trust_region_min: 0.02
+    trust_region_max: 0.20
+    trust_region_grow: 1.50
+    trust_region_shrink: 0.50
+    improvement_tolerance: 0.002
+
+  cdf:
+    # Learned CDF safety margin. This is in the CDF output/configuration-space
+    # units, not meters and not a conversion of the VBC primitive margin.
+    # proximity_margin remains only the selector's candidate search band.
+    # The numeric value is model-space tuning and requires CDF-side validation;
+    # it has no physical-clearance interpretation.
+    safety_margin: 0.010
+    # Active visibility obligations use a separate CDF-unit guard. It is not a
+    # spatial margin and is not mapped from the VBC's meter-valued margin.
+    # Ordinary UNKNOWN/occupied CDF rows keep the safety_margin above.
+    # It may be read as rad-equivalent only if the CDF checkpoint documents
+    # that scale; it is never inferred from a VBC meter value.
+    visibility_obligation_cdf_margin: 0.05
+    # Each distinct VBC rejection advances only the rejected point by0.15:
+    # 0.05 -> 0.20 -> 0.30, then remains capped. Other observation
+    # points retain their own 0.05 base.
+    # Both active and queued points use this native CDF ladder, not meters.
+    vbc_feedback_cdf_margin_step: 0.15
+    vbc_feedback_cdf_margin_max: 0.30
+    visibility_obligation_horizon_steps: 20
+
+    # Hard GCDF safety in both NORMAL and REPAIR.
+    # No user slack variables: low-confidence space is a true forbidden set.
+    slack_enabled: false
+
+    # Diagnostic only: if a hard NORMAL/PROBE task QP fails, solve the same
+    # convex subproblem once with uncapped per-constraint slacks. This shadow
+    # result is never executable; required_max_slack distinguishes numerical
+    # non-convergence (~0 slack) from genuine local hard-GCDF infeasibility.
+    task_failure_slack_diagnostic_enabled: true
+    task_failure_slack_diagnostic_weight: 10000.0
+
+    # C5.25: if a PROBE hard QP fails, the existing soft diagnostic may be
+    # reused exactly once as an INTERNAL SCP feasibility-restoration iterate.
+    # It is never published/executed. A fresh GCDF query and a later hard QP
+    # must succeed before any candidate can leave the local planner.
+    probe_feasibility_restoration_enabled: true
+    probe_feasibility_restoration_max_attempts: 1
+
+    slack_linear_weight: 10.0
+    slack_quadratic_weight: 0.0
+    per_constraint_slack: true
+    slack_use_upper_bound: false
+    slack_upper_bound: 2.0
+
+    adaptive_slack_penalty: false
+    slack_penalty_multiplier: 10.0
+    slack_penalty_max: 100000000.0
+    slack_tolerance: 0.005
+
+    # Current low-confidence/unknown space is a hard constraint only over
+    # the trajectory segment that may actually be executed before the next
+    # sense/replan cycle. With dt=0.05 s, 5 steps = 0.25 s, covering the
+    # 0.15 s committed prefix plus braking margin.
+    # REPAIR and PROBE_NORMAL use this horizon; NORMAL keeps all 20 steps.
+    # This safety horizon is intentionally configured separately from
+    # local_planner/probe_task_horizon_steps even though both are 5 in C5.24.
+    constraint_horizon_steps: 5
+
+    safe_row_screening: true
+    linearization_tolerance_inf: 0.0001
+
+  piqp:
+    max_iterations: 300
+    eps_abs: 0.00001
+    eps_rel: 0.00001
+    verbose: false
+
+  joint_states: /care_arm/joint_states
+  reference_trajectory: /care_planner/task_trajectory
+  waypoint_schedule_topic: /care_planner/active_sensing/visibility_waypoint_schedule
+  recovery_topic: /care_planner/execution/predicted_vbc_recovery_triggered
+  replan_request_topic: /care_planner/local_planner/replan_request
+  smooth_replan_request_topic: /care_planner/local_planner/smooth_handoff_replan_request
+  executed_command_topic: /care_arm/arm_group_velocity_controller/command
+  execution_summary_topic: /care_planner/execution/tracker_summary
+  cdf_batch_topic: /care_planner/local_planner/cdf_constraint_batch
+  query_trajectory_topic: /care_planner/local_planner/scp_query_trajectory
+  candidate_trajectory_topic: /care_planner/local_planner/candidate_trajectory
+  summary_topic: /care_planner/local_planner/summary
+
+# The local planner reuses physical limits from this legacy block.
+mpc:
+  rate: 20.0
+  horizon_duration: 1.0
+  num_intervals: 20
+  q_tracking_weight: 50.0
+  terminal_q_tracking_weight: 100.0
+  u_tracking_weight: 2.0
+  u_smooth_weight: 1.0
+
+  visibility:
+    enabled: false
+    weight: 0.0
+    timeout: 0.15
+    gradient_norm_clip: 0.0
+    active_topic: /care_planner/active_sensing/acquisition_active
+    gradient_topic: /care_planner/active_sensing/normalized_gradient_q
+
+  visibility_waypoint:
+    enabled: false
+    weight: 0.0
+    timeout: 0.20
+    horizon_slack: 0.025
+    active_topic: /care_planner/active_sensing/visibility_waypoint_active
+    q_topic: /care_planner/active_sensing/visibility_waypoint_q
+    deadline_topic: /care_planner/active_sensing/visibility_waypoint_deadline
+    recovery_enabled: false
+    recovery_weight_scale: 1.0
+    recovery_active_topic: /care_planner/execution/visibility_recovery_active
+    recovery_complete_topic: /care_planner/execution/visibility_recovery_complete
+    replan_ready_topic: /care_planner/execution/visibility_replan_ready
+
+  cdf_shadow:
+    enabled: false
+    safety_margin: 0.0
+    trust_region_q_inf: 0.20
+    constraint_horizon_steps: 20
+    snapshot_timeout: 0.75
+    snapshot_history_size: 12
+    stamp_tolerance: 0.000001
+    constraint_batch_topic: /care_planner/collision_cdf/constraint_batch
+    predicted_trajectory_topic: /care_planner/mpc/cdf_shadow_predicted_trajectory
+    summary_topic: /care_planner/mpc/cdf_shadow_summary
+
+  joint_position_margin: 0.01
+  joint_position_limits:
+    joint1: {lower: -3.14, upper: 3.14}
+    joint2: {lower: -2.30, upper: 2.30}
+    joint3: {lower: -3.14, upper: 3.14}
+    joint4: {lower: -2.65, upper: 2.65}
+    wrist_joint1: {lower: -3.14, upper: 3.14}
+    wrist_joint2: {lower: -3.14, upper: 3.14}
+    wrist_joint3: {lower: -1.20, upper: 1.20}
+  joint_velocity_limits:
+    joint1: 2.0
+    joint2: 2.0
+    joint3: 2.0
+    joint4: 2.0
+    wrist_joint1: 2.0
+    wrist_joint2: 2.0
+    wrist_joint3: 2.0
+  joint_acceleration_limits:
+    joint1: 3.0
+    joint2: 3.0
+    joint3: 4.0
+    joint4: 4.0
+    wrist_joint1: 6.0
+    wrist_joint2: 6.0
+    wrist_joint3: 6.0
+  piqp:
+    max_iterations: 100
+    eps_abs: 0.000001
+    eps_rel: 0.000001
+    verbose: false
+    compute_timings: true
+  joint_states: /care_arm/joint_states
+  reference_trajectory: /care_planner/command_trajectory_candidate
+  output_velocity_command: /care_planner/mpc/internal_velocity_command_unused
+  predicted_trajectory: /care_planner/mpc/predicted_trajectory
+  joint_state_timeout: 0.20
+  reference_timeout: 0.20
+
+topics:
+  joint_states: /care_arm/joint_states
+  target_pose: /care_planner/ee_target_pose
+  task_trajectory: /care_planner/task_trajectory
+  command_trajectory: /care_planner/command_trajectory_candidate
+
+debug:
+  publish_task_trajectory: true
+  overrun_warn_ratio: 1.0
+
+visualization:
+  marker_topic: /care_planner/debug/markers
+  path_line_width: 0.015
+  command_line_width: 0.03
+  target_axis_length: 0.12
+  target_axis_width: 0.01
+  target_sphere_radius: 0.035
+  publish_rate: 10.0
+
+execution:
+  rate: 100.0
+  joint_states: /care_arm/joint_states
+  input_trajectory: /care_planner/mpc/predicted_trajectory
+  output_velocity_command: /care_arm/arm_group_velocity_controller/command
+  reference_state: /care_planner/execution/reference_state
+  control_dt: 0.05
+  max_start_error: 0.3
+  max_tracking_error: 0.8
+  hold_when_no_trajectory: true
+  hold_when_tracking_error_large: true
+  reject_large_start_error: true
+  hold_initial_zero_pose: true
+  hold_last_reference_when_no_trajectory: true
+  reference_timeout: 0.15
+  # Runtime tracker body-envelope threshold (20 mm). VBC's 10 mm swept-volume
+  # margin remains independent and unchanged.
+  certified_tracking_margin_m: 0.020
+  # Body tracking protection compares measured q with the nearest point on
+  # the local reference path, so pure phase lag is recorded separately from
+  # spatial path error. Keep the window bounded to avoid matching a distant
+  # loop of a non-monotone trajectory.
+  tracking_phase_alignment_enabled: true
+  tracking_phase_search_window_s: 0.50
+  # When the legacy conservative body bound would trip, run the lightweight
+  # configuration-aware maximum primitive displacement check. Normal ticks
+  # keep the legacy fast path; FK failures remain fail-closed.
+  primitive_tracking_relative_fk: true
+  replan_tracking_error_inf: 0.25
+  replan_request_min_interval: 0.50
+
+  # Smooth certified receding-horizon execution. Each committed trajectory
+  # remains safe through its own brake/hold tail; this merely starts preparing
+  # a replacement early enough to hand off before that tail in normal operation.
+  smooth_handoff_enabled: true
+  smooth_replan_lead_time: 0.35
+  smooth_replan_min_phase: 0.08
+  smooth_replan_request_topic: /care_planner/local_planner/smooth_handoff_replan_request
+
+  summary_topic: /care_planner/execution/tracker_summary
+  replan_request_topic: /care_planner/local_planner/replan_request
+  position_feedback_gain: 2.5
+  max_command_velocity: 2.0
+  # Reject incompatible continuous curves before GCDF/VBC and at the tracker.
+  enforce_motion_limits: true

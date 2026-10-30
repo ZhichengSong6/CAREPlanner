@@ -84,7 +84,18 @@ bool RecedingHorizonPlanner::initialize(const ros::NodeHandle& nh,
 
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1, &RecedingHorizonPlanner::jointStateCallback, this);
-  target_pose_sub_ = nh_.subscribe(
+  pnh_.param("enable_observation_context",task_context_enabled_,false);
+  pnh_.param("require_bound_regime",require_bound_regime_,false);
+  if(require_bound_regime_ && !task_context_enabled_)return false;
+  if(require_bound_regime_)task_control_sub_=nh_.subscribe("/care_planner/c4_4/task_control",8,
+      &RecedingHorizonPlanner::taskControlCallback,this);
+  if(task_context_enabled_) {
+    task_context_sub_=nh_.subscribe("/care_planner/active_sensing/observation_context",32,
+        &RecedingHorizonPlanner::taskContextCallback,this);
+    task_refresh_sub_=nh_.subscribe("/care_planner/local_planner/normal_task_replan_request",4,
+        &RecedingHorizonPlanner::taskReferenceRefreshCallback,this);
+    bound_reference_pub_=nh_.advertise<CandidateTransfer>(task_trajectory_topic_+"/bound",4,false);
+  } else target_pose_sub_ = nh_.subscribe(
       target_pose_topic_, 1, &RecedingHorizonPlanner::targetPoseCallback, this);
   mpc_command_sub_ = nh_.subscribe(
       mpc_command_topic_, 2, &RecedingHorizonPlanner::mpcCommandCallback, this);
@@ -163,11 +174,20 @@ void RecedingHorizonPlanner::targetPoseCallback(
   if (!msg) return;
 
   std::lock_guard<std::mutex> lock(data_mutex_);
+  acceptTargetLocked(*msg);
+}
+
+void RecedingHorizonPlanner::acceptTargetLocked(const geometry_msgs::PoseStamped& target) {
+  const auto* msg=&target;
   latest_target_pose_ = *msg;
   has_target_pose_ = true;
   new_target_pending_ = true;
   reference_retry_.start(ros::SteadyTime::now().toSec());
   reference_ik_seed_.resize(0);
+  Eigen::Isometry3d pose;
+  reference_has_cached_ik_seed_ = robot_model_->poseMsgToEigen(*msg, pose) &&
+      successful_ik_goal_.matches(msg->header.frame_id, pose, robot_model_->nq());
+  if (reference_has_cached_ik_seed_) reference_ik_seed_ = successful_ik_goal_.q;
   reference_request_ros_time_ = ros::Time::now();
   publishReferenceStatusLocked("pending", "new_target");
 
@@ -184,6 +204,46 @@ void RecedingHorizonPlanner::targetPoseCallback(
                   << msg->pose.position.z << "]");
 }
 
+void RecedingHorizonPlanner::taskReferenceRefreshCallback(const std_msgs::BoolConstPtr& msg) {
+  if(require_bound_regime_)return;
+  if(!msg || !msg->data)return;
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  if(task_context_.current(task_context_.binding,ros::Time::now()) && !reference_retry_.active)
+    acceptTargetLocked(task_context_.target);
+}
+
+void RecedingHorizonPlanner::taskControlCallback(const std_msgs::StringConstPtr& msg) {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  try {
+    const auto event=task_control_receiver_.parse(msg->data,task_context_,ros::Time::now(),"regime_control");
+    const auto sequence=event.payload.get<std::uint64_t>("reference_refresh_seq");
+    const auto mode=event.payload.get<std::string>("mode");
+    taskControlRecoveryTarget(event.payload);
+    if(mode!="NORMAL" && mode!="REPAIR" && mode!="PROBE_NORMAL")return;
+    task_control_receiver_.remember(event);
+    if(sequence>task_reference_refresh_sequence_) {
+      task_reference_refresh_sequence_=sequence;
+      if(event.payload.get<bool>("ready") && mode=="NORMAL" && !reference_retry_.active)
+        acceptTargetLocked(task_context_.target);
+    }
+  } catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,"[TaskControl reference] "<<e.what());}
+}
+
+void RecedingHorizonPlanner::taskContextCallback(const std_msgs::StringConstPtr& msg) {
+  std::lock_guard<std::mutex> lock(data_mutex_);
+  try {
+    const bool changed=task_context_.update(msg->data,ros::Time::now());
+    if(changed)task_reference_refresh_sequence_=0;
+    if(!changed)return;
+    if(task_context_.active)acceptTargetLocked(task_context_.target);
+    else {
+      ++reference_retry_.id;reference_retry_.active=false;
+      has_target_pose_=false;new_target_pending_=false;has_persistent_command_=false;
+      persistent_command_.clear();publishReferenceStatusLocked("cancelled","task_context_ended");
+    }
+  } catch(const std::exception& e) {ROS_WARN_STREAM("[TaskContext] "<<e.what());}
+}
+
 void RecedingHorizonPlanner::publishReferenceStatusLocked(
     const std::string& status, const std::string& reason) {
   std::ostringstream s;
@@ -197,6 +257,7 @@ void RecedingHorizonPlanner::publishReferenceStatusLocked(
 }
 
 bool RecedingHorizonPlanner::hasValidInputs() const {
+  if(task_context_enabled_ && !task_context_.current(task_context_.binding,ros::Time::now()))return false;
   if (!has_joint_state_) {
     ROS_WARN_THROTTLE(1.0, "[RecedingHorizonPlanner] Waiting for joint state.");
     return false;
@@ -231,9 +292,12 @@ void RecedingHorizonPlanner::planningTimerCallback(const ros::TimerEvent&) {
 bool RecedingHorizonPlanner::publishPersistentCommand() {
   arm_trajectory::JointTrajectory persistent_command;
   ros::Time start_time;
+  std::string suffix_context;
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
     if (!has_persistent_command_ || persistent_command_.empty()) return false;
+    if(task_context_enabled_ && !task_context_.current(task_context_.binding,ros::Time::now()))return false;
+    suffix_context=task_context_.binding;
     persistent_command = persistent_command_;
     start_time = persistent_command_start_time_;
   }
@@ -276,7 +340,9 @@ bool RecedingHorizonPlanner::publishPersistentCommand() {
         "[RecedingHorizonPlanner] Failed to convert persistent command suffix.");
     return false;
   }
-  command_traj_pub_.publish(cmd_msg);
+  {std::lock_guard<std::mutex> lock(data_mutex_);
+    if(task_context_enabled_ && !task_context_.current(suffix_context,ros::Time::now()))return false;
+    command_traj_pub_.publish(cmd_msg);}
 
   ROS_INFO_STREAM_THROTTLE(
       0.5,
@@ -292,12 +358,14 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   Eigen::VectorXd latest_mpc_command;
   Eigen::VectorXd previous_mpc_command;
   Eigen::VectorXd ik_seed;
+  std::string ik_seed_source="measured";
   ros::Time latest_mpc_time;
   ros::Time previous_mpc_time;
   bool have_mpc_command = false;
   bool have_previous_mpc_command = false;
   bool should_plan_new_target = false;
   std::uint64_t request_id = 0;
+  std::string solve_task_context;
 
   {
     std::lock_guard<std::mutex> lock(data_mutex_);
@@ -311,7 +379,16 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
 
     if (new_target_pending_ && reference_retry_.claim(now)) {
       request_id = reference_retry_.id;
+      solve_task_context=task_context_.binding;
       ik_seed = reference_ik_seed_;
+      ik_seed_source=reference_has_cached_ik_seed_ && reference_retry_.attempts==1
+          ? "cached_goal" : ik_seed.size() ? "continuation" : "measured";
+      // The same-target retry spends its original three attempts on distinct
+      // seeds: converged cached goal, measured state, then best continuation.
+      if (reference_has_cached_ik_seed_ && reference_retry_.attempts == 2) {
+        ik_seed.resize(0);
+        ik_seed_source="measured";
+      }
       joint_state = latest_joint_state_;
       target_pose = latest_target_pose_;
       latest_mpc_command = latest_mpc_command_;
@@ -329,9 +406,10 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
 
   if (!should_plan_new_target) return publishPersistentCommand();
 
-  const auto fail = [this, request_id](const std::string& reason) {
+  const auto fail = [this, request_id, solve_task_context](const std::string& reason) {
     std::lock_guard<std::mutex> lock(data_mutex_);
-    if (request_id != reference_retry_.id) return false;
+    if (request_id != reference_retry_.id || (task_context_enabled_ &&
+        !task_context_.current(solve_task_context,ros::Time::now()))) return false;
     new_target_pending_ = reference_retry_.fail(request_id, ros::SteadyTime::now().toSec());
     publishReferenceStatusLocked(new_target_pending_ ? "retry_scheduled" : "exhausted", reason);
     return false;
@@ -403,6 +481,7 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   }
 
   arm_trajectory::JointTrajectory tau_task;
+  ROS_INFO_STREAM("[TaskReferenceIK] request_id="<<request_id<<" ik_seed_source="<<ik_seed_source);
   const PlannerStatus gen_status =
       task_generator_.generate(q_current, dq_planning, ddq_current, target_pose, tau_task,
                                ik_seed.size() ? &ik_seed : nullptr);
@@ -410,7 +489,8 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
     const auto& ik = task_generator_.lastIKResult();
     if (gen_status == PlannerStatus::IK_APPROXIMATE) {
       std::lock_guard<std::mutex> lock(data_mutex_);
-      if (request_id != reference_retry_.id) return false;
+      if (request_id != reference_retry_.id || (task_context_enabled_ &&
+        !task_context_.current(solve_task_context,ros::Time::now()))) return false;
       reference_ik_seed_ = task_generator_.lastGoalQ();
     }
     ROS_WARN_STREAM(
@@ -475,7 +555,18 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       publishReferenceStatusLocked("exhausted", "result_after_timeout");
       return false;
     }
-    if (publish_task_trajectory_) task_traj_pub_.publish(task_msg);
+    if (publish_task_trajectory_) {
+      task_traj_pub_.publish(task_msg);
+      if(task_context_enabled_) {
+        CandidateTransfer reference;reference.action="reference";reference.trajectory=task_msg;
+        reference.task_context=solve_task_context;bound_reference_pub_.publish(reference);
+      }
+    }
+    Eigen::Isometry3d successful_pose;
+    if (task_generator_.lastIKResult().converged() &&
+        robot_model_->poseMsgToEigen(target_pose, successful_pose))
+      successful_ik_goal_.store(target_pose.header.frame_id, successful_pose,
+                               task_generator_.lastGoalQ());
     publishReferenceStatusLocked("succeeded", publish_task_trajectory_
         ? "reference_published" : "reference_debug_disabled");
     persistent_command_ = tau_cmd;

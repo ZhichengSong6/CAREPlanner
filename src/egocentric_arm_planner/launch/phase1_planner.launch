@@ -1,4 +1,6 @@
 <launch>
+  <arg name="enable_observation_context" default="false" />
+  <arg name="require_bound_regime" default="false" />
   <!-- ========================= -->
   <!-- Basic frames / config      -->
   <!-- ========================= -->
@@ -47,6 +49,8 @@
 
     <rosparam command="load" file="$(arg config_file)" />
 
+    <param name="enable_observation_context" value="$(arg enable_observation_context)" />
+    <param name="require_bound_regime" value="$(arg require_bound_regime)" />
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="ee_frame" value="$(arg ee_frame)" />
   </node>

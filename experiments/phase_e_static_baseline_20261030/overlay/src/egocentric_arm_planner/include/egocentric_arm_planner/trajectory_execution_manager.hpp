@@ -1,0 +1,272 @@
+#pragma once
+
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include "egocentric_arm_planner/execution_stop_state.hpp"
+#include <ros/ros.h>
+
+#include <sensor_msgs/JointState.h>
+#include <std_msgs/Bool.h>
+#include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
+#include <trajectory_msgs/JointTrajectory.h>
+#include <trajectory_msgs/JointTrajectoryPoint.h>
+
+#include <Eigen/Dense>
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace egocentric_arm_planner {
+
+// Low-level trajectory tracker.
+//
+// C5.4 architecture:
+//   local trajectory optimizer -> exact verifier/commit -> this tracker -> actuator
+//
+// Unlike the legacy C4 short-step backend, this class owns a complete committed
+// trajectory and advances through it using elapsed wall/ROS time.  Therefore a
+// planner is free to run event-triggered or at a low rate; execution does not
+// require a fresh 20 Hz planning trajectory to keep moving.
+class TrajectoryExecutionManager {
+public:
+  TrajectoryExecutionManager() = default;
+
+  bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
+
+private:
+  care_confidence_map::VbcPrimitiveModel tracking_geometry_;
+  bool primitive_tracking_guard_ = false;
+  // Use a configuration-aware maximum primitive displacement only for ticks
+  // where the legacy conservative bound is already over the guard margin.
+  // This keeps the normal 100 Hz path allocation-free and inexpensive.
+  // Keep the legacy guard as the default for configurations that do not opt
+  // into the configuration-aware fallback.  The C5.5 regime enables it
+  // explicitly in its YAML file.
+  bool primitive_tracking_relative_fk_ = false;
+  bool primitive_tracking_relative_fk_ready_ = false;
+  bool enforce_motion_limits_ = false;
+  std::vector<double> reference_velocity_limits_, reference_acceleration_limits_;
+  // Runtime tracker body-envelope threshold. This is separate from the VBC
+  // swept-volume margin; VBC keeps its own certification margin.
+  double certified_tracking_margin_m_ = 0.020;
+  double last_tracking_bound_m_ = 0.0;
+  double last_same_phase_tracking_bound_m_ = 0.0;
+  double last_spatial_tracking_error_inf_ = 0.0;
+  double last_spatial_tracking_bound_m_ = 0.0;
+  double last_relative_fk_tracking_bound_m_ = 0.0;
+  bool last_relative_fk_used_ = false;
+  double last_tracking_phase_match_s_ = 0.0;
+  double last_tracking_phase_lag_s_ = 0.0;
+  bool last_tracking_phase_alignment_used_ = false;
+  void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
+  void limiterOutputCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
+  void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void safetyHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void vbcSafetyHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void executionVbcStopCallback(const std_msgs::StringConstPtr& msg);
+  void executionTimerCallback(const ros::TimerEvent& event);
+
+  bool loadConfig();
+
+  bool extractMeasuredState(const sensor_msgs::JointState& msg,
+                            Eigen::VectorXd& q,
+                            Eigen::VectorXd& dq) const;
+
+  bool trajectoryHasExpectedJoints(
+      const trajectory_msgs::JointTrajectory& traj) const;
+
+  bool buildTrajectoryJointIndexMap(
+      const trajectory_msgs::JointTrajectory& traj,
+      std::vector<int>& traj_index_for_control_joint) const;
+
+  static bool sampleTrajectory(
+      const trajectory_msgs::JointTrajectory& traj,
+      const std::vector<int>& traj_index_for_control_joint,
+      double t,
+      Eigen::VectorXd& q_ref,
+      Eigen::VectorXd& dq_ref,
+      Eigen::VectorXd& ddq_ref);
+
+  // Find a nearby point on the locally time-windowed reference curve.
+  // This separates spatial path error from
+  // longitudinal phase lag: the tracker still executes at its current phase,
+  // but the body-envelope monitor compares measured q with this nearest path
+  // point rather than blindly comparing against q_ref(current_phase).
+  static bool findNearestTrajectoryReference(
+      const trajectory_msgs::JointTrajectory& traj,
+      const std::vector<int>& traj_index_for_control_joint,
+      double center_t,
+      double search_window_s,
+      const Eigen::VectorXd& q_measured,
+      double& matched_t,
+      Eigen::VectorXd& q_match);
+
+  static bool getPointVector(
+      const trajectory_msgs::JointTrajectoryPoint& point,
+      const std::vector<double>& field,
+      const std::vector<int>& traj_index_for_control_joint,
+      Eigen::VectorXd& out,
+      bool allow_missing_as_zero);
+
+  double getTrajectoryEndTime(
+      const trajectory_msgs::JointTrajectory& traj) const;
+
+  Eigen::VectorXd computeVelocityCommand(const Eigen::VectorXd& q_ref,
+                                         const Eigen::VectorXd& dq_ref,
+                                         const Eigen::VectorXd& q_measured) const;
+
+  Eigen::VectorXd clampVelocityCommand(const Eigen::VectorXd& dq_cmd) const;
+
+  void publishVelocityCommand(const Eigen::VectorXd& dq_cmd);
+
+  void publishReferenceState(const Eigen::VectorXd& q_ref,
+                             const Eigen::VectorXd& dq_ref);
+
+  void publishSummary(bool trajectory_active,
+                      bool trajectory_complete,
+                      uint32_t trajectory_seq,
+                      uint64_t execution_stamp_ns,
+                      double phase_s,
+                      double remaining_s,
+                      double tracking_error_inf,
+                      int tracking_error_joint_index,
+                      double tracking_error_q_ref,
+                      double tracking_error_q_measured,
+                      const std::string& source,
+                      const ros::Time& sample_time);
+
+  void maybePublishReplanRequest(double tracking_error_inf);
+  void flushPendingReplanRequest();
+  void maybePublishSmoothHandoffReplanRequest(
+      bool trajectory_active,
+      uint64_t execution_stamp_ns,
+      double phase_s,
+      double remaining_s);
+
+  Eigen::VectorXd makeZeroVelocityCommand() const;
+
+private:
+  ros::NodeHandle nh_;
+  ros::NodeHandle pnh_;
+
+  ros::Subscriber joint_state_sub_;
+  ros::Subscriber limiter_output_sub_;
+  ros::Subscriber trajectory_sub_;
+  ros::Subscriber safety_hold_sub_;
+  ros::Subscriber vbc_safety_hold_sub_;
+  ros::Subscriber execution_vbc_stop_sub_;
+
+  ros::Publisher velocity_command_pub_;
+  ros::Publisher reference_state_pub_;
+  ros::Publisher summary_pub_;
+  ros::Publisher replan_request_pub_;
+  ros::Publisher smooth_replan_request_pub_;
+
+  ros::Timer execution_timer_;
+
+  mutable std::mutex data_mutex_;
+
+  bool has_joint_state_ = false;
+  bool external_safety_hold_ = false;
+  bool vbc_safety_hold_ = false;
+  uint64_t execution_vbc_stop_stamp_ns_ = 0;
+  ros::Time external_safety_hold_start_time_;
+  unsigned long long external_safety_hold_event_count_ = 0;
+  sensor_msgs::JointState latest_joint_state_;
+  Eigen::VectorXd q_measured_;
+  Eigen::VectorXd dq_measured_;
+  ExecutionStopState stop_state_;
+  Eigen::VectorXd latest_limiter_output_;
+  ros::Time latest_limiter_output_received_;
+
+  // Complete committed trajectory.  A new message atomically replaces the
+  // active trajectory; the controller then advances through it at execution_rate_.
+  bool has_active_trajectory_ = false;
+  bool has_received_trajectory_ = false;
+  trajectory_msgs::JointTrajectory active_trajectory_;
+  std::vector<int> active_trajectory_mapping_;
+  ros::Time active_trajectory_start_time_;
+  ros::Time active_trajectory_received_time_;
+  double active_trajectory_duration_s_ = 0.0;
+  uint32_t active_trajectory_seq_ = 0;
+  uint64_t active_execution_stamp_ns_ = 0;
+
+  // Last valid reference is retained after trajectory completion so the robot
+  // holds its final configuration instead of snapping back to home.
+  bool has_last_reference_ = false;
+  Eigen::VectorXd last_q_ref_;
+  Eigen::VectorXd last_dq_ref_;
+
+  std::vector<std::string> joint_names_;
+
+  double execution_rate_ = 100.0;
+  // Legacy parameter kept for config compatibility; full-trajectory tracking
+  // no longer samples a fixed short step.
+  double control_dt_ = 0.05;
+
+  double max_start_error_ = 0.5;
+  double max_tracking_error_ = 1.0;
+
+  bool hold_when_no_trajectory_ = true;
+  bool hold_when_tracking_error_large_ = true;
+  bool reject_large_start_error_ = true;
+
+  bool hold_initial_zero_pose_ = true;
+  bool hold_last_reference_when_no_trajectory_ = true;
+  double reference_timeout_ = 0.15;
+  bool tracking_phase_alignment_enabled_ = true;
+  double tracking_phase_search_window_s_ = 0.50;
+
+  double position_feedback_gain_ = 1.0;
+  double max_command_velocity_ = 0.2;
+
+  // Event-triggered replanning support. This is advisory only: the tracker
+  // continues to enforce its own hold policy even if no planner subscribes.
+  double replan_tracking_error_inf_ = 0.25;
+  double replan_request_min_interval_s_ = 0.50;
+  ros::Time last_replan_request_time_;
+  bool replan_request_pending_ = false;
+  ros::Time replan_request_pending_time_;
+  uint64_t replan_request_pending_execution_stamp_ns_ = 0;
+  unsigned long long replan_request_count_ = 0;
+  unsigned long long replan_request_deferred_count_ = 0;
+
+  // A tracking-envelope abort is a terminal event for the committed token.
+  // Keep a bounded-in-practice tombstone set so delayed duplicate trajectory
+  // messages cannot reactivate a trajectory that was stopped for safety.
+  std::unordered_set<uint64_t> aborted_execution_stamps_;
+
+  // Smooth certified receding-horizon handoff. The current certified
+  // trajectory always remains executable through its own braking/hold tail;
+  // this look-ahead request only asks the planner to prepare a replacement
+  // before that tail is normally reached.
+  bool smooth_handoff_enabled_ = false;
+  double smooth_replan_lead_time_s_ = 0.35;
+  double smooth_replan_min_phase_s_ = 0.08;
+  uint64_t last_smooth_replan_execution_stamp_ns_ = 0;
+  unsigned long long smooth_replan_request_count_ = 0;
+
+  std::string joint_state_topic_ = "/care_arm/joint_states";
+  std::string input_trajectory_topic_ =
+      "/care_planner/committed_trajectory";
+  std::string output_velocity_command_topic_ =
+      "/care_arm/arm_group_velocity_controller/command";
+  std::string reference_state_topic_ =
+      "/care_planner/execution/reference_state";
+  std::string summary_topic_ =
+      "/care_planner/execution/tracker_summary";
+  std::string replan_request_topic_ =
+      "/care_planner/local_planner/replan_request";
+  std::string smooth_replan_request_topic_ =
+      "/care_planner/local_planner/smooth_handoff_replan_request";
+  std::string external_safety_hold_topic_ =
+      "/care_planner/execution_gcdf/hard_hold";
+  std::string vbc_safety_hold_topic_ =
+      "/care_planner/execution/predicted_vbc_verification_hold";
+};
+
+}  // namespace egocentric_arm_planner

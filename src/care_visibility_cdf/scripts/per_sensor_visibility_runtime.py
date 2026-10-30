@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
@@ -55,6 +56,8 @@ from check_visibility_self_occlusion import (
     raycast_self_occlusion,
 )
 from candidate_replacement_runtime import replacement_mount_group_pool
+from observation_task_rejoin import candidate_cost, improves_candidate, alternative_can_improve
+from observation_corridor_cost import approach_visibility_order
 
 
 _LEGACY_OUTPUT_SEMANTICS = "per_sensor_signed_visibility_cdf"
@@ -379,6 +382,7 @@ class PerSensorVisibilityRuntime:
         nominal_z_min: float = 0.15,
         nominal_z_max: float = 0.75,
         require_primitive_los: bool = True,
+        allow_nominal_proposals: bool = False,
     ) -> None:
         if projection_iters < 1:
             raise ValueError("projection_iters must be >= 1")
@@ -423,6 +427,9 @@ class PerSensorVisibilityRuntime:
         self.max_branch_attempts = int(max_branch_attempts)
         self.min_conservative_g = float(min_conservative_g)
         self.require_primitive_los = bool(require_primitive_los)
+        self.allow_nominal_proposals = bool(allow_nominal_proposals)
+        if self.allow_nominal_proposals and not self.require_primitive_los:
+            raise ValueError('nominal observation proposals require primitive LOS')
 
         self.cons_hfov = float(conservative_hfov_deg)
         self.cons_vfov = float(conservative_vfov_deg)
@@ -461,6 +468,7 @@ class PerSensorVisibilityRuntime:
             find_chain_joints(self.reference_robot, "base_link", frame)
             for frame in DEFAULT_SENSOR_FRAMES
         ]
+        self.task_ee_chain = find_chain_joints(self.reference_robot, 'base_link', 'EE_link')
         self.primitives = load_collision_primitives(self.self_filter_robot)
         if not self.primitives:
             raise RuntimeError(
@@ -602,6 +610,14 @@ class PerSensorVisibilityRuntime:
         )
         return self.branch_score(points, q, int(sensor_id))
 
+    def branch_value_and_grad_numpy(self, points_xyz, q_row, sensor_id):
+        points = torch.tensor(np.asarray(points_xyz, dtype=np.float32).reshape(-1, 3),
+                              device=self.device, dtype=torch.float32)
+        q = torch.tensor(np.asarray(q_row, dtype=np.float32).reshape(1, 7),
+                         device=self.device, dtype=torch.float32)
+        value, grad = self.branch_value_and_grad(points, q, int(sensor_id))
+        return value, grad.detach().cpu().numpy().reshape(7).astype(np.float64)
+
     def _projection_step(
         self,
         q: torch.Tensor,
@@ -718,7 +734,8 @@ class PerSensorVisibilityRuntime:
         return best_q.detach(), float(best_f), history
 
     def _optimize_branch(
-        self, points: torch.Tensor, q_start: torch.Tensor, sensor_id: int
+        self, points: torch.Tensor, q_start: torch.Tensor, sensor_id: int,
+        geometry_guided: bool = False, geometry_threshold: float = 0.0,
     ) -> Dict[str, object]:
         """Legacy-scalar-style per-head projection -> root -> ascent."""
         sensor_id = int(sensor_id)
@@ -730,6 +747,9 @@ class PerSensorVisibilityRuntime:
         initial_score = self.branch_score(points, q, sensor_id)
         best_q = q.clone()
         best_score = float(initial_score)
+        best_geometry_q = q.clone()
+        best_geometry = (self._proposal_fov_objective(points.detach().cpu().numpy(),
+            q[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf)
 
         projection_history: List[Dict[str, object]] = [{
             "iter": 0,
@@ -738,6 +758,8 @@ class PerSensorVisibilityRuntime:
             "joint_limit_clamped": bool(initial_clamped),
             "q": q[0].detach().cpu().numpy().astype(float).tolist(),
         }]
+        if geometry_guided:
+            projection_history[0]['geometry_quality'] = best_geometry
         root_history: List[Dict[str, object]] = []
         ascent_history: List[Dict[str, object]] = []
 
@@ -761,7 +783,19 @@ class PerSensorVisibilityRuntime:
             if q_zero is not None:
                 break
 
-            score, grad = self.branch_value_and_grad(points, q, sensor_id)
+            projection_objective = 'learned_visibility'
+            geometry_stalled = (geometry_guided and iteration > self.projection_iters // 2 and
+                projection_history[-1]['geometry_quality'] -
+                projection_history[max(0, len(projection_history)-3)]['geometry_quality'] < .001)
+            if geometry_stalled:
+                score, grad, objective = self._ascent_objective(
+                    points,q,sensor_id,True,geometry_threshold)
+                if objective == 'proposal_fov':
+                    score = self._proposal_fov_objective(points.detach().cpu().numpy(),
+                        q[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
+                    projection_objective = objective
+            else:
+                score, grad = self.branch_value_and_grad(points, q, sensor_id)
             q_next, diag = self._projection_step(q, score, grad)
             if bool(diag["degenerate"]):
                 root_source = "degenerate_projection_gradient"
@@ -771,9 +805,15 @@ class PerSensorVisibilityRuntime:
             if f_next > best_score:
                 best_score = float(f_next)
                 best_q = q_next.clone()
+            if geometry_guided:
+                geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),
+                    q_next[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
+                if geometry > best_geometry:
+                    best_geometry,best_geometry_q = geometry,q_next.clone()
 
             projection_history.append({
                 "iter": int(iteration),
+                "objective": projection_objective,
                 "score": float(f_next),
                 "grad_norm": float(diag["grad_norm"]),
                 "raw_step_norm": float(diag["raw_step_norm"]),
@@ -782,6 +822,8 @@ class PerSensorVisibilityRuntime:
                 "joint_limit_clamped": bool(diag["joint_limit_clamped"]),
                 "q": q_next[0].detach().cpu().numpy().astype(float).tolist(),
             })
+            if geometry_guided:
+                projection_history[-1]['geometry_quality'] = geometry
 
             if f_current * f_next <= 0.0 and f_current != f_next:
                 q_zero, f_zero, root_history = self._refine_branch_root(
@@ -804,9 +846,8 @@ class PerSensorVisibilityRuntime:
         if q_zero is not None:
             q_vis = q_zero.clone()
             for step in range(1, self.branch_ascent_steps + 1):
-                score, grad = self.branch_value_and_grad(
-                    points, q_vis, sensor_id
-                )
+                score, grad, objective = self._ascent_objective(
+                    points,q_vis,sensor_id,geometry_guided and step>self.branch_ascent_steps-2,geometry_threshold)
                 q_next, diag = self._ascent_step(q_vis, grad)
                 if bool(diag["degenerate"]):
                     break
@@ -822,6 +863,7 @@ class PerSensorVisibilityRuntime:
                         diag["joint_limit_clamped"]
                     ),
                     "fallback": False,
+                    "objective": objective,
                     "q": q_vis[0]
                     .detach().cpu().numpy().astype(float).tolist(),
                 })
@@ -829,13 +871,13 @@ class PerSensorVisibilityRuntime:
         else:
             # Exactly mirror the legacy scalar active-set fallback: keep the
             # best projection iterate, then run a short best-effort ascent.
-            q_vis = best_q.clone()
+            q_vis = best_geometry_q.clone() if geometry_guided else best_q.clone()
             best_shared_q = q_vis.clone()
             best_shared_score = float(best_score)
+            best_shared_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),best_shared_q[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
             for step in range(1, self.branch_fallback_ascent_steps + 1):
-                score, grad = self.branch_value_and_grad(
-                    points, q_vis, sensor_id
-                )
+                score, grad, objective = self._ascent_objective(
+                    points,q_vis,sensor_id,geometry_guided,geometry_threshold)
                 q_next, diag = self._ascent_step(q_vis, grad)
                 if bool(diag["degenerate"]):
                     break
@@ -849,13 +891,17 @@ class PerSensorVisibilityRuntime:
                         diag["joint_limit_clamped"]
                     ),
                     "fallback": True,
+                    "objective": objective,
                     "q": q_next[0]
                     .detach().cpu().numpy().astype(float).tolist(),
                 })
                 q_vis = q_next.detach()
-                if f_next > best_shared_score:
+                current_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),q_vis[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
+                if ((geometry_guided and current_geometry>best_shared_geometry+1e-8) or
+                        (not geometry_guided and f_next > best_shared_score)):
                     best_shared_score = float(f_next)
                     best_shared_q = q_vis.clone()
+                    best_shared_geometry=current_geometry
 
             q_vis = best_shared_q
             best_score = max(best_score, best_shared_score)
@@ -865,6 +911,11 @@ class PerSensorVisibilityRuntime:
                 root_source = "branch_root_not_found"
             solution_mode = "branch_best_effort_ascent"
 
+        if geometry_guided:
+            current_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),
+                q_vis[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
+            if best_geometry > current_geometry + 1e-8:
+                q_vis = best_geometry_q
         final_score = self.branch_score(points, q_vis, sensor_id)
 
         return {
@@ -886,6 +937,36 @@ class PerSensorVisibilityRuntime:
             "root_history": root_history,
             "ascent_history": ascent_history,
         }
+
+    def _fov_objective(self, points_xyz, q, sensor_id):
+        transform=fk_transform(self.sensor_chains[int(sensor_id)],q_row_to_map(DEFAULT_JOINT_NAMES,q))
+        return min(float(sensor_margin(p,transform,self.cons_hfov,self.cons_vfov,self.cons_z_min,self.cons_z_max)[0]-self.cons_delta)
+                   for p in np.asarray(points_xyz).reshape(-1,3))
+
+    def _proposal_fov_objective(self, points_xyz, q, sensor_id, threshold):
+        """Joint quality target: avoid improving conservative FOV at the
+        expense of the nominal gate that will actually reject the proposal.
+        No LOS/path acceptance is inferred from this optimization objective.
+        """
+        transform=fk_transform(self.sensor_chains[int(sensor_id)],q_row_to_map(DEFAULT_JOINT_NAMES,q))
+        return min(min(float(sensor_margin(p,transform,self.cons_hfov,self.cons_vfov,
+                self.cons_z_min,self.cons_z_max)[0]-self.cons_delta-threshold),
+            float(sensor_margin(p,transform,self.nom_hfov,self.nom_vfov,
+                self.nom_z_min,self.nom_z_max)[0])) for p in np.asarray(points_xyz).reshape(-1,3))
+
+    def _ascent_objective(self, points, q, sensor_id, geometry_guided, threshold):
+        if geometry_guided:
+            xyz=points.detach().cpu().numpy();row=q[0].detach().cpu().numpy().astype(float)
+            if self._proposal_fov_objective(xyz,row,sensor_id,threshold)<0.:
+                names={j.name for j in self.sensor_chains[int(sensor_id)] if j.type!='fixed'}
+                gradient=np.zeros(7);h=1e-4
+                for j,name in enumerate(DEFAULT_JOINT_NAMES):
+                    if name not in names:continue
+                    plus=row.copy();minus=row.copy();plus[j]+=h;minus[j]-=h
+                    gradient[j]=(self._proposal_fov_objective(xyz,plus,sensor_id,threshold)-self._proposal_fov_objective(xyz,minus,sensor_id,threshold))/(2*h)
+                return self.branch_score(points,q,sensor_id),torch.as_tensor(gradient,device=q.device,dtype=q.dtype).reshape(1,7),'proposal_fov'
+        score,gradient=self.branch_value_and_grad(points,q,sensor_id)
+        return score,gradient,'learned_visibility'
 
     def _candidate_geometry(
         self, points_xyz, q_row, sensor_id: int,
@@ -965,11 +1046,11 @@ class PerSensorVisibilityRuntime:
             len(point_rows) > 0
             and math.isfinite(min_cons_g)
             and math.isfinite(min_nom_margin)
-            and conservative_passes
+            and (conservative_passes or getattr(self, 'allow_nominal_proposals', False))
             and min_nom_margin >= 0.0
             and (not self.require_primitive_los or not any_occluded)
         )
-        if not conservative_passes:
+        if not conservative_passes and not getattr(self, 'allow_nominal_proposals', False):
             reject_reason = "conservative_fov"
         elif min_nom_margin < 0.0:
             reject_reason = "nominal_fov"
@@ -980,6 +1061,9 @@ class PerSensorVisibilityRuntime:
 
         return {
             "accepted": accepted,
+            "conservative_passes": bool(conservative_passes),
+            "proposal_geometry": ('nominal_fov_with_los' if
+                getattr(self, 'allow_nominal_proposals', False) else 'conservative_fov_with_los'),
             "reject_reason": reject_reason,
             "min_conservative_g": float(min_cons_g),
             "minimum_conservative_g_required": float(threshold),
@@ -996,8 +1080,9 @@ class PerSensorVisibilityRuntime:
         replacement=None,
         preferred_sensor_ids=None,
         preference_reason=None,
+        task_rejoin=None,
     ) -> Dict[str, object]:
-        """Return first FOV+LOS-certified sensor branch.
+        """Return a bounded FOV/LOS proposal with optional task-return ranking.
 
         Sensor ranking is performed at scalar q_zero.  Every branch solve starts
         independently from branch_seed_row; if omitted, q_zero is used.
@@ -1034,10 +1119,24 @@ class PerSensorVisibilityRuntime:
             dtype=torch.float32,
         )
 
-        scores, order = self.rank_sensors(points, q_zero)
-        seed_scores, _ = self.rank_sensors(points, branch_seed)
+        # Rank and optimize from the same measured seed. The scalar q_zero is
+        # retained for provenance, not used as a reachability surrogate.
+        scores, order = self.rank_sensors(points, branch_seed)
+        seed_scores = scores
         attempts = []
         selected = None
+        first_accepted = None
+        rejoin_start = None
+        task_pose = None
+        rejoin_diagnostic = dict(enabled=task_rejoin is not None and replacement is None,
+            selected_by='first_geometry_accepted', candidates=[])
+        if rejoin_diagnostic['enabled']:
+            task_pose = fk_transform(self.task_ee_chain,
+                q_row_to_map(DEFAULT_JOINT_NAMES, task_rejoin['q_task']))
+            rejoin_diagnostic['source'] = task_rejoin.get('source')
+            rejoin_diagnostic['context'] = {key: task_rejoin[key] for key in (
+                'q_start', 'q_task', 'velocity', 'acceleration', 'ros_per_wall_s', 'completion')
+                if key in task_rejoin}
 
         ranked = [(rank, int(sid)) for rank, sid in enumerate(order.tolist(), 1)]
         selection, sensor_priority = preferred_sensor_selection(
@@ -1046,6 +1145,8 @@ class PerSensorVisibilityRuntime:
             str(preference_reason) if preferred_sensor_ids else "none")
         diversity = []
         replacement_group_priority = None
+        replacement_score_override = None
+        replacement_geometry_order = []
         if replacement is not None:
             # One pre-reserved recovery attempt buys ONE branch optimization.
             # Rank locations remain scalar q_zero. Diversity only orders this
@@ -1073,11 +1174,13 @@ class PerSensorVisibilityRuntime:
             replacement_group_priority['sensor_priority']['reason'] = str(
                 replacement.get('preference_reason', preference_reason or 'none'))
             desired = np.asarray(replacement['previous_q'], dtype=float)-branch_seed_np
+            seed_gradients = {}
             for rank, sid in ranked:
                 if sid in excluded:
                     continue
                 _, grad = self.branch_value_and_grad(points, branch_seed, sid)
                 g = grad.detach().cpu().numpy().reshape(7)
+                seed_gradients[sid] = g
                 denom = float(np.linalg.norm(g)*np.linalg.norm(desired))
                 if denom > 1e-12 and np.all(np.isfinite(g)):
                     diversity.append((float(g @ desired / denom), rank, sid))
@@ -1090,6 +1193,62 @@ class PerSensorVisibilityRuntime:
             else:
                 selection = [(rank, sid) for _, rank, sid in diversity
                              if sid in eligible][:1]
+            score_gap = replacement.get('score_gap_override')
+            if score_gap is not None:
+                score_gap = float(score_gap)
+                if not math.isfinite(score_gap) or score_gap <= 0.0:
+                    raise ValueError('replacement score-gap override must be positive')
+                # EE preference is soft ordering; mount-group coverage is the
+                # boundary for score overrides too. A high-scoring mate of a
+                # tried sensor must not spend the last slot before a new group.
+                score_pool, score_priority = replacement_mount_group_pool(
+                    ranked, excluded)
+                replacement_group_priority['score_eligible_sensor_ids'] = [
+                    sid for _, sid in score_pool]
+                replacement_group_priority['score_phase'] = score_priority['phase']
+                if selection and score_pool:
+                    best = max(score_pool, key=lambda row: float(seed_scores[row[1]]))
+                    selected_score = float(seed_scores[selection[0][1]])
+                    best_score = float(seed_scores[best[1]])
+                    if best_score - selected_score >= score_gap:
+                        replacement_score_override = dict(
+                            original_sensor_id=int(selection[0][1]),
+                            chosen_sensor_id=int(best[1]),
+                            original_seed_score=selected_score,
+                            chosen_seed_score=best_score,
+                            required_gap=score_gap,
+                            reason='measured_seed_score_gap')
+                        selection = [best]
+            # Compare a bounded local FOV probe using the gradients already
+            # evaluated for diversity. One reservation still optimizes only
+            # ONE branch. A plausible short approach takes precedence over
+            # an arbitrary opposite direction; this is never a path proof.
+            for rank, sid in (explicitly_preferred or group_pool):
+                direction = seed_gradients.get(sid)
+                if direction is None:
+                    continue
+                norm = float(np.max(np.abs(direction)))
+                if not math.isfinite(norm) or norm <= 1e-6:
+                    continue
+                probe = np.clip(branch_seed_np + .05 * direction / norm,
+                                self.q_min_np, self.q_max_np)
+                margin = self._fov_objective(points_np, branch_seed_np, sid)
+                gain = self._fov_objective(points_np, probe, sid) - margin
+                if not math.isfinite(margin) or not math.isfinite(gain):
+                    continue
+                threshold = float(replacement.get('minimum_conservative_g', self.min_conservative_g))
+                if margin >= threshold:
+                    distance = 0.
+                elif gain > 1e-5:
+                    distance = (threshold-margin)*.05/gain
+                else:
+                    continue
+                replacement_geometry_order.append(dict(sensor_id=int(sid), rank=int(rank),
+                    margin_m=float(margin), probe_gain_m=float(gain), approach_joint_proxy=float(distance)))
+            if replacement_geometry_order:
+                chosen = min(replacement_geometry_order,
+                    key=lambda row:(row['approach_joint_proxy'], -float(seed_scores[row['sensor_id']]), row['rank']))
+                selection = [(chosen['rank'], chosen['sensor_id'])]
             replacement_group_priority['selected_sensor_id'] = (
                 int(selection[0][1]) if selection else -1)
 
@@ -1098,14 +1257,34 @@ class PerSensorVisibilityRuntime:
                                   'minimum_conservative_g', self.min_conservative_g)))
 
         for rank, sensor_id in selection:
+            if first_accepted is not None and rejoin_diagnostic['enabled']:
+                elapsed = time.perf_counter() - rejoin_start
+                possible = alternative_can_improve(first_accepted['task_rejoin_cost'], task_rejoin, elapsed)
+                rejoin_diagnostic.setdefault('alternative_decisions', []).append(dict(
+                    next_sensor_id=int(sensor_id), elapsed_after_acceptance_ms=1000.*elapsed,
+                    proxy_can_improve=possible))
+                if (os.environ.get('CARE_COMPLETION_PRUNE_ENABLED', 'false').lower() == 'true'
+                        and not possible):
+                    rejoin_diagnostic['alternative_pruned'] = dict(
+                        reason='direct_return_proxy_cannot_beat_first_after_elapsed_compute',
+                        next_sensor_id=int(sensor_id), remaining_declared_branches=len(selection)-len(attempts))
+                    break
             branch_tic = time.perf_counter()
-            branch = self._optimize_branch(
-                points, branch_seed, int(sensor_id)
-            )
-            geometry = self._candidate_geometry(
-                points_np, branch["q_candidate"], int(sensor_id),
-                minimum_conservative_g=geometry_threshold,
-            )
+            try:
+                if replacement is None:
+                    branch = self._optimize_branch(points, branch_seed, int(sensor_id))
+                else:
+                    branch = self._optimize_branch(points, branch_seed, int(sensor_id),
+                        geometry_guided=True,geometry_threshold=geometry_threshold)
+                geometry = self._candidate_geometry(
+                    points_np, branch["q_candidate"], int(sensor_id),
+                    minimum_conservative_g=geometry_threshold,
+                )
+            except Exception as exc:
+                if first_accepted is None or not rejoin_diagnostic['enabled']:
+                    raise
+                rejoin_diagnostic['alternative_error'] = str(exc)
+                break
             attempt = dict(branch)
             attempt["rank"] = int(rank)
             attempt["geometry"] = geometry
@@ -1114,8 +1293,36 @@ class PerSensorVisibilityRuntime:
             attempt["branch_latency_ms"] = 1000.0 * (time.perf_counter() - branch_tic)
             attempts.append(attempt)
             if bool(geometry["accepted"]):
-                selected = attempt
-                break
+                if first_accepted is None:
+                    first_accepted = selected = attempt
+                    rejoin_start = time.perf_counter()
+                if not rejoin_diagnostic['enabled']:
+                    break
+                pose = fk_transform(self.task_ee_chain,
+                    q_row_to_map(DEFAULT_JOINT_NAMES, branch['q_candidate']))
+                cost = candidate_cost(branch['q_candidate'], task_rejoin, pose, task_pose)
+                try:
+                    approach_order=approach_visibility_order(self,points_np,task_rejoin['q_start'],
+                        branch['q_candidate'],int(sensor_id))
+                except Exception as exc:
+                    approach_order=dict(status='unavailable',reason=str(exc))
+                cost['approach_visibility_order']=approach_order
+                if approach_order['status']=='valid':cost['approach_requires_detour']=approach_order['requires_detour']
+                attempt['branch_latency_ms'] = 1000.*(time.perf_counter()-branch_tic)
+                attempt['task_rejoin_cost'] = cost
+                rejoin_diagnostic['candidates'].append(dict(sensor_id=int(sensor_id), **cost))
+                if attempt is not first_accepted and improves_candidate(cost,
+                        first_accepted['task_rejoin_cost'], time.perf_counter()-rejoin_start):
+                    selected = attempt
+                    rejoin_diagnostic['selected_by'] = ('sampled_observation_before_entry' if
+                        first_accepted['task_rejoin_cost'].get('approach_requires_detour') is True and
+                        cost.get('approach_requires_detour') is False else 'bounded_task_rejoin_improvement')
+                    break
+
+        rejoin_diagnostic['first_accepted_sensor_id'] = (
+            int(first_accepted['sensor_id']) if first_accepted is not None else -1)
+        rejoin_diagnostic['extra_compute_ms'] = (
+            1000.*(time.perf_counter()-rejoin_start) if rejoin_start is not None else 0.)
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
@@ -1156,7 +1363,10 @@ class PerSensorVisibilityRuntime:
             "attempts": attempts,
             "replacement_diversity": diversity,
             "replacement_group_priority": replacement_group_priority,
+            "replacement_score_override": replacement_score_override,
+            "replacement_geometry_order": replacement_geometry_order,
             "sensor_priority": sensor_priority,
+            "task_rejoin": rejoin_diagnostic,
             "rejected_sensor_ids": [
                 int(a["sensor_id"])
                 for a in attempts
@@ -1167,6 +1377,7 @@ class PerSensorVisibilityRuntime:
                 "branch_solver": (
                     "per_head_projection_root_ascent_from_branch_seed"
                 ),
+                "allow_nominal_proposals": getattr(self, 'allow_nominal_proposals', False),
                 "projection_iters": self.projection_iters,
                 "projection_damping": self.projection_damping,
                 "projection_epsilon_f": self.projection_epsilon_f,

@@ -1,0 +1,6 @@
+{
+  "upstream_commit": "de79713d37fb38560a187ac0c3e1b034f35a13fb",
+  "upstream_header_sha256": "bfd33a9750f8328890717d3ff1a305bb305f8b16654fe6724c50a712850c3a33",
+  "patched_header_sha256": "574917197b6cf1a83ffadbc50e4d95ca58e25ef845c604f6c1e26ff5d8a1560a",
+  "purpose": "Avoid reading unused finite-bound indices during dual recovery"
+}

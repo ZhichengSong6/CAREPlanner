@@ -1,0 +1,41 @@
+{
+  "note": "Weights removed from the Git index only; local copies are retained. Prior commits are not rewritten.",
+  "models": [
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/best.pt",
+      "bytes": 8864362,
+      "sha256": "9696fb5ca49d508180193990e532d84af59b70545a4f7e55d2b06a4d97bc5a4e",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    },
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt",
+      "bytes": 8864094,
+      "sha256": "fea15cb71b278b9d003337d200f3796ccbbe8a59106287a8ea85abb2c89cb0df",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    },
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed_globalcdf_aux05/best.pt",
+      "bytes": 8864746,
+      "sha256": "2703ff9b4a8dadb903c54f9d485c662c7fe65aa2aa478ade3d82568e1881ae31",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    },
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed_globalcdf_aux05/final.pt",
+      "bytes": 8864478,
+      "sha256": "e1a6824e92851b67e65a40b671922894138247ab7c01dcefe84a66faa0d9024c",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    },
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed_globalcdf_aux10/best.pt",
+      "bytes": 8864746,
+      "sha256": "c65dad1a4beedd11acd1844cc0ffe0dc3fc4d5e6d4739ce1ceb341d4896ee391",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    },
+    {
+      "path": "src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed_globalcdf_aux10/final.pt",
+      "bytes": 8864478,
+      "sha256": "bf4e24bbc48a80e4eef46ee80d34476d1f8c43946bbe63359cd0366cb5e7ec3a",
+      "available_from_commit": "b8e234e10f64f9e812cb1c60643d2e1b544a741e"
+    }
+  ]
+}

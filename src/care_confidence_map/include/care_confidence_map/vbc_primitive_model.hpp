@@ -6,6 +6,7 @@
 #include <pinocchio/multibody/model.hpp>
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -24,6 +25,27 @@ struct VbcPrimitiveFrame {
 
 class VbcPrimitiveModel {
  public:
+  // One immutable audit owns this cache and the caller's original FK ledger.
+  // Covers depend on exact geometry/point/floor, never on map classification.
+  struct ProofInterval {
+    Eigen::VectorXd a,b,c;
+    int depth=0;
+    double slack=0.;
+  };
+  struct ProofCover {
+    std::vector<ProofInterval> leaves;
+    double sampled_upper=std::numeric_limits<double>::infinity();
+  };
+  struct ProofFkCache {
+    const VbcPrimitiveModel* model = nullptr;
+    const TrajectoryRiskEvaluator* evaluator = nullptr;
+    unsigned long long geometry_revision=0;
+    std::map<std::vector<double>,VbcPrimitiveFrame> frames;
+    std::map<std::vector<double>,ProofCover> covers;
+    std::size_t cover_leaves=0;
+    int cover_hits=0, last_weak_interval=-1;
+    int hits = 0, misses = 0;
+  };
   bool load(const std::string& urdf_file, const std::vector<std::string>& ignored_links,
             std::string* error);
   bool computeTrajectory(const TrajectoryRiskEvaluator& fk,
@@ -35,9 +57,37 @@ class VbcPrimitiveModel {
       const std::vector<Eigen::VectorXd>& q, const std::vector<int>& indices,
       const std::vector<double>& times, std::vector<VbcPrimitiveFrame>* out,
       std::vector<int>* out_indices, std::vector<double>* out_times,
-      std::string* error, bool use_motion_bounds = false) const;
+      std::string* error, bool use_motion_bounds = true,
+      const std::vector<Eigen::VectorXd>& curvature = {}) const;
   std::vector<double> displacementBounds(const std::vector<std::string>& names,
       const Eigen::VectorXd& delta) const;
+
+  // A bounded exclusion proof for one grid center in the nominal linear sweep.
+  // True means EVERY interval/solid is farther than margin. Ambiguous geometry,
+  // invalid inputs, depth limits and exhausted FK budget all return false.
+  // Callers must retain their original enclosure on false; measured-body audit
+  // poses are separate from the nominal trajectory and are not covered here.
+  bool provePointOutsideContinuousTrajectory(const TrajectoryRiskEvaluator& fk,
+      const std::vector<Eigen::VectorXd>& q, const Eigen::Vector3d& point,
+      double margin, int* remaining_fk,
+      const std::vector<Eigen::VectorXd>& curvature = {},
+      double* proved_clearance = nullptr) const;
+  // Same proof and budget accounting, with a diagnostic-only failure reason.
+  bool provePointOutsideContinuousTrajectory(const TrajectoryRiskEvaluator& fk,
+      const std::vector<Eigen::VectorXd>& q, const Eigen::Vector3d& point,
+      double margin, int* remaining_fk,
+      const std::vector<Eigen::VectorXd>& curvature,
+      double* proved_clearance, std::string* diagnostic) const;
+  // Optional clearance quality refinement starts only after full exclusion.
+  // With a positive target, true may return a smaller proved clearance: every
+  // interval remains covered when optional refinement runs out of FK work.
+  bool provePointOutsideContinuousTrajectory(const TrajectoryRiskEvaluator& fk,
+      const std::vector<Eigen::VectorXd>& q, const Eigen::Vector3d& point,
+      double margin, int* remaining_fk,
+      const std::vector<Eigen::VectorXd>& curvature,
+      double* proved_clearance, std::string* diagnostic, ProofFkCache* cache,
+      double desired_clearance = 0.,
+      const std::function<bool()>& may_refine = {}) const;
 
   // Configuration-aware runtime body displacement.  Each returned value is a
   // conservative bound for one primitive between q_measured and q_reference:
@@ -53,6 +103,7 @@ class VbcPrimitiveModel {
       const Eigen::VectorXd& q_reference) const;
 
  private:
+  unsigned long long geometry_revision_=0;
   std::vector<std::string> frames_;
   std::vector<VbcPrimitive> primitives_;
   std::vector<std::map<std::string, double>> joint_radii_;
@@ -72,7 +123,8 @@ struct VbcGrid {
 };
 
 // Grid-center rasterization of static poses or conservative interval enclosures.
-// Continuous coverage requires frames from computeContinuousTrajectory; this
+// Continuous coverage requires computeContinuousTrajectory with motion bounds;
+// explicitly disabling them is for offline sampling comparisons only. This
 // does not certify voxel-cube intersections or unmodelled actuator motion.
 // Template output keeps the selector's evidence/temporal pipeline unchanged.
 template <class Voxel>

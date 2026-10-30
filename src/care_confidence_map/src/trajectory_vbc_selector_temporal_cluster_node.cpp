@@ -1,9 +1,14 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
 #include <care_confidence_map/QueryConfidence.h>
+#include <care_confidence_map/QueryConfidenceSnapshot.h>
 #include <care_confidence_map/vbc_evidence.hpp>
 #include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/initial_shell_recovery.hpp>
+#include <care_confidence_map/trajectory_motion.hpp>
+#include <boost/property_tree/json_parser.hpp>
 
 #include <ros/ros.h>
+#include <ros/callback_queue.h>
 
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PointStamped.h>
@@ -30,8 +35,9 @@
 // C4.3 selector with bounded temporal clustering.
 //
 // VBC candidates are confidence-map voxel centers inside the configured body
-// geometry at evaluated trajectory knots. Backend defaults to legacy samples;
-// primitive uses exact URDF solids. VBC margin is independent of GCDF inflation.
+// geometry. Primitive sweeps enclose every original piecewise-linear interval,
+// including its endpoints; samples retain their legacy discrete semantics.
+// VBC margin is independent of GCDF inflation.
 // Every low-confidence swept voxel is then evaluated independently with analytic
 // VBC. Steering semantics
 // are coarser: violating candidates are first grouped into ordered temporal
@@ -45,16 +51,48 @@ class TrajectoryVbcTemporalClusterNode
   friend struct VbcPrimitiveTest;
   friend struct VbcPrimitiveReplay;
 public:
-  TrajectoryVbcTemporalClusterNode() : nh_(), pnh_("~") {}
+  TrajectoryVbcTemporalClusterNode() : nh_(), pnh_("~"), measured_spinner_(1,&measured_queue_) {}
+  ~TrajectoryVbcTemporalClusterNode() { measured_spinner_.stop(); }
 
   bool initialize()
   {
     loadParams();
+    // Midpoints without displacement bounds can skip initial shell points.
+    // Keep that ablation in the offline geometry API, never a live verifier.
+    if (geometry_backend_ == "primitive" && !continuous_motion_bound_enabled_) {
+      ROS_ERROR("Primitive VBC requires continuous_motion_bound_enabled=true; sampled-only verification is unsupported");
+      return false;
+    }
     pnh_.param("trajectory_vbc/include_measured_body", include_measured_body_, false);
-    if (include_measured_body_) measured_sub_=nh_.subscribe<sensor_msgs::JointState>(
-        "/care_arm/joint_states",1,[this](const sensor_msgs::JointStateConstPtr& msg) {
-          std::lock_guard<std::mutex> lock(mutex_); latest_measured_=msg;
-        });
+    pnh_.param("trajectory_vbc/initial_shell_recovery_enabled", initial_shell_recovery_enabled_, false);
+    pnh_.param("trajectory_vbc/initial_shell_execution_margin_m", shell_execution_margin_m_, 0.);
+    pnh_.param("trajectory_vbc/initial_shell_occupied_margin_m", shell_occupied_margin_m_, 0.);
+    if (initial_shell_recovery_enabled_ && (geometry_backend_!="primitive" ||
+        !std::isfinite(shell_execution_margin_m_) || shell_execution_margin_m_<0. ||
+        shell_execution_margin_m_>=swept_volume_margin_m_ || !std::isfinite(shell_occupied_margin_m_))) return false;
+    if (include_measured_body_ || initial_shell_recovery_enabled_) {
+      // Receive state while the serialized verifier performs FK and map RPCs.
+      // Only this immutable pointer is updated here; geometry, evidence and the
+      // per-audit FK ledger stay on the original single verification queue.
+      auto options=ros::SubscribeOptions::create<sensor_msgs::JointState>(
+          "/care_arm/joint_states",1,[this](const sensor_msgs::JointStateConstPtr& msg) {
+            std::lock_guard<std::mutex> lock(mutex_);latest_measured_=msg;
+          },ros::VoidConstPtr(),&measured_queue_);
+      measured_sub_=nh_.subscribe(options);
+      measured_spinner_.start();
+    }
+    if (initial_shell_recovery_enabled_) {
+      recovery_context_sub_=nh_.subscribe<std_msgs::String>(
+          predicted_trajectory_topic_+"/initial_shell_context",4,
+          &TrajectoryVbcTemporalClusterNode::recoveryContextCallback,this);
+      recovery_quality_sub_=nh_.subscribe<std_msgs::String>(
+          predicted_trajectory_topic_+"/initial_shell_quality",4,
+          &TrajectoryVbcTemporalClusterNode::recoveryQualityCallback,this);
+      recovery_protocol_pub_=nh_.advertise<std_msgs::String>(
+          predicted_trajectory_topic_+"/protocol_status",8,false);
+      shell_diagnostic_pub_=nh_.advertise<std_msgs::String>(
+          predicted_trajectory_topic_+"/initial_shell_diagnostic",32,false);
+    }
 
     std::string error_msg;
     if (geometry_backend_ != "samples" && geometry_backend_ != "primitive")
@@ -131,6 +169,8 @@ public:
     confidence_query_client_ =
         nh_.serviceClient<care_confidence_map::QueryConfidence>(
             confidence_query_service_, confidence_query_persistent_);
+    if(initial_shell_recovery_enabled_) shell_snapshot_client_=nh_.serviceClient<care_confidence_map::QueryConfidenceSnapshot>(
+        confidence_query_service_+"_snapshot");
 
     bool tcp_nodelay = false;
     pnh_.param("trajectory_vbc/tcp_nodelay", tcp_nodelay, false);
@@ -210,6 +250,13 @@ private:
     int source_collision_index = -1;
     std::string source_collision_name;
     double primitive_signed_distance_m = std::numeric_limits<double>::quiet_NaN();
+    std::string refinement_status = "not_applicable";
+    int refinement_fk_before = -1, refinement_fk_after = -1;
+    double candidate_margin_m = std::numeric_limits<double>::quiet_NaN();
+    double initial_support_distance_m = std::numeric_limits<double>::quiet_NaN();
+    bool initial_support_unknown = false;
+    bool initial_shell_certified = false;
+    bool full_path_excluded = false;
     Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
     double raw_sample_radius_m = 0.0;
     double swept_radius_m = 0.0;
@@ -290,7 +337,634 @@ private:
         << " total_eval_ms=" << current_eval_timing_.total_eval_ms
         << " predicted_periodic_skip_count=" << predicted_periodic_skip_count_
         << " predicted_periodic_refresh_count=" << predicted_periodic_refresh_count_;
+    oss << " shell_recovery_count=" << shell_recovery_count_
+        << " shell_recovery_evidence=" << shell_recovery_evidence_
+        << " context_request_session=" << current_context_session_
+        << " context_request_sequence=" << current_context_sequence_
+        << " context_prefix_session=" << current_prefix_session_
+        << " context_prefix_revision=" << current_prefix_revision_
+        << " context_prefix_s=" << current_prefix_s_
+        << " wire_header_seq=" << current_eval_wire_seq_;
     return oss.str();
+  }
+
+  void recoveryContextCallback(const std_msgs::StringConstPtr& msg) {
+    if (!msg || msg->data.size()>256*1024) return;
+    try {
+      boost::property_tree::ptree t;
+      std::istringstream in(msg->data); boost::property_tree::read_json(in,t);
+      const auto stamp=t.get<unsigned long long>("trajectory_stamp_ns");
+      if (!stamp) return;
+      trajectory_msgs::JointTrajectory pending;
+      bool recheck=false;
+      {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto old=recovery_contexts_.find(stamp);
+        const bool conflict=old!=recovery_contexts_.end() && old->second!=msg->data;
+        const bool first=old==recovery_contexts_.end();
+        // Once an identity has conflicting contents it stays invalid, including
+        // after a later duplicate of the first message. No certificate ratchet.
+        if(conflict) old->second.clear();
+        else recovery_contexts_[stamp]=msg->data;
+        while (recovery_contexts_.size()>64) recovery_contexts_.erase(recovery_contexts_.begin());
+        recheck=(first || conflict) && has_predicted_traj_ && !force_bootstrap_ &&
+            latest_predicted_traj_.header.stamp.toNSec()==stamp;
+        if(recheck)pending=latest_predicted_traj_;
+      }
+      if(recheck)evaluate(pending,"predicted","recovery_context_callback");
+    } catch (...) {
+      ROS_WARN_THROTTLE(1.,"[VBC_PROTOCOL] malformed context without usable audit identity");
+    }
+  }
+
+  void recoveryQualityCallback(const std_msgs::StringConstPtr& msg) {
+    if(!msg || msg->data.size()>2048)return;
+    try {
+      boost::property_tree::ptree t;std::istringstream in(msg->data);boost::property_tree::read_json(in,t);
+      for(const auto* key:{"schema","trajectory_stamp_ns","request_session","request_sequence","required_residual_m"})
+        if(t.count(key)!=1)return;
+      const auto stamp=t.get<unsigned long long>("trajectory_stamp_ns");
+      const double target=t.get<double>("required_residual_m");
+      const double reply=t.get<double>("reply_allowance_s",.003);
+      if(t.get<int>("schema")!=1 || !stamp || !std::isfinite(target) || target<=0. || target>1.)return;
+      if(t.count("reply_allowance_s")>1 || !std::isfinite(reply) || reply<.001 || reply>.01)return;
+      std::lock_guard<std::mutex> lock(mutex_);
+      const auto context=recovery_contexts_.find(stamp);
+      if(context==recovery_contexts_.end() || context->second.empty())return;
+      boost::property_tree::ptree c;std::istringstream raw(context->second);boost::property_tree::read_json(raw,c);
+      const auto now=ros::Time::now().toNSec();
+      if(c.get<std::string>("request_session")!=t.get<std::string>("request_session") ||
+          c.get<unsigned long long>("request_sequence")!=t.get<unsigned long long>("request_sequence") ||
+          now<stamp || now>c.get<unsigned long long>("deadline_ns"))return;
+      recovery_quality_[stamp]=std::max(recovery_quality_[stamp],target);
+      recovery_reply_allowance_[stamp]=std::max(recovery_reply_allowance_[stamp],reply);
+      while(recovery_quality_.size()>64)recovery_quality_.erase(recovery_quality_.begin());
+      while(recovery_reply_allowance_.size()>64)recovery_reply_allowance_.erase(recovery_reply_allowance_.begin());
+    } catch(...) {}
+  }
+
+  bool recoveryContext(const trajectory_msgs::JointTrajectory& traj,
+                       bool* eligible, Eigen::VectorXd* acceleration) {
+    *eligible=false;
+    current_shared_budget_=false;
+    current_geometric_restore_=false; current_margin_recovery_=false; geometric_restore_points_.clear();
+    current_proof_resource_evidence_="none";
+    current_restore_mode_epoch_.clear();current_restore_observation_token_.clear();
+    current_context_state_="invalid";
+    current_context_reason_="malformed_context";
+    current_context_session_="none";current_context_sequence_=0;
+    current_prefix_session_="none";current_prefix_revision_=0;current_prefix_s_=0.;
+    auto reject=[this](const std::string& reason) {
+      current_context_reason_=reason;return false;
+    };
+    std::string raw;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto it=recovery_contexts_.find(traj.header.stamp.toNSec());
+      if(it==recovery_contexts_.end()) {
+        current_context_state_="waiting";return reject("missing_context");
+      }
+      raw=it->second;
+    }
+    if(raw.empty())return reject("conflicting_context");
+    try {
+      boost::property_tree::ptree t;
+      std::istringstream in(raw); boost::property_tree::read_json(in,t);
+      for (const auto& name:{"schema","trajectory_stamp_ns","request_session","request_sequence","frame","deadline_ns","kind","q","times_s","joint_names"})
+        if(t.count(name)!=1)return reject("missing_or_duplicate_field");
+      if(t.get<int>("schema")!=2 && t.get<int>("schema")!=3)return reject("unsupported_schema");
+      current_context_session_=t.get<std::string>("request_session");
+      current_context_sequence_=t.get<unsigned long long>("request_sequence");
+      if(current_context_session_.empty() || current_context_session_.size()>80 || !current_context_sequence_ ||
+          !std::all_of(current_context_session_.begin(),current_context_session_.end(),[](unsigned char c) {
+            return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9') || c=='_' || c=='-';
+          })) {current_context_session_="none";return reject("invalid_business_identity");}
+      const auto now=ros::Time::now().toNSec();
+      const auto deadline=t.get<unsigned long long>("deadline_ns");
+      // Header.seq is a ROS topic counter, not the application request identity.
+      // Bind the immutable stamp and exact content even when a preceding request
+      // was cancelled or rejected before it reached this publisher.
+      if(t.get<unsigned long long>("trajectory_stamp_ns")!=traj.header.stamp.toNSec())return reject("audit_stamp_mismatch");
+      if(t.get<std::string>("frame")!=traj.header.frame_id)return reject("context_frame_mismatch");
+      if(now<traj.header.stamp.toNSec() || now>deadline || deadline<traj.header.stamp.toNSec() ||
+          deadline-traj.header.stamp.toNSec()>500000000ULL)return reject("context_deadline_invalid");
+      if (
+          t.get_child("q").size()!=traj.points.size() || t.get_child("times_s").size()!=traj.points.size() ||
+          t.get_child("joint_names").size()!=traj.joint_names.size() || traj.joint_names!=evaluator_.activeJointNames())return reject("context_shape_mismatch");
+      std::size_t i=0;
+      for(const auto& name:t.get_child("joint_names")) {
+        if(!name.first.empty() || name.second.get_value<std::string>()!=traj.joint_names.at(i++))return reject("context_joint_mismatch");
+      }
+      i=0;
+      for(const auto& row:t.get_child("q")) {
+        if(!row.first.empty() || row.second.size()!=traj.joint_names.size())return reject("context_shape_mismatch");
+        std::size_t j=0;
+        for(const auto& v:row.second) {
+          const double x=v.second.get_value<double>();
+          if(!v.first.empty() || !std::isfinite(x) || std::abs(x-traj.points.at(i).positions.at(j++))>1e-12)return reject("context_q_mismatch");
+        }
+        ++i;
+      }
+      i=0;
+      for(const auto& time:t.get_child("times_s")) {
+        const double x=time.second.get_value<double>();
+        if(!time.first.empty() || !std::isfinite(x) || std::abs(x-traj.points.at(i++).time_from_start.toSec())>1e-12)return reject("context_time_mismatch");
+      }
+      if(t.get<int>("schema")==3) {
+        current_shared_budget_=true;
+        if(t.count("v")!=1)return reject("context_velocity_shape");
+        const auto& velocities=t.get_child("v");
+        if(velocities.size()!=traj.points.size())return reject("context_velocity_shape");
+        std::size_t k=0;
+        for(const auto& row:velocities) {
+          if(row.second.size()!=traj.points[k].velocities.size())return reject("context_velocity_shape");
+          std::size_t j=0;
+          for(const auto& item:row.second) {
+            const double x=item.second.get_value<double>();
+            if(!std::isfinite(x) || x!=traj.points[k].velocities[j++])return reject("context_velocity_mismatch");
+          }
+          ++k;
+        }
+      }
+      if (t.count("planned_prefix")>1)return reject("duplicate_prefix_contract");
+      if (t.count("planned_prefix")) {
+        const auto& c=t.get_child("planned_prefix");
+        if(c.size()!=7)return reject("invalid_prefix_contract");
+        for(const auto& name:{"schema","session","revision","prefix_s","acceleration","brake_dt_s","brake_steps"})
+          if(c.count(name)!=1)return reject("invalid_prefix_contract");
+        const auto session=c.get<std::string>("session");
+        const auto revision=c.get<unsigned long long>("revision");
+        const double prefix=c.get<double>("prefix_s");
+        if(c.get<int>("schema")!=1 || session.size()!=32 || !revision ||
+            !std::all_of(session.begin(),session.end(),[](char x){return (x>='0'&&x<='9')||(x>='a'&&x<='f');}) ||
+            !std::isfinite(prefix) || prefix<=0. || traj.points.empty() || prefix>traj.points.back().time_from_start.toSec() ||
+            c.get<double>("brake_dt_s")!=t.get<double>("brake_dt_s") ||
+            c.get<int>("brake_steps")!=t.get<int>("brake_steps") ||
+            c.get_child("acceleration").size()!=traj.joint_names.size() ||
+            t.get_child("acceleration").size()!=traj.joint_names.size())return reject("invalid_prefix_contract");
+        auto a=t.get_child("acceleration").begin();
+        for(const auto& v:c.get_child("acceleration")) {
+          const double x=v.second.get_value<double>();
+          if(!v.first.empty() || !std::isfinite(x) || x<=0. || x!=(a++)->second.get_value<double>())return reject("prefix_parameters_mismatch");
+        }
+        current_prefix_session_=session;current_prefix_revision_=revision;current_prefix_s_=prefix;
+      }
+      const auto kind=t.get<std::string>("kind");
+      if(kind=="ordinary") {current_context_state_="validated";current_context_reason_="exact_content_bound";return true;}
+      if(kind=="geometric_restore") {
+        if(t.count("geometric_restore")!=1 || t.get<int>("schema")!=3 || current_prefix_session_=="none")
+          return reject("invalid_geometric_restore_identity");
+        const auto& r=t.get_child("geometric_restore");
+        for(const auto& name:{"schema","raw_candidate_stamp_ns","query_stamp_ns","mode_epoch","observation_token","points"})
+          if(r.count(name)!=1)return reject("invalid_geometric_restore_identity");
+        const auto query=r.get<unsigned long long>("query_stamp_ns");
+        const int restore_schema=r.get<int>("schema");
+        const auto query_time=restore_schema==2 ? r.get<unsigned long long>("query_ros_ns") : query;
+        const auto raw_stamp=r.get<unsigned long long>("raw_candidate_stamp_ns");
+        const auto token=r.get<std::string>("observation_token");
+        const bool margin_recovery=r.count("margin_recovery")==1;
+        if(margin_recovery && (restore_schema!=2 || r.get<std::string>("margin_recovery")!="true"))
+          return reject("invalid_margin_recovery_intent");
+        if((restore_schema!=1 && restore_schema!=2) || r.size()!=std::size_t((restore_schema==2 ? 7 : 6)+(margin_recovery ? 1 : 0)) ||
+            (restore_schema==2 && r.count("query_ros_ns")!=1) || !r.get<unsigned long long>("mode_epoch") ||
+            !query || !query_time || query_time>raw_stamp || raw_stamp>traj.header.stamp.toNSec() || now<query_time || now-query_time>1000000000ULL ||
+            token.compare(0,12,"care_obs_v1_")!=0 || token.size()>120 ||
+            r.get_child("points").empty() || r.get_child("points").size()>32)
+          return reject("invalid_geometric_restore_identity");
+        for(const auto& row:r.get_child("points")) {
+          if(!row.first.empty() || row.second.size()!=3)return reject("invalid_geometric_restore_points");
+          Eigen::Vector3d p;int j=0;
+          for(const auto& x:row.second) {if(!x.first.empty())return reject("invalid_geometric_restore_points");p[j++]=x.second.get_value<double>();}
+          if(!p.allFinite() || std::any_of(geometric_restore_points_.begin(),geometric_restore_points_.end(),
+              [&](const Eigen::Vector3d& old){return (old-p).lpNorm<Eigen::Infinity>()<=1e-5;}))
+            return reject("invalid_geometric_restore_points");
+          geometric_restore_points_.push_back(p);
+        }
+        current_geometric_restore_=true;
+        current_margin_recovery_=margin_recovery;
+        current_restore_mode_epoch_=r.get<std::string>("mode_epoch");
+        current_restore_observation_token_=token;
+      }
+      if((kind!="repair_prefix_brake_hold" && kind!="geometric_restore") || t.count("acceleration")!=1 ||
+          t.get<double>("brake_dt_s")!=.05 || t.get<int>("brake_steps")!=20 ||
+          t.get_child("acceleration").size()!=traj.joint_names.size())return reject("invalid_recovery_parameters");
+      acceleration->resize(traj.joint_names.size());i=0;
+      for(const auto& a:t.get_child("acceleration"))(*acceleration)[i++]=a.second.get_value<double>();
+      if(!acceleration->allFinite() || (acceleration->array()<=0.).any())return reject("invalid_recovery_parameters");
+      *eligible=true;current_context_state_="validated";current_context_reason_="exact_content_bound";return true;
+    } catch (...) { return reject("malformed_context"); }
+  }
+
+  void publishRecoveryProtocol(const trajectory_msgs::JointTrajectory& traj) {
+    const auto stamp=traj.header.stamp.toNSec();
+    const auto value=current_context_state_+":"+current_context_reason_;
+    if(recovery_protocol_states_[stamp]==value)return;
+    recovery_protocol_states_[stamp]=value;
+    while(recovery_protocol_states_.size()>64)recovery_protocol_states_.erase(recovery_protocol_states_.begin());
+    std::ostringstream out;
+    out<<"trajectory_stamp_ns="<<stamp<<" state="<<current_context_state_
+        <<" reason="<<current_context_reason_<<" request_session="<<current_context_session_
+        <<" request_sequence="<<current_context_sequence_<<" wire_header_seq="<<traj.header.seq
+        <<" path_counterexample_evidence="<<current_shell_path_counterexample_evidence_
+        <<" proof_resource_evidence="<<current_proof_resource_evidence_;
+    std_msgs::String msg;msg.data=out.str();recovery_protocol_pub_.publish(msg);
+    if(current_context_state_!="validated")ROS_WARN_STREAM("[VBC_PROTOCOL] "<<msg.data);
+  }
+
+  bool certifyInitialShell(std::vector<Candidate>* candidates,
+      const std::vector<Eigen::VectorXd>& q, const Eigen::VectorXd& acceleration,
+      int* remaining_fk, const std::vector<Eigen::VectorXd>& curves,
+      const trajectory_msgs::JointTrajectory& trajectory,
+      care_confidence_map::VbcPrimitiveModel::ProofFkCache& proof_fk_cache) {
+    current_shell_path_counterexample_=false;
+    current_shell_path_counterexample_evidence_="none";
+    current_proof_resource_evidence_="none";
+    // Diagnostics preserve the original decisions, identity and FK ledger.
+    const auto begin_wall=ros::WallTime::now();
+    const auto begin_ros=ros::Time::now();
+    const int fk_before=*remaining_fk;
+    const int cache_begin_hits=proof_fk_cache.hits,cache_begin_misses=proof_fk_cache.misses,
+        cover_begin_hits=proof_fk_cache.cover_hits;
+    struct ProvedMotion {
+      std::vector<Eigen::VectorXd> q, curves;
+      Eigen::Vector3d point;
+      double floor, slack;
+      std::string stage;
+      bool ordinary_unknown;
+      int weak_interval;
+    };
+    std::vector<ProvedMotion> proved_motions;
+    double residual_before=0., residual_after=0.;
+    int reserve_refinement_fk=0, reserve_refinement_attempts=0;
+    std::string residual_stage="none";
+    Eigen::Vector3d residual_point=Eigen::Vector3d::Zero();
+    double residual_floor=0.;
+    bool residual_ordinary_unknown=false;
+    int residual_interval=-1;
+    ros::Time measured_stamp,snapshot_stamp;
+    std::string stage="initial_support",proof_reason="none";
+    Eigen::Vector3d proof_point=Eigen::Vector3d::Zero();
+    double proof_floor=0., proof_occupancy=-1., proof_confidence=-1.;
+    bool proof_shell_point=false;
+    bool has_proof_point=false;
+    const auto finish=[&](const char* reason) {
+      // Only a fresh, complete mandatory work allowance may drive steering.
+      // A periodic replay of an already-spent audit cannot mint another event.
+      if(std::string(reason)=="continuous_proof_failed" &&
+          proof_reason=="fk_budget_exhausted" && fk_before==256 &&
+          *remaining_fk==0 && proof_fk_cache.misses==256 && has_proof_point &&
+          current_geometric_restore_) {
+        std::ostringstream evidence;
+        evidence<<std::setprecision(17)<<"{\"schema\":1,\"kind\":\"mandatory_proof_resource_exhausted\","
+            <<"\"trajectory_stamp_ns\":\""<<current_eval_stamp_ns_
+            <<"\",\"mode_epoch\":\""<<current_restore_mode_epoch_
+            <<"\",\"observation_token\":\""<<current_restore_observation_token_
+            <<"\",\"stage\":\""<<stage<<"\",\"floor_m\":"<<proof_floor
+            <<",\"point\":["<<proof_point.x()<<','<<proof_point.y()<<','<<proof_point.z()
+            <<"],\"fk_before\":256,\"fk_spent\":256,\"fk_remaining\":0"
+            <<",\"ordinary_unknown\":"<<((stage=="map_path_proof" && !proof_shell_point &&
+                proof_occupancy>=0. && proof_occupancy<=.5 && proof_confidence>=0. &&
+                proof_confidence<=frontier_confidence_threshold_ && proof_floor==swept_volume_margin_m_)?"true":"false")<<'}';
+        current_proof_resource_evidence_=evidence.str();
+      }
+      current_shell_path_counterexample_=std::string(reason)=="continuous_proof_failed" &&
+          proof_reason=="distance_within_margin" &&
+          (stage=="map_path_proof" || stage=="support_path_proof");
+      if(current_shell_path_counterexample_ && stage=="map_path_proof" &&
+          !proof_shell_point && proof_occupancy>=0. && proof_occupancy<=.5 &&
+          proof_confidence>=0. && proof_confidence<=frontier_confidence_threshold_ &&
+          proof_floor==swept_volume_margin_m_) {
+        std::ostringstream evidence;
+        evidence<<std::setprecision(17)<<"{\"schema\":1,\"kind\":\"unknown_ordinary_path_floor\","
+            <<"\"trajectory_stamp_ns\":\""<<current_eval_stamp_ns_<<"\",\"floor_m\":"<<proof_floor
+            <<",\"point\":["<<proof_point.x()<<','<<proof_point.y()<<','<<proof_point.z()<<"]}";
+        current_shell_path_counterexample_evidence_=evidence.str();
+      }
+      const auto end=ros::Time::now();
+      std::ostringstream out;
+      out<<"trajectory_stamp_ns="<<current_eval_stamp_ns_
+          <<" request_session="<<current_context_session_
+          <<" request_sequence="<<current_context_sequence_
+          <<" result="<<reason<<" stage="<<stage<<" proof_reason="<<proof_reason
+          <<" begin_ros_ns="<<begin_ros.toNSec()<<" end_ros_ns="<<end.toNSec()
+          <<" measured_stamp_ns="<<measured_stamp.toNSec()
+          <<" snapshot_stamp_ns="<<snapshot_stamp.toNSec()
+          <<" measured_age_ms="<<(measured_stamp.isZero()?-1.:(end-measured_stamp).toSec()*1000.)
+          <<" snapshot_age_ms="<<(snapshot_stamp.isZero()?-1.:(end-snapshot_stamp).toSec()*1000.)
+          <<" wall_ms="<<wallMs(begin_wall)
+          <<" fk_before="<<fk_before<<" fk_after="<<*remaining_fk
+          <<" fk_cache_hits="<<proof_fk_cache.hits-cache_begin_hits<<" fk_cache_misses="<<proof_fk_cache.misses-cache_begin_misses
+          <<" fk_cache_total_misses="<<proof_fk_cache.misses<<" cover_hits="<<proof_fk_cache.cover_hits-cover_begin_hits
+          <<" residual_before_m="<<residual_before<<" residual_after_m="<<residual_after
+          <<" reserve_refinement_fk="<<reserve_refinement_fk
+          <<" reserve_refinement_attempts="<<reserve_refinement_attempts
+          <<" residual_stage="<<residual_stage<<" residual_floor_m="<<residual_floor
+          <<" residual_point="<<residual_point.x()<<','<<residual_point.y()<<','<<residual_point.z();
+      if(has_proof_point)out<<" proof_point="<<proof_point.x()<<','<<proof_point.y()<<','<<proof_point.z()
+          <<" proof_floor_m="<<proof_floor<<" proof_occupancy="<<proof_occupancy
+          <<" proof_confidence="<<proof_confidence<<" proof_shell_point="<<proof_shell_point;
+      std_msgs::String msg;msg.data=out.str();shell_diagnostic_pub_.publish(msg);
+      ROS_INFO_STREAM("[VBC_SHELL_CERT] "<<msg.data);
+      return std::string(reason)=="certified";
+    };
+    const auto prove=[&](const std::vector<Eigen::VectorXd>& motion,const Eigen::Vector3d& point,
+        double floor,const std::vector<Eigen::VectorXd>& bend,double* slack) {
+      proof_point=point;has_proof_point=true;proof_floor=floor;
+      const bool ok=primitive_model_.provePointOutsideContinuousTrajectory(evaluator_,motion,point,
+          floor,remaining_fk,bend,slack,&proof_reason,&proof_fk_cache);
+      if(ok)proved_motions.push_back({motion,bend,point,floor,*slack,stage,
+          stage=="map_path_proof" && !proof_shell_point && proof_occupancy>=0. && proof_occupancy<=.5 &&
+          proof_confidence>=0. && proof_confidence<=frontier_confidence_threshold_ && floor==swept_volume_margin_m_,
+          proof_fk_cache.last_weak_interval});
+      return ok;
+    };
+    std::vector<std::size_t> initial;
+    for(std::size_t i=0;i<candidates->size();++i)
+      if(candidates->at(i).initial_support_unknown)initial.push_back(i);
+    if(initial.empty())return finish("no_initial_support");
+    if(initial.size()>32)return finish("initial_support_limit");
+    stage="measured_state";
+    sensor_msgs::JointStateConstPtr measured;
+    {std::lock_guard<std::mutex> lock(mutex_);measured=latest_measured_;}
+    if(measured)measured_stamp=measured->header.stamp;
+    const auto now=ros::Time::now();
+    if(!measured || measured->header.stamp.isZero() ||
+        measured->position.size()!=measured->name.size() || measured->velocity.size()!=measured->name.size() ||
+        measured->name.size()!=q.front().size() || now<measured->header.stamp ||
+        (now-measured->header.stamp).toSec()>.05)return finish("measured_state_invalid_or_stale");
+    Eigen::VectorXd actual(q.front().size()), velocity(q.front().size());
+    for(int j=0;j<actual.size();++j) {
+      const auto& name=evaluator_.activeJointNames()[j];
+      if(std::count(measured->name.begin(),measured->name.end(),name)!=1)return finish("measured_joint_identity");
+      const auto k=std::distance(measured->name.begin(),std::find(measured->name.begin(),measured->name.end(),name));
+      actual[j]=measured->position[k];velocity[j]=measured->velocity[k];
+    }
+    if(!actual.allFinite() || !velocity.allFinite() || (actual-q.front()).lpNorm<Eigen::Infinity>()>.03)
+      return finish("measured_state_invalid_or_changed");
+    stage="initial_geometry";
+    std::vector<care_confidence_map::VbcPrimitiveFrame> actual_frames,end_frames;
+    std::string error;
+    if(!primitive_model_.computeTrajectory(evaluator_,{actual},&actual_frames,&error) ||
+        !primitive_model_.computeTrajectory(evaluator_,{q.back()},&end_frames,&error))return finish("initial_fk_failed");
+    std::map<CandidateKey,double> point_floors;
+    for(const auto i:initial) {
+      const auto& c=candidates->at(i);double d=1e9;
+      for(const auto& b:actual_frames.front().primitives)d=std::min(d,b.signedDistance(c.point_base));
+      double floor;bool recovering;
+      if(!shell_recovery_.floor(c.point_base,std::min(d,c.initial_support_distance_m),
+          swept_volume_margin_m_,shell_execution_margin_m_,&floor,&recovering,
+          current_margin_recovery_ && std::any_of(geometric_restore_points_.begin(),geometric_restore_points_.end(),
+              [&](const Eigen::Vector3d& p){return (p-c.point_base).lpNorm<Eigen::Infinity>()<=1e-5;})) ||
+          (!recovering && !current_geometric_restore_))return finish("initial_floor_rejected");
+      point_floors[care_confidence_map::InitialShellRecovery::key(c.point_base)]=floor;
+    }
+    const Eigen::VectorXd reference_velocity=velocity;
+    std::vector<Eigen::VectorXd> brake{actual};
+    std::vector<Eigen::VectorXd> brake_curves;
+    for(int step=0;step<20 && velocity.cwiseAbs().maxCoeff()>1e-6;++step) {
+      Eigen::VectorXd next=velocity;
+      for(int j=0;j<velocity.size();++j)next[j]=std::copysign(std::max(0.,std::abs(velocity[j])-acceleration[j]*.05),velocity[j]);
+      brake.push_back(brake.back()+.025*(velocity+next));
+      brake_curves.push_back(.05*(velocity-next)/8.);velocity=next;
+    }
+    if(velocity.cwiseAbs().maxCoeff()>1e-5)return finish("brake_steps_exhausted");
+    stage="brake_geometry";
+    // The measured stop is a distinct possible motion. Query its complete
+    // geometry too, including occupied voxel volumes, instead of checking
+    // only the points responsible for the nominal recovery request.
+    std::vector<int> indices;std::vector<double> times;
+    for(std::size_t k=0;k<brake.size();++k){indices.push_back(k);times.push_back(k*.05);}
+    std::vector<care_confidence_map::VbcPrimitiveFrame> brake_frames;
+    std::vector<int> brake_indices;std::vector<double> brake_times;
+    if(!primitive_model_.computeContinuousTrajectory(evaluator_,brake,indices,times,&brake_frames,&brake_indices,&brake_times,&error,true,brake_curves))return finish("brake_sweep_failed");
+    std::vector<Eigen::VectorXd> full_motion{actual};
+    full_motion.insert(full_motion.end(),q.begin(),q.end());
+    std::vector<Eigen::VectorXd> full_curves{Eigen::VectorXd::Zero(actual.size())};
+    full_curves.insert(full_curves.end(),curves.begin(),curves.end());
+    std::vector<int> full_indices;std::vector<double> full_times;
+    for(std::size_t k=0;k<full_motion.size();++k){full_indices.push_back(k);full_times.push_back(k*.05);}
+    std::vector<care_confidence_map::VbcPrimitiveFrame> full_frames;
+    std::vector<int> full_out_indices;std::vector<double> full_out_times;
+    if(!primitive_model_.computeContinuousTrajectory(evaluator_,full_motion,full_indices,full_times,
+        &full_frames,&full_out_indices,&full_out_times,&error,true,full_curves))return finish("full_sweep_failed");
+    brake_frames.insert(brake_frames.end(),full_frames.begin(),full_frames.end());
+    brake_indices.resize(brake_frames.size());brake_times.resize(brake_frames.size());
+    for(std::size_t k=0;k<brake_frames.size();++k){brake_indices[k]=k;brake_times[k]=k*.05;}
+    const double occupied_floor=.5*std::sqrt(3.)*map_resolution_+shell_occupied_margin_m_;
+    const double broad_margin=std::max(shell_execution_margin_m_,occupied_floor)+swept_volume_margin_m_-shell_execution_margin_m_;
+    std::vector<SweepVoxel> brake_voxels;
+    try { brake_voxels=care_confidence_map::buildPrimitiveSweptVoxels<SweepVoxel>(brake_frames,brake_indices,brake_times,
+        {{map_x_min_,map_y_min_,map_z_min_},{map_x_max_,map_y_max_,map_z_max_},map_resolution_},broad_margin); }
+    catch (...) { return finish("brake_voxel_build_failed"); }
+    // Declared restoration points need a current map classification even when
+    // they lie outside this motion's broad-phase enclosure.
+    for(const auto& p:geometric_restore_points_) {
+      if(std::none_of(brake_voxels.begin(),brake_voxels.end(),[&](const SweepVoxel& v){
+          return (v.point_base-p).lpNorm<Eigen::Infinity>()<=1e-5;})) {
+        SweepVoxel v;v.point_base=p;brake_voxels.push_back(v);
+      }
+    }
+    care_confidence_map::QueryConfidenceSnapshot snapshot;
+    stage="map_snapshot";
+    snapshot.request.horizon_s=0.;snapshot.request.minimum_confidence=frontier_confidence_threshold_;
+    for(const auto& v:brake_voxels) {
+      geometry_msgs::Point p;p.x=v.point_base.x();p.y=v.point_base.y();p.z=v.point_base.z();snapshot.request.points.push_back(p);
+    }
+    if(!shell_snapshot_client_.waitForExistence(ros::Duration(query_timeout_)) || !shell_snapshot_client_.call(snapshot))return finish("snapshot_rpc_failed");
+    const auto& s=snapshot.response;
+    snapshot_stamp=s.snapshot_stamp;
+    const double snapshot_age=(ros::Time::now()-s.snapshot_stamp).toSec();
+    if(!s.valid || s.clock_fault || s.frame!=base_frame_ || s.resolution!=map_resolution_ || s.instance.empty() ||
+        s.snapshot_stamp.isZero() || snapshot_age<0. || snapshot_age>.05 ||
+        s.inside_map.size()!=brake_voxels.size() || s.confidence_now.size()!=brake_voxels.size() ||
+        s.occupancy.size()!=brake_voxels.size())return finish("snapshot_invalid_or_stale");
+    double onset_budget=swept_volume_margin_m_-shell_execution_margin_m_;
+    double certified_residual=std::numeric_limits<double>::infinity();
+    for(std::size_t i=0;i<brake_voxels.size();++i) {
+      if(!s.inside_map[i]) {
+        if(std::any_of(geometric_restore_points_.begin(),geometric_restore_points_.end(),[&](const Eigen::Vector3d& p){
+            return (p-brake_voxels[i].point_base).lpNorm<Eigen::Infinity>()<=1e-5;}))return finish("restore_point_outside_map");
+        continue;
+      }
+      if(!std::isfinite(s.occupancy[i]) || !std::isfinite(s.confidence_now[i]) ||
+          s.occupancy[i]<0. || s.occupancy[i]>1. || s.confidence_now[i]<0. || s.confidence_now[i]>1.)return finish("invalid_map_values");
+      const bool occupied=s.occupancy[i]>.5;
+      if(!occupied && s.confidence_now[i]>frontier_confidence_threshold_)continue;
+      proof_occupancy=s.occupancy[i];proof_confidence=s.confidence_now[i];
+      proof_shell_point=point_floors.count(care_confidence_map::InitialShellRecovery::key(brake_voxels[i].point_base));
+      const double required=occupied ? occupied_floor : shell_execution_margin_m_;
+      double d=1e9;
+      for(const auto& b:actual_frames.front().primitives)d=std::min(d,b.signedDistance(brake_voxels[i].point_base));
+      onset_budget=std::min(onset_budget,d-required);
+      double slack;
+      stage="map_brake_proof";
+      if(!prove(brake,brake_voxels[i].point_base,required,brake_curves,&slack))return finish("continuous_proof_failed");
+      certified_residual=std::min(certified_residual,slack);
+      const auto point_floor=point_floors.find(care_confidence_map::InitialShellRecovery::key(brake_voxels[i].point_base));
+      const bool shell_point=point_floor!=point_floors.end();
+      const double path_floor=occupied ? occupied_floor : shell_point ? point_floor->second : swept_volume_margin_m_;
+      auto guarded_motion=full_motion;auto guarded_curves=full_curves;
+      if(!occupied && !shell_point) {
+        const auto observed=std::find_if(candidates->begin(),candidates->end(),[&](const Candidate& c){
+          return (c.point_base-brake_voxels[i].point_base).lpNorm<Eigen::Infinity>()<=1e-5 &&
+              c.nominally_visible && c.margin_s>=min_margin_s_;
+        });
+        // Preserve ordinary VBC's observation-before-entry permission. The
+        // geometric envelope protects the approach up to that observation;
+        // the ordinary deadline and measured execution verifier still apply.
+        if(observed!=candidates->end()) {
+          const std::size_t count=std::min(guarded_motion.size(),std::size_t(observed->see_eval_timestep+2));
+          guarded_motion.resize(count);guarded_curves.resize(count-1);
+        }
+      }
+      stage="map_path_proof";
+      if(!prove(guarded_motion,brake_voxels[i].point_base,path_floor,guarded_curves,&slack))return finish("continuous_proof_failed");
+      certified_residual=std::min(certified_residual,slack);
+      // This full measured-start path proof already establishes the optional
+      // ordinary-margin exclusion. A visibility-truncated or owned-floor
+      // proof cannot remove an observation candidate.
+      if(!occupied && !shell_point && path_floor==swept_volume_margin_m_ &&
+          guarded_motion.size()==full_motion.size())
+        for(auto& c:*candidates)
+          if((c.point_base-brake_voxels[i].point_base).lpNorm<Eigen::Infinity>()<=1e-5)
+            c.full_path_excluded=true;
+    }
+    if(onset_budget<=0. || !std::isfinite(onset_budget))return finish("onset_clearance_exhausted");
+    double actual_min=std::numeric_limits<double>::infinity();bool progress=false;
+    std::ostringstream points;points<<'[';bool first=true;
+    for(const auto i:initial) {
+      const auto& c=candidates->at(i);
+      double actual_d=1e9,end_d=1e9;
+      for(const auto& b:actual_frames.front().primitives)actual_d=std::min(actual_d,b.signedDistance(c.point_base));
+      for(const auto& b:end_frames.front().primitives)end_d=std::min(end_d,b.signedDistance(c.point_base));
+      double floor;bool recovering;
+      if(!shell_recovery_.floor(c.point_base,std::min(actual_d,c.initial_support_distance_m),
+          swept_volume_margin_m_,shell_execution_margin_m_,&floor,&recovering,
+          current_margin_recovery_ && std::any_of(geometric_restore_points_.begin(),geometric_restore_points_.end(),
+              [&](const Eigen::Vector3d& p){return (p-c.point_base).lpNorm<Eigen::Infinity>()<=1e-5;})) ||
+          (!recovering && !current_geometric_restore_))return finish("initial_floor_rejected");
+      double slack;
+      stage="support_path_proof";
+      if(!prove(q,c.point_base,floor,curves,&slack))return finish("continuous_proof_failed");
+      certified_residual=std::min(certified_residual,slack);
+      stage="support_onset_proof";
+      if(!prove({actual,q.front()},c.point_base,shell_execution_margin_m_,{},&slack))return finish("continuous_proof_failed");
+      certified_residual=std::min(certified_residual,slack);
+      stage="support_brake_proof";
+      if(!prove(brake,c.point_base,shell_execution_margin_m_,brake_curves,&slack))return finish("continuous_proof_failed");
+      certified_residual=std::min(certified_residual,slack);
+      actual_min=std::min(actual_min,actual_d);
+      progress=progress || end_d>c.initial_support_distance_m+care_confidence_map::InitialShellRecovery::tolerance_m() ||
+          (c.nominally_visible && c.see_time_s>0.) ||
+          (current_geometric_restore_ && (!recovering || current_margin_recovery_) &&
+              (q.back()-q.front()).lpNorm<Eigen::Infinity>()>1e-4);
+      if(!first)points<<',';first=false;
+      points<<"{\"point\":["<<care_confidence_map::evidenceNumber(c.point_base.x())<<','
+          <<care_confidence_map::evidenceNumber(c.point_base.y())<<','<<care_confidence_map::evidenceNumber(c.point_base.z())
+          <<"],\"floor_m\":"<<care_confidence_map::evidenceNumber(floor)
+          <<",\"start_m\":"<<care_confidence_map::evidenceNumber(c.initial_support_distance_m)
+          <<",\"end_m\":"<<care_confidence_map::evidenceNumber(end_d)<<'}';
+    }
+    if(!progress)return finish("no_recovery_progress");
+    points<<']';
+    // A Boolean exclusion proof may stop with an arbitrarily small positive
+    // residual. Complete ALL mandatory geometry first, then spend only the
+    // same request's remaining FK allowance on stronger proofs. The 2 mm
+    // target is optional certificate quality, never a new execution floor or
+    // permission to accept an unproved state change. Incremental strengthening
+    // retains a complete interval cover even when the target is unattainable.
+    residual_before=std::min(certified_residual,onset_budget);
+    double requested_residual=0.,reply_allowance=.003;
+    {std::lock_guard<std::mutex> lock(mutex_);const auto hint=recovery_quality_.find(current_eval_stamp_ns_);
+      if(hint!=recovery_quality_.end())requested_residual=hint->second;
+      const auto reply=recovery_reply_allowance_.find(current_eval_stamp_ns_);
+      if(reply!=recovery_reply_allowance_.end())reply_allowance=reply->second;}
+    // Quality hints schedule work only. The live commit formula remains the gate.
+    const double reserve_target=std::min(onset_budget,requested_residual>0. ?
+        requested_residual*1.25 : .002);
+    std::stable_sort(proved_motions.begin(),proved_motions.end(),
+        [](const ProvedMotion& a,const ProvedMotion& b){return a.slack<b.slack;});
+    const int refinement_start=*remaining_fk;
+    // Use the observed return allowance for optional work. Every subdivision
+    // rechecks time, and final admission independently enforces the original50ms.
+    const auto may_refine=[&]() {
+      const auto now=ros::Time::now();
+      return now>=measured_stamp && now>=snapshot_stamp &&
+          (now-measured_stamp).toSec()<.05-reply_allowance && (now-snapshot_stamp).toSec()<.05-reply_allowance;
+    };
+    for(auto& proof:proved_motions) {
+      if(*remaining_fk<=0 || proof.slack>=reserve_target)break;
+      // Do not spend optional work after the evidence's original validity
+      // interval. The downstream freshness/identity checks remain authoritative.
+      if(!may_refine())break;
+      double stronger_slack=0.;std::string refinement_reason;
+      ++reserve_refinement_attempts;
+      if(primitive_model_.provePointOutsideContinuousTrajectory(evaluator_,proof.q,
+          proof.point,proof.floor,remaining_fk,proof.curves,
+          &stronger_slack,&refinement_reason,&proof_fk_cache,reserve_target,may_refine))
+        {proof.slack=std::max(proof.slack,stronger_slack);proof.weak_interval=proof_fk_cache.last_weak_interval;}
+    }
+    reserve_refinement_fk=refinement_start-*remaining_fk;
+    certified_residual=std::numeric_limits<double>::infinity();
+    for(const auto& proof:proved_motions) {
+      if(proof.slack<certified_residual) {
+        certified_residual=proof.slack;residual_stage=proof.stage;
+        residual_point=proof.point;residual_floor=proof.floor;
+        residual_ordinary_unknown=proof.ordinary_unknown;residual_interval=proof.weak_interval;
+      }
+    }
+    residual_after=std::min(certified_residual,onset_budget);
+    if(onset_budget<=certified_residual){residual_stage="onset_budget";residual_ordinary_unknown=false;residual_interval=-1;}
+    std::ostringstream evidence;
+    evidence<<"{\"schema\":2,\"trajectory_stamp_ns\":\""<<current_eval_stamp_ns_
+        <<"\",\"measured_stamp_ns\":\""<<measured->header.stamp.toNSec()
+        <<"\",\"execution_floor_m\":"<<care_confidence_map::evidenceNumber(shell_execution_margin_m_)
+        <<",\"actual_min_distance_m\":"<<care_confidence_map::evidenceNumber(actual_min)
+        <<",\"onset_clearance_budget_m\":"<<care_confidence_map::evidenceNumber(onset_budget)
+        <<",\"map_snapshot_stamp_ns\":\""<<s.snapshot_stamp.toNSec()<<"\""
+        <<",\"certified_residual_m\":"<<care_confidence_map::evidenceNumber(std::min(certified_residual,onset_budget))
+        <<",\"residual_stage\":\""<<residual_stage<<"\",\"residual_floor_m\":"<<care_confidence_map::evidenceNumber(residual_floor)
+        <<",\"residual_point\":["<<care_confidence_map::evidenceNumber(residual_point.x())<<','
+        <<care_confidence_map::evidenceNumber(residual_point.y())<<','<<care_confidence_map::evidenceNumber(residual_point.z())<<']'
+        <<",\"residual_ordinary_unknown\":"<<(residual_ordinary_unknown?"true":"false")
+        <<",\"residual_interval_index\":"<<residual_interval
+        <<",\"requested_residual_m\":"<<care_confidence_map::evidenceNumber(requested_residual)
+        <<",\"quality_target_m\":"<<care_confidence_map::evidenceNumber(reserve_target)
+        <<",\"reply_allowance_s\":"<<care_confidence_map::evidenceNumber(reply_allowance)
+        <<",\"certificate_end_ros_ns\":\""<<ros::Time::now().toNSec()<<"\""
+        <<",\"motion_horizon_s\":"<<care_confidence_map::evidenceNumber(trajectory.points.back().time_from_start.toSec())
+        <<",\"measured_stop_contract\":\"ramp_stop_and_linear_start_bridge_v1\""
+        <<",\"measured_stop_horizon_s\":"<<care_confidence_map::evidenceNumber(brake_curves.size()*.05)
+        <<",\"measured_velocity\":[";
+    for(int j=0;j<actual.size();++j){if(j)evidence<<',';evidence<<care_confidence_map::evidenceNumber(reference_velocity[j]);}
+    evidence<<"],\"initial_q\":[";
+    for(int j=0;j<actual.size();++j){if(j)evidence<<',';evidence<<care_confidence_map::evidenceNumber(q.front()[j]);}
+    evidence<<"],\"initial_velocity\":[";
+    for(std::size_t j=0;j<trajectory.points.front().velocities.size();++j){if(j)evidence<<',';evidence<<care_confidence_map::evidenceNumber(trajectory.points.front().velocities[j]);}
+    evidence<<"],\"remaining_fk\":"<<*remaining_fk<<",\"map_instance\":\""<<s.instance
+        <<"\",\"map_epoch\":"<<s.epoch<<",\"map_revision\":"<<s.revision
+        <<",\"points\":"<<points.str()<<",\"measured_q\":[";
+    for(int j=0;j<actual.size();++j){if(j)evidence<<',';evidence<<care_confidence_map::evidenceNumber(actual[j]);}
+    evidence<<"],\"joint_motion_radii\":[";
+    for(int j=0;j<actual.size();++j) {
+      if(j)evidence<<',';
+      const auto bounds=primitive_model_.displacementBounds(evaluator_.activeJointNames(),Eigen::VectorXd::Unit(actual.size(),j));
+      evidence<<care_confidence_map::evidenceNumber(*std::max_element(bounds.begin(),bounds.end()));
+    }
+    evidence<<"]}";
+    if(current_geometric_restore_) {
+      std::string value=evidence.str();value.pop_back();std::ostringstream extra;
+      extra<<value<<",\"contract\":\"geometric_restore\",\"restoration_points\":[";
+      for(std::size_t i=0;i<geometric_restore_points_.size();++i) {
+        if(i)extra<<',';const auto& p=geometric_restore_points_[i];
+        extra<<'['<<care_confidence_map::evidenceNumber(p.x())<<','<<care_confidence_map::evidenceNumber(p.y())<<','<<care_confidence_map::evidenceNumber(p.z())<<']';
+      }
+      extra<<"]}";evidence.str("");evidence.clear();evidence<<extra.str();
+    }
+    shell_recovery_evidence_=evidence.str();shell_recovery_count_=initial.size();
+    for(const auto i:initial)candidates->at(i).initial_shell_certified=true;
+    stage="complete";
+    return finish("certified");
   }
 
   void loadParams()
@@ -368,7 +1042,7 @@ private:
         swept_volume_margin_m_, 0.025);
     pnh_.param(
         "trajectory_vbc/continuous_motion_bound_enabled",
-        continuous_motion_bound_enabled_, false);
+        continuous_motion_bound_enabled_, true);
     pnh_.param(
         "trajectory_vbc/map_resolution",
         map_resolution_, 0.05);
@@ -777,7 +1451,7 @@ private:
 
   bool isViolation(const Candidate& c) const
   {
-    return !c.nominally_visible || c.margin_s < min_margin_s_;
+    return !c.initial_shell_certified && (!c.nominally_visible || c.margin_s < min_margin_s_);
   }
 
   bool betterViolation(const Candidate& a, const Candidate& b) const
@@ -1069,6 +1743,9 @@ private:
         << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
         << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
+        << " sweep_refinement_checks=" << last_sweep_refinement_checks_
+        << " sweep_refinement_excluded=" << last_sweep_refinement_excluded_
+        << " sweep_refinement_fk=" << last_sweep_refinement_fk_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " continuous_motion_bound_enabled=" << continuous_motion_bound_enabled_
         << " reason=" << reason
@@ -1091,7 +1768,8 @@ private:
         << " min_required_margin_s=" << min_margin_s_
         << " vbc_evidence=" << care_confidence_map::vbcEvidence(
              current_eval_stamp_ns_, active_set_bundle_seq_, min_margin_s_,
-             map_resolution_, std::vector<Candidate>{}, std::vector<TemporalLayer>{}, geometry_backend_)
+             map_resolution_, std::vector<Candidate>{}, std::vector<TemporalLayer>{}, geometry_backend_,
+             continuous_motion_bound_enabled_)
         << timingFields();
     std_msgs::String msg;
     msg.data = oss.str();
@@ -1178,9 +1856,14 @@ private:
         << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
         << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
+        << " sweep_refinement_checks=" << last_sweep_refinement_checks_
+        << " sweep_refinement_excluded=" << last_sweep_refinement_excluded_
+        << " sweep_refinement_fk=" << last_sweep_refinement_fk_
         << " swept_volume_margin_m=" << swept_volume_margin_m_
         << " continuous_motion_bound_enabled=" << continuous_motion_bound_enabled_
         << " reason=selected_temporal_cluster"
+        << " start_support_unknown_count=" << std::count_if(candidates.begin(), candidates.end(),
+             [](const Candidate& c) { return c.initial_support_unknown; })
         << " trajectory_source=" << trajectory_source
         << " trajectory_stamp_ns=" << current_eval_stamp_ns_
         << " evaluation_trigger=" << current_eval_trigger_
@@ -1256,7 +1939,7 @@ private:
     oss << timingFields()
         << " vbc_evidence=" << care_confidence_map::vbcEvidence(
              current_eval_stamp_ns_, active_set_bundle_seq_, min_margin_s_,
-             map_resolution_, candidates, layers, geometry_backend_);
+             map_resolution_, candidates, layers, geometry_backend_, continuous_motion_bound_enabled_);
 
     std_msgs::String summary_msg;
     summary_msg.data = oss.str();
@@ -1287,6 +1970,13 @@ private:
   {
     const ros::WallTime eval_begin = ros::WallTime::now();
     current_eval_timing_ = EvalTiming();
+    last_sweep_refinement_checks_ = last_sweep_refinement_excluded_ = 0;
+    last_sweep_refinement_fk_ = 0;
+    shell_recovery_count_=0;shell_recovery_evidence_="none";current_shared_budget_=false;
+    current_geometric_restore_=false;current_margin_recovery_=false;geometric_restore_points_.clear();
+    current_context_session_="none";current_context_sequence_=0;
+    current_prefix_session_="none";current_prefix_revision_=0;current_prefix_s_=0.;
+    current_eval_wire_seq_=traj.header.seq;
     // Diagnostic only: arrival callback -> evaluation start, independently of
     // trajectory ROS stamp and geometry/service compute time. No scheduling change.
     {
@@ -1313,6 +2003,7 @@ private:
     }
 
     std::vector<Eigen::VectorXd> q_traj;
+    std::vector<Eigen::VectorXd> q_curves;
     std::vector<int> original_indices;
     std::vector<double> eval_times_s;
     std::string error_msg;
@@ -1326,17 +2017,33 @@ private:
       return;
     }
     current_eval_timing_.trajectory_convert_ms = wallMs(convert_begin);
+    std::vector<int> curve_mapping;
+    for(const auto& name:evaluator_.activeJointNames())
+      curve_mapping.push_back(std::distance(traj.joint_names.begin(),std::find(traj.joint_names.begin(),traj.joint_names.end(),name)));
+    if(geometry_backend_=="primitive")q_curves=care_confidence_map::trajectoryCurvatures(traj,curve_mapping);
+    bool shell_eligible=false;Eigen::VectorXd shell_acceleration;
+    if(initial_shell_recovery_enabled_ && trajectory_source=="predicted") {
+      const bool valid=recoveryContext(traj,&shell_eligible,&shell_acceleration);
+      publishRecoveryProtocol(traj);
+      if(!valid)return;
+    }
 
     const ros::WallTime body_fk_begin = ros::WallTime::now();
     care_confidence_map::TrajectorySampleResult sample_result;
     std::vector<care_confidence_map::VbcPrimitiveFrame> primitive_frames;
+    std::vector<care_confidence_map::VbcPrimitiveFrame> initial_frames;
     std::vector<int> sweep_indices;
     std::vector<double> sweep_times;
     bool body_ok = false;
-    if (geometry_backend_ == "primitive")
+    if (geometry_backend_ == "primitive") {
       body_ok = primitive_model_.computeContinuousTrajectory(evaluator_, q_traj,
           original_indices, eval_times_s, &primitive_frames, &sweep_indices,
-          &sweep_times, &error_msg, continuous_motion_bound_enabled_);
+          &sweep_times, &error_msg, continuous_motion_bound_enabled_,q_curves);
+      // Exact initial geometry classifies recovery's starting condition. The
+      // interval enclosures above remain the gate; this is not an exemption.
+      if (body_ok) body_ok = primitive_model_.computeTrajectory(
+          evaluator_, {q_traj.front()}, &initial_frames, &error_msg);
+    }
     else
     {
       sample_result = evaluator_.computeTrajectorySamples(q_traj);
@@ -1420,6 +2127,29 @@ private:
 
     const ros::WallTime candidate_filter_begin = ros::WallTime::now();
     std::map<CandidateKey, Candidate> candidate_map;
+    // Spend a bounded amount of work on coarse-enclosure-only unknown points.
+    // A failed proof retains the original voxel AND its original entry time.
+    // primitive_frames already includes the same-snapshot measured pose.
+    // Its exact margin support must survive any nominal-only exclusion proof.
+    if(current_shared_budget_ && !certification_budgets_.count(current_eval_stamp_ns_))
+      certification_budgets_[current_eval_stamp_ns_]=256;
+    while(certification_budgets_.size()>64)certification_budgets_.erase(certification_budgets_.begin());
+    int refinement_fk_remaining = current_shared_budget_ ? certification_budgets_[current_eval_stamp_ns_] : 256;
+    // Both candidate exclusion and the mandatory recovery certificate query
+    // the same pure FK at many identical configurations. Share those exact
+    // frames within this evaluation; otherwise point-by-point exclusion can
+    // consume all 256 FK calls before the measured brake is even checked.
+    // Point distances, margins, map classes and interval proofs remain fresh.
+    care_confidence_map::VbcPrimitiveModel::ProofFkCache local_proof_cache;
+    auto& proof_fk_cache=current_shared_budget_ ? proof_audit_caches_[current_eval_stamp_ns_] : local_proof_cache;
+    while(proof_audit_caches_.size()>8) {
+      auto old=proof_audit_caches_.begin();if(old->first==current_eval_stamp_ns_)++old;
+      proof_audit_caches_.erase(old);
+    }
+    struct BudgetSaver {
+      std::map<unsigned long long,int>* budgets;unsigned long long stamp;int* remaining;
+      ~BudgetSaver(){if(budgets)(*budgets)[stamp]=*remaining;}
+    } save_budget{current_shared_budget_?&certification_budgets_:nullptr,current_eval_stamp_ns_,&refinement_fk_remaining};
     for (std::size_t i = 0; i < swept_voxels.size(); ++i)
     {
       const bool inside = confidence_srv.response.inside_map[i] != 0;
@@ -1429,9 +2159,46 @@ private:
           confidence_srv.response.current_visibility[i]);
       if (!inside) continue;
       if (confidence > frontier_confidence_threshold_ ||
-          current_visibility > 0.5) continue;
+          current_visibility > 0.5) {
+        shell_recovery_.observedFree(swept_voxels[i].point_base); continue;
+      }
 
       const SweepVoxel& voxel = swept_voxels[i];
+      const int refinement_before = refinement_fk_remaining;
+      std::string refinement_status = geometry_backend_ == "primitive"
+          ? (voxel.primitive_signed_distance_m <= swept_volume_margin_m_ + 1e-12
+              ? "representative_inside_margin" : "fk_budget_exhausted")
+          : "not_applicable";
+      if (!(shell_eligible && current_geometric_restore_) && geometry_backend_ == "primitive" &&
+          voxel.primitive_signed_distance_m > swept_volume_margin_m_ + 1e-12 &&
+          refinement_fk_remaining > 0) {
+        // The first enclosing frame can be outside the nominal margin while
+        // a later sampled pose actually intersects it. Such a point cannot
+        // pass the full-path proof; reuse existing FK to avoid futile splits.
+        // For execution this also checks the frozen measured-body frame: a
+        // point in its margin cannot be discarded by a nominal-path proof.
+        const bool sampled_intersection = std::any_of(
+            primitive_frames.begin(), primitive_frames.end(), [&](const auto& frame) {
+              return std::any_of(frame.primitives.begin(), frame.primitives.end(),
+                  [&](const auto& primitive) {
+                    return primitive.signedDistance(voxel.point_base) <=
+                        swept_volume_margin_m_ + 1e-12;
+                  });
+            });
+        refinement_status = sampled_intersection ? "sampled_intersection"
+            : "continuous_exclusion_not_proven";
+        if (!sampled_intersection) ++last_sweep_refinement_checks_;
+        if (!sampled_intersection && primitive_model_.provePointOutsideContinuousTrajectory(
+                evaluator_, q_traj, voxel.point_base, swept_volume_margin_m_,
+                &refinement_fk_remaining,q_curves,nullptr,nullptr,&proof_fk_cache)) {
+          ++last_sweep_refinement_excluded_;
+          continue;
+        }
+      }
+      if (refinement_status == "continuous_exclusion_not_proven" && refinement_fk_remaining == 0)
+        refinement_status = "continuous_exclusion_budget_exhausted";
+      if(shell_eligible && current_geometric_restore_)
+        refinement_status="deferred_for_mandatory_certificate";
       const CandidateKey key = candidateKey(voxel.point_base);
       auto it = candidate_map.find(key);
       if (it == candidate_map.end())
@@ -1444,6 +2211,17 @@ private:
         candidate.source_collision_index = voxel.source_collision_index;
         candidate.source_collision_name = voxel.source_collision_name;
         candidate.primitive_signed_distance_m = voxel.primitive_signed_distance_m;
+        candidate.refinement_status = refinement_status;
+        candidate.refinement_fk_before = refinement_before;
+        candidate.refinement_fk_after = refinement_fk_remaining;
+        candidate.candidate_margin_m = swept_volume_margin_m_;
+        if (!initial_frames.empty()) {
+          double distance = std::numeric_limits<double>::infinity();
+          for (const auto& primitive : initial_frames.front().primitives)
+            distance = std::min(distance, primitive.signedDistance(voxel.point_base));
+          candidate.initial_support_distance_m = distance;
+          candidate.initial_support_unknown = distance <= swept_volume_margin_m_ + 1e-12;
+        }
         candidate.sample_center_base = voxel.sample_center_base;
         candidate.raw_sample_radius_m = voxel.raw_sample_radius_m;
         candidate.swept_radius_m = voxel.swept_radius_m;
@@ -1467,6 +2245,10 @@ private:
           it->second.source_collision_index = voxel.source_collision_index;
           it->second.source_collision_name = voxel.source_collision_name;
           it->second.primitive_signed_distance_m = voxel.primitive_signed_distance_m;
+          it->second.refinement_status = refinement_status;
+          it->second.refinement_fk_before = refinement_before;
+          it->second.refinement_fk_after = refinement_fk_remaining;
+          it->second.candidate_margin_m = swept_volume_margin_m_;
           it->second.sample_center_base = voxel.sample_center_base;
           it->second.raw_sample_radius_m = voxel.raw_sample_radius_m;
           it->second.swept_radius_m = voxel.swept_radius_m;
@@ -1478,7 +2260,16 @@ private:
       }
     }
 
+    last_sweep_refinement_fk_ = 256 - refinement_fk_remaining;
     current_eval_timing_.candidate_filter_ms = wallMs(candidate_filter_begin);
+    if(current_geometric_restore_) {
+      for(const auto& p:geometric_restore_points_) {
+        auto& c=candidate_map[candidateKey(p)];
+        c.point_base=p;c.initial_support_unknown=true;c.initial_support_distance_m=1e9;
+        for(const auto& b:initial_frames.front().primitives)
+          c.initial_support_distance_m=std::min(c.initial_support_distance_m,b.signedDistance(p));
+      }
+    }
     if (candidate_map.empty())
     {
       finalize_total();
@@ -1524,6 +2315,23 @@ private:
       }
       candidates.push_back(c);
     }
+    if(shell_eligible) {
+      const bool certified=certifyInitialShell(&candidates,q_traj,shell_acceleration,&refinement_fk_remaining,q_curves,traj,proof_fk_cache);
+      if(current_geometric_restore_ && !certified) {
+        current_context_state_="invalid";
+        current_context_reason_=current_shell_path_counterexample_
+            ? "geometric_restore_path_counterexample" : current_proof_resource_evidence_!="none"
+            ? "geometric_restore_proof_resource_exhausted" : "geometric_restore_certificate_unavailable";
+        publishRecoveryProtocol(traj);finalize_total();return;
+      }
+      last_sweep_refinement_fk_=256-refinement_fk_remaining;
+      if(certified) {
+        const auto before=candidates.size();
+        candidates.erase(std::remove_if(candidates.begin(),candidates.end(),
+            [](const Candidate& c){return c.full_path_excluded;}),candidates.end());
+        last_sweep_refinement_excluded_+=before-candidates.size();
+      }
+    }
     current_eval_timing_.visibility_scan_ms = wallMs(visibility_begin);
 
     const ros::WallTime cluster_begin = ros::WallTime::now();
@@ -1533,7 +2341,8 @@ private:
     {
       finalize_total();
       publishNoTargetSummary(
-          "all_low_confidence_points_seen_before_deadline",
+          shell_recovery_count_>0 ? "initial_shell_recovery_certified" :
+              "all_low_confidence_points_seen_before_deadline",
           trajectory_source,
           static_cast<int>(candidates.size()));
       return;
@@ -1866,7 +2675,7 @@ private:
   double frontier_confidence_threshold_ = 0.50;
   double candidate_resolution_ = 0.05;
   double swept_volume_margin_m_ = 0.025;
-  bool continuous_motion_bound_enabled_ = false;
+  bool continuous_motion_bound_enabled_ = true;
   double map_resolution_ = 0.05;
   double map_x_min_ = -0.95;
   double map_x_max_ = 0.95;
@@ -1875,6 +2684,9 @@ private:
   double map_z_min_ = 0.0;
   double map_z_max_ = 1.15;
   std::size_t last_swept_voxel_query_count_ = 0;
+  std::size_t last_sweep_refinement_checks_ = 0;
+  std::size_t last_sweep_refinement_excluded_ = 0;
+  int last_sweep_refinement_fk_ = 0;
   unsigned long long current_eval_stamp_ns_ = 0;
   std::string current_eval_trigger_ = "startup";
   EvalTiming current_eval_timing_;
@@ -1895,8 +2707,41 @@ private:
   std::string primitive_urdf_file_;
   care_confidence_map::VbcPrimitiveModel primitive_model_;
   bool include_measured_body_ = false;
+  ros::CallbackQueue measured_queue_;
+  ros::AsyncSpinner measured_spinner_;
   ros::Subscriber measured_sub_;
   sensor_msgs::JointStateConstPtr latest_measured_;
+  bool initial_shell_recovery_enabled_=false;
+  double shell_execution_margin_m_=0.;
+  double shell_occupied_margin_m_=0.;
+  ros::ServiceClient shell_snapshot_client_;
+  care_confidence_map::InitialShellRecovery shell_recovery_;
+  ros::Subscriber recovery_context_sub_;
+  ros::Subscriber recovery_quality_sub_;
+  ros::Publisher recovery_protocol_pub_;
+  ros::Publisher shell_diagnostic_pub_;
+  std::map<unsigned long long,std::string> recovery_contexts_;
+  std::map<unsigned long long,std::string> recovery_protocol_states_;
+  std::string current_context_state_,current_context_reason_,current_context_session_="none";
+  bool current_shell_path_counterexample_=false;
+  std::string current_shell_path_counterexample_evidence_="none";
+  std::string current_proof_resource_evidence_="none";
+  std::string current_restore_mode_epoch_,current_restore_observation_token_;
+  unsigned long long current_context_sequence_=0;
+  std::string current_prefix_session_="none";
+  unsigned long long current_prefix_revision_=0;
+  double current_prefix_s_=0.;
+  unsigned int current_eval_wire_seq_=0;
+  int shell_recovery_count_=0;
+  std::string shell_recovery_evidence_="none";
+  bool current_shared_budget_=false;
+  bool current_geometric_restore_=false;
+  bool current_margin_recovery_=false;
+  std::vector<Eigen::Vector3d> geometric_restore_points_;
+  std::map<unsigned long long,int> certification_budgets_;
+  std::map<unsigned long long,double> recovery_quality_;
+  std::map<unsigned long long,double> recovery_reply_allowance_;
+  std::map<unsigned long long,care_confidence_map::VbcPrimitiveModel::ProofFkCache> proof_audit_caches_;
   std::string base_frame_ = "base_link";
   std::string input_trajectory_topic_ = "/care_planner/task_trajectory";
   std::string predicted_trajectory_topic_ =

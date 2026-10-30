@@ -107,7 +107,8 @@ else
   VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
   PRIMITIVE_TRACKING_GUARD=false
 fi
-VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-false}"
+EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M="${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M:-${VBC_SWEPT_VOLUME_MARGIN_M}}"
+VBC_CONTINUOUS_MOTION_BOUND_ENABLED="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED:-true}"
 # Keep the runtime tracker threshold independent from the VBC swept-volume
 # margin. The tracker defaults to the requested 20 mm tolerance; callers can
 # override it for a controlled comparison without changing VBC certification.
@@ -164,6 +165,7 @@ PER_SENSOR_BRANCH_MAX_STEP_NORM="${PER_SENSOR_BRANCH_MAX_STEP_NORM:-0.25}"
 PER_SENSOR_MAX_BRANCH_ATTEMPTS="${PER_SENSOR_MAX_BRANCH_ATTEMPTS:-4}"
 PER_SENSOR_MIN_CONSERVATIVE_G="${PER_SENSOR_MIN_CONSERVATIVE_G:-0.0}"
 PER_SENSOR_REQUIRE_PRIMITIVE_LOS="${PER_SENSOR_REQUIRE_PRIMITIVE_LOS:-true}"
+PER_SENSOR_ALLOW_NOMINAL_PROPOSALS="${PER_SENSOR_ALLOW_NOMINAL_PROPOSALS:-false}"
 PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED="${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED:-false}"
 PER_SENSOR_HIGH_WITNESS_Z_MIN="${PER_SENSOR_HIGH_WITNESS_Z_MIN:-0.85}"
 
@@ -181,6 +183,7 @@ GOAL_SUCCESS_HOLD_S="${GOAL_SUCCESS_HOLD_S:-0.10}"
 GOAL_SETTLE_VELOCITY_INF_RAD_S="${GOAL_SETTLE_VELOCITY_INF_RAD_S:-0.05}"
 GOAL_SETTLE_TIMEOUT_S="${GOAL_SETTLE_TIMEOUT_S:-1.0}"
 GOAL_POST_SUCCESS_RECORD_S="${GOAL_POST_SUCCESS_RECORD_S:-0.0}"
+GOAL_OBSERVE_TERMINAL_STOP="${GOAL_OBSERVE_TERMINAL_STOP:-false}"
 
 # Recording profile:
 #   full             = historical diagnostics used by formal C4/C5 runs.
@@ -224,6 +227,30 @@ EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC="/care_planner/execution_vbc/audit_active_
 REGIME_TOPIC="/care_planner/c4_4/regime_summary"
 TRACKER_DESIRED_TOPIC="/care_planner/execution/tracker_velocity_desired"
 ACTUATOR_TOPIC="/care_arm/arm_group_velocity_controller/command"
+ACTUATOR_COMMAND_WATCHDOG="${ACTUATOR_COMMAND_WATCHDOG:-false}"
+STOP_SHADOW_ENABLED="${STOP_SHADOW_ENABLED:-false}"
+STOP_SHADOW_RATE="${STOP_SHADOW_RATE:-5}"
+STOP_SHADOW_PYTHON="${STOP_SHADOW_PYTHON:-/home/zhicheng/miniconda3/envs/viscdf/bin/python}"
+case "${STOP_SHADOW_ENABLED}" in
+  true)
+    if [[ "${ACTUATOR_COMMAND_WATCHDOG}" != "true" || ! -x "${STOP_SHADOW_PYTHON}" ]]; then
+      echo "[ERROR] stop shadow requires the stamped watchdog and its Python environment" >&2
+      exit 2
+    fi
+    ;;
+  false) ;;
+  *) echo "STOP_SHADOW_ENABLED must be true or false" >&2; exit 2 ;;
+esac
+LIMITER_OUTPUT_TOPIC="${ACTUATOR_TOPIC}"
+LIMITER_STAMPED_TOPIC=""
+case "${ACTUATOR_COMMAND_WATCHDOG}" in
+  true)
+    LIMITER_OUTPUT_TOPIC="/care_arm/arm_group_velocity_controller/requested_command"
+    LIMITER_STAMPED_TOPIC="/care_arm/arm_group_velocity_controller/command_stamped"
+    ;;
+  false) ;;
+  *) echo "ACTUATOR_COMMAND_WATCHDOG must be true or false" >&2; exit 2 ;;
+esac
 SCHEDULE_TOPIC="/care_planner/active_sensing/visibility_waypoint_schedule"
 SCHEDULE_SUMMARY_TOPIC="/care_planner/active_sensing/visibility_waypoint_schedule_summary"
 
@@ -330,13 +357,17 @@ PY
 fi
 echo "[INITIAL Q] apply_initial_joint_overrides=${APPLY_INITIAL_JOINT_OVERRIDES}"
 
-GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""
+GAZEBO_PID=""; GEN_PID=""; CONTROL_PID=""; TRACKER_PID=""; SHADOW_PID=""
 REC_PIDS=()
 REC_NAMES=()
 # A unique token prevents a stale/latching arm message from another run from
 # dispatching this benchmark goal. The broker's existing prior gates stay on.
 export CARE_BENCHMARK_ARM_TOKEN=""
 if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
+  TERMINAL_OBSERVATION_ARGS=()
+  if [ "${GOAL_OBSERVE_TERMINAL_STOP}" = "true" ]; then
+    TERMINAL_OBSERVATION_ARGS+=(--observe-terminal-stop)
+  fi
   export CARE_BENCHMARK_ARM_TOKEN="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
 fi
 kill_group() {
@@ -354,6 +385,7 @@ kill_group() {
   wait "${pid}" 2>/dev/null || true
 }
 cleanup() {
+  kill_group "${SHADOW_PID}"; SHADOW_PID=""
   for pid in "${REC_PIDS[@]:-}"; do kill_group "${pid}"; done
   REC_PIDS=()
   kill_group "${CONTROL_PID}"; CONTROL_PID=""
@@ -367,6 +399,7 @@ trap 'exit 143' TERM
 
 echo "[VIS] gazebo_gui=${GAZEBO_GUI} use_rviz=${USE_RVIZ} world_file=${WORLD_FILE}"
 setsid roslaunch arm_description gazebo_velocity_control.launch \
+  use_command_watchdog:="${ACTUATOR_COMMAND_WATCHDOG}" \
   world_file:="${WORLD_FILE}" \
   gazebo_gui:="${GAZEBO_GUI}" use_rviz:="${USE_RVIZ}" \
   apply_initial_joint_overrides:="${APPLY_INITIAL_JOINT_OVERRIDES}" \
@@ -416,6 +449,24 @@ then
   echo "[DEBUG] gazebo log: ${LOG}/gazebo.log"
   tail -n 260 "${LOG}/gazebo.log" 2>/dev/null || true
   exit 1
+fi
+
+if [[ "${ACTUATOR_COMMAND_WATCHDOG}" == "true" ]]; then
+  if ! python3 - <<'PY'
+import rospy
+from controller_manager_msgs.srv import ListControllers
+rospy.init_node('careplanner_watchdog_controller_ready', anonymous=True, disable_signals=True)
+service='/care_arm/controller_manager/list_controllers'
+rospy.wait_for_service(service, timeout=10.)
+controllers=rospy.ServiceProxy(service,ListControllers)().controller
+matches=[c for c in controllers if c.name=='arm_group_velocity_controller']
+assert len(matches)==1 and matches[0].state=='running' and matches[0].type=='care_velocity_controller/ExpiringJointVelocityController', matches
+print('[READY] stamped command watchdog is the running actuator controller')
+PY
+  then
+    echo "[ERROR] requested actuator watchdog is not running" >&2
+    exit 1
+  fi
 fi
 
 echo "[WAIT] validating measured Gazebo initial q against case initial_q"
@@ -516,13 +567,14 @@ setsid roslaunch egocentric_arm_planner c4_3_low_level_tracker.launch \
   config_file:="${CONFIG_FILE}" input_trajectory:="${COMMITTED_TOPIC}" \
   output_velocity_command:="${TRACKER_DESIRED_TOPIC}" \
   use_acceleration_limiter:=true \
-  rate_limiter_output_velocity_command:="${ACTUATOR_TOPIC}" \
+  rate_limiter_output_velocity_command:="${LIMITER_OUTPUT_TOPIC}" \
+  rate_limiter_stamped_output_velocity_command:="${LIMITER_STAMPED_TOPIC}" \
   > "${LOG}/low_level_tracker.log" 2>&1 &
 TRACKER_PID=$!
 
 echo "[PER-SENSOR HYBRID] enabled=${PER_SENSOR_HYBRID_ENABLED} checkpoint=${PER_SENSOR_CHECKPOINT} branch_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS} attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} LOS=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} high_witness_priority=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} high_witness_z_min=${PER_SENSOR_HIGH_WITNESS_Z_MIN}"
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _frontier_step_inf:=${FRONTIER_STEP_INF} _frontier_vbc_escalation_enabled:=${FRONTIER_VBC_ESCALATION_ENABLED} _frontier_vbc_escalation_after:=${FRONTIER_VBC_ESCALATION_AFTER} _frontier_escalated_step_inf:=${FRONTIER_ESCALATED_STEP_INF} _blocker_push_max_sweep_s:=${BLOCKER_PUSH_MAX_SWEEP_S:-0.30} _blocker_confirmations:=${BLOCKER_CONFIRMATIONS:-2} _final_vbc_recovery_enabled:=${FINAL_VBC_RECOVERY_ENABLED} _final_vbc_recovery_feedback_topic:='${LOCAL_SCP_SUMMARY_TOPIC}' _execution_active_set_bundle_topic:='${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}' _candidate_replacement_enabled:=${CANDIDATE_REPLACEMENT_ENABLED:-false} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _per_sensor_high_witness_priority_enabled:=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} _per_sensor_high_witness_z_min:=${PER_SENSOR_HIGH_WITNESS_Z_MIN} _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _frontier_step_inf:=${FRONTIER_STEP_INF} _frontier_vbc_escalation_enabled:=${FRONTIER_VBC_ESCALATION_ENABLED} _frontier_vbc_escalation_after:=${FRONTIER_VBC_ESCALATION_AFTER} _frontier_escalated_step_inf:=${FRONTIER_ESCALATED_STEP_INF} _blocker_push_max_sweep_s:=${BLOCKER_PUSH_MAX_SWEEP_S:-0.30} _blocker_confirmations:=${BLOCKER_CONFIRMATIONS:-2} _final_vbc_recovery_enabled:=${FINAL_VBC_RECOVERY_ENABLED} _final_vbc_recovery_feedback_topic:='${LOCAL_SCP_SUMMARY_TOPIC}' _execution_active_set_bundle_topic:='${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}' _candidate_replacement_enabled:=${CANDIDATE_REPLACEMENT_ENABLED:-false} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _per_sensor_allow_nominal_proposals:=${PER_SENSOR_ALLOW_NOMINAL_PROPOSALS} _per_sensor_high_witness_priority_enabled:=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} _per_sensor_high_witness_z_min:=${PER_SENSOR_HIGH_WITNESS_Z_MIN} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 
@@ -605,6 +657,7 @@ setsid roslaunch egocentric_arm_planner phaseC4_4_verified_regime_planner.launch
   local_scp_selector_jsonl:="${LOCAL_SCP_SELECTOR_JSONL}" \
   local_scp_proximity_margin:="${LOCAL_SCP_PROXIMITY_MARGIN}" \
   vbc_swept_volume_margin_m:="${VBC_SWEPT_VOLUME_MARGIN_M}" \
+  execution_vbc_swept_volume_margin_m:="${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M}" \
   vbc_continuous_motion_bound_enabled:="${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}" \
   vbc_geometry_backend:="${VBC_GEOMETRY_BACKEND}" \
   repair_prefix_verification_enabled:="${REPAIR_PREFIX_VERIFY}" \
@@ -742,8 +795,40 @@ expect_rosparam_bool /optimized_trajectory_continuity/final_gcdf_enabled "${FINA
 expect_rosparam_bool /optimized_trajectory_continuity/continuation_enabled "${COMMITTED_CONTINUATION_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/execution_audit_enabled "${EXECUTION_AUDIT_STREAM_ENABLED}"
 expect_rosparam_bool /optimized_trajectory_continuity/cycle_recovery_enabled "${CYCLE_RECOVERY_ENABLED}"
+expect_rosparam_bool /optimized_trajectory_continuity/candidate_admission_enabled "${PROBE_SINGLE_FLIGHT_ENABLED}"
+REPAIR_EXECUTABLE_VIEW_ENABLED=false
+if [ "${VBC_GEOMETRY_BACKEND}" = "primitive" ] && { [ "${REPAIR_PREFIX_VERIFY}" = "true" ] || [ "${REPAIR_PREFIX_VERIFY}" = "1" ]; }; then
+  REPAIR_EXECUTABLE_VIEW_ENABLED=true
+fi
+expect_rosparam_bool /optimized_trajectory_continuity/repair_projection_consistent_dispatch_enabled "${REPAIR_EXECUTABLE_VIEW_ENABLED}"
+REPAIR_PREFIX_BINDING_ENABLED=false
+if [ "${REPAIR_EXECUTABLE_VIEW_ENABLED}" = "true" ] && [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  REPAIR_PREFIX_BINDING_ENABLED=true
+fi
+expect_rosparam_bool /optimized_trajectory_continuity/repair_prefix_binding_enabled "${REPAIR_PREFIX_BINDING_ENABLED}"
+if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  expect_rosparam_bool /probe_single_flight_gate/repair_prefix_binding_enabled "${REPAIR_PREFIX_BINDING_ENABLED}"
+fi
+if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
+  expect_rosparam_bool /local_sparse_scp_planner_node/local_planner/repair_executable_view/enabled "${REPAIR_EXECUTABLE_VIEW_ENABLED}"
+  expect_rosparam_bool /local_sparse_scp_planner_node/local_planner/repair_prefix_binding/enabled "${REPAIR_PREFIX_BINDING_ENABLED}"
+  if [ "${REPAIR_EXECUTABLE_VIEW_ENABLED}" = "true" ]; then
+    python3 - <<'PY'
+import rospy
+rospy.init_node('repair_executable_contract_preflight', anonymous=True, disable_signals=True)
+p='/local_sparse_scp_planner_node/local_planner/repair_executable_view/'
+c='/optimized_trajectory_continuity/'
+for key,other in [('prefix_s','repair_execution_prefix_s'),('brake_dt_s','repair_brake_dt_s'),
+                  ('max_brake_steps','repair_brake_max_steps'),('acceleration_limits','repair_acceleration_limits'),
+                  ('cycle_enabled','cycle_recovery_enabled'),('cycle_prefixes_s','cycle_recovery_prefixes_s')]:
+    if rospy.get_param(p+key) != rospy.get_param(c+other):
+        raise SystemExit('Planner/executor construction mismatch: '+key)
+PY
+  fi
+fi
 
 if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+  expect_rosparam_bool /probe_single_flight_gate/candidate_admission_enabled "true"
   if ! rosnode list | grep -q '^/probe_single_flight_gate$'; then
     echo "[ERROR] C5.9 probe_single_flight requested but node is missing"
     exit 1
@@ -754,7 +839,7 @@ echo "[RUNTIME] final_gcdf=${FINAL_EXECUTABLE_GCDF_ENABLED} continuation=${COMMI
 echo "[PHASE E] tof_fusion=${TOF_FUSION_ENABLED} runtime_self_hit_rviz_diag=${RUNTIME_SELF_HIT_RVIZ_DIAG_ENABLED} confidence_map_config=${CONFIDENCE_MAP_CONFIG_FILE}"
 echo "[BODY PRIOR A/B] main_trajectory_risk_refresh=${TRAJECTORY_RISK_REFRESH_BODY_PRIOR_BEFORE_QUERY}; local/final/execution exporters remain false"
 echo "[PHASE E5] execution_gcdf=${EXECUTION_GCDF_AUDIT_ENABLED} warn=${EXECUTION_GCDF_WARNING_MARGIN} hard=${EXECUTION_GCDF_HARD_MARGIN} stale=${EXECUTION_GCDF_STALE_TIMEOUT_S} body_inflation=${GCDF_BODY_INFLATION_M}"
-echo "[MARGIN SPLIT] VBC swept margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
+echo "[MARGIN SPLIT] candidate VBC swept margin=${VBC_SWEPT_VOLUME_MARGIN_M} m; execution VBC swept margin=${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M} m; GCDF proximity margin=${LOCAL_SCP_PROXIMITY_MARGIN} m"
 echo "[MARGIN SPLIT] tracker certified body-envelope threshold=${TRACKER_CERTIFIED_MARGIN_M} m"
 
 RUNTIME_BRANCH="$(git branch --show-current)"
@@ -790,13 +875,24 @@ execution_gcdf_stale_timeout_s=${EXECUTION_GCDF_STALE_TIMEOUT_S}
 gcdf_body_inflation_m=${GCDF_BODY_INFLATION_M}
 gcdf_geometry_backend=${GCDF_GEOMETRY_BACKEND}
 use_local_sparse_scp=${USE_LOCAL_SPARSE_SCP}
+repair_executable_view_enabled=${REPAIR_EXECUTABLE_VIEW_ENABLED}
 local_scp_proximity_margin_m=${LOCAL_SCP_PROXIMITY_MARGIN}
 vbc_swept_volume_margin_m=${VBC_SWEPT_VOLUME_MARGIN_M}
+execution_vbc_swept_volume_margin_m=${EXECUTION_VBC_SWEPT_VOLUME_MARGIN_M}
 vbc_continuous_motion_bound_enabled=${VBC_CONTINUOUS_MOTION_BOUND_ENABLED}
 tracker_certified_margin_m=${TRACKER_CERTIFIED_MARGIN_M}
+actuator_command_watchdog=${ACTUATOR_COMMAND_WATCHDOG}
+stop_shadow_enabled=${STOP_SHADOW_ENABLED}
+stop_shadow_rate_hz=${STOP_SHADOW_RATE}
+stop_shadow_protocol=content_snapshot_then_recheck_v2
+stop_shadow_runtime_admission=false
+limiter_output_topic=${LIMITER_OUTPUT_TOPIC}
+limiter_stamped_topic=${LIMITER_STAMPED_TOPIC}
+actuator_applied_command_topic=${ACTUATOR_TOPIC}
 primitive_tracking_guard=${PRIMITIVE_TRACKING_GUARD}
 vbc_geometry_backend=${VBC_GEOMETRY_BACKEND}
 raw_planner_topic=${RAW_PLANNER_TOPIC}
+record_audited_candidates=${RECORD_AUDITED_CANDIDATES:-false}
 commit_pipeline_candidate_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
 final_gcdf_enabled=${RUNTIME_FINAL_GCDF}
 continuation_enabled=${RUNTIME_CONTINUATION}
@@ -812,6 +908,9 @@ probe_single_flight_node=${RUNTIME_PROBE_NODE_COUNT}
 probe_single_flight_input_topic=${RAW_PLANNER_TOPIC}
 probe_single_flight_output_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
 continuity_input_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}
+candidate_admission_enabled=${PROBE_SINGLE_FLIGHT_ENABLED}
+candidate_admission_transfer_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}/transfer
+candidate_admission_status_topic=${COMMIT_PIPELINE_CANDIDATE_TOPIC}/admission_status
 probe_single_flight_wiring_distinct=$([ "${RAW_PLANNER_TOPIC}" != "${COMMIT_PIPELINE_CANDIDATE_TOPIC}" ] && echo 1 || echo 0)
 probe_repair_requires_visibility_obligation=true
 adaptive_refinement_enabled=${ADAPTIVE_REFINEMENT_ENABLED}
@@ -822,6 +921,7 @@ frontier_vbc_escalation_enabled=${FRONTIER_VBC_ESCALATION_ENABLED}
 frontier_vbc_escalation_after=${FRONTIER_VBC_ESCALATION_AFTER}
 frontier_escalated_step_inf=${FRONTIER_ESCALATED_STEP_INF}
 per_sensor_hybrid_enabled=${PER_SENSOR_HYBRID_ENABLED}
+per_sensor_allow_nominal_proposals=${PER_SENSOR_ALLOW_NOMINAL_PROPOSALS}
 final_vbc_recovery_enabled=${FINAL_VBC_RECOVERY_ENABLED}
 per_sensor_checkpoint=${PER_SENSOR_CHECKPOINT}
 candidate_replacement_enabled=${CANDIDATE_REPLACEMENT_ENABLED:-false}
@@ -868,6 +968,8 @@ else
   echo "[RECORDING] profile=full"
   record_topic /care_planner/execution/nominal_progress_summary "${OUT}/nominal_progress_summary.csv"
   record_topic "${CANDIDATE_VBC_TOPIC}" "${OUT}/candidate_vbc_summary.csv"
+  record_topic "${VERIFY_TOPIC}/initial_shell_context" "${OUT}/candidate_vbc_context.csv"
+  record_topic "${VERIFY_TOPIC}/protocol_status" "${OUT}/candidate_vbc_protocol_status.csv"
   record_topic "${EXECUTION_VBC_TOPIC}" "${OUT}/execution_vbc_summary.csv"
   record_topic /care_planner/trajectory_risk/vbc_active_set_bundle "${OUT}/candidate_vbc_active_set_bundle.csv"
   record_topic "${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}" "${OUT}/execution_vbc_active_set_bundle.csv"
@@ -895,11 +997,16 @@ else
   record_topic /care_planner/active_sensing/blocker_stack_summary "${OUT}/blocker_stack_summary.csv"
   record_topic /care_planner/active_sensing/visibility_frontier_summary "${OUT}/visibility_frontier_summary.csv"
   record_topic /care_planner/active_sensing/visibility_frontier_target "${OUT}/visibility_frontier_target.csv"
+  record_topic /care_planner/active_sensing/visibility_guidance "${OUT}/visibility_guidance.csv"
   record_topic /care_planner/trajectory_risk/force_bootstrap "${OUT}/force_bootstrap.csv"
   record_topic /care_planner/final_gcdf/risk/summary "${OUT}/final_gcdf_risk_summary.csv"
   record_topic /care_planner/final_gcdf/selector_summary "${OUT}/final_gcdf_selector_summary.csv"
   record_topic /care_planner/final_gcdf/recovery_visibility_event "${OUT}/final_gcdf_recovery_event.csv"
   record_topic "${PROBE_SINGLE_FLIGHT_SUMMARY_TOPIC}" "${OUT}/probe_single_flight_summary.csv"
+  if [ "${PROBE_SINGLE_FLIGHT_ENABLED}" = "true" ]; then
+    record_topic "${COMMIT_PIPELINE_CANDIDATE_TOPIC}/admission_status" "${OUT}/candidate_admission_status.csv"
+    record_topic /care_planner/repair_prefix_selection "${OUT}/repair_prefix_selection.csv"
+  fi
   if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
     record_topic "${LOCAL_SCP_SUMMARY_TOPIC}" "${OUT}/local_planner_summary.csv"
     record_topic /care_planner/local_planner/cdf_selector_summary "${OUT}/local_cdf_selector_summary.csv"
@@ -920,6 +1027,8 @@ else
     record_topic /velocity_qp_mpc_waypoint_node/summary "${OUT}/mpc_summary.csv"
   fi
   record_topic /care_planner/execution/tracker_summary "${OUT}/tracker_summary.csv"
+  record_topic /care_planner/execution/audit_identity "${OUT}/execution_audit_identity.csv"
+  record_topic /care_planner/execution/vbc_stop_request "${OUT}/execution_vbc_stop_request.csv"
   record_topic /care_planner/optimized_trajectory_summary "${OUT}/commit_summary.csv"
   record_topic /care_planner/verification_outcome "${OUT}/verification_outcome.csv"
   record_topic /care_planner/local_planner/observation_candidate_identity "${OUT}/observation_candidate_identity.csv"
@@ -935,8 +1044,18 @@ else
   record_topic /care_planner/task_trajectory "${OUT}/task_trajectory.csv"
   record_topic /care_planner/ee_target_pose "${OUT}/ee_target_pose.csv"
   record_topic /care_planner/committed_trajectory "${OUT}/committed_trajectory.csv"
+  # Preserve rejected paths as well: a commit-only recorder cannot replay an
+  # exact VBC rejection. Header stamps join these messages to verification_outcome.
+  if [ "${RECORD_AUDITED_CANDIDATES:-false}" = "true" ]; then
+    record_topic "${RAW_PLANNER_TOPIC}" "${OUT}/raw_candidate_trajectory.csv"
+    record_topic /care_planner/optimized_trajectory "${OUT}/audited_candidate_trajectory.csv"
+  fi
   record_topic "${TRACKER_DESIRED_TOPIC}" "${OUT}/tracker_desired_velocity.csv"
   record_topic "${ACTUATOR_TOPIC}" "${OUT}/actuator_command.csv"
+  if [[ "${ACTUATOR_COMMAND_WATCHDOG}" == "true" ]]; then
+    record_topic /care_arm/arm_group_velocity_controller/state "${OUT}/actuator_watchdog_state.csv"
+    record_topic "${LIMITER_STAMPED_TOPIC}" "${OUT}/actuator_stamped_request.csv"
+  fi
 fi
 
 if [ -z "${CARE_BENCHMARK_ARM_TOKEN}" ]; then
@@ -1000,6 +1119,31 @@ else
   echo "[BENCHMARK] watcher and recorders arm goal first; execution gate wait is inside task window"
 fi
 
+# Start the observer before the benchmark arm. It owns no control publisher.
+if [[ "${STOP_SHADOW_ENABLED}" == "true" ]]; then
+  setsid "${STOP_SHADOW_PYTHON}" scripts/phase_e_stop_shadow_node.py \
+    --output-dir "${OUT}/stop_shadow" --rate "${STOP_SHADOW_RATE}" \
+    > "${LOG}/stop_shadow.log" 2>&1 &
+  SHADOW_PID=$!
+  if ! python3 - "${OUT}/stop_shadow/ready.json" "${SHADOW_PID}" <<'PYREADY'
+import json,os,sys,time
+from pathlib import Path
+path=Path(sys.argv[1]); pid=int(sys.argv[2]); deadline=time.monotonic()+20.
+while time.monotonic()<deadline:
+    os.kill(pid,0)
+    if path.exists():
+        assert json.loads(path.read_text())['ready']
+        print('[READY] read-only stop shadow has live state and snapshot service')
+        break
+    time.sleep(.05)
+else: raise SystemExit('stop shadow readiness timeout')
+PYREADY
+  then
+    echo "[ERROR] stop shadow startup failed; see ${LOG}/stop_shadow.log" >&2
+    exit 1
+  fi
+fi
+
 if [ "${USE_LOCAL_SPARSE_SCP}" = "true" ]; then
   echo "[ARCH] Sparse-SCP -> executable GCDF(${FINAL_EXECUTABLE_GCDF_ENABLED}) -> exact VBC -> single commit"
   echo "[ARCH] continuation=${COMMITTED_CONTINUATION_ENABLED} execution_audit=${EXECUTION_AUDIT_STREAM_ENABLED} probe_single_flight=${PROBE_SINGLE_FLIGHT_ENABLED}"
@@ -1007,6 +1151,20 @@ else
   echo "[ARCH] candidate verifier != committed execution auditor"
 fi
 echo "[REGIME] NORMAL -> REPAIR -> PROBE_NORMAL -> NORMAL (${PROBE_SAFE_COMMITS} safe probe commits required)"
+if [ -n "${CARE_BENCHMARK_ARM_TOKEN}" ]; then
+  # The existing startup deadline also covers actual receiver-side receipt.
+  # Gazebo's command topic may use the stamped watchdog interface.
+  rosparam set /care_planner/benchmark/actuator_readiness_required true
+  rosparam set /care_planner/benchmark/qp_retry_readiness_required true
+  if [ "${REGION_SCHEDULE_MODE}" = "blocker_aware_acquisition" ] && [ "${RECORDING_PROFILE}" = "full" ]; then
+    rosparam set /care_planner/benchmark/observation_readiness_required true
+  fi
+  CARE_ACTUATOR_RECEIVER_TOPIC="${LIMITER_OUTPUT_TOPIC}"
+  if [ "${ACTUATOR_COMMAND_WATCHDOG}" = "true" ]; then
+    CARE_ACTUATOR_RECEIVER_TOPIC="${LIMITER_STAMPED_TOPIC}"
+  fi
+  rosparam set /care_planner/benchmark/actuator_readiness "{tracker_node: /trajectory_execution_manager_node, limiter_node: /joint_velocity_rate_limiter, controller_node: /gazebo, desired_topic: '${TRACKER_DESIRED_TOPIC}', command_topic: '${CARE_ACTUATOR_RECEIVER_TOPIC}', command_stamped: ${ACTUATOR_COMMAND_WATCHDOG}}"
+fi
 if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; then
   echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} up to ${RUN_SECONDS}s; early stop on stable EE goal"
   python3 scripts/wait_for_phase_d_goal.py \
@@ -1020,12 +1178,34 @@ if [ "${EARLY_STOP_ON_GOAL}" = "true" ] || [ "${EARLY_STOP_ON_GOAL}" = "1" ]; th
     --settle-velocity-inf-rad-s "${GOAL_SETTLE_VELOCITY_INF_RAD_S}" \
     --settle-timeout-s "${GOAL_SETTLE_TIMEOUT_S}" \
     --post-success-record-s "${GOAL_POST_SUCCESS_RECORD_S}" \
+    "${TERMINAL_OBSERVATION_ARGS[@]}" \
     --goal-position "${GX}" "${GY}" "${GZ}" \
     --goal-orientation "${GQX}" "${GQY}" "${GQZ}" "${GQW}" \
     --status-json "${OUT}/goal_stop_status.json"
 else
   echo "[RUN] ${CASE_ID}: ${REGION_SCHEDULE_MODE} for fixed ${RUN_SECONDS}s ROS/Gazebo simulation time"
   python3 scripts/wait_for_ros_duration.py --duration-s "${RUN_SECONDS}"
+fi
+
+
+if [[ "${STOP_SHADOW_ENABLED}" == "true" ]]; then
+  if ! kill -0 "${SHADOW_PID}" 2>/dev/null; then
+    echo "[ERROR] stop shadow exited during the benchmark" >&2
+    exit 1
+  fi
+  kill_group "${SHADOW_PID}"; SHADOW_PID=""
+  if ! python3 - "${OUT}/stop_shadow/result.json" <<'PYRESULT'
+import json,sys
+from pathlib import Path
+result=json.loads(Path(sys.argv[1]).read_text())
+assert result['rows']>0 and result['input_hashes_unchanged']
+assert result['runtime_admission'] is False and result['control_publishers']==[]
+assert not any(k.startswith('observer_exception') for k in result['reason_counts'])
+PYRESULT
+  then
+    echo "[ERROR] stop shadow evidence did not close cleanly" >&2
+    exit 1
+  fi
 fi
 
 kill_group "${CONTROL_PID}"; CONTROL_PID=""

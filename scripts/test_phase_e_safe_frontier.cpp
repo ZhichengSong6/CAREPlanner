@@ -99,5 +99,86 @@ int main(int argc, char** argv) {
   assert(boundedTangentTarget(zero,goal,full,1,.03).size()==0);
   assert(boundedTangentTarget(zero,goal,{},1,.03).size()==0);
   assert(boundedTangentTarget(zero,goal,{normal},6,.03).size()==0);
+  V observe_goal=zero,mask=zero; observe_goal[1]=1.; mask.head(4).setOnes();
+  auto configure=[&](const std::string& name,unsigned long long mode) {
+    s.select(name,mode); s.setObservationGoal("care_obs_v1_"+name,observe_goal,mask); q=zero;
+  };
+  configure("wrist",10);
+  for(int i=0;i<5;++i) {q[5]=-.02*i;assert(!sample(6000+10*i,50.+i*.25,.05,q));}
+  q[5]=-.1;assert(sample(6050,51.25,.05,q));
+  assert(s.stage()==1 && s.last_stall_reason=="observation_no_progress");
+  configure("forward",11);
+  for(int i=0;i<20;++i){q[1]=.002*i;assert(!sample(6100+10*i,53.+i*.25,.05,q));}
+  assert(s.stage()==0); // cumulative target improvement resets the observation window
+  configure("sideways",12);
+  for(int i=0;i<5;++i){q[0]=.02*i;assert(!sample(6400+10*i,60.+i*.25,.05,q));}
+  q[0]=.1;assert(sample(6450,61.25,.05,q)); // motion away from q_vis is not progress
+  configure("detour",13);s.advance();
+  sample(6500,63.,.05,q);
+  for(int i=1;i<=5;++i){q[0]=.02*i;assert(sample(6500+10*i,63.+i*.25,.05,q));}
+  assert(s.stage()==1 && s.segments==5); // necessary sideways detour gets its bounded segments
+  q[0]=.12;assert(sample(6560,64.5,.05,q));assert(s.stage()==2);
+  configure("feedback",14);
+  const std::string token="care_obs_v1_feedback";
+  assert(s.noteObservationFeedback(token,66.,66.,Eigen::Vector3d::Zero()));
+  assert(!s.noteObservationFeedback("care_obs_v1_old",66.1,66.1,Eigen::Vector3d::Ones()));
+  assert(!s.noteObservationFeedback(token,65.,66.1,Eigen::Vector3d::Ones()));
+  assert(!s.noteObservationFeedback(token,66.,66.1,Eigen::Vector3d::Ones()));
+  assert(!s.noteObservationFeedback(token,66.2,66.1,Eigen::Vector3d::Ones()));
+  for(int i=0;i<5;++i)assert(!sample(6700+10*i,66.+i*.25,.05,q));
+  assert(s.noteObservationFeedback(token,67.2,67.2,Eigen::Vector3d(.1,0.,0.)));
+  assert(!sample(6750,67.25,.05,q));assert(s.stage()==0);
+  for(int i=0;i<4;++i)assert(!sample(6760+10*i,67.5+i*.25,.05,q));
+  assert(sample(6800,68.5,.05,q)); // constant positive feedback cannot indefinitely postpone recovery
+  configure("duplicate",15);
+  s.remember(7000,.05);assert(s.certify(7000,7001));
+  for(int i=0;i<10;++i){q[5]=.02*i;assert(!s.observe(7001,70.+i*.25,q));}
+  assert(s.observation_commits==1 && s.stage()==0); // one execution is counted once
+  s.abort(7001);assert(s.observation_commits==0);
+  configure("target",16);
+  for(int i=0;i<5;++i)assert(!sample(7100+10*i,73.+i*.25,.05,q));
+  s.setObservationGoal("care_obs_v1_new",observe_goal,mask);
+  assert(!sample(7150,74.25,.05,q));assert(s.observation_commits==1);
+  s.setObservationGoal("care_obs_v1_new",observe_goal,mask); // identical target refresh is not progress
+  assert(!sample(7160,74.5,.05,q));assert(s.observation_commits==2);
+  configure("view_plateau",17);s.advance();s.monitor_detour_observation=true;
+  const std::string signature(64,'a');
+  for(int i=0;i<6;++i) {
+    const double t=80.+i*.25;
+    assert(s.noteGeometryFeedback("care_obs_v1_view_plateau",signature,t,t,-.25+i*.00002));
+    assert(s.noteObservationFeedback("care_obs_v1_view_plateau",t,t,Eigen::Vector3d::Zero()));
+    q[1]=.012*i;sample(7200+10*i,t,.03,q);
+  }
+  assert(s.attempts==2 && s.observation_replacement_due);
+  assert(s.last_advance_reason=="view_geometry_stall"); // approaching q_vis cannot hide FOV stagnation
+  configure("view_improving",18);s.advance();s.monitor_detour_observation=true;
+  for(int i=0;i<20;++i) {
+    const double t=83.+i*.25;
+    assert(s.noteGeometryFeedback("care_obs_v1_view_improving",signature,t,t,-.25+i*.003));
+    q[1]=.002*i;sample(7300+10*i,t,.03,q);
+    assert(!s.observation_replacement_due);
+  }
+  assert(s.attempts==1); // productive preparation is allowed before entering FOV
+  configure("view_final",19);s.active=true;s.attempts=5;s.monitor_detour_observation=true;
+  for(int i=0;i<6;++i) {
+    const double t=90.+i*.25;
+    assert(s.noteGeometryFeedback("care_obs_v1_view_final",signature,t,t,-.25));
+    q[1]=.002*i;sample(7600+10*i,t,.03,q);
+  }
+  assert(s.observation_replacement_due && s.attempts==5 && !s.blocked());
+  assert(s.reserveReplacementAfterVbc(true) && s.attempts==5 && s.final_stage_replacement_used);
+  assert(!s.reserveReplacementAfterVbc(true)); // final reservation cannot repeat
+  assert(!s.noteGeometryFeedback("care_obs_v1_old",signature,92.,92.,1.));
+  assert(!s.noteGeometryFeedback("care_obs_v1_view_final",signature,91.,92.,1.));
+  assert(!s.noteGeometryFeedback("care_obs_v1_view_final",signature,93.,92.,1.));
+  assert(!s.noteGeometryFeedback("care_obs_v1_view_final","bad",92.,92.,1.));
+  configure("segment_memory",20);s.advance();
+  sample(7700,94.,.03,q);
+  for(int i=1;i<=6;++i){s.detour_direction=V::Unit(7,0);q[0]=.02*i;sample(7700+10*i,94.+i*.25,.03,q);}
+  assert(s.attempts==2 && s.failed_directions.empty()); // spending segments is not a directional counterexample
+  s.detour_direction=V::Unit(7,0);s.advance();assert(s.failed_directions.size()==1);
+  const int spent=s.attempts;
+  s.setObservationGoal("care_obs_v1_replacement",observe_goal,mask);
+  assert(s.failed_directions.empty() && s.attempts==spent); // new view context clears directions, never the ledger
   std::cout << "PASS safe frontier identity, progress, bounded attempts and tangent tests\n";
 }

@@ -1,0 +1,36 @@
+# Coherent diagnostic snapshot. No reservation or physical free-space lease.
+geometry_msgs/Point[] points
+float64 horizon_s
+float64 minimum_confidence
+# Empty instance disables version matching; otherwise all three must match.
+string expected_instance
+uint64 expected_epoch
+uint64 expected_revision
+---
+bool valid
+string reason
+string instance
+uint64 epoch
+uint64 revision
+time snapshot_stamp
+time map_update_stamp
+string frame
+float64 resolution
+geometry_msgs/Point map_min
+geometry_msgs/Point map_max
+uint32[3] grid_size
+string observation_mode
+bool clock_fault
+bool future_free_space_guaranteed
+float64 horizon_s
+float64 temporal_decay_time
+# Aligned arrays, zero/unknown on invalid requests or version mismatch.
+uint8[] inside_map
+float32[] confidence_now
+float32[] confidence_at_horizon
+float32[] occupancy
+float64[] last_seen_s
+# Bit mask: 1 sensor, 2 frozen bootstrap, 4 test oracle (not real perception).
+uint8[] provenance
+# Conditional on no contrary observation/layer change; not an admission result.
+uint8[] model_free_at_horizon

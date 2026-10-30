@@ -1,0 +1,4 @@
+# Frozen source snapshots and patch context must retain their exact bytes/SHA.
+experiments/phase_e_static_baseline_20261030/overlay/** -text -whitespace
+experiments/phase_e_static_baseline_20261030/template/** -text -whitespace
+patches/piqp/*.patch -text -whitespace

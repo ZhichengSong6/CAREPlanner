@@ -1,4 +1,7 @@
 #pragma once
+#include "egocentric_arm_planner/task_observation_context.hpp"
+#include <egocentric_arm_planner/CandidateTransfer.h>
+#include "egocentric_arm_planner/fixed_start_clearance.hpp"
 
 #include <ros/ros.h>
 
@@ -6,6 +9,10 @@
 #include <care_collision_cdf/CollisionCDFWitnessRequest.h>
 #include <care_collision_cdf/CollisionCDFWitnessResponse.h>
 #include <care_collision_cdf/CollisionCDFRejectionFeedback.h>
+#include <egocentric_arm_planner/RepairPrefixSelection.h>
+#include <egocentric_arm_planner/CandidateTransfer.h>
+#include <egocentric_arm_planner/VisibilityGuidance.h>
+#include "egocentric_arm_planner/visibility_guidance.hpp"
 
 #include <sensor_msgs/JointState.h>
 #include <std_msgs/Bool.h>
@@ -13,10 +20,25 @@
 #include <std_msgs/String.h>
 #include "egocentric_arm_planner/task_reference_retry.hpp"
 #include "egocentric_arm_planner/qp_no_progress.hpp"
+#include "egocentric_arm_planner/normal_active_no_progress.hpp"
+#include "egocentric_arm_planner/normal_unknown_no_progress.hpp"
+#include "egocentric_arm_planner/normal_unknown_task_progress.hpp"
 #include "egocentric_arm_planner/qp_backtrack_policy.hpp"
 #include "egocentric_arm_planner/repair_no_progress.hpp"
 #include "egocentric_arm_planner/final_vbc_no_progress.hpp"
+#include "egocentric_arm_planner/vbc_failure_direction_memory.hpp"
 #include "egocentric_arm_planner/safe_frontier_recovery.hpp"
+#include "egocentric_arm_planner/task_recovery_policy.hpp"
+#include "egocentric_arm_planner/state_evidence_retry.hpp"
+#include "egocentric_arm_planner/execution_response_monitor.hpp"
+#include "egocentric_arm_planner/repair_candidate_failure.hpp"
+#include "egocentric_arm_planner/repair_conflict_reseed.hpp"
+#include "egocentric_arm_planner/primitive_observation_guard.hpp"
+#include "egocentric_arm_planner/normal_terminal_retention.hpp"
+#include <geometry_msgs/PoseStamped.h>
+#include <care_confidence_map/initial_shell_recovery.hpp>
+#include "egocentric_arm_planner/repair_executable_view.hpp"
+#include "egocentric_arm_planner/repair_executable_iterates.hpp"
 #include <trajectory_msgs/JointTrajectory.h>
 
 #include <Eigen/Dense>
@@ -28,6 +50,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -60,12 +83,28 @@ private:
     Eigen::VectorXd joint_mask;
     int recovery_attempt = 0;
     Eigen::VectorXd recovery_target;
+    Eigen::VectorXd visibility_gradient;
+    std::vector<Eigen::VectorXd> failed_directions;
   };
 
   struct SparseSolveResult {
     bool solved = false;
     std::string status = "not_solved";
     int box_conflicting_cdf_rows = 0;
+    int reachable_conflicting_cdf_rows = 0;
+    int first_step_conflicting_cdf_rows = 0;
+    int later_conflicting_cdf_rows = 0;
+    int first_step_conflicting_occupied_rows = 0;
+    std::vector<Eigen::Vector3d> first_step_unknown_conflict_points;
+    std::vector<Eigen::Vector3d> geometric_restore_guard_points;
+    std::vector<PrimitiveObservationPoint> geometric_restore_path_guards;
+    int primitive_conflicting_rows = 0;
+    std::vector<Eigen::Vector3d> primitive_margin_recovery_points;
+    int reachable_conflicting_repair_witness_rows = 0;
+    int first_step_conflicting_repair_witness_rows = 0;
+    int later_conflicting_repair_witness_rows = 0;
+    double worst_repair_witness_reachable_deficit = 0.0;
+    std::string repair_hard_qp_snapshot;
     int visibility_objective_step = -1;
     unsigned long long trace_plan_sequence = 0;
     std::string trace_observation_token = "none";
@@ -83,12 +122,36 @@ private:
     double setup_and_solve_ms = 0.0;
     int batch_pairs = 0;
     int selected_cdf_rows = 0;
+    int primitive_observation_rows = 0;
+    int primitive_observation_points = 0;
+    int primitive_executable_rows = 0;
+    int primitive_executable_samples = 0;
+    bool primitive_executable_valid = true;
+    bool primitive_live_rebase_checked = false;
+    bool primitive_live_rebase_required = false;
+    Eigen::VectorXd primitive_live_rebase_start;
+    Eigen::VectorXd primitive_live_rebase_velocity;
+    double primitive_live_rebase_shift_inf = 0.;
+    double primitive_live_rebase_min_m = std::numeric_limits<double>::quiet_NaN();
+    double primitive_executable_min_distance_m = std::numeric_limits<double>::quiet_NaN();
+    double primitive_executable_numerical_tightening_m = 0.;
+    double executable_step_scale = 1.;
+    bool executable_recheck_only = false;
+    bool executable_trial_restored = false;
+    bool executable_retained_available = false;
+    double primitive_observation_start_distance_m = std::numeric_limits<double>::quiet_NaN();
+    bool fixed_start_unknown_blocked = false;
+    Eigen::Vector3d fixed_start_unknown_point = Eigen::Vector3d::Zero();
+    double fixed_start_unknown_distance_m = 0., fixed_start_unknown_floor_m = 0.;
+    int primitive_shell_recovery_points = 0;
+    int primitive_shell_penalty_rows = 0;
     int selected_unknown_cdf_rows = 0;
     int selected_occupied_cdf_rows = 0;
     int selected_obligation_cdf_rows = 0;
     // Exact batch-pair identities that actually entered the hard QP as
     // UNKNOWN rows. Used to route local-GCDF blockers directly to sensing.
     std::vector<int> selected_unknown_pair_indices;
+    std::vector<Eigen::Vector3d> normal_blocking_unknown_points;
     int screened_safe_rows = 0;
     int skipped_step0_rows = 0;
     int skipped_horizon_rows = 0;
@@ -100,7 +163,10 @@ private:
     double slack_linear_weight_used = 0.0;
     double step_inf = 0.0;
     Eigen::VectorXd recovery_frontier;
+    double recovery_start_clearance=0.;
+    std::string recovery_clearance_signature;
     int recovery_normals = 0;
+    int recovery_tight_normals = 0;
     bool recovery_rejoining = false;
     std::vector<Eigen::Vector3d> observation_dependency_points;
     Eigen::MatrixXd q;
@@ -108,6 +174,34 @@ private:
   };
 
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
+  void repairPrefixSelectionCallback(const egocentric_arm_planner::RepairPrefixSelectionConstPtr& msg);
+  bool prefixSelectionCompatible(const egocentric_arm_planner::RepairPrefixSelection& msg) const;
+  bool prefixSelectionCurrentLocked(const egocentric_arm_planner::RepairPrefixSelection& msg) const;
+  bool task_context_enabled_=false;
+  TaskObservationContext task_context_;
+  std::string plan_task_context_;
+  bool require_bound_regime_=false,task_control_ready_=false;
+  bool require_bound_recovery_policy_=false;
+  TaskPlanningEventReceiver task_event_receiver_;
+  std::string task_regime_,plan_task_regime_,task_event_source_;
+  std::uint64_t task_control_until_=0,task_recovery_until_=0,task_replan_sequence_=0;
+  std::uint64_t task_status_sequence_=0,task_control_revision_=0;
+  std::string task_control_source_;
+  std::string task_control_target_sha_,task_recovery_target_sha_;
+  std::string plan_recovery_target_sha_,plan_recovery_policy_sha_;
+  TaskRecoveryPolicy task_recovery_policy_;
+  ros::Subscriber task_control_sub_,task_recovery_sub_;
+  ros::Publisher task_status_pub_;
+  void taskControlCallback(const std_msgs::StringConstPtr& msg);
+  void taskRecoveryCallback(const std_msgs::StringConstPtr& msg);
+  void publishTaskStatusLocked(const std::string& name,const std::string& text);
+  void acceptQpRetryLocked(const std::string& token);
+  CandidateTransferConstPtr pending_bound_reference_;
+  ros::Time pending_bound_reference_received_;
+  ros::Subscriber task_context_sub_,bound_reference_sub_;
+  void taskContextCallback(const std_msgs::StringConstPtr& msg);
+  void boundReferenceCallback(const CandidateTransferConstPtr& msg);
+  void acceptReferenceLocked(const trajectory_msgs::JointTrajectory& msg, bool bound);
   void referenceCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void taskReferenceStatusCallback(const std_msgs::StringConstPtr& msg);
@@ -117,17 +211,32 @@ private:
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void visibilityFrontierCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
+  void visibilityGuidanceCallback(const egocentric_arm_planner::VisibilityGuidanceConstPtr& msg);
   void singleWaypointActiveCallback(const std_msgs::BoolConstPtr& msg);
   void singleWaypointQCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void recoveryCallback(const std_msgs::BoolConstPtr& msg);
   void probeActiveCallback(const std_msgs::BoolConstPtr& msg);
   void replanRequestCallback(const std_msgs::BoolConstPtr& msg);
+  void qpRetryRequestCallback(const std_msgs::StringConstPtr& msg);
   void smoothReplanRequestCallback(const std_msgs::BoolConstPtr& msg);
+  void terminalGoalCallback(const geometry_msgs::PoseStampedConstPtr& msg);
+  void terminalAuditCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  void terminalCommitCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
+  std::string terminalContextLocked() const;
+  bool terminalPoseInsideLocked(const Eigen::VectorXd& q) const;
+  void armTerminalLocked();
+  bool retainTerminalLocked();
   void executedCommandCallback(
       const std_msgs::Float64MultiArrayConstPtr& msg);
   void executionSummaryCallback(const std_msgs::StringConstPtr& msg);
+  void desiredCommandCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
+  void limiterSummaryCallback(const std_msgs::StringConstPtr& msg);
+  void vbcExecutionHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void gcdfExecutionHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void observationProgressCallback(const std_msgs::StringConstPtr& msg);
   void finalVerificationCallback(const std_msgs::StringConstPtr& msg);
+  void admissionTerminalCallback(const egocentric_arm_planner::CandidateTransferConstPtr& msg);
   void candidateReplacementCallback(const std_msgs::StringConstPtr& msg);
   void cdfConstraintBatchCallback(
       const care_collision_cdf::CollisionCDFConstraintBatchConstPtr& msg);
@@ -170,6 +279,7 @@ private:
   void requestPlanLocked(const std::string& reason);
   std::string repairTargetKeyLocked() const;
   void selectRepairTargetLocked();
+  VbcFailureDirectionMemory::Context vbcFailureContextLocked() const;
   bool startPlan();
   void abortPlan(const std::string& reason);
 
@@ -192,19 +302,34 @@ private:
       double trust_radius,
       double slack_linear_weight,
       bool force_diagnostic_slack = false,
-      bool previous_vbc_margins = false) const;
+      bool previous_vbc_margins = false,
+      double executable_step_scale = 1.,
+      bool executable_recheck_only = false,
+      const egocentric_arm_planner::RepairPrefixSelection* selected_prefix = nullptr,
+      bool free_joint_task = false) const;
+  bool freeJointTaskImproves(const SparseSolveResult& primary,
+      const SparseSolveResult& trial, const std::vector<DeadlineWaypoint>& schedule,
+      const FrontierObjective& frontier, const Eigen::MatrixXd& q_ref) const;
+
+  std::string repairExecutableContextLocked() const;
 
   ros::Time publishQueryTrajectory(
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
-      const std::string& frame_id);
+      const std::string& frame_id,
+      unsigned long long expected_plan_sequence = 0,
+      unsigned long long expected_mode_epoch = 0,
+      const RepairNoProgress::Ticket* expected_repair_ticket = nullptr);
   void publishCandidateTrajectory(
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
       const std::string& frame_id,
       const std::string& observation_token,
       const care_collision_cdf::CollisionCDFConstraintBatch& batch,
-      const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u);
+      const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u,
+      const std::vector<Eigen::Vector3d>& normal_blocking_unknown_points,
+      const std::vector<Eigen::Vector3d>& geometric_restore_points = {},
+      bool margin_recovery = false);
   bool publishLocalGcdfRecoveryEvidence(
       const care_collision_cdf::CollisionCDFConstraintBatch& batch,
       const SparseSolveResult& result,
@@ -215,7 +340,15 @@ private:
       const Eigen::MatrixXd& q,
       const Eigen::MatrixXd& u,
       const std::string& frame_id,
-      const ros::Time& stamp) const;
+      const ros::Time& stamp,
+      const Eigen::VectorXd* normal_initial_velocity = nullptr) const;
+  bool buildNormalMotionSeed(const Eigen::VectorXd& q_current,
+      const Eigen::VectorXd& v_current, const Eigen::MatrixXd& q_ref,
+      Eigen::MatrixXd& q, Eigen::MatrixXd& u) const;
+  std::string repairWarmStartKeyLocked() const;
+  bool takeRepairWarmStartLocked(const Eigen::VectorXd& q_current,
+      const Eigen::VectorXd& v_current, Eigen::MatrixXd& q,
+      Eigen::MatrixXd& u, int& charged_iterations);
 
   void publishSummary(const std::string& event,
                       const SparseSolveResult* result = nullptr,
@@ -240,8 +373,21 @@ private:
   ros::Subscriber probe_active_sub_;
   ros::Subscriber replan_request_sub_;
   ros::Subscriber smooth_replan_request_sub_;
+  ros::Subscriber terminal_goal_sub_,terminal_audit_sub_,terminal_commit_sub_;
+  bool terminal_retention_enabled_=false,terminal_goal_valid_=false;
+  NormalTerminalRetention terminal_retention_;
+  std::string plan_terminal_context_;
+  Eigen::Isometry3d terminal_goal_=Eigen::Isometry3d::Identity();
+  std::string terminal_base_frame_="base_link",terminal_ee_frame_="EE_link";
+  unsigned long long terminal_goal_revision_=0,terminal_tracker_token_=0;
+  ros::Time terminal_tracker_received_;
+  std::string terminal_tracker_source_;
+  bool terminal_tracker_completed_=false,terminal_tracker_aborted_=false;
   ros::Subscriber executed_command_sub_;
   ros::Subscriber execution_summary_sub_;
+  ros::Subscriber desired_command_sub_, limiter_summary_sub_;
+  ros::Subscriber vbc_execution_hold_sub_, gcdf_execution_hold_sub_;
+  ros::Subscriber observation_progress_sub_;
   ros::Subscriber cdf_batch_sub_;
 
   ros::Publisher query_trajectory_pub_;
@@ -256,10 +402,21 @@ private:
   ros::Subscriber candidate_replacement_sub_;
   ros::Publisher candidate_replacement_grant_pub_;
   ros::Publisher candidate_replacement_trigger_pub_;
-  bool requestQpReplacementLocked(const std::string& reason);
-  std::string repair_candidate_failed_key_;
-  unsigned long long repair_candidate_failed_epoch_ = 0, repair_candidate_failed_progress_ = 0;
+  std::string handleHandoffResidualLocked(unsigned long long raw,unsigned long long audit,
+      const HandoffResidualFailure& failure);
+  bool requestQpReplacementLocked(const std::string& reason,
+      unsigned long long rejected_raw = 0, unsigned long long rejected_audit = 0);
+  bool qpReplacementRetryCurrentLocked() const;
+  std::string finishReplacementLocked(bool refresh_failed_target, const std::string& reason);
+  RepairCandidateFailure repair_candidate_failure_;
+  FixedStartClearanceHold fixed_start_clearance_hold_;
+  RepairCandidateFailure candidate_replacement_reserved_failure_;
+  RepairCandidateFailure candidate_replacement_retry_context_;
+  bool candidate_replacement_reserved_qp_ = false;
+  bool candidate_replacement_retry_pending_ = false;
+  bool plan_candidate_replacement_refresh_only_ = false;
   std::string candidate_replacement_trigger_reason_ = "final_vbc_repeat";
+  std::string candidate_replacement_trigger_observation_token_;
   bool candidate_replacement_enabled_ = false;
   bool candidate_replacement_pending_ = false;
   bool candidate_replacement_trigger_pending_ = false;
@@ -277,17 +434,54 @@ private:
   std::string candidate_replacement_new_token_;
   std::string final_vbc_repeat_target_key_ = "none";
   std::vector<Eigen::Vector3d> final_vbc_previous_points_;
+  std::vector<Eigen::Vector3d> final_gcdf_previous_points_;
+  VbcFailureDirectionMemory vbc_failure_direction_memory_;
   ros::Publisher summary_pub_;
   ros::Publisher task_infeasible_pub_;
   ros::Publisher task_obstacle_blocked_pub_;
   ros::Publisher task_uncertified_pub_;
   ros::Publisher task_stall_pub_;
+  ros::Subscriber qp_retry_request_sub_;
+  ros::Publisher qp_retry_ack_pub_;
+  std::string qp_retry_token_;
+  std::string qp_retry_consumed_token_;
+  unsigned long long qp_retry_plan_sequence_ = 0;
+  unsigned long long qp_retry_mode_epoch_ = 0;
   QPNoProgress task_no_progress_;
+  NormalActiveNoProgress normal_active_no_progress_;
+  NormalUnknownNoProgress normal_unknown_no_progress_;
+  NormalUnknownTaskProgress normal_unknown_task_progress_;
+  unsigned long long normal_task_progress_logged_sequence_ = 0;
+  bool normal_task_stall_pending_ = false;
+  std::string normal_task_stall_context_;
+  double normal_task_stall_credited_error_ = -1.;
+  std::string normalUnknownContextLocked() const;
+  std::string normalTaskProgressContextLocked() const;
+  void logNormalTaskProgressLocked();
+  void resetNormalTaskProgressLocked(const std::string& reason);
+  // Count measured progress after distinct certified NORMAL executions too.
+  // A hard QP that recovers to a stationary hold must not reset liveness.
+  double normal_no_progress_target_gap_inf_ = 0.10;
+  unsigned long long normal_measured_stall_count_ = 0;
   RepairNoProgress repair_no_progress_;
   FinalVbcNoProgress final_vbc_no_progress_;
   ros::Subscriber final_verification_sub_;
+  ros::Subscriber admission_terminal_sub_;
+  struct AdmissionCandidate {
+    egocentric_arm_planner::CandidateTransfer planned;
+    egocentric_arm_planner::RepairPrefixSelection prefix;
+    unsigned long long epoch;
+    std::string observation_token, recovery_key;
+  };
+  std::map<unsigned long long, AdmissionCandidate> admission_pending_;
   ros::Subscriber gcdf_rejection_feedback_sub_;
-  std::map<std::uint64_t, FinalVbcNoProgress::Candidate> gcdf_feedback_pending_;
+  struct GcdfCandidate {
+    FinalVbcNoProgress::Candidate identity;
+    std::string observation_token;
+    ros::Time raw_stamp;
+    ros::WallTime deadline;
+  };
+  std::map<std::uint64_t, GcdfCandidate> gcdf_feedback_pending_;
   ros::Publisher candidate_audit_context_pub_;
   bool rejection_snapshots_enabled_ = false;
   RepairNoProgress::Ticket plan_repair_ticket_;
@@ -309,14 +503,37 @@ private:
   unsigned long long latest_vbc_obligation_points_seq_ = 0;
   long long latest_vbc_obligation_id_ = -1;
   FrontierObjective latest_frontier_;
+  ros::Subscriber visibility_guidance_sub_;
+  bool rolling_visibility_guidance_enabled_=false;
+  VisibilityGuidanceState latest_visibility_guidance_;
+  std::string latest_observation_region_;
+  int latest_observation_sensor_=-1;
   bool safe_frontier_recovery_enabled_ = false;
   SafeFrontierRecovery safe_frontier_recovery_;
+  std::map<std::string,bool> state_evidence_retry_used_;
+  std::string state_evidence_retry_pending_;
+  ros::WallTime state_evidence_retry_deadline_;
+  StateEvidenceRetryWait state_evidence_retry_wait_;
+  unsigned long long state_residual_retry_raw_=0,state_residual_retry_audit_=0,state_residual_retry_epoch_=0;
+  std::string state_residual_retry_token_;
+  HandoffResidualFailure state_residual_retry_failure_;
+  std::string geometric_restore_scope_;
+  std::set<std::string> geometric_restore_snapshot_scopes_;
+  bool buildGeometricRestoreProposalLocked(const SparseSolveResult& failure,
+      const std::string& observation_token, double prefix_s,
+      Eigen::MatrixXd* q, Eigen::MatrixXd* u);
+  ExecutionResponseMonitor execution_response_monitor_;
+  Eigen::VectorXd latest_desired_command_;
+  ros::Time latest_desired_command_received_, latest_limiter_summary_received_;
+  bool latest_limiter_intentional_hold_ = false;
+  bool vbc_execution_hold_ = false, gcdf_execution_hold_ = false;
   std::string safe_frontier_margin_geometry_key_;
   bool latest_single_waypoint_active_ = false;
   bool has_single_waypoint_q_ = false;
   Eigen::VectorXd latest_single_waypoint_q_;
   Eigen::VectorXd latest_single_waypoint_joint_mask_;
   std::string latest_observation_token_ = "none";
+  bool latest_observation_feedback_unseen_ = false;
   std::string plan_observation_token_ = "none";
   Eigen::VectorXd latest_executed_command_;
   ros::Time latest_joint_state_received_;
@@ -384,6 +601,11 @@ private:
   Eigen::MatrixXd plan_q_ref_;
   Eigen::MatrixXd plan_u_ref_;
   Eigen::MatrixXd plan_q_bar_;
+  // One-use shape only. Fresh q/v, query, executable and audit are required.
+  Eigen::MatrixXd repair_warm_q_;
+  std::string repair_warm_key_;
+  ros::Time repair_warm_stamp_;
+  int repair_warm_iterations_ = 0;
   // The last accepted hard-SCP center is retained so a CDF point-set change
   // that makes the next hard QP fail can be retried once from a known center.
   Eigen::MatrixXd plan_previous_q_bar_;
@@ -391,6 +613,12 @@ private:
   bool plan_has_hard_solution_ = false;
   QPBacktrackPolicy plan_qp_backtrack_policy_;
   bool plan_normal_reseed_used_ = false;
+  RepairConflictReseed plan_repair_conflict_reseed_;
+  RepairExecutableIterates plan_executable_iterates_;
+  std::atomic<int> repair_hard_qp_snapshots_written_{0};
+  // One replayable failed hard QP before and after a live obligation appears.
+  mutable std::atomic<bool> normal_qp_snapshot_unowned_written_{false};
+  mutable std::atomic<bool> normal_qp_snapshot_owned_written_{false};
   Eigen::MatrixXd plan_u_bar_;
   std::vector<DeadlineWaypoint> plan_schedule_;
   FrontierObjective plan_frontier_;
@@ -413,8 +641,26 @@ private:
     bool vbc_feedback = false;
     double previous_margin = -1.;
     double margin_ceiling = 0.30;
+    bool has_primitive_guard = false;
+    PrimitiveObservationPoint primitive_guard;
   };
   std::vector<RepairWitness> repair_unknown_witnesses_;
+  bool primitive_observation_guard_enabled_ = false;
+  bool unknown_corridor_guard_enabled_ = true;
+  double primitive_observation_margin_m_ = 0.;
+  PrimitiveObservationGuard primitive_observation_guard_;
+  std::string restore_path_guard_scope_;
+  std::vector<PrimitiveObservationPoint> restore_path_guard_points_;
+  bool initial_shell_recovery_enabled_ = false;
+  double initial_shell_execution_margin_m_ = 0.;
+  mutable care_confidence_map::InitialShellRecovery initial_shell_recovery_;
+  bool repair_executable_view_enabled_ = false;
+  RepairExecutableSettings repair_executable_settings_;
+  bool repair_prefix_binding_enabled_ = false;
+  ros::Subscriber repair_prefix_selection_sub_;
+  ros::Publisher planned_candidate_pub_;
+  egocentric_arm_planner::RepairPrefixSelection latest_prefix_selection_, plan_prefix_selection_;
+  std::set<std::string> closed_prefix_sessions_;
   bool repair_witness_requires_reobserve_ = false;
   bool repair_witness_overflow_ = false;
   RepairNoProgress::Ticket repair_witness_ticket_;
@@ -472,10 +718,12 @@ private:
   // outward only as far as hard GCDF safety permits.
   bool repair_hold_initialization_enabled_ = false;
   double repair_task_tracking_scale_ = 0.0;
+  double repair_free_joint_task_tracking_scale_ = 0.0;
   // C5.24: PROBE advances only a short task-reference horizon and holds the
   // remaining tail at that local target. This is deliberately separate from
   // the GCDF constraint horizon even when both are configured to five steps.
   int probe_task_horizon_steps_ = 5;
+  double probe_velocity_cap_ = 0.5;
   // C5.25 PROBE-only hard-GCDF feasibility restoration. A soft-QP solution
   // may seed the next SCP linearization, but can never be published.
   bool probe_feasibility_restoration_enabled_ = false;

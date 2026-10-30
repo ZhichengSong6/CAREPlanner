@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -32,14 +33,18 @@ from typing import Dict, List
 import numpy as np
 import rospy
 import torch
-from std_msgs.msg import Bool, Float64MultiArray, String
+from std_msgs.msg import Bool, Float64MultiArray, MultiArrayDimension, String
 from trajectory_msgs.msg import JointTrajectory
 
 from vbc_visibility_acquisition_impl import VisibilityAcquisitionWaypointNode
 from evaluate_direct_vs_projection_ascent import model_value_and_grad_q
 from observation_identity import observation_region_token, observation_token, vbc_bundle_identity
+from observation_identity import observation_target_state, restore_observation_target_state
 from bounded_visibility_recovery import VisibilityRecoveryBudget, region_key, certified_distinct_q
 from candidate_replacement_runtime import attach_candidate_replacement
+from pending_vbc_blockers import PendingVbcBlockers
+from stopping_observation_demands import inherit_stopping_request
+from rolling_visibility_guidance import RollingVisibilityGuidance
 
 
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
@@ -66,6 +71,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._coherent_bundle_sweep_s = math.nan
         self._coherent_bundle_points = np.zeros((0, 3), dtype=np.float64)
         self._coherent_bundle_pending_nonempty = False
+        self._pending_vbc_blockers = PendingVbcBlockers()
         self._coherent_bundle_received_count = 0
         self._coherent_bundle_processed_count = 0
         self._coherent_bundle_drop_count = 0
@@ -101,6 +107,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # different obligation id still changes the active target normally.
         self._active_qvis_target_lock_enabled = True
         self._safety_union_merge_count = 0
+        self._owned_region_reuse_count = 0
 
         # C5.41 motion-efficient progressive shared visibility steering.
         # This cache affects only the learned REPAIR steering target. Exact
@@ -128,6 +135,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._frontier_compute_count = 0
         self._frontier_publish_count = 0
         self._frontier_error_count = 0
+        self._rolling_guidance = RollingVisibilityGuidance()
+        self._guidance_feedback = None
+        self.rolling_guidance_mode = str(rospy.get_param(
+            '~rolling_visibility_guidance_mode',
+            os.environ.get('ROLLING_VISIBILITY_GUIDANCE_MODE', 'off')))
+        if self.rolling_guidance_mode not in ('off', 'shadow', 'drive'):
+            raise ValueError('rolling visibility guidance mode must be off, shadow or drive')
+        self._rolling_guidance_last = None
         self._frontier_last_mode = "startup"
         self._frontier_last_considered_ids: List[int] = []
         self._frontier_last_f_values: Dict[int, float] = {}
@@ -439,6 +454,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self.frontier_summary_pub = rospy.Publisher(
             self.frontier_summary_topic,
             String, queue_size=1, latch=True)
+        if self.rolling_guidance_mode != 'off':
+            from egocentric_arm_planner.msg import VisibilityGuidance
+            self._guidance_message_type = VisibilityGuidance
+            self.guidance_pub = rospy.Publisher(
+                '/care_planner/active_sensing/visibility_guidance',
+                VisibilityGuidance, queue_size=1, latch=False)
         self.active_set_bundle_sub = rospy.Subscriber(
             self.active_set_bundle_topic, Float64MultiArray,
             self._active_set_bundle_cb, queue_size=1)
@@ -561,7 +582,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._coherent_bundle_sweep_s = (
                 float(sweep) if canonical.shape[0] else math.nan)
             self._coherent_bundle_points = canonical
-            self._coherent_bundle_pending_nonempty = canonical.shape[0] > 0
+            if canonical.shape[0]:
+                outcome = self._pending_vbc_blockers.add(dict(
+                    generation=generation, source=source, source_seq=seq,
+                    identity=self._trace_coherent_bundle_identity,
+                    points=canonical.copy(), sweep=float(sweep)))
+                if outcome == 'capacity_hold':
+                    rospy.logerr_throttle(1., '[vbc_blocker_stack] pending blocker capacity reached; acquisition hold')
+            self._coherent_bundle_pending_nonempty = self._pending_vbc_blockers.pending
             self._coherent_bundle_received_count += 1
             self._coherent_bundle_last_reason = (
                 "pending_nonempty" if canonical.shape[0] else "empty_bundle")
@@ -575,7 +603,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._raw_active_set_serial = generation
             no_obligations = len(self._obligations) == 0
 
-        if canonical.shape[0] > 0:
+        if self._coherent_bundle_pending_nonempty:
             # A fresh confirmed blocker must keep acquisition incomplete until
             # this exact bundle has materialized into an obligation.
             if self._acquisition_complete and no_obligations and not was_pending:
@@ -583,6 +611,19 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._acquisition_started = True
             self._acquisition_complete = False
             self.acquisition_complete_pub.publish(Bool(data=False))
+
+    def pending_blocker_matches(self, audit_stamp, points):
+        """Only a waiting discovery; this is not a replacement grant."""
+        with self._coherent_bundle_lock:
+            return self._pending_vbc_blockers.contains(audit_stamp, points)
+
+    def _set_acquisition_completion(self, complete):
+        # Keep the final publication atomic with admission of new blocker work.
+        # Confidence queries remain outside this short lock.
+        with self._coherent_bundle_lock:
+            complete = bool(complete and not self._pending_vbc_blockers.pending)
+            self._acquisition_complete = complete
+            self.acquisition_complete_pub.publish(Bool(data=complete))
 
     @staticmethod
     def _stamp_key(stamp):
@@ -1427,6 +1468,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 child = self._generate_new_obligation(
                     region, trajectory, float(sweep_s),
                     trajectory_received, trajectory_source)
+                if by_id[int(region['parent_obligation_id'])].get('stopping_prefix_request'):
+                    inherit_stopping_request(by_id[int(region['parent_obligation_id'])],child)
                 children.append(child)
         except Exception as exc:
             self._adaptive_refinement_failure_count += 1
@@ -1501,15 +1544,35 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             str(new_root))
         return True
 
+    def _match_existing(self, region: Dict[str, object]):
+        """Keep ownership of exact solver points independent of steering quality.
+
+        Shared/pinned targets can supersede an individual proposal. Rejecting
+        its old pose must not create a second owner for the same requirement,
+        restart recovery budgets, or introduce an ancestor cycle. No point is
+        removed and no observation is completed by this lookup.
+        """
+        points = np.asarray(region.get('points', []), dtype=float).reshape(-1, 3)
+        if not len(points) or not np.all(np.isfinite(points)):
+            return None
+        keys = set(region_key(points))
+        owners = [ob for ob in self._obligations if keys.issubset(
+            set(region_key(ob['points'])))]
+        if owners:
+            owner = min(owners, key=lambda ob: (len(region_key(ob['points'])), int(ob['id'])))
+            self._owned_region_reuse_count = getattr(self, '_owned_region_reuse_count', 0) + 1
+            rospy.loginfo('[OBSERVATION_OWNER] id=%d points=%d reuse=exact_owned_points',
+                          int(owner['id']), len(points))
+            return owner
+        return super()._match_existing(region)
+
     def _match_candidate_compatible(
             self, ob: Dict[str, object], region: Dict[str, object]) -> bool:
-        """Require the stored q_vis to remain valid for refreshed geometry.
+        """Check new geometry against the current steering proposal.
 
-        A spatial match is accepted only when the old q_vis still satisfies the
-        learned visibility field for every point in the new region. If it does
-        not, _match_existing returns no match and the normal obligation creation
-        path generates a new q_vis tied to the new geometry instead of silently
-        overwriting points/centroid under a stale q_vis.
+        Exact already-owned points are handled before this compatibility
+        check. New points require the published/pinned sensor proposal's
+        physical FOV/LOS, or the legacy scalar visibility condition.
         """
         self._qvis_match_check_count += 1
         oid = int(ob.get("id", -1))
@@ -1525,7 +1588,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     "refined_child_rejects_coarse_geometry")
                 return False
 
-        q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
+        # Match geometry against the actual proposal snapshot, including its
+        # sensor and mask. Never evaluate a published shared pose with the
+        # original individual proposal's sensor identity.
+        target = dict(ob)
+        region_token = observation_region_token(ob)
+        published = getattr(self, '_trace_published_target', None)
+        pin = getattr(self, '_dependency_pins', {}).get(oid)
+        if published is not None and published.get('region_token') == region_token:
+            restore_observation_target_state(target, published)
+        elif pin is not None and pin.get('region') == region_key(ob['points']):
+            restore_observation_target_state(target, pin)
+        q_vis = np.asarray(target.get("q_vis", []), dtype=np.float64).reshape(-1)
         points = np.asarray(
             region.get("points", []), dtype=np.float64).reshape(-1, 3)
         if (q_vis.shape != (7,) or not np.all(np.isfinite(q_vis)) or
@@ -1536,8 +1610,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
 
         try:
-            hybrid_used = bool(ob.get("per_sensor_hybrid_used", False))
-            sensor_id = int(ob.get("per_sensor_selected_sensor_id", -1))
+            hybrid_used = bool(target.get("per_sensor_hybrid_used", False))
+            sensor_id = int(target.get("per_sensor_selected_sensor_id", -1))
             if (hybrid_used and sensor_id >= 0 and
                     getattr(self, "_per_sensor_runtime", None) is not None):
                 # Preserve the branch identity that certified this q_vis.
@@ -1547,6 +1621,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 f_min = float(
                     self._per_sensor_runtime.branch_score_numpy(
                         points, q_vis, sensor_id))
+                geometry = self._per_sensor_runtime._candidate_geometry(points, q_vis, sensor_id)
+                compatible = bool(geometry['accepted'])
             else:
                 x = torch.tensor(
                     points, device=self.device, dtype=torch.float32)
@@ -1556,6 +1632,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 values = self._per_point_values(x, q)
                 f_min = (
                     float(np.min(values)) if values.size else -math.inf)
+                compatible = bool(math.isfinite(f_min) and
+                    f_min + 1e-9 >= self._obligation_match_qvis_min_f)
         except Exception as exc:
             self._qvis_match_error_count += 1
             self._qvis_match_reject_count += 1
@@ -1569,14 +1647,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
 
         self._qvis_match_last_f_min = f_min
-        compatible = bool(
-            math.isfinite(f_min) and
-            f_min + 1e-9 >= self._obligation_match_qvis_min_f)
         if compatible:
             self._qvis_match_accept_count += 1
             self._qvis_match_last_reason = (
                 "per_sensor_qvis_compatible"
-                if bool(ob.get("per_sensor_hybrid_used", False))
+                if bool(target.get("per_sensor_hybrid_used", False))
                 else "qvis_compatible")
             return True
 
@@ -1768,20 +1843,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
         return any(int(oid) in earliest for oid in stack[:-1])
 
-    def _compute_visibility_frontier(self):
+    def _compute_visibility_frontier(self, selected_obligations=None):
         if not self.frontier_steering_enabled:
             return None
 
         with self._obligation_lock:
-            copied = [dict(ob) for ob in self._obligations]
+            copied = [dict(ob) for ob in (self._obligations if selected_obligations is None else selected_obligations)]
             stack = [
                 int(oid) for oid in self._repair_stack
-                if any(int(ob["id"]) == int(oid) for ob in self._obligations)
+                if any(int(ob["id"]) == int(oid) for ob in copied)
             ]
         by_id = {int(ob["id"]): ob for ob in copied}
         if not by_id:
             return None
-        active_id = stack[-1] if stack else min(by_id)
+        active_id = (int(selected_obligations[0]['id']) if selected_obligations else
+                     (stack[-1] if stack else min(by_id)))
         allowed_ids = self._shared_path_candidate_ids(by_id, active_id)
         copied = [ob for ob in copied if int(ob["id"]) in allowed_ids]
         by_id = {int(ob["id"]): ob for ob in copied}
@@ -1797,6 +1873,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             None if self._latest_measured_q is None
             else np.asarray(
                 self._latest_measured_q, dtype=np.float64).copy())
+        measured_snapshot = getattr(self, '_trace_measured', (None, math.nan))
+        if getattr(self, 'rolling_guidance_mode', 'off') != 'off':
+            measured = None if measured_snapshot[0] is None else np.asarray(
+                measured_snapshot[0], dtype=np.float64).copy()
         if (measured is None or measured.shape != (7,) or
                 not np.all(np.isfinite(measured))):
             self._frontier_last_mode = "no_measured_q"
@@ -1868,6 +1948,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 stack, self._last_active_layer_ids)
             result = {
                 "active": True,
+                "q_eval": measured.copy(),
+                "measured_stamp": measured_snapshot[1] if measured_snapshot[0] is not None and
+                    np.array_equal(measured_snapshot[0], measured) else math.nan,
                 "target": target,
                 "q_vis_joint_mask": joint_mask.copy(),
                 "frontier_weight_scale": 1.0,
@@ -1880,16 +1963,40 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 "direction_norm_inf": delta_inf,
                 "target_shift_inf": target_shift_inf,
                 "observation_token": qvis_token,
+                "region_token": observation_region_token(active),
                 "vbc_rejection_failures": rejection_failures,
                 "escalation_active": escalation_active,
             }
+            if getattr(self, 'rolling_guidance_mode', 'off') != 'off':
+                result['legacy_target'] = target.copy()
+                stamp = measured_snapshot[1]
+                snapshot = published if published is not None and published.get(
+                    'observation_token') == qvis_token else None
+                try:
+                    guide = None if snapshot is None else self._rolling_guidance.evaluate(
+                        getattr(self, '_per_sensor_runtime', None), snapshot,
+                        active['points'], measured, stamp, rospy.Time.now().to_sec(),
+                        getattr(self, '_guidance_feedback', None),
+                        self.frontier_escalated_step_inf if escalation_active else self.frontier_step_inf,
+                        drive_enabled=self.rolling_guidance_mode == 'drive')
+                    result['guidance'] = guide
+                    if guide is not None:
+                        self._rolling_guidance_last = guide
+                        result['f_values'] = {int(active_id): guide['value']}
+                        if guide['drive_enabled']:
+                            result['target'] = guide['target']
+                            result['mode'] = 'rolling_per_sensor_visibility_frontier'
+                            result['target_shift_inf'] = float(np.max(np.abs(guide['target']-measured)))
+                except Exception as exc:
+                    self._frontier_error_count += 1
+                    rospy.logwarn_throttle(1., '[visibility_guidance] evaluation fallback: %s', exc)
             with self._frontier_lock:
                 self._frontier_cache_key = None
                 self._frontier_cache = result
                 self._frontier_compute_count += 1
                 self._frontier_last_mode = result["mode"]
                 self._frontier_last_considered_ids = [int(active_id)]
-                self._frontier_last_f_values = {}
+                self._frontier_last_f_values = dict(result['f_values'])
                 self._frontier_last_softmin_weights = {}
                 self._frontier_last_direction_norm_inf = delta_inf
                 self._frontier_last_target_shift_inf = target_shift_inf
@@ -2022,11 +2129,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             if cycle_active else "base_softmin_frontier")
         result = {
             "active": True,
+            "q_eval": measured.copy(),
+            "measured_stamp": measured_snapshot[1] if measured_snapshot[0] is not None and
+                np.array_equal(measured_snapshot[0], measured) else math.nan,
             "target": target,
             "frontier_weight_scale": float(frontier_weight_scale),
             "qvis_weight_scale": float(qvis_weight_scale),
             "cycle_active": bool(cycle_active),
             "mode": mode,
+            "observation_token": observation_token(by_id[active_id]),
+            "region_token": observation_region_token(by_id[active_id]),
+            "q_vis_joint_mask": np.asarray(by_id[active_id].get('q_vis_joint_mask',[1.]*7),dtype=np.float64).copy(),
             "considered_ids": list(valid_ids),
             "f_values": {
                 int(oid): float(fv)
@@ -2055,10 +2168,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._frontier_last_cycle_active = bool(cycle_active)
         return result
 
-    def _publish_visibility_frontier(self) -> None:
+    def _publish_visibility_frontier(self, result=None, computed=False) -> None:
         if not hasattr(self, "frontier_target_pub"):
             return
-        result = self._compute_visibility_frontier()
+        if not computed:
+            result = self._compute_visibility_frontier()
         with self._frontier_lock:
             self._frontier_last_observation_token = (
                 "none" if result is None else
@@ -2075,11 +2189,33 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 float(result["frontier_weight_scale"]),
                 float(result["qvis_weight_scale"]),
                 *[float(v) for v in np.asarray(
-                    result["target"], dtype=np.float64).reshape(7)],
+                    result.get('legacy_target', result['target']), dtype=np.float64).reshape(7)],
                 *[float(v) for v in joint_mask],
             ]
             self._frontier_publish_count += 1
+            msg.layout.dim = [MultiArrayDimension(
+                label=str(result.get('observation_token', 'none')), size=len(msg.data), stride=len(msg.data))]
         self.frontier_target_pub.publish(msg)
+        guide = None if result is None else result.get('guidance')
+        if guide is not None and hasattr(self, 'guidance_pub'):
+            gm = self._guidance_message_type()
+            gm.measured_stamp = rospy.Time.from_sec(guide['measured_stamp'])
+            gm.sequence = guide['sequence']
+            gm.observation_token, gm.region_token = guide['observation_token'], guide['region_token']
+            gm.sensor_id, gm.value = guide['sensor_id'], guide['value']
+            gm.q_eval, gm.q_target = guide['q_eval'].tolist(), guide['target'].tolist()
+            gm.joint_mask, gm.gradient = guide['joint_mask'].tolist(), guide['gradient'].tolist()
+            gm.drive_enabled = guide['drive_enabled']
+            gm.geometry_valid = guide['geometry_valid']
+            gm.geometry_signature = guide['geometry_signature']
+            gm.conservative_fov_margin = guide['conservative_fov_margin']
+            self.guidance_pub.publish(gm)
+            rospy.loginfo_throttle(.5,
+                '[visibility_guidance] token=%s sensor=%d sequence=%d value=%.6f '
+                'predicted_gain=%.6f model_gain=%.6f points=%d drive=%d backoff=%d',
+                gm.observation_token, gm.sensor_id, gm.sequence, gm.value,
+                guide.get('predicted_gain', math.nan), guide.get('model_gain', math.nan),
+                guide['point_count'], gm.drive_enabled, guide.get('backoff', 0))
 
         summary = String()
         summary.data = (
@@ -2112,7 +2248,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         )
         self.frontier_summary_pub.publish(summary)
 
-    def _region_learned_slack(self, ob, q_vis):
+    def _region_learned_slack(self, ob, q_vis, proposal=None):
         points = np.asarray(ob.get("points", []), dtype=np.float64).reshape(-1, 3)
         if points.shape[0] == 0 or not np.all(np.isfinite(points)):
             return math.inf, -math.inf
@@ -2122,6 +2258,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             device=self.device, dtype=torch.float32)
         values = self._per_point_values(x, q)
         f_min = float(np.min(values)) if values.size else -math.inf
+        if (proposal is not None and proposal.get('per_sensor_hybrid_used') and
+                getattr(self, '_per_sensor_runtime', None) is not None):
+            sid = int(proposal.get('per_sensor_selected_sensor_id', -1))
+            if sid >= 0:
+                geometry = self._per_sensor_runtime._candidate_geometry(points, q_vis, sid)
+                # Physical proposal geometry owns steering quality; learned
+                # values remain diagnostics. Actual confidence owns completion.
+                return (0. if geometry['accepted'] else math.inf), f_min
         slack = max(0.0, self.progressive_shared_accept_f_min - f_min)
         return float(slack), f_min
 
@@ -2223,7 +2367,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     qv = np.asarray(result["q_vis"], dtype=np.float64).reshape(7)
                     slacks = {}
                     for oid in active:
-                        slack, _ = self._region_learned_slack(by_id[oid], qv)
+                        slack, _ = self._region_learned_slack(by_id[oid], qv, result)
                         slacks[oid] = slack
 
                     if all(
@@ -2354,8 +2498,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._progressive_shared_last_slacks = {}
 
         first = dict(by_id[active_id])
+        if getattr(self, '_require_task_binding', False):
+            # Shared/pinned q_vis is a derived selection, not necessarily the
+            # stored individual pose. Retain its source for the late recheck.
+            first['_task_storage_target'] = self._task_target(by_id[active_id])
+            first['_task_storage_stack'] = list(stack)
         if pinned:
-            first['q_vis'] = pin['q_vis'].copy()
+            stored_mask = first.get('q_vis_joint_mask', [1.] * 7)
+            stored_mask_explicit = 'q_vis_joint_mask' in first
+            restore_observation_target_state(first, pin)
+            restored_mask = first.get('q_vis_joint_mask', [1.] * 7)
+            if (not np.array_equal(stored_mask, restored_mask) or
+                    stored_mask_explicit != ('q_vis_joint_mask' in first)):
+                token = observation_token(first)
+                if token != getattr(self, '_dependency_last_mask_restore_token', None):
+                    self._dependency_last_mask_restore_token = token
+                    rospy.logwarn(
+                        '[observation_target_pin] obligation_id=%d token=%s '
+                        'stored_mask=%s restored_mask=%s stored_explicit=%d restored_explicit=%d',
+                        active_id, token, list(stored_mask), list(restored_mask),
+                        stored_mask_explicit, 'q_vis_joint_mask' in first)
             first['shared_solution_mode'] = 'observation_dependency_target_locked'
         if shared is not None:
             first["q_vis"] = np.asarray(
@@ -2678,6 +2840,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             parent_q = np.asarray(published['q_vis'], dtype=np.float64).copy()
             if parent_q.shape != (7,) or not np.all(np.isfinite(parent_q)):
                 return
+            parent_target = observation_target_state(published)
             snapshot = [dict(ob) for ob in self._obligations]
             ancestors = set(self._repair_stack)
         # Exact point ownership, not proximity. Choose one child at a time.
@@ -2764,8 +2927,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 if child_q.shape != (7,) or not np.all(np.isfinite(child_q)):
                     self._dependency_reason = 'dependency_invalid_target'
                     return
-                self._dependency_pins[pid] = dict(region=region_key(parent['points']), q_vis=parent_q)
-                self._dependency_pins[cid] = dict(region=region_key(child['points']), q_vis=child_q.copy())
+                self._dependency_pins[pid] = dict(
+                    region=region_key(parent['points']), **parent_target)
+                self._dependency_pins[cid] = dict(
+                    region=region_key(child['points']), **observation_target_state(child))
                 self._dependency_edges[cid] = pid
                 self._repair_stack.append(cid)
                 self._stack_push_count += 1
@@ -3061,13 +3226,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
         if self._coherent_bundle_enabled:
             with self._coherent_bundle_lock:
-                serial = self._coherent_bundle_seq
-                raw = self._coherent_bundle_points.copy()
-                sweep = self._coherent_bundle_sweep_s
-                trace_identity = getattr(self, '_trace_coherent_bundle_identity', None)
-                urgent_recovery = bool(self._coherent_bundle_urgent_recovery)
-                bundle_source = self._coherent_bundle_source
-                bundle_source_seq = self._coherent_bundle_source_seq
+                work = self._pending_vbc_blockers.peek()
+                if work is None and self._pending_vbc_blockers.overflow:
+                    self._last_process_reason = 'pending_blocker_capacity_hold'
+                    return
+                serial = work['generation'] if work else self._coherent_bundle_seq
+                raw = work['points'].copy() if work else np.zeros((0, 3))
+                sweep = work['sweep'] if work else math.nan
+                trace_identity = work['identity'] if work else None
+                bundle_source = work['source'] if work else self._coherent_bundle_source
+                bundle_source_seq = work['source_seq'] if work else self._coherent_bundle_source_seq
+                urgent_recovery = bundle_source == 'execution'
             with self._obligation_lock:
                 processed = self._processed_active_set_serial
         else:
@@ -3082,7 +3251,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 sweep = self._sweep_time_s
             bundle_source_seq = serial
 
-        if serial == processed:
+        if serial == processed and (not self._coherent_bundle_enabled or work is None):
             self._last_process_reason = "duplicate_serial"
             return
 
@@ -3094,7 +3263,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             if self._coherent_bundle_enabled:
                 with self._coherent_bundle_lock:
                     if self._coherent_bundle_seq == serial:
-                        self._coherent_bundle_pending_nonempty = False
+                        self._coherent_bundle_pending_nonempty = self._pending_vbc_blockers.pending
                         self._coherent_bundle_processed_count += 1
                         self._coherent_bundle_last_reason = "processed_empty"
             self._last_process_reason = "empty_active_set"
@@ -3145,6 +3314,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     self._schedule_matched_obligations += 1
                     continue
                 if len(self._obligations) >= self.max_obligations:
+                    all_regions_handled = False
                     trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None, route='capacity_exhausted'))
                     rospy.logerr_throttle(
                         1.0, "[vbc_blocker_stack] max_obligations=%d reached",
@@ -3174,6 +3344,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     active_ids.append(int(matched["id"]))
                     trace_routes.append(dict(points=region['points'].tolist(), obligation_id=int(matched['id']), route='matched_after_generation'))
                 else:
+                    all_regions_handled = False
                     trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None, route='capacity_after_generation'))
 
         if all_regions_handled:
@@ -3182,10 +3353,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     self._processed_active_set_serial, serial)
             if self._coherent_bundle_enabled:
                 with self._coherent_bundle_lock:
-                    if self._coherent_bundle_seq == serial:
-                        self._coherent_bundle_pending_nonempty = False
+                    if self._pending_vbc_blockers.acknowledge(serial):
                         self._coherent_bundle_processed_count += 1
                         self._coherent_bundle_last_reason = "materialized"
+                    self._coherent_bundle_pending_nonempty = self._pending_vbc_blockers.pending
             self._process_success_count += 1
             self._last_process_reason = "handled"
         else:
@@ -3231,30 +3402,25 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # bundle that has not yet materialized into an obligation is itself an
         # outstanding acquisition responsibility. Empty obligation storage must
         # not be misread as "everything has been seen".
-        with self._coherent_bundle_lock:
-            pending_nonempty = self._coherent_bundle_pending_nonempty
-        with self._obligation_lock:
-            no_obligations = len(self._obligations) == 0
-        if self._coherent_bundle_enabled and pending_nonempty and no_obligations:
-            self._acquisition_started = True
-            self._acquisition_complete = False
-            self.acquisition_complete_pub.publish(Bool(data=False))
-            self._publish_acquisition_summary([])
-            self._prune_or_initialize_stack()
-            self._publish_schedule()
-            self._publish_blocker_stack_summary()
-            return
-
+        # Continue querying/removing actually seen obligations even when the
+        # inbox is full. _set_acquisition_completion keeps pending work false.
         super()._update_actual_visibility_completion()
         self._prune_or_initialize_stack()
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
     def _publish_schedule(self) -> None:
-        super()._publish_schedule()
-        if getattr(self, "_c49_ready", False):
-            self._publish_visibility_frontier()
-            self._publish_blocker_stack_summary()
+        with self._schedule_publish_lock:
+            super()._publish_schedule()
+            if getattr(self, "_c49_ready", False):
+                if getattr(self, '_require_task_binding', False):
+                    selection = self._task_selected_obligations
+                    frontier = self._compute_visibility_frontier(selected_obligations=selection)
+                    self._publish_visibility_frontier(frontier, computed=True)
+                    self._publish_task_recovery_snapshot(obligations=selection, frontier=frontier)
+                else:
+                    self._publish_visibility_frontier()
+                self._publish_blocker_stack_summary()
 
     def _publish_blocker_stack_summary(self) -> None:
         if not getattr(self, "_c49_ready", False) or not hasattr(
@@ -3340,8 +3506,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" coherent_bundle_processed_count={self._coherent_bundle_processed_count}"
             f" coherent_bundle_drop_count={self._coherent_bundle_drop_count}"
             f" coherent_bundle_reason={self._coherent_bundle_last_reason}"
+            f" pending_blocker_count={len(self._pending_vbc_blockers.records)}"
+            f" pending_blocker_enqueued={self._pending_vbc_blockers.enqueued}"
+            f" pending_blocker_coalesced={self._pending_vbc_blockers.coalesced}"
+            f" pending_blocker_materialized={self._pending_vbc_blockers.materialized}"
+            f" pending_blocker_capacity_fault={int(self._pending_vbc_blockers.overflow)}"
             f" switch_reason={self._last_switch_reason}"
             f" obligation_match_qvis_min_f={self._obligation_match_qvis_min_f:.6f}"
+            f" owned_region_reuse_count={self._owned_region_reuse_count}"
             f" qvis_match_check_count={self._qvis_match_check_count}"
             f" qvis_match_accept_count={self._qvis_match_accept_count}"
             f" qvis_match_reject_count={self._qvis_match_reject_count}"

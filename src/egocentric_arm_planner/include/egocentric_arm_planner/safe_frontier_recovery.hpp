@@ -31,7 +31,8 @@ struct SafeFrontierRecovery {
   static constexpr int max_attempts = 5;
   static constexpr int max_segments = 6;
   struct Candidate { int generation; double span; bool following_frontier; };
-  struct Budget { int attempts, segments; bool active, final_stage_replacement_used; };
+  struct Budget { int attempts, segments; bool active, final_stage_replacement_used;
+    std::vector<Eigen::VectorXd> failed_directions; std::string direction_token; };
   std::string key;
   unsigned long long epoch = 0, last_execution = 0;
   int attempts = 0, generation = 0, tiny_commits = 0, rejected = 0;
@@ -42,13 +43,159 @@ struct SafeFrontierRecovery {
   double last_observed_time = -1.0, last_raw_span = 0.0;
   double last_stall_duration = 0.0, last_stall_motion = 0.0;
   int last_stall_commits = 0;
+  std::string last_stall_reason = "none", observation_token;
+  Eigen::VectorXd observation_goal, observation_mask;
+  double observation_window_start = -1., observation_best_gap = -1.;
+  int observation_commits = 0;
+  double feedback_query_time = -1.;
+  Eigen::Vector3d feedback_best = Eigen::Vector3d::Constant(-1.);
+  bool feedback_progress_pending = false;
+  bool monitor_detour_observation = false;
+  Eigen::VectorXd detour_direction;
+  std::vector<Eigen::VectorXd> failed_directions;
+  std::string failed_direction_token;
+  std::string clearance_token, clearance_signature;
+  double clearance_query_time=-1., clearance_best=-1.;
+  bool clearance_progress_pending=false;
+  // Preserve this independent view-progress window across local detour
+  // generations. Small pose/clearance gains cannot indefinitely hide a view
+  // that is still outside the FOV. Same original six-commit/one-second gate.
+  std::string geometry_signature;
+  double geometry_query_time=-1., geometry_best=0., view_window_start=-1.;
+  bool geometry_progress_pending=false;
+  int view_window_commits=0;
+  std::string last_advance_reason="none";
+  bool observation_replacement_due=false;
+  double progress_paused_at = -1.;
   Eigen::VectorXd anchor, window_anchor, target;
   std::map<unsigned long long, Candidate> pending, certified;
   std::map<std::string, Budget> budgets;
 
+  void pauseProgress(double now) {
+    if (!std::isfinite(now)) return;
+    if (progress_paused_at>=0. && now>progress_paused_at) {
+      const double dt=now-progress_paused_at;
+      if (window_start>=0.) window_start+=dt;
+      if (observation_window_start>=0.) observation_window_start+=dt;
+      if (view_window_start>=0.) view_window_start+=dt;
+    }
+    progress_paused_at=now;
+  }
+  void resumeProgress(double now) {
+    if (progress_paused_at<0.) return;
+    pauseProgress(now); progress_paused_at=-1.;
+  }
+
+  void clearObservationWindow(bool clear_view=true) {
+    observation_window_start = -1.; observation_best_gap = -1.;
+    observation_commits = 0; feedback_progress_pending = false;
+    if (clear_view) {view_window_start=-1.;view_window_commits=0;geometry_progress_pending=false;}
+  }
+  void setObservationGoal(const std::string& token, const Eigen::VectorXd& q,
+                          const Eigen::VectorXd& mask) {
+    const bool valid = token.compare(0,12,"care_obs_v1_")==0 && q.size()==7 &&
+        mask.size()==7 && q.allFinite() && mask.allFinite() &&
+        (mask.array()>=0.).all() && (mask.array()<=1.).all() && mask.sum()>0.;
+    if (!valid) {
+      observation_token.clear(); observation_goal.resize(0); observation_mask.resize(0);
+      geometry_signature.clear();geometry_query_time=-1.;
+      clearObservationWindow(); feedback_query_time=-1.; feedback_best.setConstant(-1.); return;
+    }
+    if (token==observation_token && observation_goal.size()==7 &&
+        (q-observation_goal).norm()==0. && (mask-observation_mask).norm()==0.) return;
+    if(token!=failed_direction_token) {
+      failed_directions.clear();detour_direction.resize(0);failed_direction_token=token;
+    }
+    observation_token=token; observation_goal=q; observation_mask=mask;
+    geometry_signature.clear();geometry_query_time=-1.;geometry_progress_pending=false;
+    clearance_token.clear(); clearance_query_time=-1.; clearance_progress_pending=false;
+    clearObservationWindow(); feedback_query_time=-1.; feedback_best.setConstant(-1.);
+  }
+  // Actual measured-start collision-query progress is a scheduling hint only.
+  // It never completes observations, refunds attempts, or extends segment caps.
+  void noteClearanceFeedback(const std::string& token, const std::string& signature,
+                            double query_time, double now, double clearance) {
+    if (token!=observation_token || signature.empty() || !std::isfinite(clearance) ||
+        !std::isfinite(query_time) || !std::isfinite(now) || query_time<=clearance_query_time ||
+        now-query_time<0. || now-query_time>.5) return;
+    if (token!=clearance_token || signature!=clearance_signature) {
+      clearance_token=token; clearance_signature=signature; clearance_best=clearance;
+    } else if (clearance-clearance_best>=.001) {
+      clearance_progress_pending=true; clearance_best=clearance;
+    }
+    clearance_query_time=query_time;
+  }
+  // Real map-query feedback may extend a progress window, never complete an
+  // obligation or grant motion. Strict token/time checks also reject latched data.
+  bool noteObservationFeedback(const std::string& token, double query_time,
+                               double now, const Eigen::Vector3d& metrics) {
+    if (token!=observation_token || token.empty() || !std::isfinite(query_time) ||
+        !std::isfinite(now) || query_time<=feedback_query_time || now-query_time<0. ||
+        now-query_time>.5 || !metrics.allFinite() ||
+        (metrics.array()<0.).any() || (metrics.array()>1.).any()) return false;
+    const bool initialized = feedback_query_time>=0.;
+    if (initialized && (metrics-feedback_best).maxCoeff()>=.001)
+      feedback_progress_pending=true;
+    feedback_best=feedback_best.cwiseMax(metrics); feedback_query_time=query_time;
+    return true;
+  }
+  bool noteGeometryFeedback(const std::string& token,const std::string& signature,
+                            double query_time,double now,double margin) {
+    if(token!=observation_token || token.empty() || signature.size()!=64 ||
+        signature.find_first_not_of("0123456789abcdef")!=std::string::npos ||
+        !std::isfinite(query_time) || !std::isfinite(now) || !std::isfinite(margin) ||
+        query_time<=geometry_query_time || now-query_time<0. || now-query_time>.2)return false;
+    if(signature!=geometry_signature) {
+      geometry_signature=signature;geometry_best=margin;
+      view_window_start=-1.;view_window_commits=0;geometry_progress_pending=false;
+    } else if(margin-geometry_best>=.001) {
+      geometry_best=margin;geometry_progress_pending=true;
+    }
+    geometry_query_time=query_time;return true;
+  }
+  bool observeGoalProgress(bool new_execution, double now, const Eigen::VectorXd& q) {
+    const double gap=((q-observation_goal).cwiseProduct(observation_mask)).norm();
+    if (observation_window_start<0.) {
+      observation_window_start=now; observation_best_gap=gap;
+    }
+    const bool map_progress=feedback_progress_pending && now-feedback_query_time>=0. &&
+        now-feedback_query_time<=.5;
+    const bool sensed_progress=map_progress || (clearance_progress_pending &&
+        now-clearance_query_time>=0. && now-clearance_query_time<=.5);
+    feedback_progress_pending=false;
+    clearance_progress_pending=false;
+    const bool fresh_geometry=geometry_query_time>=0. && now-geometry_query_time>=0. &&
+        now-geometry_query_time<=.5;
+    if(active && monitor_detour_observation && fresh_geometry) {
+      if(view_window_start<0. || map_progress || geometry_progress_pending) {
+        view_window_start=now;view_window_commits=0;
+      }
+      geometry_progress_pending=false;
+      if(new_execution)++view_window_commits;
+      if(view_window_commits>=6 && now-view_window_start>=1. && !blocked()) {
+        last_stall_duration=now-view_window_start;last_stall_motion=0.;
+        last_stall_commits=view_window_commits;last_stall_reason="observation_no_progress";
+        view_window_start=now;view_window_commits=0;
+        advanceObservation(true,"view_geometry_stall");return true;
+      }
+    }
+    if (observation_best_gap-gap>=.001 || sensed_progress) {
+      observation_window_start=now; observation_commits=0;
+      observation_best_gap=std::min(observation_best_gap,gap);
+    }
+    if (new_execution) ++observation_commits;
+    if (observation_commits<6 || now-observation_window_start<1.0 || blocked()) return false;
+    last_stall_duration=now-observation_window_start;
+    last_stall_motion=std::max(0.,observation_best_gap-gap);
+    last_stall_commits=observation_commits; last_stall_reason="observation_no_progress";
+    advanceObservation(true,"observation_stall"); return true;
+  }
+
   void invalidateMotion() {
+    progress_paused_at=-1.;
     ++generation; target.resize(0); anchor.resize(0); clearWindow();
     last_observed_time = -1.;
+    clearObservationWindow(false);
     pending.clear(); certified.clear(); following_frontier = false;
   }
 
@@ -56,28 +203,40 @@ struct SafeFrontierRecovery {
     if (next == key && mode == epoch) return;
     if (mode != epoch) budgets.clear();
     else if (!key.empty() && (budgets.count(key) || budgets.size()<64))
-      budgets[key] = Budget{attempts, segments, active, final_stage_replacement_used};
+      budgets[key] = Budget{attempts, segments, active, final_stage_replacement_used, failed_directions, failed_direction_token};
     key = next; epoch = mode;
+    monitor_detour_observation=false;observation_replacement_due=false;
     attempts = segments = rejected = 0; active = false; following_frontier = false;
     final_stage_replacement_used = false;
+    failed_directions.clear();failed_direction_token.clear(); detour_direction.resize(0);
     last_stall_duration = last_stall_motion = last_raw_span = 0.; last_stall_commits = 0;
     const auto saved = budgets.find(key);
     if (saved != budgets.end()) {
       attempts = saved->second.attempts; segments = saved->second.segments;
       active = saved->second.active;
       final_stage_replacement_used = saved->second.final_stage_replacement_used;
+      failed_directions=saved->second.failed_directions;
+      failed_direction_token=saved->second.direction_token;
     } else if (budgets.size() >= 64) {
       active = true; attempts = max_attempts + 1; // bounded, no eviction/retry loop
     }
     invalidateMotion(); last_execution = 0;
+    clearObservationWindow();geometry_signature.clear();geometry_query_time=-1.;
+    last_advance_reason="none";
+    observation_token.clear(); observation_goal.resize(0); observation_mask.resize(0);
+    feedback_query_time=-1.; feedback_best.setConstant(-1.); last_stall_reason="none";
   }
   bool blocked() const { return active && attempts > max_attempts; }
   int stage() const { return active ? attempts : 0; }
   // A sensor replacement spends the SAME recovery ledger, before generation.
   // Token changes, rejected proposals and timeouts never refund this charge.
+  bool canReserveReplacement() const {
+    return active && attempts >= 1 && attempts <= max_attempts &&
+        segments < max_segments &&
+        (attempts < max_attempts || !final_stage_replacement_used);
+  }
   bool reserveReplacement() {
-    if (!active || attempts < 1 || attempts > max_attempts ||
-        segments >= max_segments) return false;
+    if (!canReserveReplacement()) return false;
     // A fifth direction may already have been charged by measured-stall
     // recovery. It still gets one sensor-group experiment before hold.
     if (attempts == max_attempts) {
@@ -118,12 +277,27 @@ struct SafeFrontierRecovery {
     if (!certified.erase(execution)) return;
     last_execution = std::max(last_execution, execution);
     clearWindow();
+    clearObservationWindow();
   }
-  void advance() {
+  void advance(bool mark_direction_failed=true,const char* reason="direction_failure") {
+    last_advance_reason=reason;
+    if (mark_direction_failed && detour_direction.size()==7 && detour_direction.allFinite() &&
+        detour_direction.norm()>1e-9 && failed_directions.size()<max_attempts)
+      failed_directions.push_back(detour_direction.normalized());
+    detour_direction.resize(0);
     active = true; ++attempts; ++generation; rejected = 0; segments = 0;
     final_stage_replacement_used = false;
     following_frontier = false;
     target.resize(0); clearWindow(); pending.clear(); certified.clear();
+    clearObservationWindow(false);
+  }
+  void advanceObservation(bool failed_direction,const char* reason) {
+    // The existing fifth stage has one final replacement reservation. Ask
+    // for it before crossing into the exhausted sentinel; no budget is added.
+    if(attempts==max_attempts && canReserveReplacement()) {
+      invalidateMotion();last_advance_reason=reason;
+    } else advance(failed_direction,reason);
+    observation_replacement_due=true;
   }
   void remember(unsigned long long raw, double span) {
     if (!raw || key.empty() || !std::isfinite(span) || span < 0.) return;
@@ -137,12 +311,14 @@ struct SafeFrontierRecovery {
     while (certified.size() >= 64) certified.erase(certified.begin());
     certified.emplace(execution, it->second); pending.erase(it); return true;
   }
-  bool reject(unsigned long long raw) {
+  // A direct path counterexample may activate the same finite recovery ledger
+  // before any motion is certified. Generic unavailable evidence does not.
+  bool reject(unsigned long long raw, bool activate_recovery = false) {
     const auto it = pending.find(raw);
     if (it == pending.end()) return false;
     const bool current = it->second.generation == generation;
     pending.erase(it);
-    if (current && active && !blocked() && ++rejected >= 2) { advance(); return true; }
+    if (current && (active || activate_recovery) && !blocked() && ++rejected >= 2) { advance(); return true; }
     return false;
   }
   // Called only with fresh measured state and a matching, non-aborted tracker
@@ -153,19 +329,37 @@ struct SafeFrontierRecovery {
     if (it == certified.end() || execution < last_execution ||
         it->second.generation != generation || now <= last_observed_time) return false;
     const Candidate c = it->second;
+    observation_replacement_due=false;
     const bool new_execution = execution != last_execution;
     last_execution = execution; last_observed_time = now; last_raw_span = c.span;
     certified.erase(certified.begin(), it); // retain current identity for later measured samples
+    // Ordinary observation steering and rejoining count progress toward the
+    // stable published q_vis, not the rolling local frontier or any wrist motion.
+    // A bounded detour keeps the existing whole-arm segment/stall accounting.
+    const bool observation_monitor=observation_goal.size()==7 &&
+        (!active || c.following_frontier || monitor_detour_observation);
+    if (observation_monitor && observeGoalProgress(new_execution,now,q)) return true;
+    if (!observation_monitor) clearObservationWindow(false);
     if (anchor.size() != 7) anchor = q;
     // Movement is a local waypoint transition, NEVER observation completion.
     // Continue the detour across commits, with a finite segment budget.
     if ((q-anchor).lpNorm<Eigen::Infinity>() >= .01) {
       anchor = q; clearWindow();
       if (!active || blocked()) return false;
-      if (!c.following_frontier && ++segments >= max_segments) advance();
+      if (!c.following_frontier && ++segments >= max_segments) {
+        const bool unseen_approach=observation_monitor && monitor_detour_observation &&
+            geometry_query_time>=0. && now-geometry_query_time>=0. && now-geometry_query_time<=.5 &&
+            geometry_best<0. && feedback_query_time>=0. && now-feedback_query_time>=0. &&
+            now-feedback_query_time<=.5 && feedback_best.maxCoeff()==0.;
+        if(unseen_approach) {
+          last_stall_reason="observation_no_progress";
+          advanceObservation(false,"unseen_approach_budget");
+        } else advance(false,"segment_budget");
+      }
       else { ++generation; target.resize(0); pending.clear(); certified.clear(); }
       return true;
     }
+    if (observation_monitor) return false;
     // The raw candidate may be much larger than the certified/executed prefix.
     // Only measured motion ends a stall window, including across handoffs.
     // Keep a separate anchor so small steps can accumulate into a .01 rad segment.
@@ -178,13 +372,23 @@ struct SafeFrontierRecovery {
       last_stall_duration = now-window_start;
       last_stall_motion = (q-window_anchor).lpNorm<Eigen::Infinity>();
       last_stall_commits = tiny_commits;
+      last_stall_reason = "measured_motion_stall";
       advance(); return true;
     }
     return false;
   }
 };
 
-// Tangential search around the currently tight CDF halfspaces. The candidate
+// A nearby one-sided CDF guard needs a detour only when the proposed forward
+// step does not improve it and would leave it below its required margin.
+// An improving step may still be insufficient from a deficient start: this
+// chooses an objective only; the complete hard QP must establish feasibility.
+inline bool recoveryForwardBlocked(double clearance, double along) {
+  if (!std::isfinite(clearance) || !std::isfinite(along)) return true;
+  return clearance < .005 && along <= 1e-9 && clearance + along < 0.;
+}
+
+// Tangential search around the currently blocking CDF halfspaces. The candidate
 // target is only an objective: all original QP constraints remain unchanged.
 inline Eigen::VectorXd boundedTangentTarget(
     const Eigen::VectorXd& q0, const Eigen::VectorXd& desired,
@@ -216,5 +420,59 @@ inline Eigen::VectorXd boundedTangentTarget(
   for (const auto& g : gradients)
     if (g.dot(v)<-1e-8) return Eigen::VectorXd();
   return q0+v;
+}
+
+// A bounded objective-direction pool; feasibility is still established ONLY
+// by the original full hard QP. Outward directions complement tangent ones.
+inline Eigen::VectorXd boundedObservationTarget(
+    const Eigen::VectorXd& q0, const Eigen::VectorXd& desired,
+    const std::vector<Eigen::VectorXd>& normals, const std::vector<double>& slack,
+    const Eigen::VectorXd& vis_gradient, const Eigen::VectorXd& mask,
+    const std::vector<Eigen::VectorXd>& failed, double step) {
+  if (q0.size()!=7 || desired.size()!=7 || vis_gradient.size()!=7 || mask.size()!=7 ||
+      !q0.allFinite() || !desired.allFinite() || !vis_gradient.allFinite() ||
+      !mask.allFinite() || normals.empty() || slack.size()!=normals.size() ||
+      !std::isfinite(step) || step<=0.) return Eigen::VectorXd();
+  Eigen::MatrixXd projector=Eigen::MatrixXd::Identity(7,7);
+  std::vector<Eigen::VectorXd> basis;
+  Eigen::VectorXd outward=Eigen::VectorXd::Zero(7);
+  for (const auto& g:normals) {
+    if (g.size()!=7 || !g.allFinite() || g.norm()<1e-9) return Eigen::VectorXd();
+    outward+=g.normalized(); Eigen::VectorXd v=g.normalized();
+    for (const auto& b:basis) v-=b.dot(v)*b;
+    if (v.norm()>1e-7) basis.push_back(v.normalized());
+  }
+  for (const auto& b:basis) projector-=b*b.transpose();
+  // Maximum pool size stays fourteen, the old +/- seven-coordinate pool.
+  std::vector<Eigen::VectorXd> pool={projector*vis_gradient, outward,
+      projector*(desired-q0), vis_gradient.cwiseProduct(mask)};
+  for (int j=0;j<7 && pool.size()<14;++j) {
+    const Eigen::VectorXd v=projector.col(j);
+    if (v.norm()>.1) { pool.push_back(v); if (pool.size()<14) pool.push_back(-v); }
+  }
+  double best=-1e100; Eigen::VectorXd chosen;
+  for (auto v:pool) {
+    if (!v.allFinite() || v.lpNorm<Eigen::Infinity>()<1e-8) continue;
+    v*=std::min(.03,step)/v.lpNorm<Eigen::Infinity>();
+    bool tried=false;
+    for (const auto& old:failed)
+      if (old.size()==7 && old.allFinite() && old.norm()>1e-9 &&
+          old.normalized().dot(v.normalized())>.98) tried=true;
+    if (tried) continue;
+    double violation=0., clearance_gain=1e100;
+    for (std::size_t i=0;i<normals.size();++i) {
+      if (!std::isfinite(slack[i])) return Eigen::VectorXd();
+      const double gain=normals[i].dot(v)/normals[i].norm();
+      violation+=std::max(0.,-(slack[i]/normals[i].norm()+gain));
+      clearance_gain=std::min(clearance_gain,gain);
+    }
+    const double vis_gain=vis_gradient.norm()>1e-9 ?
+        vis_gradient.normalized().dot(v):0.;
+    const Eigen::VectorXd delta=(desired-q0).cwiseProduct(mask);
+    const double goal_gain=delta.norm()>1e-9 ? delta.normalized().dot(v):0.;
+    const double score=-100.*violation+vis_gain+clearance_gain+.2*goal_gain;
+    if (score>best+1e-10) {best=score;chosen=q0+v;}
+  }
+  return chosen;
 }
 }  // namespace egocentric_arm_planner

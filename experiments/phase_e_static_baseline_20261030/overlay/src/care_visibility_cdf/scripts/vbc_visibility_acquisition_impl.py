@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""C4.7 visibility-acquisition repair semantics.
+
+Key semantic correction
+-----------------------
+A deadline inherited from the nominal/task candidate is meaningful while judging
+that candidate, but it is NOT a hard clock that a repair detour must preserve.
+Once CAREPlanner enters REPAIR, nominal tracking is intentionally abandoned.  A
+repair candidate may delay/avoid the original low-confidence sweep, so the old
+nominal deadline is no longer a planning constraint.
+
+C4.7 therefore treats VBC violations as persistent visibility obligations:
+
+    O_r = (spatial region R_r, learned visible configuration q_vis^r)
+
+No nominal absolute deadline is attached to the REPAIR objective.  The MPC uses
+its legacy terminal q_vis repair objective and may need multiple receding-horizon
+safe commits to reach q_vis.  Exact VBC still audits every repair candidate using
+THAT candidate's own sweep times.  Thus the candidate is allowed to:
+
+  * see a low-confidence point before it sweeps it, OR
+  * delay/avoid that sweep while moving safely toward a visibility pose.
+
+A safe repair candidate is only safe to EXECUTE; it does not mean the visibility
+obligation is finished.  Obligations are removed only when the real confidence
+map reports that all points in the region have actually been seen.  Only after
+all obligations are observed does the node publish acquisition_complete=True,
+which permits the regime manager to PROBE_NORMAL.
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import threading
+import time
+from typing import Dict, List
+
+import numpy as np
+import rospy
+from care_confidence_map.srv import QueryConfidenceRequest
+from geometry_msgs.msg import Point
+from std_msgs.msg import Bool, Float64, Float64MultiArray, String
+from std_msgs.msg import MultiArrayDimension
+from observation_identity import observation_token, observation_region_token
+
+from vbc_deadline_waypoint_node import _vector_msg
+from vbc_multi_deadline_obligation_impl import (
+    AccumulatedMultiDeadlineWaypointNode,
+    q_vis_joint_mask,
+)
+
+
+class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
+    """Persistent visibility goals; clear only on actual confidence acquisition."""
+
+    def __init__(self) -> None:
+        # Must exist before parent ROS subscribers/timer can call virtual methods.
+        self._c47_ready = False
+        self._acquisition_complete = False
+        self._acquisition_started = False
+        self._seen_obligation_count = 0
+        self._task_first_research = os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true'
+        self._task_first_seen_points = set()
+        self._task_first_initial_point_seen = {}
+        self._last_visibility_check_s = -math.inf
+        self._safe_repair_candidate_count = 0
+        self._visibility_episode_reopen_count = 0
+        # Several ROS subscriber callbacks and the rospy.Timer may all request
+        # schedule publication. Serialize the publication transaction so
+        # q_vis/q_zero/deadline messages from two snapshots cannot interleave.
+        self._schedule_publish_lock = threading.RLock()
+        self._timer_exception_count = 0
+        self._trace_last_target = None
+        self._trace_published_target = None
+        self._trace_seen_samples = {}
+        super().__init__()
+        self._trace_observation("session_started")
+
+        self.visibility_check_rate = float(rospy.get_param(
+            "~visibility_check_rate", 20.0))
+        self.required_seen_fraction = float(rospy.get_param(
+            "~required_seen_fraction", 1.0))
+        self.acquisition_complete_topic = str(rospy.get_param(
+            "~acquisition_complete_topic",
+            "/care_planner/active_sensing/visibility_acquisition_complete"))
+        self.acquisition_summary_topic = str(rospy.get_param(
+            "~acquisition_summary_topic",
+            "/care_planner/active_sensing/visibility_acquisition_summary"))
+        # The active obligation's spatial points are published separately from
+        # q_vis so the local repair planner can carry the urgent VBC region into
+        # its CDF query.  The message contains only the current target (the
+        # blocker-aware stack decides whether a new region is urgent).
+        self.current_obligation_points_topic = str(rospy.get_param(
+            "~current_obligation_points_topic",
+            "/care_planner/active_sensing/current_visibility_obligation_points"))
+
+        if self.visibility_check_rate <= 0.0:
+            raise ValueError("~visibility_check_rate must be positive")
+        if not 0.0 < self.required_seen_fraction <= 1.0:
+            raise ValueError("~required_seen_fraction must be in (0,1]")
+
+        self.acquisition_complete_pub = rospy.Publisher(
+            self.acquisition_complete_topic, Bool, queue_size=1, latch=True)
+        self.acquisition_summary_pub = rospy.Publisher(
+            self.acquisition_summary_topic, String, queue_size=1, latch=True)
+        self.current_obligation_points_pub = rospy.Publisher(
+            self.current_obligation_points_topic,
+            Float64MultiArray, queue_size=1, latch=True)
+        self._current_obligation_points_key = None
+        self._current_obligation_points_seq = 0
+        self.acquisition_complete_pub.publish(Bool(data=False))
+
+        self._c47_ready = True
+        rospy.logwarn(
+            "[vbc_acquisition] C4.7 ENABLED: nominal deadlines ignored in REPAIR; "
+            "obligations clear only from actual confidence, seen_threshold=%.3f "
+            "required_fraction=%.2f",
+            self.seen_threshold, self.required_seen_fraction)
+
+    def _active_set_callback(self, msg) -> None:
+        """A fresh unsafe active set starts a new acquisition episode.
+
+        C4.7 completion is latched True after all current obligations are seen.
+        If VBC later discovers a new non-empty unsafe active set, that True must
+        no longer describe the current world state.  Reopen the episode
+        immediately (False) while q_vis generation catches up.  The regime
+        manager still waits for visibility_waypoint_active before entering
+        REPAIR, so this edge cannot create a repair without a steering target.
+        """
+        super()._active_set_callback(msg)
+        if msg is None or len(getattr(msg, "data", [])) == 0:
+            return
+
+        with self._obligation_lock:
+            no_obligations = len(self._obligations) == 0
+        if self._acquisition_complete and no_obligations:
+            self._acquisition_started = True
+            self._acquisition_complete = False
+            self._visibility_episode_reopen_count += 1
+            if hasattr(self, "acquisition_complete_pub"):
+                self.acquisition_complete_pub.publish(Bool(data=False))
+            rospy.logwarn(
+                "[vbc_acquisition] NEW UNSAFE ACTIVE SET reopens acquisition "
+                "episode count=%d while waiting for q_vis obligation",
+                self._visibility_episode_reopen_count)
+
+    # ------------------------------------------------------------------
+    # Candidate VBC verdict semantics
+    # ------------------------------------------------------------------
+    def _candidate_vbc_summary_callback(self, msg: String) -> None:
+        """Never clear a visibility goal merely because one candidate is safe."""
+        if msg is None:
+            return
+        fields = dict(self._tokenize_summary(str(msg.data)))
+        if fields.get("trajectory_source") != "predicted":
+            return
+        if fields.get("has_violation") == "0":
+            self._safe_repair_candidate_count += 1
+            rospy.loginfo_throttle(
+                0.5,
+                "[vbc_acquisition] predicted candidate SAFE, but visibility "
+                "obligations persist until actual confidence confirms seen")
+
+    @staticmethod
+    def _tokenize_summary(text):
+        # Avoid another module-level regex dependency.
+        import re
+        return re.findall(r"([A-Za-z0-9_]+)=([^\s]+)", text or "")
+
+    # ------------------------------------------------------------------
+    # Actual confidence completion
+    # ------------------------------------------------------------------
+    def _query_region_seen(self, ob: Dict[str, object]):
+        points = np.asarray(ob["points"], dtype=np.float64).reshape(-1, 3)
+        n = int(points.shape[0])
+        nan3 = np.asarray(
+            [math.nan, math.nan, math.nan], dtype=np.float64)
+        xyz_min = (
+            np.min(points, axis=0).astype(np.float64)
+            if n else nan3.copy())
+        xyz_max = (
+            np.max(points, axis=0).astype(np.float64)
+            if n else nan3.copy())
+        query_diag = {
+            "status": "empty_points" if n == 0 else "not_queried",
+            "inside_count": 0,
+            "outside_count": 0,
+            "unclassified_count": n,
+            "finite_confidence_count": 0,
+            "nonfinite_confidence_count": 0,
+            "finite_current_visibility_count": 0,
+            "xyz_min": xyz_min,
+            "xyz_max": xyz_max,
+            "response_confidence_count": -1,
+            "response_inside_count": -1,
+            "response_visibility_count": -1,
+            "exception": "none",
+        }
+        if n == 0:
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, 0,
+                nan3.copy(), math.nan, query_diag)
+
+        req = QueryConfidenceRequest()
+        req.points = [Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                      for p in points]
+        try:
+            res = self.confidence_client(req)
+        except Exception as exc:
+            query_diag["status"] = "service_exception"
+            error_text = "_".join(str(exc).strip().split()) or type(exc).__name__
+            error_text = (
+                error_text.replace(",", ";").replace("|", "/")
+                .replace("=", ":"))[:180]
+            query_diag["exception"] = error_text
+            rospy.logwarn_throttle(
+                1.0, "[vbc_acquisition] confidence query failed: %s", exc)
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, n,
+                nan3.copy(), math.nan, query_diag)
+
+        query_diag["response_confidence_count"] = len(res.confidence)
+        query_diag["response_inside_count"] = len(res.inside_map)
+        query_diag["response_visibility_count"] = len(res.current_visibility)
+        if (len(res.confidence) != n or len(res.inside_map) != n or
+                len(res.current_visibility) != n):
+            query_diag["status"] = "length_mismatch"
+            rospy.logwarn_throttle(
+                1.0,
+                "[vbc_acquisition] confidence query length mismatch "
+                "points=%d confidence=%d inside=%d visibility=%d",
+                n, len(res.confidence), len(res.inside_map),
+                len(res.current_visibility))
+            return (
+                False, 0.0, math.nan, math.nan, math.nan, n,
+                nan3.copy(), math.nan, query_diag)
+
+        conf = np.asarray(res.confidence, dtype=np.float64)
+        # rospy may deserialize uint8[] as bytes; np.asarray(bytes, bool)
+        # produces one scalar True, incorrectly admitting out-of-map points.
+        inside = (np.frombuffer(res.inside_map, dtype=np.uint8).astype(bool)
+                  if isinstance(res.inside_map, (bytes, bytearray))
+                  else np.asarray(res.inside_map, dtype=bool))
+        current_vis = np.asarray(res.current_visibility, dtype=np.float64)
+        finite_conf = np.isfinite(conf)
+        finite_inside = inside & finite_conf
+        finite_vis = np.isfinite(current_vis)
+
+        query_diag["status"] = "ok"
+        query_diag["inside_count"] = int(np.count_nonzero(inside))
+        query_diag["outside_count"] = int(n - np.count_nonzero(inside))
+        query_diag["unclassified_count"] = 0
+        query_diag["finite_confidence_count"] = int(
+            np.count_nonzero(finite_inside))
+        query_diag["nonfinite_confidence_count"] = int(
+            np.count_nonzero(inside & ~finite_conf))
+        query_diag["finite_current_visibility_count"] = int(
+            np.count_nonzero(finite_vis))
+
+        good = finite_inside & (conf >= self.seen_threshold)
+        query_diag['point_seen'] = good.tolist()
+        if getattr(self, '_task_first_research', False):
+            # Inbox prechecks also call this query. Remember their baseline,
+            # but do not label already-known points as an observation gain.
+            for point, is_seen in zip(np.round(points, 6), good):
+                if np.isfinite(point).all():
+                    self._task_first_initial_point_seen.setdefault(tuple(point), bool(is_seen))
+        fraction = float(np.mean(good)) if n else 0.0
+        seen = fraction + 1e-12 >= self.required_seen_fraction
+
+        min_conf = (
+            float(np.min(conf[finite_inside]))
+            if np.any(finite_inside) else math.nan)
+        mean_conf = (
+            float(np.mean(conf[finite_inside]))
+            if np.any(finite_inside) else math.nan)
+        max_vis = (
+            float(np.max(current_vis[finite_vis]))
+            if np.any(finite_vis) else math.nan)
+
+        worst_point = nan3.copy()
+        if np.any(finite_inside):
+            valid_indices = np.where(finite_inside)[0]
+            worst_idx = int(valid_indices[np.argmin(conf[valid_indices])])
+            worst_point = points[worst_idx].copy()
+
+        q_dist_inf = math.nan
+        measured, measured_stamp = getattr(self, "_trace_measured", (None, math.nan))
+        query_diag["measured_q"] = None if measured is None else measured.copy()
+        query_diag["measured_ros_s"] = measured_stamp
+        q_vis = np.asarray(ob.get("q_vis", []), dtype=np.float64).reshape(-1)
+        if (measured is not None and measured.shape == (7,) and
+                q_vis.shape == (7,) and np.all(np.isfinite(q_vis))):
+            q_dist_inf = float(np.max(np.abs(measured - q_vis)))
+
+        return (
+            bool(seen), fraction, min_conf, mean_conf, max_vis, n,
+            worst_point, q_dist_inf, query_diag)
+
+    @staticmethod
+    def _obligation_geometry_diagnostics(ob: Dict[str, object]):
+        nan3 = np.asarray(
+            [math.nan, math.nan, math.nan], dtype=np.float64)
+        current_centroid = np.asarray(
+            ob.get("centroid", nan3), dtype=np.float64).reshape(3)
+        source_centroid = np.asarray(
+            ob.get("q_vis_source_centroid", current_centroid),
+            dtype=np.float64).reshape(3)
+        source_shift = (
+            float(np.linalg.norm(current_centroid - source_centroid))
+            if np.all(np.isfinite(current_centroid)) and
+               np.all(np.isfinite(source_centroid))
+            else math.nan)
+        return {
+            "match_update_count": int(
+                ob.get("geometry_match_update_count", 0)),
+            "match_change_count": int(
+                ob.get("geometry_match_change_count", 0)),
+            "changed_since_qvis": bool(
+                ob.get("geometry_changed_since_qvis", False)),
+            "last_match_centroid_shift_m": float(
+                ob.get("last_match_centroid_shift_m", math.nan)),
+            "centroid_shift_from_qvis_m": source_shift,
+            "max_centroid_shift_from_qvis_m": float(
+                ob.get("max_centroid_shift_from_qvis_m", source_shift)),
+            "current_centroid": current_centroid,
+            "q_vis_source_centroid": source_centroid,
+            "last_match_source": str(
+                ob.get("last_geometry_match_source", "unknown")),
+        }
+
+    def _update_actual_visibility_completion(self) -> None:
+        if not self._c47_ready:
+            return
+        now_s = rospy.Time.now().to_sec()
+        if now_s - self._last_visibility_check_s < 1.0 / self.visibility_check_rate:
+            return
+        self._last_visibility_check_s = now_s
+
+        with self._obligation_lock:
+            snapshot = [dict(ob) for ob in self._obligations]
+        if not snapshot:
+            # Before the first violation/acquisition episode, do not advertise a
+            # spurious completion pulse. Once an episode has started, empty means
+            # every real visibility obligation has been seen.
+            complete = bool(self._acquisition_started)
+            self._set_acquisition_completion(complete)
+            self._publish_acquisition_summary([])
+            return
+
+        self._acquisition_started = True
+        seen_regions = {}
+        diagnostics = []
+        for ob in snapshot:
+            # Capture the actual published target, not _ordered_obligations():
+            # the latter may run a new shared solve and return a different q.
+            with self._schedule_publish_lock:
+                published = getattr(self, "_trace_published_target", None)
+            query_ros_s = rospy.Time.now().to_sec()
+            (seen, frac, min_conf, mean_conf, max_vis, point_count,
+             worst_point, q_dist_inf, query_diag) = self._query_region_seen(ob)
+            query_diag["query_ros_s"] = query_ros_s
+            oid = int(ob["id"])
+            self._record_seen_query(ob, published, seen, frac, query_diag)
+            q_dist_inf = query_diag["q_distance_inf"]
+            geometry_diag = self._obligation_geometry_diagnostics(ob)
+            diagnostics.append((
+                oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
+                q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy(),
+                query_diag, geometry_diag))
+            if seen:
+                seen_regions[oid] = observation_region_token(ob)
+
+        if seen_regions:
+            with self._obligation_lock:
+                before = len(self._obligations)
+                # A service response for an old point set cannot clear a newly
+                # refreshed region merely because its integer id is unchanged.
+                seen_ids = [int(ob["id"]) for ob in self._obligations
+                            if seen_regions.get(int(ob["id"])) == observation_region_token(ob)]
+                self._obligations = [
+                    ob for ob in self._obligations
+                    if int(ob["id"]) not in set(seen_ids)]
+                removed = before - len(self._obligations)
+            self._seen_obligation_count += removed
+            for oid in seen_ids:
+                self._trace_seen_samples.pop((oid, "original"), None)
+                self._trace_seen_samples.pop((oid, "published"), None)
+            for oid in seen_regions.keys() - set(seen_ids):
+                self._trace_observation("seen_stale_discarded", obligation_id=oid,
+                    region_token=seen_regions[oid])
+            rospy.logwarn(
+                "[vbc_acquisition] ACTUAL VISIBILITY acquired obligations=%s "
+                "removed=%d remaining=%d",
+                ":".join(str(i) for i in seen_ids), removed,
+                len(self._ordered_obligations()))
+            self._publish_schedule()
+
+        remaining = self._ordered_obligations()
+        complete = bool(self._acquisition_started and not remaining)
+        self._set_acquisition_completion(complete)
+        self._publish_acquisition_summary(diagnostics)
+
+    def _set_acquisition_completion(self, complete):
+        self._acquisition_complete = bool(complete)
+        self.acquisition_complete_pub.publish(Bool(data=bool(complete)))
+
+    @staticmethod
+    def _fmt_xyz_diag(values) -> str:
+        arr = np.asarray(values, dtype=np.float64).reshape(3)
+        return ",".join(
+            "nan" if not math.isfinite(float(v)) else f"{float(v):.3f}"
+            for v in arr)
+
+    def _publish_acquisition_summary(self, diagnostics) -> None:
+        remaining = self._ordered_obligations()
+        msg = String()
+        diag_text = ";".join(
+            (
+                f"{oid}:{int(seen)}:{point_count}:{frac:.3f}:"
+                f"{min_conf:.3f}:{mean_conf:.3f}:{max_vis:.3f}:"
+                f"{q_dist_inf:.4f}:"
+                f"{float(worst_point[0]):.3f},"
+                f"{float(worst_point[1]):.3f},"
+                f"{float(worst_point[2]):.3f}"
+            )
+            for (oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
+                 q_dist_inf, worst_point, _query_diag, _geometry_diag)
+            in diagnostics)
+
+        geometry_text = ";".join(
+            (
+                f"{oid}|{query_diag.get('status','unknown')}|"
+                f"{int(query_diag.get('inside_count',0))}|"
+                f"{int(query_diag.get('outside_count',0))}|"
+                f"{int(query_diag.get('finite_confidence_count',0))}|"
+                f"{int(query_diag.get('nonfinite_confidence_count',0))}|"
+                f"{int(geometry_diag.get('match_update_count',0))}|"
+                f"{int(geometry_diag.get('match_change_count',0))}|"
+                f"{int(bool(geometry_diag.get('changed_since_qvis',False)))}|"
+                f"{float(geometry_diag.get('centroid_shift_from_qvis_m',math.nan)):.4f}|"
+                f"{float(geometry_diag.get('last_match_centroid_shift_m',math.nan)):.4f}|"
+                f"{self._fmt_xyz_diag(geometry_diag.get('current_centroid'))}|"
+                f"{self._fmt_xyz_diag(geometry_diag.get('q_vis_source_centroid'))}|"
+                f"{self._fmt_xyz_diag(query_diag.get('xyz_min'))}|"
+                f"{self._fmt_xyz_diag(query_diag.get('xyz_max'))}"
+            )
+            for (oid, _seen, _point_count, _frac, _min_conf, _mean_conf,
+                 _max_vis, _q_dist_inf, _worst_point, query_diag,
+                 geometry_diag) in diagnostics)
+
+        remaining_ids = [int(ob["id"]) for ob in remaining]
+        by_id = {int(row[0]): row for row in diagnostics}
+        active_row = (
+            by_id.get(remaining_ids[0])
+            if remaining_ids else None)
+        if active_row is not None:
+            (active_oid, active_seen, active_point_count, active_frac,
+             active_min_conf, active_mean_conf, active_max_vis,
+             active_q_dist_inf, active_worst_point, active_query_diag,
+             active_geometry_diag) = active_row
+        else:
+            active_oid = -1
+            active_seen = False
+            active_point_count = 0
+            active_frac = math.nan
+            active_min_conf = math.nan
+            active_mean_conf = math.nan
+            active_max_vis = math.nan
+            active_q_dist_inf = math.nan
+            active_worst_point = np.asarray(
+                [math.nan, math.nan, math.nan], dtype=np.float64)
+            active_query_diag = {
+                "status": "none",
+                "inside_count": 0,
+                "outside_count": 0,
+                "unclassified_count": 0,
+                "finite_confidence_count": 0,
+                "nonfinite_confidence_count": 0,
+                "finite_current_visibility_count": 0,
+                "xyz_min": active_worst_point,
+                "xyz_max": active_worst_point,
+            }
+            active_geometry_diag = {
+                "match_update_count": 0,
+                "match_change_count": 0,
+                "changed_since_qvis": False,
+                "last_match_centroid_shift_m": math.nan,
+                "centroid_shift_from_qvis_m": math.nan,
+                "max_centroid_shift_from_qvis_m": math.nan,
+                "current_centroid": active_worst_point,
+                "q_vis_source_centroid": active_worst_point,
+                "last_match_source": "none",
+            }
+
+        measured = self._latest_measured_q
+        measured_text = (
+            ",".join(f"{float(v):.4f}" for v in measured)
+            if measured is not None and measured.shape == (7,)
+            else "none")
+        active_q_vis_text = "none"
+        active_q_vis_token = "none"
+        active_q_vis_source = "none"
+        if remaining:
+            stored_token = observation_token(remaining[0])
+            stored_q_vis = np.asarray(
+                remaining[0].get("q_vis", []), dtype=np.float64).reshape(-1)
+            q_vis = stored_q_vis
+            active_q_vis_token = stored_token
+            active_q_vis_source = "stored"
+            # The waypoint publication is the executable target. A shared
+            # solve may refresh that target before the obligation dictionary is
+            # replaced; report the same snapshot used by the planner instead
+            # of pairing a new distance with an old q_vis.
+            with self._schedule_publish_lock:
+                published = getattr(self, "_trace_published_target", None)
+                if (published is not None and
+                        published.get("region_token") == observation_region_token(remaining[0])):
+                    published_q = np.asarray(
+                        published.get("q_vis", []), dtype=np.float64).reshape(-1)
+                    if published_q.shape == (7,) and np.all(np.isfinite(published_q)):
+                        q_vis = published_q
+                        active_q_vis_token = str(
+                            published.get("observation_token", stored_token))
+                        active_q_vis_source = "published" if (
+                            active_q_vis_token != stored_token) else "stored"
+            if active_query_diag.get("q_distance_observation_token") != active_q_vis_token:
+                # Do not display a distance for a different target snapshot.
+                active_q_dist_inf = math.nan
+            if q_vis.shape == (7,) and np.all(np.isfinite(q_vis)):
+                active_q_vis_text = ",".join(
+                    f"{float(v):.4f}" for v in q_vis)
+
+        msg.data = (
+            "policy=visibility_acquisition"
+            f" started={int(self._acquisition_started)}"
+            f" complete={int(self._acquisition_complete)}"
+            f" remaining_obligation_count={len(remaining)}"
+            f" remaining_ids={':'.join(str(int(ob['id'])) for ob in remaining) or 'none'}"
+            f" seen_obligation_count={self._seen_obligation_count}"
+            f" acquired_point_count={len(getattr(self, '_task_first_seen_points', ()))}"
+            f" seen_threshold={self.seen_threshold:.6f}"
+            f" required_seen_fraction={self.required_seen_fraction:.6f}"
+            f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
+            f" timer_exception_count={self._timer_exception_count}"
+            f" episode_reopen_count={self._visibility_episode_reopen_count}"
+            f" active_obligation_id={active_oid}"
+            f" active_seen={int(active_seen)}"
+            f" active_point_count={active_point_count}"
+            f" active_seen_fraction={active_frac:.6f}"
+            f" active_min_confidence={active_min_conf:.6f}"
+            f" active_mean_confidence={active_mean_conf:.6f}"
+            f" active_max_current_visibility={active_max_vis:.6f}"
+            f" active_q_distance_inf={active_q_dist_inf:.6f}"
+            f" active_q_distance_token={active_query_diag.get('q_distance_observation_token', 'none')}"
+            f" active_q_vis_token={active_q_vis_token}"
+            f" active_q_vis_source={active_q_vis_source}"
+            f" active_worst_point_xyz="
+            f"{float(active_worst_point[0]):.4f},"
+            f"{float(active_worst_point[1]):.4f},"
+            f"{float(active_worst_point[2]):.4f}"
+            f" active_query_status={active_query_diag.get('status','unknown')}"
+            f" active_query_ros_s={float(active_query_diag.get('query_ros_s',math.nan)):.9f}"
+            f" active_feedback_token={active_query_diag.get('progress_observation_token','none')}"
+            f" active_query_error={active_query_diag.get('exception','none')}"
+            f" active_inside_map_count={int(active_query_diag.get('inside_count',0))}"
+            f" active_outside_map_count={int(active_query_diag.get('outside_count',0))}"
+            f" active_query_unclassified_count="
+            f"{int(active_query_diag.get('unclassified_count',0))}"
+            f" active_finite_confidence_count="
+            f"{int(active_query_diag.get('finite_confidence_count',0))}"
+            f" active_nonfinite_confidence_count="
+            f"{int(active_query_diag.get('nonfinite_confidence_count',0))}"
+            f" active_finite_current_visibility_count="
+            f"{int(active_query_diag.get('finite_current_visibility_count',0))}"
+            f" active_xyz_min={self._fmt_xyz_diag(active_query_diag.get('xyz_min'))}"
+            f" active_xyz_max={self._fmt_xyz_diag(active_query_diag.get('xyz_max'))}"
+            f" active_geometry_match_update_count="
+            f"{int(active_geometry_diag.get('match_update_count',0))}"
+            f" active_geometry_match_change_count="
+            f"{int(active_geometry_diag.get('match_change_count',0))}"
+            f" active_geometry_changed_since_qvis="
+            f"{int(bool(active_geometry_diag.get('changed_since_qvis',False)))}"
+            f" active_centroid_shift_from_qvis_m="
+            f"{float(active_geometry_diag.get('centroid_shift_from_qvis_m',math.nan)):.6f}"
+            f" active_max_centroid_shift_from_qvis_m="
+            f"{float(active_geometry_diag.get('max_centroid_shift_from_qvis_m',math.nan)):.6f}"
+            f" active_last_match_centroid_shift_m="
+            f"{float(active_geometry_diag.get('last_match_centroid_shift_m',math.nan)):.6f}"
+            f" active_current_centroid="
+            f"{self._fmt_xyz_diag(active_geometry_diag.get('current_centroid'))}"
+            f" active_q_vis_source_centroid="
+            f"{self._fmt_xyz_diag(active_geometry_diag.get('q_vis_source_centroid'))}"
+            f" active_last_geometry_match_source="
+            f"{active_geometry_diag.get('last_match_source','unknown')}"
+            f" measured_q={measured_text}"
+            f" active_q_vis={active_q_vis_text}"
+            f" region_checks={diag_text or 'none'}"
+            f" geometry_checks={geometry_text or 'none'}"
+        )
+        self.acquisition_summary_pub.publish(msg)
+
+    # ------------------------------------------------------------------
+    # REPAIR steering publication: no nominal-deadline schedule
+    # ------------------------------------------------------------------
+    def _ordered_obligations(self):
+        # Stable discovery order.  We do not reorder from hypothetical rejected
+        # candidates.  The current target remains until it is actually seen.
+        with self._obligation_lock:
+            return sorted(
+                [dict(ob) for ob in self._obligations],
+                key=lambda ob: int(ob["id"]))
+
+    def _publish_schedule(self) -> None:
+        """Publish one coherent visibility-acquisition snapshot.
+
+        Shared parent state is updated only while holding self._lock. All ROS
+        messages are then published from local immutable copies created by this
+        call; publication must never re-read a shared member after unlock.
+
+        The legacy target callback may reset _deadline_abs_s to None concurrently
+        when x* changes. Re-reading that member after unlock is the race that
+        previously killed the timer thread. _schedule_publish_lock also prevents
+        two ROS callback threads from interleaving the q_vis/q_zero/deadline
+        triplet from different obligation snapshots.
+        """
+        if not getattr(self, "_c47_ready", False):
+            return
+
+        with self._schedule_publish_lock:
+            obligations = self._ordered_obligations()
+            if obligations:
+                first = obligations[0]
+
+                q_vis_snapshot = np.asarray(
+                    first["q_vis"], dtype=np.float64).reshape(7).copy()
+                q_zero_snapshot = np.asarray(
+                    first["q_zero"], dtype=np.float64).reshape(7).copy()
+                deadline_snapshot = float(rospy.Time.now().to_sec() + 1.0)
+                final_f_snapshot = float(first["final_f_min"])
+
+                with self._lock:
+                    self._q_vis = q_vis_snapshot.copy()
+                    self._q_zero = q_zero_snapshot.copy()
+                    # Plumbing timestamp only. REPAIR does not optimize against
+                    # this as a nominal task deadline.
+                    self._deadline_abs_s = deadline_snapshot
+                    self._deadline_from_start_s = math.nan
+                    self._generation_success = True
+                    self._shared_min_f = final_f_snapshot
+                    self._shared_solution_mode = "c47_visibility_acquisition"
+                    self._summary = "c47_acquisition_goal_ready"
+
+                self.waypoint_pub.publish(self._traced_waypoint(first, q_vis_snapshot))
+                self.zero_pub.publish(_vector_msg(q_zero_snapshot))
+                d = Float64()
+                d.data = deadline_snapshot
+                self.deadline_pub.publish(d)
+            else:
+                if self._trace_last_target is not None:
+                    self._trace_observation("unscheduled", observation_token=self._trace_last_target)
+                self._trace_last_target = None
+                self._trace_published_target = None
+                with self._lock:
+                    self._q_vis = None
+                    self._q_zero = None
+                    self._deadline_abs_s = None
+                    self._deadline_from_start_s = math.nan
+                    self._generation_success = False
+                    self._summary = "c47_no_visibility_obligations"
+
+            # Keep the point identity coupled to the same ordered snapshot as
+            # q_vis.  Only the active target is exported: queued obligations do
+            # not preempt the current repair target.
+            first = obligations[0] if obligations else None
+            if first is None:
+                obligation_id = -1
+                points = np.zeros((0, 3), dtype=np.float64)
+            else:
+                obligation_id = int(first["id"])
+                points = np.asarray(first["points"], dtype=np.float64).reshape(-1, 3).copy()
+                if not np.all(np.isfinite(points)):
+                    points = np.zeros((0, 3), dtype=np.float64)
+                    obligation_id = -1
+            key = (obligation_id, tuple(float(x) for x in points.reshape(-1)))
+            if key != self._current_obligation_points_key:
+                self._current_obligation_points_key = key
+                self._current_obligation_points_seq += 1
+                msg = Float64MultiArray()
+                # data = [publication_seq, obligation_id, point_count,
+                #         x0, y0, z0, ...].  An empty message is a clear.
+                msg.data = [float(self._current_obligation_points_seq),
+                            float(obligation_id), float(points.shape[0])]
+                msg.data.extend(float(x) for x in points.reshape(-1))
+                msg.layout.dim = [MultiArrayDimension(
+                    label="care_visibility_obligation_points_v1",
+                    size=len(msg.data), stride=len(msg.data))]
+                self.current_obligation_points_pub.publish(msg)
+
+    def _maybe_generate(self) -> None:
+        if not self._c47_ready:
+            return
+        # Reuse C4.6 accumulation/matching, but never clear from predicted SAFE.
+        self._process_new_active_set()
+        self._update_actual_visibility_completion()
+        self._publish_schedule()
+
+    def _timer_callback(self, _event) -> None:
+        """Fail closed without permanently killing rospy's timer thread."""
+        if self._shutdown_requested():
+            return
+        try:
+            self._maybe_generate()
+            if self._shutdown_requested():
+                return
+            self._publish_state()
+        except Exception as exc:
+            if isinstance(exc, rospy.ROSException) and self._shutdown_requested():
+                return
+            self._timer_exception_count += 1
+            self._acquisition_complete = False
+            try:
+                self.acquisition_complete_pub.publish(Bool(data=False))
+            except Exception:
+                pass
+            with self._lock:
+                self._generation_success = False
+                self._summary = "c47_timer_exception_fail_closed"
+            rospy.logerr_throttle(
+                1.0,
+                "[vbc_acquisition] timer callback exception; keeping "
+                "acquisition incomplete and retrying next cycle: %s",
+                exc)
+
+    def _publish_state(self) -> None:
+        if not self._c47_ready:
+            return
+
+        # Use the same publication lock as _publish_schedule so the periodic
+        # state publisher cannot interleave its waypoint/deadline pair with a
+        # callback-driven schedule snapshot.
+        with self._schedule_publish_lock:
+            obligations = self._ordered_obligations()
+            active = len(obligations) > 0
+            a = Bool()
+            a.data = active
+            self.active_pub.publish(a)
+            if obligations:
+                q_snapshot = np.asarray(
+                    obligations[0]["q_vis"], dtype=np.float64).reshape(7).copy()
+                deadline_snapshot = float(rospy.Time.now().to_sec() + 1.0)
+                self.waypoint_pub.publish(self._traced_waypoint(obligations[0], q_snapshot))
+                # Plumbing timestamp only; not a REPAIR deadline.
+                d = Float64()
+                d.data = deadline_snapshot
+                self.deadline_pub.publish(d)
+
+        msg = String()
+        msg.data = (
+            f"active={int(active)} seen={int(self._acquisition_complete)} "
+            f"ready={int(active)} confidence=nan current_visibility=nan inside_map=1 "
+            "deadline_from_start=nan deadline_remaining=nan "
+            "reason=c47_visibility_acquisition "
+            "steering_policy=visibility_acquisition "
+            f"obligation_count={len(obligations)} "
+            f"active_set_size={sum(len(ob['points']) for ob in obligations)} "
+            "shared_solution_mode=c47_visibility_acquisition"
+        )
+        self.summary_pub.publish(msg)
+        rospy.loginfo_throttle(0.5, "[vbc_acquisition] %s", msg.data)
+
+    def _traced_waypoint(self, ob, q):
+        # Same seven data values and legacy interface. Identity travels in the
+        # SAME message, avoiding cross-topic metadata/q races. Non-aware readers
+        # continue using data, exactly as before.
+        msg = _vector_msg(q)
+        token = observation_token(ob)
+        region = observation_region_token(ob)
+        joint_mask = q_vis_joint_mask(ob)
+        self._trace_published_target = dict(
+            observation_token=token, region_token=region,
+            q_vis=np.asarray(q).copy(), q_vis_joint_mask=joint_mask.copy(),
+            q_vis_joint_mask_explicit='q_vis_joint_mask' in ob,
+            per_sensor_selected_sensor_id=int(ob.get('per_sensor_selected_sensor_id', -1)),
+            per_sensor_hybrid_used=bool(ob.get('per_sensor_hybrid_used', False)))
+        mask_label = "care_qmask_v1_" + "".join(
+            "1" if float(v) > 0.5 else "0" for v in joint_mask)
+        msg.layout.dim = [
+            MultiArrayDimension(label=token, size=7, stride=7),
+            MultiArrayDimension(label=mask_label, size=7, stride=7),
+        ]
+        if int(ob.get('per_sensor_selected_sensor_id', -1)) >= 0:
+            msg.layout.dim.append(MultiArrayDimension(
+                label='care_sensor_v1_' + str(int(ob['per_sensor_selected_sensor_id'])),
+                size=7, stride=7))
+        msg.layout.dim.append(MultiArrayDimension(label=region, size=7, stride=7))
+        if token != self._trace_last_target:
+            self._trace_last_target = token
+            self._trace_observation("scheduled", observation_token=token,
+                generation_event_id=ob.get("generation_event_id", "legacy"),
+                obligation_id=int(ob["id"]), q_vis=q.tolist(),
+                q_vis_joint_mask=joint_mask.tolist(),
+                points=np.asarray(ob["points"]).tolist(), region_token=region,
+                target_source=ob.get("shared_solution_mode", "individual"),
+                target_member_regions=ob.get("target_member_regions", [region]),
+                target_solver_points=ob.get("target_solver_points", np.asarray(ob["points"]).tolist()))
+        return msg
+
+    def _record_seen_query(self, ob, published, seen, fraction, query_diag):
+        """One real query, exact region join; never infer a head caused seen."""
+        region = observation_region_token(ob)
+        targets = [("original", observation_token(ob), np.asarray(ob["q_vis"]))]
+        with self._schedule_publish_lock:
+            current = getattr(self, "_trace_published_target", None)
+            query_diag["progress_observation_token"] = "none"
+            if (published is not None and current is not None and
+                    published["region_token"] == region and
+                    current["region_token"] == region and
+                    current["observation_token"] == published["observation_token"]):
+                query_diag["progress_observation_token"] = published["observation_token"]
+                if query_diag.get('status') == 'ok' and 'point_seen' in query_diag:
+                    if getattr(self, '_task_first_research', False):
+                        self._task_first_seen_points.update(
+                            tuple(point) for point, is_seen in
+                            zip(np.round(np.asarray(ob['points']), 6), query_diag['point_seen'])
+                            if is_seen and np.isfinite(point).all() and
+                            self._task_first_initial_point_seen.get(tuple(point)) is False)
+                    self._guidance_feedback = dict(
+                        token=published['observation_token'], region=region,
+                        query_time=float(query_diag['query_ros_s']),
+                        points=np.asarray(ob['points']).copy(),
+                        point_seen=list(query_diag['point_seen']), fraction=float(fraction))
+            if (published is not None and current is not None and
+                    published["region_token"] == region and
+                    current["observation_token"] == published["observation_token"] and
+                    published["observation_token"] != targets[0][1]):
+                targets.append(("published", published["observation_token"], published["q_vis"]))
+        measured = query_diag.get("measured_q")
+        query_diag["q_distance_observation_token"] = targets[-1][1]
+        query_diag["q_distance_inf"] = (float(np.max(np.abs(measured-targets[-1][2])))
+            if measured is not None and np.all(np.isfinite(measured)) else math.nan)
+        now_wall = time.monotonic()
+        for role, token, q in targets:
+            key = (int(ob["id"]), role)
+            last = self._trace_seen_samples.get(key, (None, False, -math.inf))
+            if token == last[0] and bool(seen) == last[1] and now_wall-last[2] < 1.0:
+                continue
+            self._trace_seen_samples[key] = (token, bool(seen), now_wall)
+            distance = (float(np.max(np.abs(measured-q)))
+                        if measured is not None and np.all(np.isfinite(measured)) else math.nan)
+            self._trace_observation("seen_query", observation_token=token, region_token=region,
+                obligation_id=int(ob["id"]), actual_seen=bool(seen), seen_fraction=float(fraction),
+                query_status=str(query_diag.get("status")), q_distance_inf=distance,
+                measured_q=None if measured is None else measured.tolist(),
+                measured_ros_s=float(query_diag.get("measured_ros_s", math.nan)),
+                evidence_relation="same_exact_region_" + role,
+                causal_head_attribution="unknown")

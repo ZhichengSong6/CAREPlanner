@@ -3,8 +3,32 @@
 Kept separate from local diagnostic trace writers so the mainline has no
 dependency on debug scripts or filesystem logging.
 """
+import copy
 import hashlib
 import json
+
+
+def observation_target_state(source):
+    """Copy a pose and its objective mask as one target, including legacy absence.
+
+    Callers retain their existing validity/identity checks. This is a snapshot,
+    not a new target, observation completion, or execution authorization.
+    """
+    return {key: copy.deepcopy(source[key])
+            for key in ('q_vis', 'q_vis_joint_mask', 'per_sensor_selected_sensor_id',
+                        'per_sensor_hybrid_used') if key in source and
+            (key != 'q_vis_joint_mask' or source.get('q_vis_joint_mask_explicit', True))}
+
+
+def restore_observation_target_state(destination, source):
+    """Restore the mask belonging to the pinned pose, never a different pose's mask."""
+    target = observation_target_state(source)
+    destination.update(target)
+    if 'q_vis_joint_mask' not in target:
+        destination.pop('q_vis_joint_mask', None)
+    for key in ('per_sensor_selected_sensor_id', 'per_sensor_hybrid_used'):
+        if key not in target:
+            destination.pop(key, None)
 
 
 def vbc_bundle_identity(msg, expected_seq):
@@ -40,5 +64,8 @@ def observation_token(ob):
     if "q_vis_joint_mask" in ob:
         payload["joint_mask"] = [
             float(x) for x in ob["q_vis_joint_mask"]]
+    sensor = int(ob.get('per_sensor_selected_sensor_id', -1))
+    if sensor >= 0:
+        payload['sensor_id'] = sensor
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
     return "care_obs_v1_" + str(ob["id"]) + "_" + digest

@@ -1,0 +1,17 @@
+collision_cdf:
+  # Model-specific settings for cdf_25mm_v2/model.pt, iteration5000.
+  # SHA256: d153c5b08af0d2b8ce12da500fe13d5d0b04cfc0d9ce07a2e6ad4d2dfd93a4e6
+  # Training caller confirms ReLU; remote mlp.py encoding/output parity is pending.
+  input_dims: 10
+  output_dims: 1
+  hidden_layers: [1024, 512, 256, 128, 128]
+  nerf: true
+  signed: true
+  activation: "relu"
+  checkpoint_key: "5000"
+  device: "cpu"
+  service_name: "/care_planner/collision_cdf/query"
+  pair_service_name: "/care_planner/collision_cdf/query_pairs"
+  max_points: 4096
+  max_q: 64
+  max_pairs: 8000

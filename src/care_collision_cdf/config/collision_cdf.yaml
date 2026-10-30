@@ -11,7 +11,7 @@ collision_cdf:
   # directly from checkpoint tensor shapes. These fields document the raw I/O.
   nerf: true
   signed: true
-  # The signed checkpoint follows the GCDF training MLP, which uses GELU.
+  # Legacy yiming_cdf checkpoint only. cdf_25mm_v2 uses its separate ReLU config.
   # Activation has no state_dict tensors, so it cannot be inferred from weights.
   activation: "gelu"
 

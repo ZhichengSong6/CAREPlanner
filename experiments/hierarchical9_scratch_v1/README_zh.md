@@ -32,7 +32,7 @@ Eikonal 为绝对值；tension 为原来的 `||H^T 1||^2`，不是完整 Hessian
 
 `model.py` 定义网络和逐行值/7D 输入梯度接口；`objective.py` 定义 loss；
 `train.py` 是四卡 DDP 训练器；`test_synthetic.py` 是无数据集合成测试；
-`submit_3090node3.sh` 提交 Slurm；`TEST_RESULTS.md` 记录本地验证范围。
+`submit_3090node3.sh` 提交 Slurm。测试产生的结果保留在本地。
 
 复用仓库已有的数据、FOV oracle、距离/梯度标签及 Cartesian sampling：
 

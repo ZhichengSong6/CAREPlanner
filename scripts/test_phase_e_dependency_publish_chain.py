@@ -33,6 +33,51 @@ def production_class(path, names, base, scope):
 
 
 class PublishChainTests(unittest.TestCase):
+    def test_parent_resume_preserves_published_pose_mask_and_token_together(self):
+        masks = [(np.ones(7), np.array([1,1,0,0,0,0,0.])),
+                 (np.array([1,1,0,0,0,0,0.]), np.ones(7)),
+                 (None, np.array([1,1,1,1,0,0,0.])),
+                 (np.ones(7), None)]
+        for stored_mask, published_mask in masks:
+            with self.subTest(stored=stored_mask, published=published_mask):
+                n, fixture, clock = self.node()
+                parent = n._obligations[0]
+                if stored_mask is not None:
+                    parent['q_vis_joint_mask'] = stored_mask.copy()
+                published = dict(parent, q_vis=np.arange(7)*.1)
+                if published_mask is None:
+                    published.pop('q_vis_joint_mask', None)
+                else:
+                    published['q_vis_joint_mask'] = published_mask.copy()
+                n._traced_waypoint(published, published['q_vis'])
+                original_token = n._trace_published_target['observation_token']
+                expected_mask = (np.ones(7) if published_mask is None else published_mask)
+                fixture.event(n)
+                self.bounded(n._process_observation_dependency)
+                n.seen_ids.add(2); clock.now += .1
+                self.bounded(n._update_actual_visibility_completion)
+                self.assertEqual(n._repair_stack, [1])
+                self.assertEqual(n._trace_published_target['observation_token'], original_token)
+                np.testing.assert_equal(n._trace_published_target['q_vis'], published['q_vis'])
+                np.testing.assert_equal(n._trace_published_target['q_vis_joint_mask'], expected_mask)
+                self.assertEqual(n._seen_obligation_count, 1)
+                self.assertEqual(list(n._dependency_attempts.values()), [1])
+
+    def test_parent_resume_restores_sensor_head_with_published_pose(self):
+        n, fixture, clock = self.node()
+        parent=n._obligations[0]
+        parent['per_sensor_selected_sensor_id']=6
+        parent['q_vis_joint_mask']=np.ones(7)
+        published=dict(parent,per_sensor_selected_sensor_id=2,
+                       q_vis=np.arange(7)*.1,q_vis_joint_mask=np.array([1,1,1,0,0,0,0.]))
+        n._traced_waypoint(published,published['q_vis'])
+        token=n._trace_published_target['observation_token']
+        fixture.event(n); self.bounded(n._process_observation_dependency)
+        n.seen_ids.add(2); clock.now+=.1
+        self.bounded(n._update_actual_visibility_completion)
+        self.assertEqual(n._trace_published_target['per_sensor_selected_sensor_id'],2)
+        self.assertEqual(n._trace_published_target['observation_token'],token)
+
     def node(self):
         fixture = dependency_tests.ObservationDependencyTests()
         old = fixture.node()
@@ -51,7 +96,8 @@ class PublishChainTests(unittest.TestCase):
             ['_publish_schedule', '_traced_waypoint', '_update_actual_visibility_completion',
              '_query_region_seen', '_record_seen_query'], type(old), scope)
         cls = production_class(REPO/'src/care_visibility_cdf/scripts/vbc_blocker_aware_acquisition_impl.py',
-            ['_publish_schedule', '_traced_waypoint', '_update_actual_visibility_completion'], base, scope)
+            ['_publish_schedule', '_traced_waypoint', '_update_actual_visibility_completion',
+             '_set_acquisition_completion'], base, scope)
         n = cls(); n.__dict__.update(old.__dict__)
         del n._publish_schedule  # use both actual class overrides, including super()
         n._obligation_lock = threading.Lock()  # exactly the production base lock
@@ -68,6 +114,8 @@ class PublishChainTests(unittest.TestCase):
         n._coherent_bundle_lock = threading.Lock()
         n._coherent_bundle_enabled = True
         n._coherent_bundle_pending_nonempty = False
+        from pending_vbc_blockers import PendingVbcBlockers
+        n._pending_vbc_blockers = PendingVbcBlockers()
         n._last_visibility_check_s = -math.inf
         n.visibility_check_rate = 20.
         n.seen_threshold = .8

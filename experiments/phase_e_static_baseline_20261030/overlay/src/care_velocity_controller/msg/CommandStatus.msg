@@ -1,0 +1,21 @@
+std_msgs/Header header
+uint8 WAITING=0
+uint8 TRACKING=1
+uint8 BRAKING=2
+uint8 LATCHED=3
+uint8 mode
+bool clock_fault
+time command_stamp
+uint32 command_sequence
+time fault_stamp
+time stopped_stamp
+uint64 rejected_commands
+uint64 rearm_successes
+uint64 rearm_rejections
+float64[7] applied_velocity
+float64[7] measured_velocity
+# Diagnostics at header.stamp, before this update's applied_velocity takes effect.
+float64[7] measured_position
+float64[7] applied_position_integral
+bool integral_valid
+float64 max_update_gap

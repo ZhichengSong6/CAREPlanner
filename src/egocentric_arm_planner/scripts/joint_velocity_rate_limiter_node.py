@@ -12,7 +12,8 @@ import threading
 
 import numpy as np
 import rospy
-from std_msgs.msg import Float64MultiArray, String
+from std_msgs.msg import Bool, Float64MultiArray, String
+from sensor_msgs.msg import JointState
 
 
 class JointVelocityRateLimiter:
@@ -28,6 +29,10 @@ class JointVelocityRateLimiter:
         self.summary_topic = str(rospy.get_param(
             "~summary_topic", "/care_planner/execution/rate_limiter_summary"))
         self.input_timeout = float(rospy.get_param("~input_timeout", 0.10))
+        self.vbc_hold_topic = str(rospy.get_param(
+            "~vbc_safety_hold_topic", "/care_planner/execution/predicted_vbc_verification_hold"))
+        self.gcdf_hold_topic = str(rospy.get_param(
+            "~external_safety_hold_topic", "/care_planner/execution_gcdf/hard_hold"))
 
         self.joint_names = list(rospy.get_param("~joint_names", []))
         if not self.joint_names:
@@ -59,13 +64,31 @@ class JointVelocityRateLimiter:
         self._limited_cycle_count = 0
         self._max_accel_ratio = 0.0
         self._last_status = "waiting_input"
+        self._vbc_hold = False
+        self._gcdf_hold = False
+        self._held_input_count = 0
+        self.require_execution_lease=bool(rospy.get_param('~require_execution_lease',False))
+        if self.require_execution_lease:
+            from care_velocity_controller.msg import LeasedVelocityCommand, CommandStatus
+            from execution_command_lease import LeasedCommandLimiter
+            self._lease_limiter=LeasedCommandLimiter(self.joint_names,self.velocity_limits,self.acceleration_limits,self.input_timeout)
+            self.leased_pub=rospy.Publisher(rospy.get_param('~leased_output_topic','/care_arm/arm_group_velocity_controller/command_leased'),LeasedVelocityCommand,queue_size=1)
+            self.lease_input_sub=rospy.Subscriber(rospy.get_param('~leased_input_topic','/care_planner/execution/leased_velocity_desired'),LeasedVelocityCommand,self._leased_desired_cb,queue_size=1,tcp_nodelay=True)
+            self.lease_state_sub=rospy.Subscriber(rospy.get_param('~controller_state_topic','/care_arm/arm_group_velocity_controller/state'),CommandStatus,self._controller_state_cb,queue_size=10,tcp_nodelay=True)
 
         self.pub = rospy.Publisher(
             self.output_topic, Float64MultiArray, queue_size=1)
+        self.stamped_output_topic = str(rospy.get_param("~stamped_output_topic", "")) or self.output_topic+'_stamped'
+        self.stamped_pub = (rospy.Publisher(self.stamped_output_topic, JointState, queue_size=1)
+                            if self.stamped_output_topic else None)
         self.summary_pub = rospy.Publisher(
             self.summary_topic, String, queue_size=1, latch=True)
-        self.sub = rospy.Subscriber(
-            self.input_topic, Float64MultiArray, self._desired_cb, queue_size=1)
+        self.sub = (None if self.require_execution_lease else rospy.Subscriber(
+            self.input_topic, Float64MultiArray, self._desired_cb, queue_size=1))
+        self.vbc_hold_sub = rospy.Subscriber(
+            self.vbc_hold_topic, Bool, self._vbc_hold_cb, queue_size=1, tcp_nodelay=True)
+        self.gcdf_hold_sub = rospy.Subscriber(
+            self.gcdf_hold_topic, Bool, self._gcdf_hold_cb, queue_size=1, tcp_nodelay=True)
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.rate), self._timer_cb)
         rospy.on_shutdown(self._on_shutdown)
@@ -102,9 +125,52 @@ class JointVelocityRateLimiter:
                 1.0, "[joint_velocity_rate_limiter] non-finite desired command")
             return
         with self._lock:
+            self._input_count += 1
+            if self._vbc_hold or self._gcdf_hold:
+                self._held_input_count += 1
+                return
             self._desired = desired
             self._desired_received = rospy.Time.now()
-            self._input_count += 1
+
+    def _set_hold(self, attribute, requested):
+        with self._lock:
+            if getattr(self, attribute) == bool(requested):
+                return
+            setattr(self, attribute, bool(requested))
+            # Neither entry nor release may reuse a pre-hold desired command.
+            # A fresh tracker callback is required once BOTH holds release.
+            self._desired_received = None
+            self._desired = np.zeros(self.dof, dtype=np.float64)
+            if getattr(self,'require_execution_lease',False):
+                self._lease_limiter.stop()
+
+    def _leased_desired_cb(self,msg):
+        with self._lock:
+            if self._lease_limiter.receive(msg,rospy.Time.now().to_sec()):
+                self._input_count+=1
+                if self._vbc_hold or self._gcdf_hold:self._lease_limiter.stop()
+
+    def _controller_state_cb(self,msg):
+        with self._lock:
+            self._lease_limiter.on_state(msg,rospy.Time.now().to_sec())
+
+    def _leased_timer_tick(self):
+        now=rospy.Time.now()
+        with self._lock:
+            dt=1./self.rate if self._last_tick is None else max(0.,min(2./self.rate,(now-self._last_tick).to_sec()))
+            self._last_tick=now
+            msg=self._lease_limiter.tick(now.to_sec(),dt)
+            if msg is None or self._shutdown_requested():return
+            self.leased_pub.publish(msg)
+            self._last_output=np.asarray(msg.velocity,dtype=float);self._output_count+=1
+            self._last_status='leased_terminal_stop' if msg.stop else 'leased_tracking'
+        self._publish_summary(self._last_status,dt,self._max_accel_ratio)
+
+    def _vbc_hold_cb(self, msg):
+        self._set_hold('_vbc_hold', msg.data)
+
+    def _gcdf_hold_cb(self, msg):
+        self._set_hold('_gcdf_hold', msg.data)
 
     def _on_shutdown(self):
         self._stopping = True
@@ -128,43 +194,51 @@ class JointVelocityRateLimiter:
                 raise
 
     def _timer_tick(self, _event):
+        if getattr(self,'require_execution_lease',False):
+            self._leased_timer_tick();return
         now = rospy.Time.now()
         with self._lock:
             desired = self._desired.copy()
             received = self._desired_received
             last = self._last_output.copy()
             last_tick = self._last_tick
+            if last_tick is None:
+                dt = 1.0 / self.rate
+            else:
+                dt = max(1e-4, min(2.0 / self.rate, (now - last_tick).to_sec()))
 
-        if last_tick is None:
-            dt = 1.0 / self.rate
-        else:
-            dt = max(1e-4, min(2.0 / self.rate, (now - last_tick).to_sec()))
+            fresh = received is not None and 0.0 <= (now - received).to_sec() <= self.input_timeout
+            if self._vbc_hold or self._gcdf_hold:
+                desired = np.zeros(self.dof, dtype=np.float64)
+                status = "vbc_hold_ramp_to_zero" if self._vbc_hold else "gcdf_hold_ramp_to_zero"
+            elif not fresh:
+                desired = np.zeros(self.dof, dtype=np.float64)
+                status = "stale_ramp_to_zero" if received is not None else "waiting_input"
+            else:
+                status = "tracking"
 
-        fresh = received is not None and 0.0 <= (now - received).to_sec() <= self.input_timeout
-        if not fresh:
-            desired = np.zeros(self.dof, dtype=np.float64)
-            status = "stale_ramp_to_zero" if received is not None else "waiting_input"
-        else:
-            status = "tracking"
-
-        desired = np.clip(desired, -self.velocity_limits, self.velocity_limits)
-        max_delta = self.acceleration_limits * dt
-        raw_delta = desired - last
-        limited_delta = np.clip(raw_delta, -max_delta, max_delta)
-        output = last + limited_delta
-        output = np.clip(output, -self.velocity_limits, self.velocity_limits)
-
-        limited = bool(np.any(np.abs(raw_delta - limited_delta) > 1e-10))
-        accel = np.abs(output - last) / max(dt, 1e-9)
-        ratio = float(np.max(accel / self.acceleration_limits)) if self.dof else 0.0
-
-        msg = Float64MultiArray()
-        msg.data = output.astype(float).tolist()
-        if self._shutdown_requested():
-            return
-        self.pub.publish(msg)
-
-        with self._lock:
+            desired = np.clip(desired, -self.velocity_limits, self.velocity_limits)
+            max_delta = self.acceleration_limits * dt
+            raw_delta = desired - last
+            limited_delta = np.clip(raw_delta, -max_delta, max_delta)
+            output = np.clip(last + limited_delta, -self.velocity_limits, self.velocity_limits)
+            limited = bool(np.any(np.abs(raw_delta - limited_delta) > 1e-10))
+            accel = np.abs(output - last) / max(dt, 1e-9)
+            ratio = float(np.max(accel / self.acceleration_limits)) if self.dof else 0.0
+            msg = Float64MultiArray()
+            msg.data = output.astype(float).tolist()
+            if self._shutdown_requested():
+                return
+            # Serialize publication with hold callbacks: an accepted hold cannot
+            # be followed by an output computed from an older nonzero request.
+            self.pub.publish(msg)
+            if self.stamped_pub is not None:
+                stamped = JointState()
+                stamped.header.stamp = now
+                stamped.header.seq = self._output_count + 1
+                stamped.name = self.joint_names
+                stamped.velocity = msg.data
+                self.stamped_pub.publish(stamped)
             self._last_output = output
             self._last_tick = now
             self._output_count += 1
@@ -181,7 +255,8 @@ class JointVelocityRateLimiter:
         with self._lock:
             text = (
                 "status={} input_count={} output_count={} limited_cycle_count={} "
-                "dt_s={:.6f} max_accel_ratio={:.6f}"
+                "dt_s={:.6f} max_accel_ratio={:.6f} "
+                "vbc_hold={} gcdf_hold={} held_input_count={}"
             ).format(
                 status,
                 self._input_count,
@@ -189,6 +264,7 @@ class JointVelocityRateLimiter:
                 self._limited_cycle_count,
                 float(dt),
                 float(max_accel_ratio),
+                int(self._vbc_hold), int(self._gcdf_hold), self._held_input_count,
             )
         if self._shutdown_requested():
             return

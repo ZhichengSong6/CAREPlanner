@@ -1,0 +1,121 @@
+<launch>
+  <!-- ========================= -->
+  <!-- Basic frames / config      -->
+  <!-- ========================= -->
+
+  <arg name="config_file"
+       default="$(find egocentric_arm_planner)/config/planner_phase1.yaml" />
+
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+
+  <!-- ========================= -->
+  <!-- Optional execution manager -->
+  <!-- ========================= -->
+
+  <!-- Default true: normal behavior, planner publishes command and execution manager tracks it.
+       Set false when testing risk / attribution without moving the robot. -->
+  <arg name="use_execution_manager" default="true" />
+
+  <!-- Keep the baseline path unchanged by default.  Stage-III closed-loop tests
+       override this with /care_planner/command_trajectory_stage3 so the original
+       TrajectoryExecutionManager remains the sole low-level velocity owner. -->
+  <arg name="execution_input_trajectory"
+       default="/care_planner/command_trajectory_candidate" />
+
+  <!-- ========================= -->
+  <!-- Optional interactive marker -->
+  <!-- ========================= -->
+
+  <arg name="use_interactive_marker" default="true" />
+  <arg name="use_trajectory_visualizer" default="true" />
+  <arg name="interactive_marker_server_name" default="ee_interactive_marker" />
+  <arg name="interactive_marker_scale" default="0.08" />
+
+  <!-- If false, marker waits until base_frame -> ee_frame TF exists.
+       This is recommended so the marker starts exactly at the initial EE pose. -->
+  <arg name="interactive_marker_allow_fallback_pose" default="false" />
+
+  <!-- ========================= -->
+  <!-- Planner node               -->
+  <!-- ========================= -->
+
+  <node pkg="egocentric_arm_planner"
+        type="receding_horizon_planner_node"
+        name="receding_horizon_planner_node"
+        output="screen">
+
+    <rosparam command="load" file="$(arg config_file)" />
+
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="ee_frame" value="$(arg ee_frame)" />
+    <!-- Research broker forwards the nominal reference and may propose a
+         measured-map detour. All executable candidates retain original gates. -->
+    <param if="$(optenv CARE_OCCLUSION_REROUTE_ENABLED false)"
+           name="topics/task_trajectory" value="/care_planner/nominal_task_trajectory" />
+  </node>
+
+  <!-- ========================= -->
+  <!-- Execution manager node     -->
+  <!-- ========================= -->
+
+  <group if="$(arg use_execution_manager)">
+    <node pkg="egocentric_arm_planner"
+          type="trajectory_execution_manager_node"
+          name="trajectory_execution_manager_node"
+          output="screen">
+
+      <rosparam command="load" file="$(arg config_file)" />
+
+      <param name="base_frame" value="$(arg base_frame)" />
+      <param name="ee_frame" value="$(arg ee_frame)" />
+      <param name="execution/input_trajectory"
+             value="$(arg execution_input_trajectory)" />
+    </node>
+  </group>
+
+  <!-- ========================= -->
+  <!-- Trajectory visualizer node -->
+  <!-- ========================= -->
+
+  <group if="$(arg use_trajectory_visualizer)">
+    <node pkg="egocentric_arm_planner"
+          type="trajectory_visualizer_node"
+          name="trajectory_visualizer_node"
+          output="screen">
+
+      <rosparam command="load" file="$(arg config_file)" />
+
+      <param name="base_frame" value="$(arg base_frame)" />
+      <param name="ee_frame" value="$(arg ee_frame)" />
+    </node>
+  </group>
+
+  <!-- ========================= -->
+  <!-- EE interactive marker node -->
+  <!-- ========================= -->
+
+  <group if="$(arg use_interactive_marker)">
+    <node pkg="egocentric_arm_planner"
+          type="ee_interactive_marker_node"
+          name="ee_interactive_marker_node"
+          output="screen">
+
+      <param name="server_name" value="$(arg interactive_marker_server_name)" />
+      <param name="base_frame" value="$(arg base_frame)" />
+      <param name="ee_frame" value="$(arg ee_frame)" />
+
+      <param name="target_pose_topic" value="/care_planner/ee_target_pose" />
+      <param name="marker_scale" value="$(arg interactive_marker_scale)" />
+
+      <param name="allow_fallback_pose"
+             value="$(arg interactive_marker_allow_fallback_pose)" />
+
+      <!-- Only used when allow_fallback_pose=true -->
+      <param name="fallback_x" value="0.3" />
+      <param name="fallback_y" value="0.0" />
+      <param name="fallback_z" value="0.3" />
+    </node>
+  </group>
+
+</launch>

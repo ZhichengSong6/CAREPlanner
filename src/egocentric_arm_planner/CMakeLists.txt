@@ -2,8 +2,12 @@ cmake_minimum_required(VERSION 3.0.2)
 project(egocentric_arm_planner)
 
 add_compile_options(-std=c++14 -Wall -Wextra -Wpedantic)
+# Keep the selected Eigen headers ahead of the older PCL-exported include.
+# Imported Pinocchio must not demote them to -isystem behind Eigen 3.3.
+set(CMAKE_NO_SYSTEM_FROM_IMPORTED ON)
 
 find_package(catkin REQUIRED COMPONENTS
+  message_generation
   roscpp
   std_msgs
   sensor_msgs
@@ -17,12 +21,17 @@ find_package(catkin REQUIRED COMPONENTS
   arm_trajectory
   care_collision_cdf
   care_confidence_map
+  care_velocity_controller
 )
 
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
+find_package(OpenSSL REQUIRED)
 
-set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
+add_message_files(FILES CandidateTransfer.msg RepairPrefixSelection.msg VisibilityGuidance.msg)
+generate_messages(DEPENDENCIES trajectory_msgs)
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/PreparePIQP.cmake")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
   message(FATAL_ERROR
     "PIQP headers are missing. Run: git submodule update --init --recursive")
@@ -32,6 +41,7 @@ catkin_package(
   INCLUDE_DIRS include
   LIBRARIES egocentric_arm_planner
   CATKIN_DEPENDS
+    message_runtime
     roscpp
     std_msgs
     sensor_msgs
@@ -45,13 +55,14 @@ catkin_package(
     arm_trajectory
     care_collision_cdf
     care_confidence_map
+    care_velocity_controller
   DEPENDS EIGEN3
 )
 
 include_directories(
+  ${EIGEN3_INCLUDE_DIRS}
   include
   ${catkin_INCLUDE_DIRS}
-  ${EIGEN3_INCLUDE_DIRS}
 )
 
 add_library(egocentric_arm_planner
@@ -64,10 +75,12 @@ add_library(egocentric_arm_planner
 )
 
 add_dependencies(egocentric_arm_planner
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 
 target_link_libraries(egocentric_arm_planner
+  OpenSSL::Crypto
   ${catkin_LIBRARIES}
 )
 
@@ -75,6 +88,7 @@ add_executable(receding_horizon_planner_node
   src/receding_horizon_planner_node.cpp
 )
 add_dependencies(receding_horizon_planner_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(receding_horizon_planner_node
@@ -86,6 +100,7 @@ add_executable(trajectory_visualizer_node
   src/trajectory_visualizer_node.cpp
 )
 add_dependencies(trajectory_visualizer_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(trajectory_visualizer_node
@@ -97,6 +112,7 @@ add_executable(trajectory_execution_manager_node
   src/trajectory_execution_manager_node.cpp
 )
 add_dependencies(trajectory_execution_manager_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(trajectory_execution_manager_node
@@ -109,6 +125,7 @@ add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc.cpp
 )
 add_dependencies(velocity_qp_mpc_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(velocity_qp_mpc_node PRIVATE
@@ -133,6 +150,7 @@ add_executable(velocity_qp_mpc_waypoint_node
   src/velocity_qp_mpc_waypoint.cpp
 )
 add_dependencies(velocity_qp_mpc_waypoint_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(velocity_qp_mpc_waypoint_node PRIVATE
@@ -155,8 +173,11 @@ target_link_libraries(velocity_qp_mpc_waypoint_node
 add_executable(local_sparse_scp_planner_node
   src/local_sparse_scp_planner_node.cpp
   src/local_sparse_scp_planner.cpp
+  src/primitive_observation_guard.cpp
 )
 add_dependencies(local_sparse_scp_planner_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(local_sparse_scp_planner_node PRIVATE
@@ -169,6 +190,7 @@ target_compile_definitions(local_sparse_scp_planner_node PRIVATE
   NDEBUG
 )
 target_link_libraries(local_sparse_scp_planner_node
+  OpenSSL::Crypto
   ${catkin_LIBRARIES}
   ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -180,6 +202,7 @@ add_executable(frozen_snapshot_repair_diagnostic_node
   src/frozen_snapshot_repair_diagnostic_node.cpp
 )
 add_dependencies(frozen_snapshot_repair_diagnostic_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(frozen_snapshot_repair_diagnostic_node PRIVATE
@@ -199,6 +222,7 @@ add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
 add_dependencies(ee_interactive_marker_node
+  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(ee_interactive_marker_node
@@ -214,6 +238,18 @@ catkin_install_python(PROGRAMS
   scripts/optimized_trajectory_continuity_node.py
   scripts/gcdf_rejection_feedback.py
   scripts/occupied_clearance.py
+  scripts/initial_shell_recovery.py
+  scripts/recovery_motion.py
+  scripts/execution_motion_limits.py
+  scripts/execution_command_lease.py
+  scripts/execution_preparation.py
+  scripts/execution_handoff.py
+  scripts/execution_preparation_handoff_node.py
+  scripts/handoff_schedule.py
+  scripts/geometric_restore.py
+  scripts/candidate_admission.py
+  scripts/observation_task_owner_node.py
+  scripts/repair_prefix_contract.py
   scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
   scripts/execution_gcdf_measured_state_trajectory_node.py

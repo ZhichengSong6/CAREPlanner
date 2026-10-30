@@ -1,0 +1,7 @@
+<library path="lib/libcare_velocity_controller">
+  <class name="care_velocity_controller/ExpiringJointVelocityController"
+         type="care_velocity_controller::ExpiringJointVelocityController"
+         base_class_type="controller_interface::ControllerBase">
+    <description>Stamped commands, expiry in the controller update, latched bounded-rate braking.</description>
+  </class>
+</library>

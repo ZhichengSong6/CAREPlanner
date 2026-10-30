@@ -1,0 +1,8 @@
+{
+  "checkpoint": "@BASELINE_RUN@/fixed/runtime/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt",
+  "checkpoint_sha256": "41a4228eee797971d56b46849e0f52c663eae79dc35667e8704c1bc3c8d72c70",
+  "activation": "gelu",
+  "checkpoint_key": "latest",
+  "model": "old",
+  "diagnostic_only": true
+}

@@ -1,6 +1,11 @@
 #pragma once
 
 #include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_velocity_controller/ExecutionLease.h>
+#include <care_velocity_controller/LeasedVelocityCommand.h>
+#include <care_velocity_controller/CommandStatus.h>
+#include "egocentric_arm_planner/execution_stop_state.hpp"
+#include "egocentric_arm_planner/prepared_execution_state.hpp"
 #include <ros/ros.h>
 
 #include <sensor_msgs/JointState.h>
@@ -47,6 +52,8 @@ private:
   // explicitly in its YAML file.
   bool primitive_tracking_relative_fk_ = false;
   bool primitive_tracking_relative_fk_ready_ = false;
+  bool enforce_motion_limits_ = false;
+  std::vector<double> reference_velocity_limits_, reference_acceleration_limits_;
   // Runtime tracker body-envelope threshold. This is separate from the VBC
   // swept-volume margin; VBC keeps its own certification margin.
   double certified_tracking_margin_m_ = 0.020;
@@ -60,8 +67,17 @@ private:
   double last_tracking_phase_lag_s_ = 0.0;
   bool last_tracking_phase_alignment_used_ = false;
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
+  void limiterOutputCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
+  void executionLeaseCallback(const care_velocity_controller::ExecutionLeaseConstPtr& msg);
+  void controllerStateCallback(const care_velocity_controller::CommandStatusConstPtr& msg);
+  void preparationCallback(const CandidateTransferConstPtr& msg);
+  void preparationContextCallback(const std_msgs::StringConstPtr& msg);
+  void preparationControlCallback(const std_msgs::StringConstPtr& msg);
+  void preparedExecutionTick();
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void safetyHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void vbcSafetyHoldCallback(const std_msgs::BoolConstPtr& msg);
+  void executionVbcStopCallback(const std_msgs::StringConstPtr& msg);
   void executionTimerCallback(const ros::TimerEvent& event);
 
   bool loadConfig();
@@ -85,8 +101,8 @@ private:
       Eigen::VectorXd& dq_ref,
       Eigen::VectorXd& ddq_ref);
 
-  // Find the closest point on the locally time-windowed piecewise-linear
-  // reference path in joint space. This separates spatial path error from
+  // Find a nearby point on the locally time-windowed reference curve.
+  // This separates spatial path error from
   // longitudinal phase lag: the tracker still executes at its current phase,
   // but the body-envelope monitor compares measured q with this nearest path
   // point rather than blindly comparing against q_ref(current_phase).
@@ -115,7 +131,7 @@ private:
 
   Eigen::VectorXd clampVelocityCommand(const Eigen::VectorXd& dq_cmd) const;
 
-  void publishVelocityCommand(const Eigen::VectorXd& dq_cmd);
+  void publishVelocityCommand(const Eigen::VectorXd& dq_cmd, bool terminal_stop=false);
 
   void publishReferenceState(const Eigen::VectorXd& q_ref,
                              const Eigen::VectorXd& dq_ref);
@@ -130,7 +146,8 @@ private:
                       int tracking_error_joint_index,
                       double tracking_error_q_ref,
                       double tracking_error_q_measured,
-                      const std::string& source);
+                      const std::string& source,
+                      const ros::Time& sample_time);
 
   void maybePublishReplanRequest(double tracking_error_inf);
   void flushPendingReplanRequest();
@@ -147,10 +164,17 @@ private:
   ros::NodeHandle pnh_;
 
   ros::Subscriber joint_state_sub_;
+  ros::Subscriber limiter_output_sub_;
+  ros::Subscriber execution_lease_sub_,controller_state_sub_;
+  ros::Subscriber preparation_sub_,preparation_context_sub_,preparation_control_sub_;
+  ros::Publisher preparation_status_pub_;
   ros::Subscriber trajectory_sub_;
   ros::Subscriber safety_hold_sub_;
+  ros::Subscriber vbc_safety_hold_sub_;
+  ros::Subscriber execution_vbc_stop_sub_;
 
   ros::Publisher velocity_command_pub_;
+  ros::Publisher leased_velocity_command_pub_;
   ros::Publisher reference_state_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher replan_request_pub_;
@@ -162,11 +186,23 @@ private:
 
   bool has_joint_state_ = false;
   bool external_safety_hold_ = false;
+  bool vbc_safety_hold_ = false;
+  uint64_t execution_vbc_stop_stamp_ns_ = 0;
   ros::Time external_safety_hold_start_time_;
   unsigned long long external_safety_hold_event_count_ = 0;
   sensor_msgs::JointState latest_joint_state_;
   Eigen::VectorXd q_measured_;
   Eigen::VectorXd dq_measured_;
+  bool require_command_lease_=false;
+  bool require_prepared_execution_=false;
+  PreparedExecutionState prepared_execution_;
+  care_velocity_controller::ExecutionLease command_lease_;
+  care_velocity_controller::CommandStatus controller_state_;
+  uint64_t command_source_sequence_=0;
+  uint64_t last_lease_sequence_=0;
+  ExecutionStopState stop_state_;
+  Eigen::VectorXd latest_limiter_output_;
+  ros::Time latest_limiter_output_received_;
 
   // Complete committed trajectory.  A new message atomically replaces the
   // active trajectory; the controller then advances through it at execution_rate_.
@@ -250,6 +286,8 @@ private:
       "/care_planner/local_planner/smooth_handoff_replan_request";
   std::string external_safety_hold_topic_ =
       "/care_planner/execution_gcdf/hard_hold";
+  std::string vbc_safety_hold_topic_ =
+      "/care_planner/execution/predicted_vbc_verification_hold";
 };
 
 }  // namespace egocentric_arm_planner

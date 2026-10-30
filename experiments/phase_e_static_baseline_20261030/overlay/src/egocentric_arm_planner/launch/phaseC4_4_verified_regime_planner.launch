@@ -1,0 +1,993 @@
+<launch>
+  <!-- Optional bounded forensic sink; never changes certification thresholds. -->
+  <arg name="rejection_snapshot_dir" default="" />
+  <!-- Unified default for all geometry consumers; per-path A/B overrides remain supported. -->
+  <arg name="geometry_backend" default="primitive" />
+  <arg name="confidence_query_dedicated_queue" default="true" />
+  <!-- Compatibility input: forwarded only to explicit samples consumers. -->
+  <arg name="body_samples_file" default="$(find care_confidence_map)/config/body_samples.yaml" />
+  <arg name="primitive_urdf_file" default="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+  <arg name="gcdf_geometry_backend" default="$(arg geometry_backend)" />
+  <!-- C4.4: verified planner regime transitions with split candidate/execution VBC. -->
+  <arg name="config_file" default="$(find egocentric_arm_planner)/config/planner_phase1_c4_3_planner.yaml" />
+  <arg name="base_frame" default="base_link" />
+  <arg name="ee_frame" default="EE_link" />
+
+  <!-- Phase E perception is opt-in. Defaults preserve frozen C5.41
+       ideal-FOV behavior. -->
+  <arg name="confidence_map_config_file"
+       default="$(find care_confidence_map)/config/confidence_map.yaml" />
+  <arg name="tof_fusion_config_file"
+       default="$(find care_confidence_map)/config/tof_fusion_self_filter.yaml" />
+  <arg name="tof_fusion_enabled" default="false" />
+  <!-- Diagnostic-only runtime self-hit visualization. No perception/planning
+       semantics are changed when enabled. -->
+  <arg name="runtime_self_hit_rviz_diag_enabled" default="false" />
+  <arg name="runtime_self_hit_sensor_id" default="5" />
+  <arg name="runtime_self_hit_sensor_name" default="link4_sensor2" />
+  <arg name="runtime_self_hit_raw_topic" default="/link4_sensor2/tof/cloud" />
+  <arg name="runtime_self_hit_sensor_frame" default="link4_sensor2_tof_link" />
+
+  <arg name="waypoint_weight" default="3000.0" />
+  <arg name="waypoint_timeout" default="0.20" />
+  <arg name="waypoint_horizon_slack" default="0.025" />
+  <arg name="vbc_min_margin_s" default="0.30" />
+  <arg name="selector_predicted_trajectory_timeout" default="0.20" />
+  <arg name="regime_input_timeout" default="0.25" />
+  <arg name="candidate_unsafe_required" default="2" />
+  <arg name="execution_unsafe_required" default="2" />
+  <arg name="probe_safe_commits_required" default="3" />
+  <arg name="rolling_safe_clear_consecutive" default="2" />
+  <arg name="rolling_target_cell_resolution" default="0.05" />
+  <arg name="goal_x" default="0.286881" />
+  <arg name="goal_y" default="0.0" />
+  <arg name="goal_z" default="0.560765" />
+  <arg name="goal_qx" default="0.0" />
+  <arg name="goal_qy" default="0.0" />
+  <arg name="goal_qz" default="0.70710678" />
+  <arg name="goal_qw" default="0.70710678" />
+  <arg name="goal_delay" default="0.5" />
+  <arg name="trial_label" default="c4_4_verified_regime" />
+  <arg name="log_output_root" default="$(find egocentric_arm_planner)/../../outputs/phase_c4_4_verified_regime" />
+
+  <arg name="nominal_progress_enabled" default="true" />
+  <arg name="nominal_progress_search_ahead_s" default="0.35" />
+  <arg name="nominal_progress_max_rate" default="1.25" />
+  <arg name="nominal_progress_max_step_s" default="0.08" />
+  <arg name="nominal_progress_max_path_error_inf" default="0.25" />
+
+  <arg name="raw_mpc_trajectory_topic" default="/care_planner/mpc/predicted_trajectory" />
+  <arg name="verification_trajectory_topic" default="/care_planner/optimized_trajectory" />
+  <arg name="committed_trajectory_topic" default="/care_planner/committed_trajectory" />
+  <arg name="candidate_vbc_summary_topic" default="/care_planner/candidate_vbc/summary" />
+  <arg name="candidate_outcome_topic" default="/care_planner/verification_outcome" />
+  <arg name="execution_vbc_summary_topic" default="/care_planner/execution_vbc/summary" />
+  <!-- Opt-in arrival evaluation for new committed trajectories. Periodic audit
+       remains active; use identical setting for samples/primitive A/B. -->
+  <arg name="execution_vbc_event_driven_eval" default="true" />
+  <arg name="verification_tcp_nodelay" default="true" />
+  <arg name="vbc_confidence_query_persistent" default="true" />
+  <arg name="execution_vbc_trajectory_topic"
+       default="/care_planner/committed_trajectory" />
+  <arg name="regime_summary_topic" default="/care_planner/c4_4/regime_summary" />
+  <!-- C4.8 legacy reactive-repair verification. C5.4 full-trajectory local
+       planning disables this and verifies the complete candidate trajectory. -->
+  <arg name="repair_prefix_verification_enabled" default="false" />
+  <arg name="repair_execution_prefix_s" default="0.15" />
+  <arg name="probe_execution_prefix_s" default="0.15" />
+  <arg name="probe_velocity_cap" default="0.50" />
+  <arg name="smooth_handoff_enabled" default="false" />
+  <arg name="repair_brake_dt_s" default="0.05" />
+  <arg name="repair_hold_s" default="0.10" />
+  <!-- Cycle recovery is opt-in so historical C4/C5 baselines remain frozen. -->
+  <arg name="cycle_recovery_enabled" default="false" />
+
+  <!-- Commit-pipeline capabilities. Legacy C4.x preserves its old behavior;
+       C5.4+ enables final executable GCDF and lets the full-trajectory tracker
+       own execution after a single commit publication. -->
+  <arg name="final_executable_gcdf_enabled" default="false" />
+  <arg name="final_gcdf_safety_margin" default="0.0" />
+  <arg name="committed_continuation_enabled" default="true" />
+  <arg name="execution_audit_stream_enabled" default="false" />
+
+  <!-- Phase E5: measured-q execution collision safety closure. Disabled by
+       default so frozen C5.41/E4 runs remain unchanged. -->
+  <arg name="execution_gcdf_audit_enabled" default="false" />
+  <arg name="execution_gcdf_measured_trajectory_topic"
+       default="/care_planner/execution_gcdf/measured_trajectory" />
+  <arg name="execution_gcdf_body_anchor_topic"
+       default="/care_planner/execution_gcdf/body_sweep_anchors" />
+  <arg name="execution_gcdf_batch_topic"
+       default="/care_planner/execution_gcdf/constraint_batch" />
+  <arg name="execution_gcdf_selector_summary_topic"
+       default="/care_planner/execution_gcdf/selector_summary" />
+  <arg name="execution_gcdf_safety_summary_topic"
+       default="/care_planner/execution_gcdf/safety_summary" />
+  <arg name="execution_gcdf_hard_hold_topic"
+       default="/care_planner/execution_gcdf/hard_hold" />
+  <arg name="execution_gcdf_warning_margin" default="0.05" />
+  <arg name="execution_gcdf_hard_margin" default="0.0" />
+  <arg name="gcdf_body_inflation_m" default="0.0" />
+  <arg name="execution_gcdf_stale_timeout_s" default="0.35" />
+
+  <!-- C5.9 commit-pipeline serialization. Legacy C4.x remains transparent.
+       When enabled, raw planner candidates first pass a PROBE-only single-flight
+       gate before entering the final GCDF -> exact VBC -> commit pipeline. -->
+  <arg name="probe_single_flight_enabled" default="false" />
+  <arg name="commit_pipeline_candidate_topic"
+       default="$(arg raw_mpc_trajectory_topic)" />
+  <arg name="probe_single_flight_summary_topic"
+       default="/care_planner/execution/probe_single_flight_summary" />
+
+  <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
+  <arg name="use_local_sparse_scp" default="false" />
+  <arg name="local_scp_query_trajectory_topic"
+       default="/care_planner/local_planner/scp_query_trajectory" />
+  <arg name="local_scp_candidate_trajectory_topic"
+       default="/care_planner/local_planner/candidate_trajectory" />
+  <arg name="local_scp_summary_topic"
+       default="/care_planner/local_planner/summary" />
+  <arg name="local_scp_replan_request_topic"
+       default="/care_planner/local_planner/replan_request" />
+  <arg name="normal_task_replan_topic"
+       default="/care_planner/local_planner/normal_task_replan_request" />
+  <arg name="local_scp_body_anchor_topic"
+       default="/care_planner/local_planner/body_sweep_anchors" />
+  <arg name="local_scp_cdf_batch_topic"
+       default="/care_planner/local_planner/cdf_constraint_batch" />
+  <arg name="local_scp_risk_output_namespace"
+       default="/care_planner/local_scp_risk" />
+  <arg name="local_scp_gpu_socket"
+       default="/tmp/care_collision_cdf_gpu_c5_4.sock" />
+  <arg name="local_scp_selector_jsonl"
+       default="/tmp/c5_4_local_scp_selector.jsonl" />
+  <!-- Collision/GCDF clearance remains independent from visibility
+       certification. The body-sphere approximation itself is conservative;
+       VBC therefore adds no extra spatial inflation by default. -->
+  <arg name="local_scp_proximity_margin" default="0.025" />
+  <arg name="vbc_swept_volume_margin_m" default="0.0" />
+  <arg name="execution_vbc_swept_volume_margin_m"
+       default="$(arg vbc_swept_volume_margin_m)" />
+  <arg name="vbc_continuous_motion_bound_enabled" default="true" />
+  <!-- Stage-one A/B only; both candidate and execution VBC use this backend. -->
+  <arg name="vbc_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="repair_prefix_binding_enabled" default="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('repair_prefix_verification_enabled')) and bool(arg('probe_single_flight_enabled')))" />
+  <arg name="body_prior_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="diagnostic_geometry_backend" default="$(arg geometry_backend)" />
+  <arg name="body_prior_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
+  <arg name="vbc_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
+  <!-- Initial unknown support may use a point-scoped recovery certificate.
+       Ordinary candidates and the execution auditor retain their margins. -->
+  <arg name="fixed_start_recovery_enabled" default="false" />
+  <arg name="fixed_start_rebase_reaudit_enabled" default="false" />
+  <arg name="summary_state_clock_coherent" default="false" />
+  <arg name="initial_shell_recovery_enabled"
+       default="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('final_executable_gcdf_enabled')) and bool(arg('repair_prefix_verification_enabled')) and float(arg('vbc_swept_volume_margin_m')) > float(arg('execution_vbc_swept_volume_margin_m')))" />
+
+  <!-- Optional C5.2 shadow diagnostics. Defaults preserve frozen C4.9 behavior. -->
+  <arg name="trajectory_risk_input_topic" default="/care_planner/task_trajectory" />
+  <!-- Strict diagnostic A/B only. This controls the MAIN trajectory-risk
+       instance; local/final/execution GCDF exporters remain refresh=false. -->
+  <arg name="trajectory_risk_refresh_body_prior_before_query" default="false" />
+  <arg name="forbidden_space_pair_publish_enabled" default="false" />
+  <arg name="forbidden_space_pair_topic"
+       default="/care_planner/trajectory_risk/body_sweep_anchors" />
+  <arg name="forbidden_space_confidence_threshold" default="0.50" />
+
+  <!-- C5.3a constrained-QP shadow. Defaults preserve all frozen C4.x runs. -->
+  <arg name="cdf_shadow_enabled" default="false" />
+  <arg name="cdf_shadow_safety_margin" default="0.0" />
+  <arg name="cdf_shadow_trust_region_q_inf" default="0.20" />
+  <arg name="cdf_shadow_constraint_horizon_steps" default="20" />
+  <arg name="cdf_shadow_snapshot_timeout" default="0.75" />
+  <arg name="cdf_shadow_constraint_batch_topic"
+       default="/care_planner/collision_cdf/constraint_batch" />
+  <arg name="cdf_shadow_prediction_topic"
+       default="/care_planner/mpc/cdf_shadow_predicted_trajectory" />
+  <arg name="cdf_shadow_summary_topic"
+       default="/care_planner/mpc/cdf_shadow_summary" />
+
+  <!-- C5.3a runtime producer + exact shadow audit.  Both are disabled by
+       default so frozen C4.x launches remain bit-for-bit behaviorally unchanged. -->
+  <arg name="cdf_selector_enabled" default="false" />
+  <arg name="cdf_selector_gpu_socket"
+       default="/tmp/care_collision_cdf_gpu.sock" />
+  <arg name="cdf_selector_output_jsonl"
+       default="/tmp/c5_3a_cpp_selector_gpu.jsonl" />
+  <arg name="cdf_selector_rate" default="20.0" />
+  <arg name="cdf_selector_map_resolution" default="0.05" />
+  <arg name="cdf_selector_proximity_margin" default="0.075" />
+  <arg name="cdf_selector_max_pairs_per_step" default="250" />
+  <arg name="cdf_selector_signed_zero_band" default="0.05" />
+  <arg name="cdf_shadow_vbc_audit_enabled" default="false" />
+  <arg name="cdf_shadow_vbc_event_driven_eval" default="true" />
+  <arg name="cdf_shadow_vbc_summary_topic"
+       default="/care_planner/cdf_shadow_vbc/summary" />
+
+  <arg name="upstream_command_topic" default="/care_planner/command_trajectory_candidate" />
+  <arg name="gated_command_topic" default="/care_planner/command_trajectory_vbc_gated" />
+  <arg name="initial_prior_ready_topic" default="/care_planner/confidence_map/initial_prior_ready" />
+  <arg name="candidate_target_topic" default="/care_planner/active_sensing/target_candidate" />
+  <arg name="candidate_active_topic" default="/care_planner/active_sensing/target_candidate_active" />
+  <arg name="candidate_sweep_time_topic" default="/care_planner/trajectory_risk/vbc_selected_sweep_time_s" />
+  <arg name="frozen_target_topic" default="/care_planner/active_sensing/target_point" />
+  <arg name="frozen_sweep_time_topic" default="/care_planner/active_sensing/frozen_sweep_time_s" />
+  <arg name="rolling_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_rolling" />
+  <arg name="effective_deadline_topic" default="/care_planner/active_sensing/visibility_waypoint_deadline_effective" />
+  <arg name="execution_ready_topic" default="/care_planner/execution/ready" />
+  <arg name="execution_start_topic" default="/care_planner/execution/start_time" />
+  <arg name="recovery_trigger_topic" default="/care_planner/execution/predicted_vbc_recovery_triggered" />
+  <arg name="recovery_clear_topic" default="/care_planner/execution/predicted_vbc_recovery_clear" />
+  <arg name="recovery_active_topic" default="/care_planner/execution/visibility_recovery_active" />
+  <!-- Kept only for legacy subscribers/diagnostics. C4.4 planner semantics do not
+       publish recovery_complete or consume replan_ready. -->
+  <arg name="recovery_complete_topic" default="/care_planner/execution/visibility_recovery_complete" />
+  <arg name="replan_ready_topic" default="/care_planner/execution/visibility_replan_ready" />
+
+  <!-- Original task intention. -->
+  <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
+    <arg name="config_file" value="$(arg config_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="ee_frame" value="$(arg ee_frame)" />
+    <arg name="use_execution_manager" value="false" />
+    <arg name="use_interactive_marker" value="false" />
+    <arg name="use_trajectory_visualizer" value="false" />
+  </include>
+
+  <!-- T0 plus progress-anchored nominal reference. Bootstrap VBC comes from
+       the candidate verifier because before raw MPC exists it audits task_trajectory. -->
+  <node pkg="egocentric_arm_planner" type="vbc_progress_reference_gate_node.py"
+        name="vbc_execution_reference_gate" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="input_reference_topic" value="$(arg upstream_command_topic)" />
+    <param name="output_reference_topic" value="$(arg gated_command_topic)" />
+    <param name="task_trajectory_topic" value="/care_planner/task_trajectory" />
+    <param name="vbc_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
+    <param name="waypoint_summary_topic" value="/care_planner/active_sensing/visibility_waypoint_summary" />
+    <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="recovery_complete_topic" value="/care_planner/execution/legacy_gate_recovery_complete_unused" />
+    <param name="replan_ready_topic" value="/care_planner/execution/legacy_gate_replan_ready_unused" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
+    <param name="synced_deadline_topic" value="/care_planner/active_sensing/visibility_waypoint_deadline_synced" />
+    <param name="publish_rate" value="20.0" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="decision_stability_count" value="2" />
+    <param name="verified_commit_startup"
+           value="$(eval optenv('CARE_OCCLUSION_REROUTE_ENABLED', 'false') == 'true' and bool(arg('use_local_sparse_scp')) and bool(arg('final_executable_gcdf_enabled')) and bool(arg('probe_single_flight_enabled')))" />
+    <param name="trial_label" value="$(arg trial_label)" />
+    <param name="output_root" value="$(arg log_output_root)" />
+    <param name="progress/enabled" value="$(arg nominal_progress_enabled)" />
+    <param name="progress/joint_states" value="/care_arm/joint_states" />
+    <param name="progress/joint_state_timeout_s" value="0.20" />
+    <param name="progress/search_ahead_s" value="$(arg nominal_progress_search_ahead_s)" />
+    <param name="progress/max_rate" value="$(arg nominal_progress_max_rate)" />
+    <param name="progress/max_step_s" value="$(arg nominal_progress_max_step_s)" />
+    <param name="progress/max_path_error_inf" value="$(arg nominal_progress_max_path_error_inf)" />
+    <param name="progress/summary_topic" value="/care_planner/execution/nominal_progress_summary" />
+  </node>
+
+  <!-- PROBE execution ownership plus bounded acknowledged candidate transfer
+       in all modes. Mode changes cancel uncommitted work before fresh admission. -->
+  <node if="$(arg probe_single_flight_enabled)"
+        pkg="egocentric_arm_planner" type="probe_single_flight_gate_node.py"
+        name="probe_single_flight_gate" output="screen">
+    <param name="candidate_admission_enabled" value="true" />
+    <param name="repair_prefix_binding_enabled" value="$(arg repair_prefix_binding_enabled)" />
+    <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
+    <param name="output_topic" value="$(arg commit_pipeline_candidate_topic)" />
+    <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
+    <param name="verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="tracker_summary_topic" value="/care_planner/execution/tracker_summary" />
+    <param name="summary_topic" value="$(arg probe_single_flight_summary_topic)" />
+  </node>
+
+  <param if="$(arg probe_single_flight_enabled)"
+         name="/care_planner/benchmark/candidate_admission_ping_topic"
+         value="$(arg commit_pipeline_candidate_topic)/admission_ping" />
+
+  <!-- Serial executable safety gate and safe-plan commit memory. -->
+  <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
+        name="optimized_trajectory_continuity" output="screen">
+    <param name="candidate_admission_enabled" value="$(arg probe_single_flight_enabled)" />
+    <param name="repair_prefix_binding_enabled" value="$(arg repair_prefix_binding_enabled)" />
+    <param name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+    <param name="rejection_snapshot_dir" value="$(arg rejection_snapshot_dir)" />
+    <!-- C5.20: load joint-position limits so PROBE measured-state rebasing
+         cannot translate the certified executable outside configured limits. -->
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="probe_start_rebase_enabled" value="true" />
+    <param name="probe_rebase_max_shift_inf" value="0.10" />
+    <param name="probe_start_joint_state_max_age_s" value="0.05" />
+    <param name="probe_commit_start_mismatch_max" value="0.03" />
+    <param name="normal_commit_start_mismatch_max" value="0.03" />
+    <param name="repair_commit_start_mismatch_max" value="0.03" />
+    <param name="smooth_handoff_rebase_enabled"
+           value="$(arg smooth_handoff_enabled)" />
+    <param name="smooth_handoff_rebase_max_shift_inf" value="0.10" />
+    <param name="smooth_handoff_joint_state_max_age_s" value="0.05" />
+    <!-- C5.21: preserve the same PROBE path segment, but time-scale it so
+         joint speeds are capped near 0.5 rad/s before brake construction. -->
+    <param name="probe_velocity_cap" value="$(arg probe_velocity_cap)" />
+    <param name="probe_time_scale_max" value="5.0" />
+    <param name="input_topic" value="$(arg commit_pipeline_candidate_topic)" />
+    <!-- GCDF rejection identities must return to the producer of the raw
+         candidate.  When PROBE single-flight is enabled, input_topic is the
+         gate output, so use raw_mpc_trajectory_topic explicitly. -->
+    <param name="gcdf_rejection_feedback_topic"
+           value="$(arg raw_mpc_trajectory_topic)/gcdf_rejection_feedback" />
+    <param name="output_topic" value="$(arg verification_trajectory_topic)" />
+    <param name="committed_output_topic" value="$(arg committed_trajectory_topic)" />
+    <param name="execution_audit_output_topic"
+           value="/care_planner/execution/audit_trajectory" />
+    <param name="execution_audit_enabled"
+           value="$(arg execution_audit_stream_enabled)" />
+    <param name="global_summary_topic" value="$(arg candidate_vbc_summary_topic)" />
+    <param name="summary_topic" value="/care_planner/optimized_trajectory_summary" />
+    <param name="verification_event_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="final_gcdf_enabled"
+           value="$(arg final_executable_gcdf_enabled)" />
+    <param name="initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="summary_state_clock_coherent" value="$(arg summary_state_clock_coherent)" />
+    <param name="fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
+    <param name="initial_shell_planning_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
+    <param name="initial_shell_execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
+    <param name="final_occupied_resolution_m" value="0.05" />
+    <param name="final_occupied_hard_margin_m" value="$(arg execution_gcdf_hard_margin)" />
+    <param name="final_gcdf_query_topic"
+           value="/care_planner/final_gcdf/query_trajectory" />
+    <param name="final_gcdf_batch_topic"
+           value="/care_planner/final_gcdf/constraint_batch" />
+    <param name="continuation_enabled"
+           value="$(arg committed_continuation_enabled)" />
+    <param name="final_gcdf_timeout_s" value="0.50" />
+    <param name="final_gcdf_safety_margin" value="$(arg final_gcdf_safety_margin)" />
+    <param name="final_gcdf_stamp_tolerance_s" value="0.000001" />
+    <param name="rate" value="20.0" />
+    <param name="continuation_start_delay_s" value="0.065" />
+    <param name="continuation_timeout_s" value="0.50" />
+    <param name="repair_prefix_verification_enabled"
+           value="$(arg repair_prefix_verification_enabled)" />
+    <param name="repair_projection_consistent_dispatch_enabled" type="bool"
+           value="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('repair_prefix_verification_enabled')))" />
+    <param name="repair_execution_prefix_s"
+           value="$(arg repair_execution_prefix_s)" />
+    <param name="probe_execution_prefix_s"
+           value="$(arg probe_execution_prefix_s)" />
+    <param name="repair_brake_dt_s"
+           value="$(arg repair_brake_dt_s)" />
+    <param name="repair_hold_s"
+           value="$(arg repair_hold_s)" />
+    <param name="repair_brake_max_steps" value="20" />
+    <rosparam param="repair_acceleration_limits">[3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0]</rosparam>
+    <param name="cycle_recovery_enabled"
+           value="$(arg cycle_recovery_enabled)" />
+    <param name="blocker_stack_summary_topic"
+           value="/care_planner/active_sensing/blocker_stack_summary" />
+    <rosparam param="cycle_recovery_prefixes_s">[0.15, 0.10, 0.05]</rosparam>
+    <param name="repair_active_topic"
+           value="$(arg recovery_trigger_topic)" />
+    <param name="probe_active_topic"
+           value="/care_planner/c4_4/probe_active" />
+  </node>
+
+  <!-- C4.4 owns planner regime; candidate transitions consume only unique
+       verification outcomes, while execution safety consumes committed audit. -->
+  <node pkg="egocentric_arm_planner" type="c4_4_verified_regime_manager_node.py"
+        name="c4_4_verified_regime_manager" output="screen">
+    <param name="rate" value="20.0" />
+    <param name="candidate_unsafe_required" value="$(arg candidate_unsafe_required)" />
+    <param name="execution_unsafe_required" value="$(arg execution_unsafe_required)" />
+    <param name="probe_safe_commits_required"
+           value="$(arg probe_safe_commits_required)" />
+    <param name="probe_completed_prefixes_required"
+           value="$(arg probe_safe_commits_required)" />
+    <param name="input_timeout" value="$(arg regime_input_timeout)" />
+    <param name="clear_pulse_s" value="0.12" />
+    <param name="probe_ignore_s" value="0.16" />
+    <param name="candidate_outcome_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="execution_summary_topic" value="$(arg execution_vbc_summary_topic)" />
+    <param name="tracker_summary_topic"
+           value="/care_planner/execution/tracker_summary" />
+    <param name="probe_single_flight_summary_topic"
+           value="$(arg probe_single_flight_summary_topic)" />
+    <param name="replan_request_topic"
+           value="$(arg local_scp_replan_request_topic)" />
+    <param name="normal_task_replan_topic"
+           value="$(arg normal_task_replan_topic)" />
+    <param name="committed_trajectory_topic" value="$(arg committed_trajectory_topic)" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="physical_deadline_topic" value="$(arg rolling_deadline_topic)" />
+    <param name="effective_deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="trigger_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="clear_topic" value="$(arg recovery_clear_topic)" />
+    <param name="verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="probe_active_topic" value="/care_planner/c4_4/probe_active" />
+    <param name="task_infeasible_topic"
+           value="/care_planner/local_planner/task_infeasible" />
+    <param name="task_obstacle_blocked_topic"
+           value="/care_planner/local_planner/task_obstacle_blocked" />
+    <param name="task_uncertified_topic"
+           value="/care_planner/local_planner/task_uncertified" />
+    <param name="visibility_waypoint_active_topic"
+           value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="candidate_vbc_summary_topic"
+           value="$(arg candidate_vbc_summary_topic)" />
+    <param name="force_vbc_bootstrap_topic"
+           value="/care_planner/trajectory_risk/force_bootstrap" />
+    <param name="summary_topic" value="$(arg regime_summary_topic)" />
+  </node>
+
+  <node unless="$(arg use_local_sparse_scp)"
+        pkg="egocentric_arm_planner" type="velocity_qp_mpc_waypoint_node"
+        name="velocity_qp_mpc_waypoint_node" output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="mpc/reference_trajectory" value="$(arg gated_command_topic)" />
+    <param name="mpc/visibility_waypoint/enabled" value="true" />
+    <param name="mpc/visibility_waypoint/weight" value="$(arg waypoint_weight)" />
+    <param name="mpc/visibility_waypoint/timeout" value="$(arg waypoint_timeout)" />
+    <param name="mpc/visibility_waypoint/horizon_slack" value="$(arg waypoint_horizon_slack)" />
+    <param name="mpc/visibility_waypoint/active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <param name="mpc/visibility_waypoint/q_topic" value="/care_planner/active_sensing/visibility_waypoint_q" />
+    <param name="mpc/visibility_waypoint/deadline_topic" value="$(arg effective_deadline_topic)" />
+    <param name="mpc/visibility_waypoint/verification_hold_topic" value="/care_planner/execution/predicted_vbc_verification_hold" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_trigger" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_trigger_topic" value="$(arg recovery_trigger_topic)" />
+    <param name="mpc/visibility_waypoint/use_external_recovery_clear" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_clear_topic" value="$(arg recovery_clear_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_signal_timeout" value="$(arg regime_input_timeout)" />
+    <param name="mpc/visibility_waypoint/recovery_enabled" value="true" />
+    <!-- Critical C4.4 semantic switch: REPAIR/NORMAL are candidate-objective
+         modes only. No RECOVERY_HOLD or task-replan handshake is allowed. -->
+    <param name="mpc/visibility_waypoint/planner_mode_semantics" value="true" />
+    <param name="mpc/visibility_waypoint/recovery_weight_scale" value="1.0" />
+    <param name="mpc/visibility_waypoint/recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <param name="mpc/visibility_waypoint/recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="mpc/visibility_waypoint/replan_ready_topic" value="$(arg replan_ready_topic)" />
+
+    <!-- C5.3a is asynchronous shadow-only: it never replaces raw MPC output. -->
+    <param name="mpc/cdf_shadow/enabled" value="$(arg cdf_shadow_enabled)" />
+    <param name="mpc/cdf_shadow/safety_margin" value="$(arg cdf_shadow_safety_margin)" />
+    <param name="mpc/cdf_shadow/trust_region_q_inf"
+           value="$(arg cdf_shadow_trust_region_q_inf)" />
+    <param name="mpc/cdf_shadow/constraint_horizon_steps"
+           value="$(arg cdf_shadow_constraint_horizon_steps)" />
+    <param name="mpc/cdf_shadow/snapshot_timeout"
+           value="$(arg cdf_shadow_snapshot_timeout)" />
+    <param name="mpc/cdf_shadow/constraint_batch_topic"
+           value="$(arg cdf_shadow_constraint_batch_topic)" />
+    <param name="mpc/cdf_shadow/predicted_trajectory_topic"
+           value="$(arg cdf_shadow_prediction_topic)" />
+    <param name="mpc/cdf_shadow/summary_topic"
+           value="$(arg cdf_shadow_summary_topic)" />
+  </node>
+
+  <!-- C5.4 event-triggered local trajectory optimizer. It plans complete
+       local trajectories and never owns the actuator command. -->
+  <node if="$(arg use_local_sparse_scp)"
+        pkg="egocentric_arm_planner"
+        type="local_sparse_scp_planner_node"
+        name="local_sparse_scp_planner_node"
+        output="screen">
+    <rosparam command="load" file="$(arg config_file)" />
+    <param name="local_planner/probe_velocity_cap" value="$(arg probe_velocity_cap)" />
+    <param name="local_planner/candidate_replacement_enabled"
+           value="$(optenv CANDIDATE_REPLACEMENT_ENABLED false)" />
+    <param name="local_planner/primitive_observation_guard/enabled"
+           value="$(eval arg('vbc_geometry_backend') == 'primitive')" />
+    <param name="local_planner/primitive_observation_guard/fk_urdf"
+           value="$(find arm_description)/urdf/Arm.urdf" />
+    <param name="local_planner/primitive_observation_guard/primitive_urdf"
+           value="$(arg vbc_primitive_urdf_file)" />
+    <param name="local_planner/primitive_observation_guard/base_frame" value="$(arg base_frame)" />
+    <rosparam param="local_planner/primitive_observation_guard/ignored_links">[base_link, link1]</rosparam>
+    <param name="local_planner/primitive_observation_guard/margin_m" value="$(arg vbc_swept_volume_margin_m)" />
+    <param name="local_planner/fixed_start_recovery_enabled" value="$(arg fixed_start_recovery_enabled)" />
+    <param name="local_planner/initial_shell_recovery/enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="local_planner/initial_shell_recovery/execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
+    <param name="local_planner/repair_executable_view/enabled" type="bool"
+           value="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('repair_prefix_verification_enabled')))" />
+    <param name="local_planner/repair_prefix_binding/enabled" value="$(arg repair_prefix_binding_enabled)" />
+    <param name="local_planner/repair_executable_view/prefix_s" value="$(arg repair_execution_prefix_s)" />
+    <param name="local_planner/repair_executable_view/cycle_enabled" value="$(arg cycle_recovery_enabled)" />
+    <rosparam param="local_planner/repair_executable_view/cycle_prefixes_s">[0.15, 0.10, 0.05]</rosparam>
+    <param name="local_planner/repair_executable_view/brake_dt_s" value="$(arg repair_brake_dt_s)" />
+    <param name="local_planner/repair_executable_view/max_brake_steps" value="20" />
+    <rosparam param="local_planner/repair_executable_view/acceleration_limits">[3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0]</rosparam>
+    <param name="local_planner/rejection_snapshots_enabled"
+           value="$(eval arg('rejection_snapshot_dir') != '')" />
+    <param name="local_planner/verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
+    <param name="local_planner/reference_trajectory"
+           value="/care_planner/task_trajectory" />
+    <param name="local_planner/vbc_obligation_points_topic"
+           value="/care_planner/active_sensing/current_visibility_obligation_points" />
+    <param name="local_planner/visibility_waypoint_weight"
+           value="$(arg waypoint_weight)" />
+    <param name="local_planner/recovery_topic"
+           value="$(arg recovery_trigger_topic)" />
+    <param name="local_planner/probe_active_topic"
+           value="/care_planner/c4_4/probe_active" />
+    <param name="local_planner/replan_request_topic"
+           value="$(arg local_scp_replan_request_topic)" />
+    <param name="local_planner/cdf_batch_topic"
+           value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="local_planner/query_trajectory_topic"
+           value="$(arg local_scp_query_trajectory_topic)" />
+    <param name="local_planner/candidate_trajectory_topic"
+           value="$(arg local_scp_candidate_trajectory_topic)" />
+    <param name="local_planner/summary_topic"
+           value="$(arg local_scp_summary_topic)" />
+    <param name="local_planner/task_infeasible_topic"
+           value="/care_planner/local_planner/task_infeasible" />
+    <param name="local_planner/task_obstacle_blocked_topic"
+           value="/care_planner/local_planner/task_obstacle_blocked" />
+    <param name="local_planner/task_uncertified_topic"
+           value="/care_planner/local_planner/task_uncertified" />
+    <param name="local_planner/force_vbc_bootstrap_topic"
+           value="/care_planner/trajectory_risk/force_bootstrap" />
+  </node>
+
+  <!-- C5.8 final executable safety audit. The continuity node first builds
+       the exact trajectory that could be committed (prefix + braking + hold).
+       This isolated trajectory-risk instance exports body anchors for that
+       exact view. One shared GPU selector/client owns two independent request
+       slots and batch topics (local SCP + final executable), with final audit
+       priority; the streams therefore cannot overwrite one another. -->
+  <group if="$(arg final_executable_gcdf_enabled)"
+         ns="final_executable_gcdf_pair_export">
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="/care_planner/final_gcdf/query_trajectory" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/final_gcdf/unused_target" />
+      <arg name="output_namespace"
+           value="/care_planner/final_gcdf/risk" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="/care_planner/final_gcdf/body_sweep_anchors" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="50.0" />
+      <arg name="event_driven_eval" value="true" />
+      <arg name="max_eval_timesteps" value="50" />
+      <arg name="refresh_body_prior_before_query" value="false" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="/care_planner/final_gcdf/query_trajectory" />
+      <arg name="output_topic" value="/care_planner/final_gcdf/body_sweep_anchors" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="50" />
+    </include>
+  </group>
+
+  <!-- No c4_3_planner_regime_handoff node in C4.4. The MPC never enters
+       RECOVERY_HOLD in planner-mode semantics, so there is nothing to ack. -->
+
+  <include if="$(arg tof_fusion_enabled)"
+           file="$(find care_confidence_map)/launch/tof_fusion_self_filter.launch">
+    <arg name="config_file" value="$(arg tof_fusion_config_file)" />
+  </include>
+
+  <include file="$(find care_confidence_map)/launch/confidence_map.launch">
+    <arg name="query_dedicated_queue" value="$(arg confidence_query_dedicated_queue)" />
+    <arg if="$(eval arg('body_prior_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="body_prior_geometry_backend" value="$(arg body_prior_geometry_backend)" />
+    <arg name="body_prior_primitive_urdf_file" value="$(arg body_prior_primitive_urdf_file)" />
+    <arg name="config_file" value="$(arg confidence_map_config_file)" />
+    <arg name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+  </include>
+
+  <!-- Diagnostic-only: reproduce endpoint containment for the selected raw
+       ToF, compute exact ray/self-primitive intersections, and publish a
+       frozen RViz snapshot when execution GCDF enters HARD_HOLD. -->
+  <node if="$(arg runtime_self_hit_rviz_diag_enabled)"
+        pkg="care_confidence_map"
+        type="runtime_self_hit_rviz_diagnostic.py"
+        name="runtime_self_hit_rviz_diagnostic"
+        output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="raw_topic" value="$(arg runtime_self_hit_raw_topic)" />
+    <param name="sensor_frame" value="$(arg runtime_self_hit_sensor_frame)" />
+    <param name="sensor_id" value="$(arg runtime_self_hit_sensor_id)" />
+    <param name="sensor_name" value="$(arg runtime_self_hit_sensor_name)" />
+    <param name="self_filter_urdf"
+           value="$(find arm_description)/urdf/Arm_with_self_filter_collision.urdf" />
+    <param name="reference_urdf"
+           value="$(find arm_description)/urdf/Arm.urdf" />
+    <param name="gazebo_link_states_topic" value="/gazebo/link_states" />
+    <param name="gazebo_model_name" value="care_arm" />
+    <param name="hard_hold_topic"
+           value="$(arg execution_gcdf_hard_hold_topic)" />
+    <param name="joint_topic" value="/care_arm/joint_states" />
+    <param name="marker_topic" value="/care_planner/debug/markers" />
+    <param name="pixel_stride" value="8" />
+    <param name="near_clip" value="0.15" />
+    <param name="far_clip" value="0.75" />
+    <param name="horizontal_fov_deg" value="55.0" />
+    <param name="vertical_fov_deg" value="72.0" />
+    <param name="hotspot_x_min" value="-0.025" />
+    <param name="hotspot_x_max" value="0.075" />
+    <param name="hotspot_y_min" value="-0.025" />
+    <param name="hotspot_y_max" value="0.125" />
+    <param name="hotspot_z_min" value="0.20" />
+    <param name="hotspot_z_max" value="0.425" />
+    <param name="map_resolution" value="0.05" />
+  </node>
+
+
+  <!-- C5.4 inner-loop geometry query. This second risk instance is isolated
+       from the main risk diagnostics and only exports body-sweep anchors for
+       the current SCP iterate. -->
+  <group if="$(arg use_local_sparse_scp)" ns="local_scp_pair_export">
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/local_planner/unused_target" />
+      <arg name="output_namespace"
+           value="$(arg local_scp_risk_output_namespace)" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="$(arg local_scp_body_anchor_topic)" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="50.0" />
+      <arg name="event_driven_eval" value="true" />
+      <arg name="refresh_body_prior_before_query" value="false" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="output_topic" value="$(arg local_scp_body_anchor_topic)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="50" />
+    </include>
+  </group>
+
+  <node if="$(arg use_local_sparse_scp)"
+        pkg="care_collision_cdf"
+        type="cpp_forbidden_voxel_gpu_shadow_node"
+        name="c5_4_local_scp_cdf_selector"
+        output="screen">
+    <param name="anchor_topic" value="$(arg local_scp_body_anchor_topic)" />
+    <param name="geometry_backend" value="$(arg gcdf_geometry_backend)" />
+    <param name="final_anchor_topic"
+           value="/care_planner/final_gcdf/body_sweep_anchors" />
+    <param name="map_topic" value="/care_planner/confidence_map/points" />
+    <param name="summary_topic"
+           value="/care_planner/local_planner/cdf_selector_summary" />
+    <param name="constraint_batch_topic"
+           value="$(arg local_scp_cdf_batch_topic)" />
+    <param name="final_summary_topic"
+           value="/care_planner/final_gcdf/selector_summary" />
+    <param name="final_constraint_batch_topic"
+           value="/care_planner/final_gcdf/constraint_batch" />
+    <param name="execution_anchor_topic"
+           value="$(arg execution_gcdf_body_anchor_topic)" />
+    <param name="execution_summary_topic"
+           value="$(arg execution_gcdf_selector_summary_topic)" />
+    <param name="execution_constraint_batch_topic"
+           value="$(arg execution_gcdf_batch_topic)" />
+    <param name="output_jsonl" value="$(arg local_scp_selector_jsonl)" />
+    <param name="gpu_socket" value="$(arg local_scp_gpu_socket)" />
+    <param name="rate" value="50.0" />
+    <param name="process_on_input_callback" value="true" />
+    <param name="local_witness_requests_required" value="true" />
+    <param name="confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+    <param name="map_resolution" value="0.05" />
+    <param name="proximity_margin" value="$(arg local_scp_proximity_margin)" />
+    <param name="execution_proximity_margin" value="0.12" />
+    <param name="occupied_hard_margin_m" value="$(arg execution_gcdf_hard_margin)" />
+    <param name="max_pairs_per_step" value="250" />
+    <param name="signed_zero_band" value="0.05" />
+    <param name="max_pairs" value="8000" />
+  </node>
+
+  <!-- Phase E5 measured-q collision audit. The current measured state is
+       wrapped as a one-point trajectory, exported through the same body-sphere
+       geometry as planning, and evaluated by the shared GCDF GPU selector.
+       Crucially, body-prior refresh is disabled so execution audit cannot clear
+       the evidence it is about to inspect. -->
+  <group if="$(arg execution_gcdf_audit_enabled)" ns="execution_gcdf_audit">
+    <node pkg="egocentric_arm_planner"
+          type="execution_gcdf_measured_state_trajectory_node.py"
+          name="measured_state_trajectory"
+          output="screen">
+      <rosparam command="load" file="$(arg config_file)" />
+      <param name="joint_states_topic" value="/care_arm/joint_states" />
+      <param name="output_topic"
+             value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <param name="frame_id" value="$(arg base_frame)" />
+      <param name="rate" value="20.0" />
+      <param name="max_age_s" value="0.15" />
+    </node>
+
+    <include if="$(eval arg('gcdf_geometry_backend') == 'samples')" file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+      <arg name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <arg name="active_sensing_target_topic"
+           value="/care_planner/execution_gcdf/unused_target" />
+      <arg name="output_namespace"
+           value="/care_planner/execution_gcdf/risk" />
+      <arg name="forbidden_space_pair_publish_enabled" value="true" />
+      <arg name="forbidden_space_pair_topic"
+           value="$(arg execution_gcdf_body_anchor_topic)" />
+      <arg name="forbidden_space_confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+      <arg name="forbidden_space_body_inflation_m"
+           value="$(arg gcdf_body_inflation_m)" />
+      <arg name="show_full_trajectory_markers" value="false" />
+      <arg name="show_worst_timestep_markers" value="false" />
+      <arg name="show_attribution_markers" value="false" />
+      <arg name="eval_rate" value="20.0" />
+      <arg name="event_driven_eval" value="true" />
+      <arg name="max_eval_timesteps" value="1" />
+      <arg name="refresh_body_prior_before_query" value="false" />
+      <arg name="evaluate_stale_trajectory" value="false" />
+    </include>
+    <include if="$(eval arg('gcdf_geometry_backend') == 'primitive')"
+             file="$(find care_confidence_map)/launch/gcdf_primitive_anchors.launch">
+      <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+      <arg name="input_trajectory_topic" value="$(arg execution_gcdf_measured_trajectory_topic)" />
+      <arg name="output_topic" value="$(arg execution_gcdf_body_anchor_topic)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="body_inflation_m" value="$(arg gcdf_body_inflation_m)" />
+      <arg name="max_eval_timesteps" value="1" />
+    </include>
+
+    <node pkg="egocentric_arm_planner"
+          type="execution_gcdf_safety_monitor_node.py"
+          name="safety_monitor"
+          output="screen">
+      <param name="batch_topic" value="$(arg execution_gcdf_batch_topic)" />
+      <param name="summary_topic"
+             value="$(arg execution_gcdf_safety_summary_topic)" />
+      <param name="replan_topic" value="$(arg local_scp_replan_request_topic)" />
+      <param name="hard_hold_topic"
+             value="$(arg execution_gcdf_hard_hold_topic)" />
+      <param name="warning_margin"
+             value="$(arg execution_gcdf_warning_margin)" />
+      <param name="hard_margin"
+             value="$(arg execution_gcdf_hard_margin)" />
+      <param name="voxel_resolution_m" value="0.05" />
+      <param name="stale_timeout_s"
+             value="$(arg execution_gcdf_stale_timeout_s)" />
+      <param name="startup_grace_s" value="2.0" />
+      <param name="replan_min_interval_s" value="0.20" />
+      <param name="clear_consecutive_required" value="2" />
+      <param name="fail_closed_on_stale" value="true" />
+    </node>
+  </group>
+
+  <include file="$(find care_confidence_map)/launch/trajectory_risk.launch">
+    <arg if="$(eval arg('diagnostic_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <arg name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="input_trajectory_topic" value="$(arg trajectory_risk_input_topic)" />
+    <arg name="active_sensing_target_topic" value="/care_planner/active_sensing/legacy_target_candidate" />
+    <arg name="refresh_body_prior_before_query"
+         value="$(arg trajectory_risk_refresh_body_prior_before_query)" />
+    <arg name="forbidden_space_pair_publish_enabled"
+         value="$(arg forbidden_space_pair_publish_enabled)" />
+    <arg name="forbidden_space_pair_topic"
+         value="$(arg forbidden_space_pair_topic)" />
+    <arg name="forbidden_space_confidence_threshold"
+         value="$(arg forbidden_space_confidence_threshold)" />
+    <arg name="forbidden_space_body_inflation_m"
+         value="$(arg gcdf_body_inflation_m)" />
+    <arg name="show_full_trajectory_markers" value="false" />
+    <arg name="show_worst_timestep_markers" value="false" />
+    <arg name="show_attribution_markers" value="false" />
+  </include>
+
+
+  <!-- C5.3a: run the paired forbidden-voxel selector inside the SAME
+       roslaunch/master as MPC and trajectory_risk.  This removes the external
+       master-registration race that produced cdf_batch_publishers=0. -->
+  <node if="$(arg cdf_selector_enabled)"
+        pkg="care_collision_cdf"
+        type="cpp_forbidden_voxel_gpu_shadow_node"
+        name="c5_3a_cpp_forbidden_voxel_gpu_shadow"
+        output="screen">
+    <param name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
+    <param name="anchor_topic" value="$(arg forbidden_space_pair_topic)" />
+    <param name="map_topic" value="/care_planner/confidence_map/points" />
+    <param name="summary_topic"
+           value="/care_planner/collision_cdf/cpp_gpu_online_summary" />
+    <param name="constraint_batch_topic"
+           value="$(arg cdf_shadow_constraint_batch_topic)" />
+    <param name="output_jsonl" value="$(arg cdf_selector_output_jsonl)" />
+    <param name="gpu_socket" value="$(arg cdf_selector_gpu_socket)" />
+    <param name="rate" value="$(arg cdf_selector_rate)" />
+    <param name="confidence_threshold"
+           value="$(arg forbidden_space_confidence_threshold)" />
+    <param name="map_resolution" value="$(arg cdf_selector_map_resolution)" />
+    <param name="proximity_margin" value="$(arg cdf_selector_proximity_margin)" />
+    <param name="max_pairs_per_step"
+           value="$(arg cdf_selector_max_pairs_per_step)" />
+    <param name="signed_zero_band"
+           value="$(arg cdf_selector_signed_zero_band)" />
+    <param name="max_pairs" value="8000" />
+  </node>
+
+  <!-- C5.3a: exact VBC audit of the constrained SHADOW trajectory.  The audit
+       is isolated and cannot feed steering/commit/execution. -->
+  <include if="$(arg cdf_shadow_vbc_audit_enabled)"
+           file="$(find egocentric_arm_planner)/launch/c5_3a_cdf_shadow_vbc_audit.launch">
+    <arg name="event_driven_eval" value="$(arg cdf_shadow_vbc_event_driven_eval)" />
+    <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+    <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+    <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+    <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="shadow_prediction_topic"
+         value="$(arg cdf_shadow_prediction_topic)" />
+    <arg name="shadow_vbc_summary_topic"
+         value="$(arg cdf_shadow_vbc_summary_topic)" />
+    <arg name="predicted_trajectory_timeout" value="0.50" />
+    <arg name="min_visibility_before_sweep_margin_s"
+         value="$(arg vbc_min_margin_s)" />
+  </include>
+
+  <!-- Candidate verifier: this copy owns steering target + active set. Only its
+       summary is remapped to candidate_vbc; all steering outputs retain C4.3 names. -->
+  <group>
+    <remap from="/care_planner/trajectory_risk/vbc_summary"
+           to="$(arg candidate_vbc_summary_topic)" />
+    <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+      <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic" value="/care_planner/task_trajectory" />
+      <arg name="predicted_trajectory_topic" value="$(arg verification_trajectory_topic)" />
+      <arg name="prefer_predicted_trajectory" value="true" />
+      <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+      <arg name="event_driven_eval" value="true" />
+      <arg name="eval_rate" value="5.0" />
+      <arg name="predicted_periodic_refresh_rate" value="5.0" />
+      <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+      <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+      <arg name="rediscovery_trajectory_topic" value="$(arg local_scp_query_trajectory_topic)" />
+      <arg name="rediscovery_trajectory_timeout" value="1.0" />
+      <arg name="output_target_topic" value="$(arg candidate_target_topic)" />
+      <arg name="candidate_active_topic" value="$(arg candidate_active_topic)" />
+      <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+      <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+      <arg name="swept_volume_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
+      <arg name="initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+      <arg name="fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
+      <arg name="initial_shell_execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
+      <arg name="initial_shell_occupied_margin_m" value="$(arg execution_gcdf_hard_margin)" />
+      <arg name="continuous_motion_bound_enabled" value="$(arg vbc_continuous_motion_bound_enabled)" />
+      <arg name="temporal_layer_mpc_steps" value="2" />
+      <arg name="region_max_diameter_m" value="0.12" />
+      <arg name="active_set_points_topic" value="/care_planner/trajectory_risk/vbc_active_set_points" />
+      <arg name="active_set_bundle_topic" value="/care_planner/trajectory_risk/vbc_active_set_bundle" />
+      <arg name="force_bootstrap_topic" value="/care_planner/trajectory_risk/force_bootstrap" />
+    </include>
+  </group>
+
+  <!-- Execution auditor reads committed execution plans; its margin may be
+       smaller than the candidate's tracking-reserved certificate margin. -->
+  <group ns="execution_vbc_audit">
+    <remap from="/care_planner/trajectory_risk/vbc_summary"
+           to="$(arg execution_vbc_summary_topic)" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_margin_s"
+           to="/care_planner/execution_vbc/selected_margin_s" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_sweep_time_s"
+           to="/care_planner/execution_vbc/selected_sweep_time_s" />
+    <remap from="/care_planner/trajectory_risk/vbc_selected_see_time_s"
+           to="/care_planner/execution_vbc/selected_see_time_s" />
+    <include file="$(find care_confidence_map)/launch/trajectory_vbc_selector.launch">
+      <arg name="event_driven_eval" value="$(arg execution_vbc_event_driven_eval)" />
+      <arg name="confidence_query_persistent" value="$(arg vbc_confidence_query_persistent)" />
+      <arg name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
+      <!-- Add arrival checks without reducing the historical 20-Hz audit. -->
+      <arg name="preserve_periodic_eval" value="true" />
+      <arg name="include_measured_body" value="true" />
+      <arg if="$(eval arg('vbc_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+      <arg name="geometry_backend" value="$(arg vbc_geometry_backend)" />
+      <arg name="primitive_urdf_file" value="$(arg vbc_primitive_urdf_file)" />
+      <arg name="base_frame" value="$(arg base_frame)" />
+      <arg name="input_trajectory_topic"
+           value="$(arg execution_vbc_trajectory_topic)" />
+      <arg name="predicted_trajectory_topic"
+           value="$(arg execution_vbc_trajectory_topic)" />
+      <arg name="prefer_predicted_trajectory" value="true" />
+      <arg name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+      <arg name="output_target_topic" value="/care_planner/execution_vbc/audit_target_unused" />
+      <arg name="candidate_active_topic" value="/care_planner/execution_vbc/audit_active_unused" />
+      <arg name="confidence_query_service" value="/care_planner/confidence_map/query" />
+      <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
+      <arg name="swept_volume_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
+      <arg name="continuous_motion_bound_enabled" value="$(arg vbc_continuous_motion_bound_enabled)" />
+      <arg name="temporal_layer_mpc_steps" value="2" />
+      <arg name="region_max_diameter_m" value="0.12" />
+      <arg name="active_set_points_topic" value="/care_planner/execution_vbc/audit_active_set_unused" />
+      <!-- The blocker-aware acquisition node consumes this committed-trajectory
+           audit stream as urgent recovery evidence. -->
+      <arg name="active_set_bundle_topic" value="/care_planner/execution_vbc/audit_active_set_bundle" />
+      <arg name="force_bootstrap_topic" value="/care_planner/execution_vbc/audit_force_bootstrap_unused" />
+    </include>
+  </group>
+
+  <!-- Single-target diagnostic audit; not the candidate/final certificate. -->
+  <include file="$(find care_confidence_map)/launch/predicted_vbc_auditor.launch">
+    <arg if="$(eval arg('diagnostic_geometry_backend') == 'samples')" name="body_samples_file" value="$(arg body_samples_file)" />
+    <arg name="primitive_urdf_file" value="$(arg primitive_urdf_file)" />
+    <arg name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
+    <arg name="base_frame" value="$(arg base_frame)" />
+    <arg name="prediction_topic" value="$(arg verification_trajectory_topic)" />
+    <arg name="target_topic" value="$(arg frozen_target_topic)" />
+    <arg name="active_topic" value="/care_planner/active_sensing/visibility_waypoint_active" />
+    <arg name="min_margin_s" value="$(arg vbc_min_margin_s)" />
+    <arg name="require_active" value="true" />
+    <arg name="audit_warn_ms" value="5.0" />
+  </include>
+
+  <node pkg="egocentric_arm_planner" type="phase_c4_3_continuous_trial_node.py"
+        name="phase_b2_controlled_trial" output="screen">
+    <param name="base_frame" value="$(arg base_frame)" />
+    <param name="goal_topic" value="/care_planner/ee_target_pose" />
+    <param name="candidate_topic" value="$(arg candidate_target_topic)" />
+    <param name="candidate_active_topic" value="$(arg candidate_active_topic)" />
+    <param name="candidate_sweep_time_topic" value="$(arg candidate_sweep_time_topic)" />
+    <param name="predicted_trajectory_topic" value="$(arg verification_trajectory_topic)" />
+    <param name="predicted_trajectory_timeout" value="$(arg selector_predicted_trajectory_timeout)" />
+    <param name="frozen_target_topic" value="$(arg frozen_target_topic)" />
+    <param name="frozen_sweep_time_topic" value="$(arg frozen_sweep_time_topic)" />
+    <param name="selected_active_topic" value="/care_planner/active_sensing/target_selection_active" />
+    <param name="rolling_deadline_topic" value="$(arg rolling_deadline_topic)" />
+    <param name="rolling_target_mode" value="true" />
+    <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
+    <param name="safe_clear_consecutive_required" value="$(arg rolling_safe_clear_consecutive)" />
+    <param name="target_cell_resolution" value="$(arg rolling_target_cell_resolution)" />
+    <param name="recovery_active_topic" value="$(arg recovery_active_topic)" />
+    <!-- Legacy callbacks remain subscribed for backwards-compatible node code,
+         but C4.4 planner-mode MPC never emits the complete/replan handshake. -->
+    <param name="recovery_complete_topic" value="$(arg recovery_complete_topic)" />
+    <param name="replan_ready_topic" value="$(arg replan_ready_topic)" />
+    <param name="normal_task_replan_topic"
+           value="$(arg normal_task_replan_topic)" />
+    <param name="execution_ready_topic" value="$(arg execution_ready_topic)" />
+    <param name="execution_start_topic" value="$(arg execution_start_topic)" />
+    <param name="require_initial_prior_ready" value="true" />
+    <param name="initial_prior_ready_topic" value="$(arg initial_prior_ready_topic)" />
+    <param name="publish_rate" value="20.0" />
+    <param name="goal_delay" value="$(arg goal_delay)" />
+    <param name="goal/x" value="$(arg goal_x)" />
+    <param name="goal/y" value="$(arg goal_y)" />
+    <param name="goal/z" value="$(arg goal_z)" />
+    <param name="goal/qx" value="$(arg goal_qx)" />
+    <param name="goal/qy" value="$(arg goal_qy)" />
+    <param name="goal/qz" value="$(arg goal_qz)" />
+    <param name="goal/qw" value="$(arg goal_qw)" />
+  </node>
+</launch>

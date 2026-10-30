@@ -1,0 +1,32 @@
+{
+  "status": "READY_FOR_NEW_RUNS",
+  "case": "007",
+  "model": "old",
+  "transform_reuse": false,
+  "source_plan": "phase_e_executable_view_selection_r2_20261030",
+  "task_wall_budget_s": 60,
+  "startup_budget_wall_s": 20,
+  "ports": [
+    12900,
+    12901
+  ],
+  "common_observation": "Existing real eight-ToF ray map, inherited motion prior unchanged; new baseline required.",
+  "qualification_rule": "Five predeclared real-ToF empty windows per group, fixed5/5 strict and independent geometry required",
+  "formal_stop_rule": "First physical contact pauses Gazebo and ends this batch; guard failure, sensor loss, unsafe audit or missing evidence also stop it. Every attempt retained; no replacement reruns.",
+  "blocked_goal_rule": "Evaluate zero box contacts, positive measured primitive clearance, zero final actuator motion and unchanged original safety separately from reachable task success. Require observed sensor occupancy. Budget exhaustion alone is not explicit planner rejection.",
+  "qualification": {
+    "configuration": "baseline",
+    "tag": "restore_fix_unused",
+    "batch": "research_restore_fix_unused",
+    "case": "007",
+    "role": "development",
+    "repeat": 0
+  },
+  "runs": [],
+  "bootstrap_rule": "All 26 inflated collision solids plus half voxel diagonal, bounded at every received pre-ARM joint sample within 0.001 rad of original q0.",
+  "guard_rule": "Real contact fixture must demonstrate first-report pause before qualification. Guard heartbeat and sensor stream required before ARM within the original 20s readiness deadline; separate owner provides process-reaping fallback.",
+  "mode": "fixed",
+  "study_status": "REPRODUCTION",
+  "window_cap": 5,
+  "formal_runs_in_this_study": 0
+}
