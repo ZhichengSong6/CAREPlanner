@@ -32,5 +32,7 @@ conda run -n "${care_setup_env}" python -m pip install \
 conda run -n "${care_setup_env}" python -m pip install \
   'numpy==2.2.6' 'PyYAML==6.0.3' 'rospkg==1.6.1' 'catkin_pkg==1.1.0' 'urdf-parser-py==0.0.4'
 git -C "${care_setup_root}" submodule update --init --recursive
+git -C "${care_setup_root}" lfs install --local
+git -C "${care_setup_root}" lfs pull --include='src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt,src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt' --exclude=''
 printf '%s\n' "Runtime environment ready: ${care_setup_env}" \
   "Next: bash scripts/run_demo.sh --env ${care_setup_env}"

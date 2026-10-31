@@ -1,6 +1,6 @@
-CAREPlanner 模型资产（2026-10-30）
+CAREPlanner 模型资产（2026-10-31）
 
-权重保持外置。将文件放在仓库根目录下的以下相对路径：
+新碰撞 CDF 和 VisCDF R1 通过 Git LFS 提供，合计 29,319,815 字节（约 28 MiB）。运行 scripts/setup_runtime.sh 或 git lfs pull 获取实际文件；两份权重的路径与 SHA256 如下。其余历史权重保持外置。
 
 此前已进入 Git 的六份标量模型已停止跟踪，本地文件保留；路径、SHA与可恢复的历史提交见 docs/legacy_model_assets.json。此次清理不重写历史，因此旧提交中的模型仍可恢复，也不会缩小已有 Git 历史。
 
@@ -10,7 +10,7 @@ checkpoint key=5000，ReLU；10维输入，经input/sin/cos编码为30维，隐�
 
 旧碰撞 CDF控制（可选，默认演示不需要）：src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt
 SHA256 41a4228eee797971d56b46849e0f52c663eae79dc35667e8704c1bc3c8d72c70
-GELU。根工程的部分历史启动脚本仍默认使用它；最新复现入口通过--model new显式选择新权重与ReLU。
+GELU。此文件不随当前发布提供，需要旧模型对照时另行准备。根工程的部分历史启动脚本仍默认使用它；最新复现入口通过--model new显式选择新权重与ReLU。
 
 统一 VisCDF R1：src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt
 SHA256 4f395926fa79c29474be8748cef4733ec400d155cd8fadb76c632c2838864002

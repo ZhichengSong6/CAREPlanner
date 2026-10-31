@@ -16,7 +16,7 @@ bash scripts/setup_runtime.sh
 
 安装脚本要求已安装 ROS Noetic 和 Conda；会安装构建依赖，并创建 `careplanner` Python 3.10 环境。PyTorch 固定为 2.11.0，使用 [官方 CUDA 12.8 wheel 索引](https://download.pytorch.org/whl/cu128/torch/)。不修改显卡驱动。
 
-运行前需要两份指定推理权重：新碰撞 CDF 和 VisCDF R1。整体可见性与八个传感器分支共享同一个 R1 网络实例，不加载旧标量 VisCDF。旧碰撞 CDF 仅供可选对照，默认演示不需要。路径与校验值见 [模型资产说明](docs/model_assets.txt)。
+两份必需权重通过 Git LFS 随仓库提供：新碰撞 CDF 和 VisCDF R1，合计约 28 MiB。安装脚本会补齐 LFS 文件；已有环境也可运行 `git lfs install --local && git lfs pull`。整体可见性与八个传感器分支共享同一个 R1 网络实例，不加载旧标量 VisCDF。路径与校验值见 [模型资产说明](docs/model_assets.txt)。
 
 ## 运行
 
@@ -46,7 +46,7 @@ Conda 不在常见安装位置时，通过 `CONDA_SH` 指定其 `etc/profile.d/c
 
 ## 代码与本地产物
 
-Git 保存源码、构建脚本、运行配置、机器人 URDF/STL 和必要说明。编译产物、训练数据、采集记录、分析报告与实验结果不纳入源码提交。
+Git 保存源码、构建脚本、运行配置、机器人 URDF/STL 和必要说明；Git LFS 仅跟踪上述两份运行权重。编译产物、训练数据、采集记录、分析报告与实验结果不纳入提交。
 
 - `src/`：ROS 包及机器人描述；保留历史集成入口。
 - `scripts/run_demo.sh`：推荐的当前静态仿真入口。
