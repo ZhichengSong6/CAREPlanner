@@ -106,7 +106,7 @@ class Tests(unittest.TestCase):
 
     def test_unlimited_submission_preserves_shards_and_freezes_mode(self):
         self.args.unlimited = True
-        with self.submit_context([reply('estimated'), reply('899\\n')]):
+        with self.submit_context([reply('estimated'), reply('899')]):
             g.submit(self.b, self.args)
         self.assertEqual(self.called.call_count, 2)
         record = self.b.read(self.root/g.STATE/'latest_submission.json')
