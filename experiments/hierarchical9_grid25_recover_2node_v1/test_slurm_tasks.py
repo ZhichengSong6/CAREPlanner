@@ -90,6 +90,76 @@ class Tests(unittest.TestCase):
         p = self.root/'batch.sh'; p.write_text(text)
         subprocess.run(['bash', '-n', str(p)], check=True)
 
+    def test_unlimited_batch_requests_no_time_limit_and_no_end_signal(self):
+        batch = g.batch_text(self.root, self.repo, self.root, '1', '', '', '', 'GPU',
+                             unlimited=True)
+        self.assertIn('#SBATCH --time=0', batch)
+        self.assertNotIn('#SBATCH --signal=', batch)
+        self.assertIn('#SBATCH --nodes=1', batch)
+        self.assertIn('#SBATCH --gres=gpu:3090:4', batch)
+        self.assertIn('#SBATCH --no-requeue', batch)
+        path = self.root/'unlimited.sbatch'; path.write_text(batch)
+        subprocess.run(['bash', '-n', str(path)], check=True)
+        normal = g.batch_text(self.root, self.repo, self.root, '1', '', '', '', 'GPU')
+        self.assertIn('#SBATCH --time=1-00:00:00', normal)
+        self.assertIn('#SBATCH --signal=B:USR1@1800', normal)
+
+    def test_unlimited_submission_preserves_shards_and_freezes_mode(self):
+        self.args.unlimited = True
+        with self.submit_context([reply('estimated'), reply('899\\n')]):
+            g.submit(self.b, self.args)
+        self.assertEqual(self.called.call_count, 2)
+        record = self.b.read(self.root/g.STATE/'latest_submission.json')
+        self.assertEqual(record['job_id'], 899)
+        spec = self.b.read(record['spec'])
+        self.assertIs(spec['unlimited'], True)
+        self.assertIn('#SBATCH --time=0', Path(record['spec']).parent.joinpath('batch.sbatch').read_text())
+        self.assertEqual((self.root/'formal/job.json').read_text(), '{}')
+
+    def test_unlimited_batch_runs_past_old_soft_deadline_to_completion(self):
+        self.b.SOFT_SECONDS = -1  # Simulate an already-expired 23.5h window.
+        self.engine.choose_segment.side_effect = [0, None, None]
+        proc = Mock(); proc.wait.return_value = 0
+        with patch.object(g, 'load_spec', return_value=({'requested_nodes': '1', 'unlimited': True}, self.root)) as _:
+            with patch.object(g.subprocess, 'Popen', return_value=proc) as popen:
+                with patch.dict(os.environ, SLURM_JOB_ID='899', SLURM_JOB_NUM_NODES='1'):
+                    with redirect_stdout(io.StringIO()):
+                        g.batch(self.b, self.root/'spec')
+        self.assertEqual(popen.call_count, 1)
+        report = self.b.read(self.root/g.STATE/'runs/899/result.json')
+        self.assertEqual(report['status'], 'READY_TO_MERGE')
+        allocation = self.b.read(self.root/g.STATE/'runs/899/allocation.json')
+        self.assertIs(allocation['unlimited'], True)
+        self.assertEqual(allocation['deadline'], g.UNLIMITED_DEADLINE_UNIX)
+        step = self.b.read(self.root/g.STATE/'runs/899/segment_000/step.json')
+        self.assertEqual(step['deadline'], g.UNLIMITED_DEADLINE_UNIX)
+
+    def test_unlimited_stops_if_segment_makes_zero_progress(self):
+        self.engine.choose_segment.return_value = 0
+        self.engine.stage_exists.return_value = False
+        proc = Mock(); proc.wait.return_value = 0
+        with patch.object(g, 'load_spec', return_value=({'requested_nodes': '1', 'unlimited': True}, self.root)):
+            with patch.object(g.subprocess, 'Popen', return_value=proc) as popen:
+                with patch.dict(os.environ, SLURM_JOB_ID='900', SLURM_JOB_NUM_NODES='1'):
+                    with redirect_stdout(io.StringIO()):
+                        with self.assertRaisesRegex(RuntimeError, 'without new published shards'):
+                            g.batch(self.b, self.root/'spec')
+        self.assertEqual(popen.call_count, 1)
+
+    def test_unlimited_retries_incomplete_segment_only_with_progress(self):
+        self.engine.choose_segment.side_effect = [0, 0, None, None]
+        self.engine.stage_exists.side_effect = [False, False, True, False,
+                                               True, False, True, True]
+        proc = Mock(); proc.wait.return_value = 0
+        with patch.object(g, 'load_spec', return_value=({'requested_nodes': '1', 'unlimited': True}, self.root)):
+            with patch.object(g.subprocess, 'Popen', return_value=proc) as popen:
+                with patch.dict(os.environ, SLURM_JOB_ID='901', SLURM_JOB_NUM_NODES='1'):
+                    with redirect_stdout(io.StringIO()):
+                        g.batch(self.b, self.root/'spec')
+        self.assertEqual(popen.call_count, 2)
+        self.assertTrue((self.root/g.STATE/'runs/901/segment_000_retry_001').is_dir())
+        self.assertEqual(self.b.read(self.root/g.STATE/'runs/901/result.json')['status'], 'READY_TO_MERGE')
+
     def test_no_shell_injection_in_resource_fields(self):
         with self.assertRaises(RuntimeError):
             g.batch_text(self.root, self.repo, self.root, '2', '', 'account\n#SBATCH --nodes=99', '', 'GPU')
