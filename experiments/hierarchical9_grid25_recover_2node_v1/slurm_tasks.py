@@ -27,6 +27,10 @@ STATE = 'slurm_tasks_v2'
 BASE_BLOB = 'bd10c9bd07f0b021c9aa99b2c083f44eaa2c0d90'
 DEFAULT_ROOT = '/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1'
 BLOCKED = {'AssocMaxNodePerJobLimit', 'QOSMaxNodePerJobLimit', 'PartitionNodeLimit'}
+# Practical sentinel for the immutable worker's numeric deadline_unix field.
+# Slurm --time=0 and the batch loop control actual unlimited operation.
+UNLIMITED_DEADLINE_UNIX = 253402300799.0  # 9999-12-31T23:59:59 UTC
+
 
 
 def require(ok, message):
@@ -96,13 +100,16 @@ def association_hint(account, partition):
                       note='Strictest visible matching association only; not proof of permission or start time')
 
 
-def batch_text(source, repo, root, nodes, nodelist, account, qos, partition):
+def batch_text(source, repo, root, nodes, nodelist, account, qos, partition, unlimited=False):
     # CPU count follows the supplied site example: 4 * 16 = 64 per node.
     opts = ['--job-name=g25_tasks', '--nodes='+nodes, '--ntasks-per-node=4',
             '--cpus-per-task=16', '--gres=gpu:3090:4', '--partition='+partition,
-            '--time=1-00:00:00', '--signal=B:USR1@1800', '--no-requeue',
+            '--time=0' if unlimited else '--time=1-00:00:00',
+            '--no-requeue',
             '--chdir='+shlex.quote(str(repo)), '--output='+shlex.quote(str(root/'logs/tasks_%j.out')),
             '--error='+shlex.quote(str(root/'logs/tasks_%j.err'))]
+    if not unlimited:
+        opts.append('--signal=B:USR1@1800')
     for key, value in (('nodelist', nodelist), ('account', account), ('qos', qos)):
         if value:
             require(re.fullmatch(r'[A-Za-z0-9_,.-]+', value), 'Invalid '+key)
@@ -232,7 +239,11 @@ def submit(b, a):
             if evidence.get('warning') or evidence.get('returncode', 0):
                 print('[policy-query unavailable] '+str(evidence.get('warning', evidence.get('stderr', ''))))
         source, hashes = freeze(b, root)
-        text = batch_text(source, repo, root, nodes, a.nodelist, a.account, a.qos, a.partition)
+        unlimited = bool(getattr(a, 'unlimited', False))
+        text = batch_text(source, repo, root, nodes, a.nodelist, a.account, a.qos, a.partition,
+                          unlimited=unlimited)
+        print('[duration] '+('UNLIMITED: --time=0; run until all shards complete' if unlimited
+                              else '24h allocation / 23h30m soft collection window'), flush=True)
         if a.mode == 'draft':
             print('[DRAFT ONLY] no sbatch; generated batch script:\n'+text); return
         python = Path(os.environ.get('VIS_PYTHON', sys.executable)).absolute()
@@ -243,7 +254,7 @@ def submit(b, a):
         script.write_text(text)
         b.write(spec_path, dict(root=str(root), source=str(source), hashes=hashes, requested_nodes=nodes,
                                engine_manifest_sha=b.sha(root/'fast_segments_v1/manifest.json'),
-                               policy_hint=evidence, batch_sha=b.sha(script)))
+                               policy_hint=evidence, batch_sha=b.sha(script), unlimited=unlimited))
         env = {k: v for k, v in os.environ.items() if not k.startswith('SBATCH_')}
         env.update(VIS_PYTHON=str(python), G25T_SPEC=str(spec_path), G25T_SPEC_SHA=b.sha(spec_path),
                    OMP_NUM_THREADS='2', OPENBLAS_NUM_THREADS='1', MKL_NUM_THREADS='2',
@@ -320,17 +331,27 @@ def batch(b, spec_path):
     with b.lock(root/'.grid25_allocation.lock'):
         engine, m, c, job = b.load_engine(root)
         folder = root/STATE/'runs'/jid; folder.mkdir(parents=True, exist_ok=False)
-        stop = folder/'STOP'; deadline = start+b.SOFT_SECONDS
+        stop = folder/'STOP'
+        unlimited = spec.get('unlimited', False)
+        require(isinstance(unlimited, bool), 'Invalid unlimited flag in frozen submission')
+        deadline = UNLIMITED_DEADLINE_UNIX if unlimited else start+b.SOFT_SECONDS
+        attempts = {}
         b.write(folder/'allocation.json', dict(job_id=jid, nodes=nodes, gpus=4*nodes,
-                  nodelist=os.environ.get('SLURM_JOB_NODELIST', ''), deadline=deadline))
+                  nodelist=os.environ.get('SLURM_JOB_NODELIST', ''), deadline=deadline,
+                  unlimited=unlimited))
         def pause(*_): stop.touch(exist_ok=True)
         old = {s: signal.signal(s, pause) for s in (signal.SIGUSR1, signal.SIGTERM)}
         try:
-            print(f'[RUNNING] ONE JobID={jid}; nodes={nodes}; tasks={4*nodes}; GPUs={4*nodes}', flush=True)
-            while not stop.exists() and time.time() < deadline:
+            print(f'[RUNNING] ONE JobID={jid}; nodes={nodes}; tasks={4*nodes}; GPUs={4*nodes}; '
+                  f'unlimited={unlimited}', flush=True)
+            while not stop.exists() and (unlimited or time.time() < deadline):
                 seg = engine.choose_segment(m, c, job)
                 if seg is None: break
-                step = folder/f'segment_{seg:03d}'; step.mkdir()
+                attempt = attempts.get(seg, 0)
+                step = folder/(f'segment_{seg:03d}' if attempt == 0 else
+                               f'segment_{seg:03d}_retry_{attempt:03d}')
+                step.mkdir()
+                before = sum(engine.stage_exists(c, job, sid) for sid in m['segments'][seg])
                 b.write(step/'step.json', dict(nodes=nodes, segment=seg, stop_file=str(stop), deadline=deadline))
                 process = subprocess.Popen(step_command(HERE, spec_path, step, nodes), start_new_session=True)
                 try:
@@ -342,7 +363,19 @@ def batch(b, spec_path):
                 complete = len(present) == len(m['segments'][seg])
                 b.write(step/'result.json', dict(complete=complete, complete_shards=len(present)))
                 if not complete:
-                    require(stop.exists() or time.time() >= deadline, 'Unexpected missing shards; stop rather than retry')
+                    if unlimited and not stop.exists():
+                        # A worker may skip a shard already locked by another task.
+                        # Explicitly retry only if published-shard count increased.
+                        require(len(present) > before,
+                                'Incomplete segment without new published shards; '
+                                'stopping rather than looping indefinitely')
+                        attempts[seg] = attempt + 1
+                        print(f'[UNLIMITED CONTINUE] segment={seg} '
+                              f'published={len(present)}/{len(m["segments"][seg])}; '
+                              'retrying remaining shards in this JobID', flush=True)
+                        continue
+                    require(stop.exists() or time.time() >= deadline,
+                            'Unexpected missing shards; stop rather than retry')
                     break
             outcome = 'READY_TO_MERGE' if engine.choose_segment(m, c, job) is None else 'WINDOW_PAUSED'
             b.write(folder/'result.json', dict(status=outcome, job_id=jid))
@@ -361,6 +394,9 @@ def main():
     p.add_argument('--account', default=os.environ.get('GRID25_ACCOUNT', ''))
     p.add_argument('--qos', default=os.environ.get('GRID25_QOS', ''))
     p.add_argument('--partition', default=os.environ.get('GRID25_PARTITION', 'GPU'))
+    p.add_argument('--unlimited', action='store_true',
+                   default=os.environ.get('GRID25_UNLIMITED', '0') == '1',
+                   help='Next submission only: Slurm --time=0; collect until all shards finish')
     p.add_argument('--spec', type=Path); p.add_argument('--step', type=Path)
     a = p.parse_args(); b = base()
     if a.mode in ('batch', 'task'):
