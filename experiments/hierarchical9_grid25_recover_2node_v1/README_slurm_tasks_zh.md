@@ -96,3 +96,33 @@ bash "$SCRIPT" verify
 - https://slurm.schedmd.com/srun.html
 - https://slurm.schedmd.com/job_reason_codes.html
 - https://slurm.schedmd.com/sacctmgr.html
+
+## 最后一轮：不限时、采齐即退出（新增，显式启用）
+
+已有 24 小时作业不受影响：每次提交都会把启动器冻结到独立快照。**必须等上一轮（例如 19094）完全退出**，确认无其他本人排队/运行任务，再启动下述新作业；不要取消旧作业来切换。本改动仅调整提交器/窗口，不改冻结采集引擎、原始数据、每分片数值和归档格式。
+
+当前分区已显示 `MaxTime=UNLIMITED`；Slurm 的 `#SBATCH --time=0` 表示请求不限制运行时间。是否真正获批仍以本机调度器（及账户、QOS、集群策略）为准，不保证作业绝不会被管理员取消、服务器重启或因程序错误退出。无时间上限的申请也可能比短作业更难排队。
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+# 需要先 git fetch/merge 更新本分支到含不限时功能的提交。
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+SCRIPT=experiments/hierarchical9_grid25_recover_2node_v1/slurm_tasks.sh
+unset GRID25_NODELIST
+squeue -u "$USER"                     # 必须先确认前一轮结束
+bash "$SCRIPT" test                    # 本地 CPU/模拟调度检查
+bash "$SCRIPT" log                     # 前一轮应为 WINDOW_PAUSED
+bash "$SCRIPT" verify                  # 所有已发布分片必须校验通过
+bash "$SCRIPT" summary                 # 若已 2707/2707，则不要再采集
+GRID25_NODES=1 GRID25_UNLIMITED=1 bash "$SCRIPT" draft
+GRID25_NODES=1 GRID25_UNLIMITED=1 bash "$SCRIPT" next
+```
+
+预览生成的 batch 应包含 `#SBATCH --nodes=1`、`#SBATCH --time=0`，且不再包含 `--signal=B:USR1@1800`；提交日志应看到 `[duration] UNLIMITED`，运行日志应看到 `unlimited=True`。**一个 sbatch / 一个 JobID / 一节点四张 3090**，启动后直到分片全部完成（`READY_TO_MERGE`）才自然退出；不进行自动合并或训练。内部不再以 23h30m 停止分片领取。旧 worker 必须有数字类型 `deadline_unix`，新入口仅在不限时模式传入公元 9999 年末的有限哨兵；它不是现实意义的运行时间限制，实际无限运行由 Slurm `--time=0` 与 batch 循环共同实现。
+
+同一段如因其他 worker 已持锁而留下未完成分片，在确实增加已发布分片的条件下打印 `[UNLIMITED CONTINUE]` 再补缺；如果没有任何新完成分片则立即报错停止，避免死循环。运行中仍保持原有原子分片与文件锁，管理员取消/重启时只保留已完整写入的分片。遇到 `[STOP]` 或 `FAILED`，应先读日志、必要时执行 `recover`；不允许手工删除分片或重复提交。
+
+如想继续使用旧的 24 小时分段窗口，**不要设置 `GRID25_UNLIMITED`**，沿用 `GRID25_NODES=1 bash "$SCRIPT" next`。如果该变量已在终端持久导出，用 `unset GRID25_UNLIMITED` 关闭。
+
+官方说明：https://slurm.schedmd.com/sbatch.html （`--time=0` 请求不设时间限制）。
