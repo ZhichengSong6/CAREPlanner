@@ -5,6 +5,6 @@ patches/piqp/*.patch -text -whitespace
 # Root mirrors retain the exact validated snapshot bytes, including whitespace.
 src/arm_description/urdf/Arm.urdf -text -whitespace
 scripts/verify_phase_e_c4_task_recovery_ros.py -text -whitespace
-# Only the two current runtime checkpoints are distributed through Git LFS.
-src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt filter=lfs diff=lfs merge=lfs -text
-src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt filter=lfs diff=lfs merge=lfs -text
+# Required checkpoints are ordinary Git blobs; pulling must not depend on LFS quota.
+src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt binary
+src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt binary

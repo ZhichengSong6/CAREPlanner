@@ -42,7 +42,7 @@ def main():
                 continue
             path = ROOT / model['path']
             if not path.is_file() or digest(path) != model['sha256']:
-                errors.append('Model missing/mismatched (run git lfs pull): ' + model['path'])
+                errors.append('Model missing/mismatched (update to the matching publication commit): ' + model['path'])
     if errors:
         raise SystemExit('\n'.join(errors))
     print(json.dumps(dict(status='PASS',source_files=len(manifest['files']),

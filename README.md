@@ -20,7 +20,6 @@ bash scripts/run_demo.sh
 ```bash
 git pull --ff-only
 git submodule update --init --recursive
-git lfs pull
 bash scripts/setup_runtime.sh
 bash scripts/run_demo.sh
 ```
@@ -34,7 +33,7 @@ bash scripts/run_demo.sh
 
 NumPy 的 BLAS 实现影响本项目的小矩阵几何计算耗时；安装时保留已验收的 MKL 配置。环境名可以改变，模型始终是同一个 R1。`CARE_RUNTIME_ENV`、`CARE_VISIBILITY_ENV` 可覆盖安装环境名；Conda 路径可由 `CONDA_SH` 指定。不修改显卡驱动。
 
-两份必需权重通过 Git LFS 提供，合计约 28 MiB，安装脚本会下载并由运行入口校验 SHA256。见 [模型资产说明](docs/model_assets.txt)。默认演示不依赖任何历史 `outputs/` 文件。
+两份必需权重作为普通 Git 文件提供，合计约 28 MiB，clone/pull 即可获取，运行入口校验 SHA256。远程 LFS 额度已耗尽，因此当前发布移除了这两份文件的 LFS 依赖。见 [模型资产说明](docs/model_assets.txt)。默认演示不依赖任何历史 `outputs/` 文件。
 
 ## 运行与输出
 
@@ -72,6 +71,6 @@ bash scripts/run_demo.sh --env viscdf --visibility-env ncdf_l4c
 
 ## 发布边界
 
-Git 保存源码、必要配置、安装/构建脚本、URDF/STL、场景和校验清单；Git LFS 保存两份运行权重。编译产物、训练数据、原始采集、实验结果及本地研究工作目录不上传。
+Git 保存源码、必要配置、安装/构建脚本、URDF/STL、场景、校验清单和两份运行权重。编译产物、训练数据、原始采集、实验结果及本地研究工作目录不上传。
 
 推荐入口由 [运行源码说明](experiments/phase_e_static_baseline_20261030/README.md)、`source_manifest.json` 和 `overlay/` 确定；根目录 `src/` 的运行源码已同步。后续修改须同步清单与对应 overlay，单改 `src/` 可能仍加载冻结版本。发布来源摘要见 `release_provenance.json`。

@@ -1,6 +1,6 @@
-CAREPlanner 模型资产（2026-10-31）
+CAREPlanner 模型资产（2026-11-06）
 
-新碰撞 CDF 和 VisCDF R1 通过 Git LFS 提供，合计 29,319,815 字节（约 28 MiB）。运行 scripts/setup_runtime.sh 或 git lfs pull 获取实际文件；两份权重的路径与 SHA256 如下。其余历史权重保持外置。
+新碰撞 CDF 和 VisCDF R1 作为普通 Git 文件提供，合计 29,319,815 字节（约 28 MiB），clone/pull 即可获取。2026-11-06 干净拉取检查发现 GitHub LFS 额度耗尽，因此将这两份必要权重改为普通文件，不再依赖 LFS 服务；权重内容和 SHA256 不变。其余历史权重保持外置。
 
 此前已进入 Git 的六份标量模型已停止跟踪，本地文件保留；路径、SHA与可恢复的历史提交见 docs/legacy_model_assets.json。此次清理不重写历史，因此旧提交中的模型仍可恢复，也不会缩小已有 Git 历史。
 

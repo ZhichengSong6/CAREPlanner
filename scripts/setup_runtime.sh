@@ -23,7 +23,7 @@ fi
 test -f "${CONDA_SH:?Install Conda or set CONDA_SH to its etc/profile.d/conda.sh}"
 source "${CONDA_SH}"
 sudo apt-get update
-sudo apt-get install -y build-essential cmake git-lfs zip xvfb xauth libgl1-mesa-dri libssl-dev libyaml-cpp-dev \
+sudo apt-get install -y build-essential cmake git zip xvfb xauth libgl1-mesa-dri libssl-dev libyaml-cpp-dev \
   libeigen3-dev python3-catkin-tools python3-numpy python3-yaml \
   ros-noetic-gazebo-ros-pkgs ros-noetic-gazebo-ros-control ros-noetic-ros-controllers \
   ros-noetic-robot-state-publisher ros-noetic-xacro ros-noetic-tf2-geometry-msgs \
@@ -52,8 +52,6 @@ conda run -n "${care_visibility_env}" python -m pip install \
 conda run -n "${care_visibility_env}" python -m pip install \
   'PyYAML==6.0.3' 'rospkg==1.6.1' 'catkin_pkg==1.1.0' 'urdf-parser-py==0.0.4'
 git -C "${care_setup_root}" submodule update --init --recursive
-git -C "${care_setup_root}" lfs install --local
-git -C "${care_setup_root}" lfs pull --include='src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt,src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt' --exclude=''
 printf '%s\n' "Runtime environment ready: ${care_setup_env}" \
   "Visibility environment ready: ${care_visibility_env}" \
   "Next: bash scripts/run_demo.sh --env ${care_setup_env} --visibility-env ${care_visibility_env}"

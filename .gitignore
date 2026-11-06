@@ -93,7 +93,7 @@ src/care_collision_cdf/checkpoints/
 /docs/maintenance/outputs_cleanup_20261028/
 /docs/handoffs/R1_Model_Definition_Handoff.zip
 
-# Source-only publication: analysis reports and recorded inputs stay local.
+# Publication: analysis reports and recorded inputs stay local.
 /docs/**
 !/docs/model_assets.txt
 !/docs/legacy_model_assets.json
