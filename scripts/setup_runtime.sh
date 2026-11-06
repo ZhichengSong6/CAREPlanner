@@ -2,6 +2,10 @@
 # Explicitly invoked setup for Ubuntu 20.04 with ROS Noetic already installed.
 set -euo pipefail
 care_setup_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+mkdir -p "${care_setup_root}/.runtime_tmp"
+care_setup_tmp="$(mktemp -d "${care_setup_root}/.runtime_tmp/setup.XXXXXX")"
+export TMPDIR="${care_setup_tmp}" TMP="${care_setup_tmp}" TEMP="${care_setup_tmp}"
+trap 'rm -rf -- "${care_setup_tmp}"' EXIT
 care_setup_env="${CARE_RUNTIME_ENV:-careplanner}"
 care_visibility_env="${CARE_VISIBILITY_ENV:-careplanner_visibility}"
 if [[ "${care_setup_env}" == "${care_visibility_env}" ]]; then
