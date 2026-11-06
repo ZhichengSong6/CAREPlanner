@@ -1,3 +1,5 @@
+#include <care_collision_cdf/QueryCollisionCDFPairs.h>
+#include <mutex>
 #include <ros/ros.h>
 
 #include <care_collision_cdf/CollisionCDFConstraintBatch.h>
@@ -323,6 +325,9 @@ class CppForbiddenVoxelGpuShadow {
     timer_ = nh_.createTimer(
         ros::Duration(1.0 / rate_hz_),
         &CppForbiddenVoxelGpuShadow::timerCallback, this);
+
+    if(std::getenv("CARE_NATIVE_VIEW_SELECTION") && std::string(std::getenv("CARE_NATIVE_VIEW_SELECTION"))=="true")
+      preview_service_=nh_.advertiseService("/care_planner/collision_cdf/query_pairs",&CppForbiddenVoxelGpuShadow::previewPairs,this);
 
     ROS_WARN_STREAM(
         "[C5.2h C++] READY rate=" << rate_hz_
@@ -1005,6 +1010,32 @@ class CppForbiddenVoxelGpuShadow {
     }
   }
 
+  ros::ServiceServer preview_service_;
+  std::mutex preview_gpu_mutex_;
+  bool previewPairs(care_collision_cdf::QueryCollisionCDFPairs::Request& request,
+      care_collision_cdf::QueryCollisionCDFPairs::Response& response) {
+    const int n=request.num_pairs;
+    if(n<=0 || n>32000 || request.points.size()!=static_cast<std::size_t>(n) ||
+        request.q_flat.size()!=static_cast<std::size_t>(7*n)) {response.success=false;response.message="dimensions";return true;}
+    std::vector<float> rows;rows.reserve(n*10);
+    for(int i=0;i<n;++i) {
+      const auto& p=request.points[i];
+      if(!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))return true;
+      rows.push_back(p.x);rows.push_back(p.y);rows.push_back(p.z);
+      for(int j=0;j<7;++j){double value=request.q_flat[i*7+j];if(!std::isfinite(value))return true;rows.push_back(value);}
+    }
+    std::vector<float> distance,gradient;double roundtrip;ResponseHeader header;
+    response.success=queryGpu(rows,n,&distance,&gradient,&roundtrip,&header);
+    if(response.success){response.distance.assign(distance.begin(),distance.end());response.gradient_flat.assign(gradient.begin(),gradient.end());response.inference_ms=header.inference_ms;}
+    if(response.success) {
+      std::ofstream trace(output_jsonl_,std::ios::out|std::ios::app);
+      trace<<std::setprecision(17)<<"{\"record_index\":"<<++record_index_<<",\"channel\":\"view_preview\",\"wall_time\":"<<ros::WallTime::now().toSec()
+        <<",\"retained_pair_count\":"<<n<<",\"timing_ms\":{\"ipc_roundtrip_ms\":"<<roundtrip<<",\"worker_total_ms\":"<<header.worker_total_ms
+        <<",\"worker_inference_ms\":"<<header.inference_ms<<",\"online_pipeline_ms\":"<<roundtrip<<"}}\n";
+    }
+    response.message=response.success?"same_bound_worker":"worker_failure";return true;
+  }
+
   bool queryGpu(
       const std::vector<float>& rows,
       std::size_t pair_count,
@@ -1012,6 +1043,7 @@ class CppForbiddenVoxelGpuShadow {
       std::vector<float>* gradient,
       double* ipc_roundtrip_ms,
       ResponseHeader* response_header) {
+    std::lock_guard<std::mutex> gpu_lock(preview_gpu_mutex_);
     if (pair_count == 0 ||
         rows.size() != pair_count * 10) {
       return false;
@@ -1493,6 +1525,13 @@ class CppForbiddenVoxelGpuShadow {
     // Zero nearby forbidden pairs is an explicit SAFE batch, not a transport
     // miss. This is especially important for the final executable gate.
     if (pairs.empty()) {
+      // Empty batches still need the exact map/query identity for replay.
+      std::ofstream evidence(output_jsonl_,std::ios::out|std::ios::app);
+      evidence << std::setprecision(17) << "{\"record_index\":" << record_index_++
+          << ",\"channel\":\"" << channelName(channel) << "\",\"status\":\"empty_batch\""
+          << ",\"anchor_cloud_stamp\":" << anchor_cloud->header.stamp.toSec()
+          << ",\"map_cloud_stamp\":" << map->stamp.toSec()
+          << ",\"retained_pair_count\":0,\"anchor_count\":" << anchors.size() << "}\n";
       ResponseHeader empty_gpu{};
       const double pipeline_ms =
           msBetween(pipeline_t0, Clock::now());

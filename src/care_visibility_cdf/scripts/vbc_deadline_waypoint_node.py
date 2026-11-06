@@ -161,8 +161,11 @@ class VbcDeadlineWaypointNode:
         self._validate_params()
         self.output_root.mkdir(parents=True, exist_ok=True)
 
+        import os
+        if os.environ.get('CARE_VISIBILITY_BACKEND','r1')=='geometry':
+            self.device_name='cpu'
         self.device = torch.device(self.device_name)
-        rospy.loginfo("[vbc_waypoint] loading shared R1 union/sensor model...")
+        rospy.loginfo("[vbc_waypoint] loading observation backend=%s", os.environ.get("CARE_VISIBILITY_BACKEND","r1"))
         self.r1_sensor_model, self.r1_checkpoint = load_r1_checkpoint(
             self.checkpoint_path, self.device)
         self.model = HierarchicalUnionView(
@@ -171,11 +174,13 @@ class VbcDeadlineWaypointNode:
         self.visibility_model_metadata = dict(
             backend="r1_shared_union_sensors", checkpoint=str(self.checkpoint_path),
             checkpoint_sha256=R1_SHA256, union_output=0, sensor_outputs=list(range(1, 9)))
+        if os.environ.get('CARE_VISIBILITY_BACKEND','r1')=='geometry':
+            self.visibility_model_metadata=dict(backend='analytic_geometry',checkpoint=None,checkpoint_sha256=None,
+                value_kind='local_linearized_joint_margin_rad',union_output=0,sensor_outputs=list(range(1,9)))
         self.q_min = torch.tensor(self.q_min_list, device=self.device, dtype=torch.float32)
         self.q_max = torch.tensor(self.q_max_list, device=self.device, dtype=torch.float32)
         self._initialize_optional_oracles()
-        rospy.logwarn("[vbc_waypoint] R1 MODEL READY: %s sha256=%s union=0 sensors=1..8",
-                      self.checkpoint_path, R1_SHA256)
+        rospy.logwarn("[vbc_waypoint] MODEL READY: %s", self.visibility_model_metadata)
 
         self._target: Optional[PointStamped] = None
         self._target_xyz: Optional[np.ndarray] = None

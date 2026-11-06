@@ -1,3 +1,5 @@
+#include <fstream>
+#include <iomanip>
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
 #include <care_confidence_map/QueryConfidence.h>
 #include <care_confidence_map/QueryConfidenceSnapshot.h>
@@ -2256,6 +2258,30 @@ private:
       return;
     }
     current_eval_timing_.confidence_query_ms = wallMs(confidence_begin);
+    const char* evidence_path=std::getenv("CARE_AUDIT_MAP_EVIDENCE");
+    std::string evidence_node=ros::this_node::getName();
+    std::replace(evidence_node.begin(),evidence_node.end(),'/','_');
+    const std::string evidence_target=evidence_path ? std::string(evidence_path)+"."+evidence_node+".jsonl" : "";
+    if(evidence_path && map_evidence_stamps_.insert(current_eval_stamp_ns_).second) {
+      const auto& response=confidence_srv.response;
+      if(response.evidence_prior.size()==swept_voxels.size() && map_evidence_points_+swept_voxels.size()<=1000000) {
+        std::ofstream evidence(evidence_target,std::ios::app);
+        evidence<<std::setprecision(17)<<"{\"trajectory_stamp_ns\":\""<<current_eval_stamp_ns_
+          <<"\",\"instance\":\""<<response.evidence_instance<<"\",\"revision\":"<<response.evidence_revision
+          <<",\"map_stamp_ns\":\""<<response.evidence_stamp.toNSec()<<"\",\"points\":[";
+        for(std::size_t i=0;i<swept_voxels.size();++i) {
+          if(i)evidence<<',';const auto& v=swept_voxels[i];
+          evidence<<'['<<v.point_base.x()<<','<<v.point_base.y()<<','<<v.point_base.z()<<','
+            <<response.confidence[i]<<','<<response.current_visibility[i]<<','<<static_cast<int>(response.inside_map[i])<<','
+            <<response.evidence_occupancy[i]<<','<<response.evidence_last_seen_s[i]<<','<<response.evidence_prior[i]<<','
+            <<v.primitive_signed_distance_m<<']';
+        }
+        evidence<<"]}\n";map_evidence_points_+=swept_voxels.size();
+      } else {
+        std::ofstream evidence(evidence_target,std::ios::app);
+        evidence<<"{\"truncated\":true,\"trajectory_stamp_ns\":\""<<current_eval_stamp_ns_<<"\"}\n";
+      }
+    }
 
     const ros::WallTime candidate_filter_begin = ros::WallTime::now();
     std::map<CandidateKey, Candidate> candidate_map;
@@ -2841,6 +2867,8 @@ private:
   std::size_t last_sweep_refinement_checks_ = 0;
   std::size_t last_sweep_refinement_excluded_ = 0;
   int last_sweep_refinement_fk_ = 0;
+  std::set<unsigned long long> map_evidence_stamps_;
+  std::size_t map_evidence_points_=0;
   unsigned long long current_eval_stamp_ns_ = 0;
   std::string current_eval_trigger_ = "startup";
   EvalTiming current_eval_timing_;

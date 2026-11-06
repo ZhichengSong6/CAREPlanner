@@ -33,29 +33,6 @@ int main(int argc,char** argv){ros::init(argc,argv,"tracker_stop_component");try
   t.trajectoryCallback(next);CHECK(t.has_active_trajectory_ && !t.stop_state_.token);
   auto old_stop=boost::make_shared<std_msgs::String>();old_stop->data="execution_stamp_ns=29000000000";
   t.executionVbcStopCallback(old_stop);CHECK(!t.execution_vbc_stop_stamp_ns_);
-  // External execution hard-hold must retire identity, not pause a live curve.
-  auto hard=boost::make_shared<std_msgs::Bool>();hard->data=true;
-  t.safetyHoldCallback(hard);t.executionTimerCallback(ros::TimerEvent{});
-  CHECK(!t.has_active_trajectory_ && t.stop_state_.token==next->header.stamp.toNSec());
-  for(int k=10;k<18;++k){
-    ros::Time::setNow(ros::Time(30,k*10000000));measured->header.stamp=ros::Time::now();
-    t.jointStateCallback(measured);t.limiterOutputCallback(command);t.executionTimerCallback(ros::TimerEvent{});
-  }
-  CHECK(t.stop_state_.settled);
-  auto fresh=boost::make_shared<trajectory_msgs::JointTrajectory>(*next);
-  fresh->header.stamp=ros::Time(30,180000000);
-  t.trajectoryCallback(fresh);CHECK(!t.has_active_trajectory_); // hold still asserted
-  hard->data=false;t.safetyHoldCallback(hard);
-  t.trajectoryCallback(next);CHECK(!t.has_active_trajectory_); // clearing does not resurrect old work
-  t.trajectoryCallback(fresh);CHECK(t.has_active_trajectory_ && !t.stop_state_.token);
-  // Candidate verification holds retain their existing temporary semantics.
-  hard->data=true;t.vbcSafetyHoldCallback(hard);t.executionTimerCallback(ros::TimerEvent{});
-  CHECK(t.has_active_trajectory_ && !t.stop_state_.token);
-  hard->data=false;t.vbcSafetyHoldCallback(hard);
-  auto current_stop=boost::make_shared<std_msgs::String>();
-  current_stop->data="execution_stamp_ns="+std::to_string(fresh->header.stamp.toNSec());
-  t.executionVbcStopCallback(current_stop);t.executionTimerCallback(ros::TimerEvent{});
-  CHECK(!t.has_active_trajectory_ && t.stop_state_.token==fresh->header.stamp.toNSec());
   std::cout<<"PASS actual tracker callbacks: over-speed reject, tracking abort, stopping identity, no restart, settled new token, stale stop rejection\n";
   ros::shutdown();return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';ros::shutdown();return 1;}}

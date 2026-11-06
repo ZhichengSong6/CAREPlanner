@@ -17,8 +17,8 @@ export CHECKPOINT="${CHECKPOINT:?explicit model checkpoint required}"
 export CDF_ACTIVATION="${CDF_ACTIVATION:?explicit activation required}"
 export CDF_EXPECTED_SHA256="${CDF_EXPECTED_SHA256:?explicit checkpoint SHA256 required}"
 export CDF_CHECKPOINT_KEY="${CDF_CHECKPOINT_KEY:-latest}"
-export GPU_ENV=viscdf GPU_DEVICE=cuda NCDF_ENV=ncdf_l4c NCDF_DEVICE=cpu
-export GPU_SOCKET="/tmp/care_collision_cdf_gpu_${RUN_ID}.sock"
+export GPU_ENV="${GPU_ENV:-viscdf}" GPU_DEVICE=cuda NCDF_ENV="${NCDF_ENV:-ncdf_l4c}" NCDF_DEVICE=cpu
+export GPU_SOCKET="${GPU_SOCKET:-${TMPDIR:-/tmp}/care_collision_cdf_gpu_${RUN_ID}.sock}"
 export GAZEBO_GUI=false USE_RVIZ=false EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
 export FORCE_ZERO_INITIAL_Q=false TOF_FUSION_ENABLED=true REQUIRE_REAL_TOF_READINESS=true
 export APPLY_INITIAL_JOINT_OVERRIDES=false

@@ -5,15 +5,12 @@ release_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 release_workspace="$(cd -- "${release_script_dir}/.." && pwd)"
 cd -- "${release_workspace}"
 source /opt/ros/noetic/setup.bash
-mkdir -p "${release_workspace}/.catkin_tools/profiles"
-catkin init --workspace "${release_workspace}"
-test -d "${release_workspace}/.catkin_tools"
-catkin config --workspace "${release_workspace}" --profile primitive_release --extend /opt/ros/noetic \
+catkin config --profile primitive_release --extend /opt/ros/noetic \
   --build-space build/primitive_release --devel-space devel/primitive_release \
   --install-space install/primitive_release --log-space logs/primitive_release \
   --install --cmake-args -DCARE_INSTALL_CHECKPOINTS=OFF \
   -DCATKIN_ENABLE_TESTING=OFF -DCMAKE_BUILD_TYPE=Release
-catkin build --workspace "${release_workspace}" --profile primitive_release egocentric_arm_planner care_visibility_cdf \
+catkin build --profile primitive_release egocentric_arm_planner care_visibility_cdf \
   arm_description --no-status -j2
 # Checkpoints stay external. Legacy samples remain available for A/B and rollback.
 printf '%s\n' 'Install candidate built: install/primitive_release' \

@@ -213,12 +213,12 @@ class AdmissionTests(unittest.TestCase):
         self.assertTrue(self.g.sender.fault)
         self.assertFalse(self.g.replan_request_pub.messages or self.n.committed_pub.messages)
 
-    def test_transport_replan_is_at_most_once(self):
+    def test_each_distinct_transport_expiry_can_replan(self):
         for _ in range(2):
             self.raw.header.stamp = rospy.Time.from_sec(self.now)
             self.g._candidate_cb(self.raw); self.g.transfer_pub.messages.clear()
             self.advance(.501); self.g._admission_tick(); self.pump()
-        self.assertEqual(len(self.g.replan_request_pub.messages), 1)
+        self.assertEqual(len(self.g.replan_request_pub.messages), 2)
 
     def test_gcdf_unsafe_remains_rejected(self):
         self.start(); self.gcdf(False); self.pump()

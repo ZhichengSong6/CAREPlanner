@@ -4,6 +4,8 @@ build/
 devel/
 install/
 logs/
+/.release_work/
+/.runtime_tmp/
 
 # ROS
 .ros/

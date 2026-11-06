@@ -7,6 +7,7 @@ class PendingVbcBlockers:
         self.capacity = capacity
         self.records = OrderedDict()
         self.enqueued = self.coalesced = self.materialized = 0
+        self.obsolete = 0
         self.overflow_count = 0
         # Losing responsibility at capacity must not report acquisition complete.
         # This fault is explicit and remains latched for this node lifetime.
@@ -39,6 +40,15 @@ class PendingVbcBlockers:
             if record['generation'] == generation:
                 del self.records[key]
                 self.materialized += 1
+                return True
+        return False
+
+    def retire_obsolete(self, generation):
+        """Retire discovery work, independently of seen/materialized counts."""
+        for key, record in self.records.items():
+            if record['generation'] == generation and record['source'] == 'candidate':
+                del self.records[key]
+                self.obsolete += 1
                 return True
         return False
 

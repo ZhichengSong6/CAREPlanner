@@ -351,7 +351,11 @@ class CandidateReplacement:
         if lineage not in self.families and len(self.families) >= 64:
             return False
         tried = self.families.setdefault(lineage, set())
-        sensor = int(ob.get('per_sensor_selected_sensor_id', -1))
+        # The trigger was matched to this published target, which may be a
+        # shared or pinned pose from a different head than the stored owner.
+        # Charge the same snapshot used for previous_q/mask below; a union
+        # target (-1) must not consume the owner's stale sensor branch.
+        sensor = int(published.get('per_sensor_selected_sensor_id', -1))
         if sensor >= 0:
             tried.add(sensor)
         if len(tried) >= 8:
@@ -376,6 +380,8 @@ class CandidateReplacement:
                 event['observation_token'], int(ob['id']), trigger_raw))
         self.log('requested', request_id=self.serial, reason=reason,
                  active_id=int(ob['id']), owners=sorted(owners),
+                 failed_sensor_id=sensor,
+                 stored_sensor_id=int(ob.get('per_sensor_selected_sensor_id', -1)),
                  query_stamp_ns=event['query_stamp_ns'],
                  trigger_raw_candidate_stamp_ns=trigger_raw)
         return True
@@ -1132,7 +1138,12 @@ def attach_candidate_replacement(node):
         with path.open('a') as stream:
             stream.write(json.dumps(row)+'\n')
         rospy.logwarn('[candidate_replacement] %s request=%s', event, data.get('request_id'))
-    runtime = CandidateReplacement(node, lambda: rospy.Time.now().to_sec(),
+    import os
+    runtime_type = CandidateReplacement
+    if os.environ.get('CARE_REPLACEMENT_EXECUTION_V2') == 'true':
+        from replacement_execution_runtime import ReplacementExecution
+        runtime_type = ReplacementExecution
+    runtime = runtime_type(node, lambda: rospy.Time.now().to_sec(),
         lambda text: publisher.publish(String(data=text)), log)
     runtime.subscriber = rospy.Subscriber('/care_planner/local_planner/candidate_replacement_grant',
         String, lambda msg: runtime.receive(msg.data), queue_size=8)

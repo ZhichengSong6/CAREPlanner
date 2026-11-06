@@ -188,6 +188,16 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             return
         if q.shape != (7,) or not np.all(np.isfinite(q)):
             return
+        # Diagnostics use an atomic q/velocity/stamp tuple. Keep the original
+        # generation seed assignment and its numerical behavior unchanged.
+        velocity = None
+        try:
+            value = np.asarray([msg.velocity[index[name]] for name in DEFAULT_JOINT_NAMES], dtype=float)
+            if np.all(np.isfinite(value)):
+                velocity = value.copy()
+        except (IndexError, TypeError, ValueError):
+            pass
+        self._activation_measured_state = (q.copy(), velocity, msg.header.stamp.to_sec())
         self._latest_measured_q = q
         self._trace_measured = (q.copy(), msg.header.stamp.to_sec())
         replacement = getattr(self, '_candidate_replacement', None)
@@ -339,6 +349,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
         if measured is None:
             raise RuntimeError("measured_joint_state_not_ready")
 
+        activation_state = getattr(self, '_activation_measured_state', None)
+        generation_state = dict(q=measured.tolist(), velocity=None, stamp_s=None)
+        if activation_state is not None and np.array_equal(activation_state[0], measured):
+            generation_state.update(velocity=None if activation_state[1] is None else activation_state[1].tolist(),
+                                    stamp_s=float(activation_state[2]))
         self._seed_override = measured
         generation_id = uuid.uuid4().hex
         t_generate_start = time.perf_counter()
@@ -505,6 +520,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                     "compute_ms", math.nan)),
             "q_vis_generation_ms": float(q_vis_generation_ms),
         }
+        if getattr(self, '_activation_refresh', None) is not None:
+            from observation_activation_refresh import accepted_candidate_pool
+            ob['activation_candidate_pool'] = accepted_candidate_pool(
+                self._per_sensor_runtime, result.get('per_sensor_hybrid', {}))
+            ob['generation_measured_state'] = generation_state
         self._next_obligation_id += 1
         self._trace_observation("generated", generation_event_id=generation_id,
             observation_token=observation_token(ob), obligation_id=int(ob["id"]),

@@ -36,6 +36,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <care_confidence_map/initial_shell_recovery.hpp>
 #include "egocentric_arm_planner/repair_executable_view.hpp"
+#include "egocentric_arm_planner/probe_executable_task.hpp"
 #include "egocentric_arm_planner/repair_executable_iterates.hpp"
 #include <trajectory_msgs/JointTrajectory.h>
 
@@ -128,6 +129,10 @@ private:
     int primitive_executable_rows = 0;
     int primitive_executable_samples = 0;
     bool primitive_executable_valid = true;
+    bool normal_curve_checked=false,normal_curve_valid=true,normal_live_checked=false,normal_live_valid=true;
+    double normal_curve_violation=0.,normal_live_violation=0.;
+    Eigen::VectorXd normal_live_q,normal_live_v;
+
     bool primitive_live_rebase_checked = false;
     bool primitive_live_rebase_required = false;
     Eigen::VectorXd primitive_live_rebase_start;
@@ -264,6 +269,14 @@ private:
   void workerLoop();
 
   struct ViewPreviewSnapshot;
+  struct ViewLocalContext;
+  void alignedViewPreview(const std_msgs::StringConstPtr& message);
+  bool view_preview_aligned_enabled_=false;
+  std::mutex view_preview_request_mutex_;
+  std::shared_ptr<const ViewLocalContext> view_local_context_;
+  std::shared_ptr<const ViewLocalContext> view_pending_context_;
+  std::string view_pending_id_;
+  ros::WallTime view_pending_started_;
   void viewPreviewCallback(const std_msgs::StringConstPtr& msg);
   ros::Subscriber view_preview_sub_;
   ros::Publisher view_preview_pub_;
@@ -290,7 +303,7 @@ private:
       bool executable_recheck_only = false,
       const egocentric_arm_planner::RepairPrefixSelection* selected_prefix = nullptr,
       bool free_joint_task = false,
-      const ViewPreviewSnapshot* preview = nullptr) const;
+      const ViewPreviewSnapshot* preview = nullptr, ViewPreviewSnapshot* capture = nullptr) const;
   bool freeJointTaskImproves(const SparseSolveResult& primary,
       const SparseSolveResult& trial, const std::vector<DeadlineWaypoint>& schedule,
       const FrontierObjective& frontier, const Eigen::MatrixXd& q_ref) const;
@@ -360,6 +373,8 @@ private:
   ros::Subscriber smooth_replan_request_sub_;
   ros::Subscriber terminal_goal_sub_,terminal_audit_sub_,terminal_commit_sub_;
   bool terminal_retention_enabled_=false,terminal_goal_valid_=false;
+  bool repair_goal_stopping_enabled_=false;
+  unsigned long long repair_goal_handoff_execution_=0;
   NormalTerminalRetention terminal_retention_;
   std::string plan_terminal_context_;
   Eigen::Isometry3d terminal_goal_=Eigen::Isometry3d::Identity();
@@ -622,6 +637,7 @@ private:
   bool plan_normal_reseed_used_ = false;
   RepairConflictReseed plan_repair_conflict_reseed_;
   RepairExecutableIterates plan_executable_iterates_;
+  Eigen::MatrixXd plan_normal_retained_q_,plan_normal_retained_u_;
   std::atomic<int> repair_hard_qp_snapshots_written_{0};
   // One replayable failed hard QP before and after a live obligation appears.
   mutable std::atomic<bool> normal_qp_snapshot_unowned_written_{false};
@@ -651,14 +667,35 @@ private:
     bool has_primitive_guard = false;
     PrimitiveObservationPoint primitive_guard;
   };
+  unsigned long long native_snapshot_probe_seq_=0,native_snapshot_normal_seq_=0;
+  int native_snapshot_count_=0;
+  bool native_snapshot_observation_seen_=false;
   struct ViewPreviewSnapshot {
+    bool native_task_replay=false,normal_live_fresh=false,primitive_live_fresh=false;
+    Eigen::VectorXd normal_live_q,normal_live_v,primitive_live_q,primitive_live_v;
+    std::string native_matrix_json;
     std::vector<RepairWitness> witnesses;
     std::vector<PrimitiveObservationPoint> path_guards;
     std::vector<Eigen::Vector3d> points;
     Eigen::Isometry3d goal = Eigen::Isometry3d::Identity();
     bool goal_valid = false;
     care_confidence_map::InitialShellRecovery shell;
-    std::unique_ptr<PrimitiveObservationGuard> guard;
+    std::shared_ptr<PrimitiveObservationGuard> guard;
+  };
+  struct ViewLocalContext {
+    care_collision_cdf::CollisionCDFConstraintBatch batch;
+    Eigen::MatrixXd q_bar,u_bar,q_ref,u_ref;
+    Eigen::VectorXd previous,measured;
+    std::vector<Eigen::Vector3d> obligation_points;
+    RepairPrefixSelection prefix;
+    ViewPreviewSnapshot snapshot;
+    double trust=0.,slack=0.,step_scale=1.;
+    int iteration=0;
+    bool repair=false;
+    unsigned long long epoch=0,plan_sequence=0,goal_revision=0;
+    std::string owner,region;
+    ros::Time measured_stamp;
+    ros::WallTime wall;
   };
   std::vector<RepairWitness> repair_unknown_witnesses_;
   bool primitive_observation_guard_enabled_ = false;
@@ -672,6 +709,8 @@ private:
   double initial_shell_execution_margin_m_ = 0.;
   mutable care_confidence_map::InitialShellRecovery initial_shell_recovery_;
   bool repair_executable_view_enabled_ = false;
+  bool probe_task_objective_enabled_ = false;
+  ProbeTaskSettings probe_task_settings_;
   RepairExecutableSettings repair_executable_settings_;
   bool repair_prefix_binding_enabled_ = false;
   ros::Subscriber repair_prefix_selection_sub_;

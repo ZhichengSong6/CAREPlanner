@@ -1,0 +1,30 @@
+{
+  "candidate": "near_prefix_observation_20261106",
+  "environment": {
+    "CARE_VISIBILITY_BACKEND": "r1",
+    "NCDF_DEVICE": "cpu",
+    "GPU_DEVICE": "cuda",
+    "OMP_NUM_THREADS": "2",
+    "MKL_NUM_THREADS": "2",
+    "OPENBLAS_NUM_THREADS": "2",
+    "CARE_QUERY_DIAGNOSTICS": "true",
+    "CARE_OBSERVATION_SELECTOR": "observation",
+    "CARE_POSITION_LIMIT_ENVELOPE": "true",
+    "CARE_ACTIVE_OBSERVATION": "true",
+    "CARE_NATIVE_TASK_SNAPSHOT": "false",
+    "CARE_TASK_FAILURE_CAPTURE": "false",
+    "CARE_PROBE_EXECUTABLE_TASK": "false"
+  },
+  "arguments": {
+    "model": "new",
+    "role": "development",
+    "policy": "prefix_objective",
+    "handoff-retry": "disabled",
+    "repair-goal-stopping": "on",
+    "normal-goal-prefix": "off",
+    "view-selection": "current",
+    "observation-release": "matched",
+    "observation-guidance": "unseen",
+    "run-seconds-wall": 60
+  }
+}

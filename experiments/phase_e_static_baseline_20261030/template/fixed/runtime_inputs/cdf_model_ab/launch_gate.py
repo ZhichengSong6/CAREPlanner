@@ -6,7 +6,7 @@ def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def verify_old_diagnostic(batch,ids,seconds):
     assert not (O.parent/'artifact_sha256.json').exists(),'Study sealed'
     plan=json.loads((O/'plan.json').read_text());matches=[r for r in plan['runs'] if r['batch']==batch]
-    assert len(matches)==1 and ids==['phase_e_goal_'+matches[0]['case']] and seconds==60
+    assert len(matches)==1 and ids==['phase_e_goal_'+matches[0]['case']] and seconds==matches[0]['task_wall_budget_s'] and seconds in (60,120)
     item=matches[0];scene=json.loads((O/'scenes.json').read_text())['configurations'][item['configuration']]
     assert os.environ['WORLD_FILE']==scene['world'] and sha(Path(scene['world']))==scene['world_sha256']
     assert os.environ['CARE_STATIC_SCENE_ID']==item['configuration']

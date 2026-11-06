@@ -21,7 +21,6 @@ then submit fresh work without waiting for the old PROBE task prefix to finish.
 """
 
 import copy
-import json
 import math
 import re
 import threading
@@ -35,9 +34,7 @@ from trajectory_msgs.msg import JointTrajectory
 from geometry_msgs.msg import PoseStamped
 from egocentric_arm_planner.msg import CandidateTransfer
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from candidate_admission import CandidateSender, WallWorker, TaskContextReceiver, payload_sha256
-from task_recovery_events import (TaskEventReceiver, TaskEventSource, CONTROL_TOPIC, PLANNER_TOPIC,
-                                 canonical, validate_regime_control, regime_identity)
+from candidate_admission import CandidateSender, WallWorker
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -106,20 +103,6 @@ class ProbeSingleFlightGate:
         self._verifying_transfer_sequence = 0
         self._repair_active = False
         self._goal_identity = None
-        self.task_context_enabled = bool(rospy.get_param("~enable_observation_context", False))
-        self.task_context = TaskContextReceiver()
-        self.require_bound_regime = bool(rospy.get_param('~require_bound_regime', False))
-        if self.require_bound_regime and not self.task_context_enabled:
-            raise ValueError('Bound regimes require task contexts')
-        self._task_control_receiver = TaskEventReceiver()
-        self._task_control_dispatch = threading.local()
-        self._task_control_event = None
-        self._task_regime_identity = ''
-        self._task_pending_regime = ''
-        self._task_event_source = TaskEventSource()
-        self._buffered_binding = ("", "", "")
-        self._task_pending_prefix = ""
-        self._task_last_handled = None
 
         self.probe_active = False
         self.phase = self.IDLE
@@ -160,23 +143,16 @@ class ProbeSingleFlightGate:
             rospy.Subscriber(self.admission_ping_topic, String, self._admission_ping_cb, queue_size=4)
             rospy.Subscriber("/care_planner/execution/predicted_vbc_recovery_triggered", Bool,
                              self._repair_active_cb, queue_size=1)
-            if not self.task_context_enabled:
-                rospy.Subscriber("/care_planner/ee_target_pose", PoseStamped, self._goal_cb, queue_size=1)
+            rospy.Subscriber("/care_planner/ee_target_pose", PoseStamped, self._goal_cb, queue_size=1)
             rospy.Subscriber("/care_planner/local_planner/candidate_replacement_grant", String,
                              self._replacement_grant_cb, queue_size=8)
 
         self.prefix_binding_enabled = bool(rospy.get_param("~repair_prefix_binding_enabled", False))
-        if self.prefix_binding_enabled or self.task_context_enabled:
+        if self.prefix_binding_enabled:
             if not self.admission_enabled:
                 raise ValueError("Prefix binding requires candidate admission")
             rospy.Subscriber(self.input_topic + "/planned", CandidateTransfer,
                              self._planned_candidate_cb, queue_size=1)
-        if self.task_context_enabled:
-            rospy.Subscriber("/care_planner/active_sensing/observation_context", String,
-                             self._task_context_cb, queue_size=32)
-        if self.require_bound_regime:
-            self.task_status_pub = rospy.Publisher(PLANNER_TOPIC, String, queue_size=16)
-            rospy.Subscriber(CONTROL_TOPIC, String, self._task_control_cb, queue_size=8)
         rospy.Subscriber(
             self.input_topic, JointTrajectory, self._candidate_cb, queue_size=1)
         rospy.Subscriber(
@@ -211,11 +187,8 @@ class ProbeSingleFlightGate:
         self._verifying_raw_stamp_ns = 0
         self._verifying_transfer_sequence = 0
         self.last_reason = reason
-        self._task_last_handled = None
 
     def _probe_active_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False) and not getattr(self._task_control_dispatch, 'active', False):
-            return
         if msg is None:
             return
         value = bool(msg.data)
@@ -224,7 +197,6 @@ class ProbeSingleFlightGate:
             if self.probe_active == value:
                 return
             self.probe_active = value
-            if self.task_context_enabled:self.task_context.pending_candidate=None
             if self.sender is not None:
                 actions = self.sender.invalidate(time.monotonic())
             if not value:
@@ -237,34 +209,12 @@ class ProbeSingleFlightGate:
         self._emit_admission_actions(actions)
 
     def _repair_active_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False) and not getattr(self._task_control_dispatch, 'active', False):
-            return
         with self._lock:
             if self._repair_active == bool(msg.data):
                 return
             self._repair_active = bool(msg.data)
-            if self.task_context_enabled:self.task_context.pending_candidate=None
             actions = self.sender.invalidate(time.monotonic())
         self._emit_admission_actions(actions)
-
-    def _task_context_cb(self, msg):
-        try:
-            with self._lock:
-                before = self.task_context.snapshot(rospy.Time.now().to_nsec())
-                after = self.task_context.update(json.loads(msg.data), rospy.Time.now().to_nsec())
-                changed = (before or {}).get('candidate_binding') != (after or {}).get('candidate_binding')
-                actions = []
-                if changed or after is None:
-                    self._reset_locked('task_context_changed')
-                    actions = self.sender.invalidate(time.monotonic())
-            self._emit_admission_actions(actions)
-            if changed and after is not None:
-                with self._lock:
-                    pending=self.task_context.candidate_envelope(rospy.Time.now().to_nsec())
-                if pending is not None:
-                    self._consume_task_candidate(pending)
-        except (ValueError, KeyError, TypeError) as exc:
-            rospy.logwarn('[TaskContext gate] %s', exc)
 
     def _goal_cb(self, msg):
         p, q = msg.pose.position, msg.pose.orientation
@@ -334,61 +284,26 @@ class ProbeSingleFlightGate:
 
     def _admission_tick(self):
         with self._lock:
-            if ((self.task_context_enabled and self.task_context.snapshot(rospy.Time.now().to_nsec()) is None) or
-                    (self.require_bound_regime and not self._task_regime_current_locked())):
-                self._reset_locked("task_context_expired")
-                actions = self.sender.invalidate(time.monotonic())
-            else:
-                actions = self.sender.tick(time.monotonic())
+            actions = self.sender.tick(time.monotonic())
             self._publish_summary_locked()
-            pending = self.task_context.candidate_envelope(rospy.Time.now().to_nsec()) if self.task_context_enabled else None
         self._emit_admission_actions(actions)
-        if pending is not None:
-            self._consume_task_candidate(pending)
 
     def _planned_candidate_cb(self, msg):
-        if msg.action != "planned":
-            return
-        if self.task_context_enabled:
-            try:
-                with self._lock:
-                    self.task_context.offer_candidate(msg.trajectory,msg.task_context,rospy.Time.now().to_nsec(),
-                        dict(prefix_context=msg.planned_prefix_context,task_regime=getattr(msg,'task_regime','')))
-                    self._task_pending_prefix=msg.planned_prefix_context
-                    self._task_pending_regime=getattr(msg, 'task_regime', '')
-                    pending=self.task_context.candidate_envelope(rospy.Time.now().to_nsec())
-                if pending is None:
-                    return
-            except (ValueError,KeyError,TypeError):
-                return
-            self._consume_task_candidate(pending)
-        else:
-            self._candidate_cb(msg.trajectory, msg.planned_prefix_context, getattr(msg,"task_context",""),
-                               getattr(msg, 'task_regime', ''))
+        if msg.action == "planned":
+            self._candidate_cb(msg.trajectory, msg.planned_prefix_context)
 
-    def _consume_task_candidate(self, envelope):
-        metadata = envelope.get('metadata', {})
-        self._candidate_cb(envelope['trajectory'], metadata.get('prefix_context', ''),
-                           envelope['binding'], metadata.get('task_regime', ''))
-
-    def _forward_candidate(self, msg, prefix_context="", task_context="", task_regime=""):
+    def _forward_candidate(self, msg, prefix_context=""):
         with self._lock:
-            if (self.require_bound_regime and (not self._task_regime_current_locked() or
-                                               task_regime != self._task_regime_identity)):
-                return
-            if self.task_context_enabled and not self.task_context.accepts(
-                    task_context, rospy.Time.now().to_nsec(), msg.header.frame_id):
-                return
             if self.probe_active:
                 self._verifying_raw_stamp_ns = msg.header.stamp.to_nsec()
-            actions = self.sender.forward(msg, time.monotonic(), prefix_context, task_context, task_regime) if self.sender else []
+            actions = self.sender.forward(msg, time.monotonic(), prefix_context) if self.sender else []
         if self.sender is not None:
             self._emit_admission_actions(actions)
         else:
             self.output_pub.publish(msg)
 
-    def _candidate_cb(self, msg, prefix_context=None, task_context="", task_regime=""):
-        if (getattr(self, 'prefix_binding_enabled', False) or self.task_context_enabled) and prefix_context is None:
+    def _candidate_cb(self, msg, prefix_context=None):
+        if getattr(self, 'prefix_binding_enabled', False) and prefix_context is None:
             return  # Raw diagnostic topic cannot bypass the bound transport.
         prefix_context = prefix_context or ""
         if msg is None or not msg.points:
@@ -396,15 +311,6 @@ class ProbeSingleFlightGate:
 
         publish = False
         with self._lock:
-            if (getattr(self, 'require_bound_regime', False) and
-                    (not self._task_regime_current_locked() or task_regime != self._task_regime_identity)):
-                return
-            if self.task_context_enabled and not self.task_context.accepts(
-                    task_context, rospy.Time.now().to_nsec(), msg.header.frame_id):
-                return
-            digest = payload_sha256(msg,prefix_context,task_context,task_regime) if self.task_context_enabled else None
-            if self.task_context_enabled and digest==self._task_last_handled:
-                return
             self.input_count += 1
             if not self.probe_active:
                 self.forward_count += 1
@@ -430,54 +336,15 @@ class ProbeSingleFlightGate:
                 else:
                     self.buffer_replace_count += 1
                 self.buffered_candidate = copy.deepcopy(msg)
-                self._buffered_binding = (prefix_context, task_context, task_regime)
-                self._task_last_handled=digest
                 self.last_reason = "probe_candidate_buffered_lookahead"
             else:
                 self.drop_busy_count += 1
                 self.last_reason = "probe_candidate_dropped_{}".format(
                     self.phase.lower())
-            if publish:self._task_last_handled=digest
             self._publish_summary_locked()
 
         if publish:
-            self._forward_candidate(msg, prefix_context, task_context, task_regime)
-
-    def _task_regime_current_locked(self):
-        event = self._task_control_event
-        now = rospy.Time.now().to_nsec()
-        return bool(event and event['stamp_ns'] <= now <= event['valid_until_ns'] and
-                    event['payload']['ready'] and self.task_context.accepts(event['task_context'], now))
-
-    def _task_control_cb(self, msg):
-        try:
-            with self._lock:
-                now = rospy.Time.now().to_nsec()
-                event = self._task_control_receiver.parse(msg.data,
-                    self.task_context.snapshot(now), now, 'regime_control')
-                payload = validate_regime_control(event['payload'])
-                identity = regime_identity(event)
-                changed = identity != self._task_regime_identity
-                self._task_control_receiver.remember(event)
-                self._task_control_event = event
-                self._task_regime_identity = identity
-                self._task_control_dispatch.active = True
-                try:
-                    self._repair_active_cb(Bool(data=payload['ready'] and payload['mode'] == 'REPAIR'))
-                    self._probe_active_cb(Bool(data=payload['ready'] and payload['mode'] == 'PROBE_NORMAL'))
-                finally:
-                    self._task_control_dispatch.active = False
-                if changed:
-                    actions = self.sender.invalidate(time.monotonic())
-                    self._reset_locked('bound_regime_changed')
-                    self.probe_completed_prefix_streak = 0
-                    self._task_last_handled = None
-                else:
-                    actions = []
-            self._emit_admission_actions(actions)
-            self._admission_tick()
-        except (ValueError, TypeError, KeyError, OverflowError):
-            return
+            self._forward_candidate(msg, prefix_context)
 
     def _verification_outcome_cb(self, msg):
         if msg is None:
@@ -606,8 +473,6 @@ class ProbeSingleFlightGate:
                 pass
             else:
                 self.prefix_release_count += 1
-                if self.require_bound_regime:
-                    self.probe_completed_prefix_streak += 1
                 self.execution_stamp_ns = 0
                 self.effective_prefix_s = float("nan")
 
@@ -617,7 +482,6 @@ class ProbeSingleFlightGate:
                     # prefix+brake+hold executable, then run final GCDF + exact
                     # VBC before any commit. No safety authority is bypassed.
                     candidate_to_publish = self.buffered_candidate
-                    candidate_binding = self._buffered_binding
                     self.buffered_candidate = None
                     self.phase = self.VERIFYING
                     self.lookahead_requested = False
@@ -643,11 +507,9 @@ class ProbeSingleFlightGate:
         if request_lookahead:
             self.replan_request_pub.publish(Bool(data=True))
         if candidate_to_publish is not None:
-            self._forward_candidate(candidate_to_publish, *candidate_binding)
+            self._forward_candidate(candidate_to_publish)
 
     def _regime_summary_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -694,14 +556,9 @@ class ProbeSingleFlightGate:
             a = self.sender.active or {}
             msg.data += " admission_enabled=1 admission_stage={} transfer_sequence={} receipt_count={} resend_count={} admission_timeout_count={} transport_replan_count={} transport_fault={} transfer_connections={}".format(
                 self.sender.last_stage, a.get("sequence", 0), self.sender.receipt_count,
-                self.sender.resend_count, self.sender.timeout_count, int(self.sender.replan_used),
+                self.sender.resend_count, self.sender.timeout_count, self.sender.replan_count,
                 int(self.sender.fault), self.transfer_pub.get_num_connections())
             self._summary_pending = msg
-            if getattr(self, 'require_bound_regime', False) and self._task_regime_current_locked():
-                context = self.task_context.snapshot(rospy.Time.now().to_nsec())
-                self._summary_pending_task_event = self._task_event_source.event('planner_status', context,
-                    dict(name='single_flight', text=msg.data, task_regime=self._task_regime_identity),
-                    rospy.Time.now().to_nsec())
         else:
             self.summary_pub.publish(msg)
 
@@ -709,13 +566,6 @@ class ProbeSingleFlightGate:
         with self._lock:
             msg = self._summary_pending
             self._summary_pending = None
-            event = getattr(self, '_summary_pending_task_event', None)
-            self._summary_pending_task_event = None
-            if (event is not None and self._task_regime_current_locked() and
-                    event['payload']['task_regime'] == self._task_regime_identity and
-                    self.task_context.accepts(event['task_context'], rospy.Time.now().to_nsec()) and
-                    rospy.Time.now().to_nsec() <= event['valid_until_ns']):
-                self.task_status_pub.publish(String(data=canonical(event)))
         if msg is not None:
             self.summary_pub.publish(msg)
 

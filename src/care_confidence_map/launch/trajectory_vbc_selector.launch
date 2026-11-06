@@ -50,6 +50,7 @@
   <arg name="continuous_motion_bound_enabled" default="true" />
   <arg name="include_measured_body" default="false" />
   <arg name="initial_shell_recovery_enabled" default="false" />
+  <arg name="fixed_start_rebase_reaudit_enabled" default="false" />
   <arg name="initial_shell_execution_margin_m" default="0.0" />
   <arg name="initial_shell_occupied_margin_m" default="0.0" />
 
@@ -129,6 +130,7 @@
     <param name="trajectory_vbc/continuous_motion_bound_enabled" value="$(arg continuous_motion_bound_enabled)" />
     <param name="trajectory_vbc/include_measured_body" value="$(arg include_measured_body)" />
     <param name="trajectory_vbc/initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="trajectory_vbc/fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
     <param name="trajectory_vbc/initial_shell_execution_margin_m" value="$(arg initial_shell_execution_margin_m)" />
     <param name="trajectory_vbc/initial_shell_occupied_margin_m" value="$(arg initial_shell_occupied_margin_m)" />
     <param name="trajectory_vbc/temporal_layer_mpc_steps" value="$(arg temporal_layer_mpc_steps)" />

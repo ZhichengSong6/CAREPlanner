@@ -179,7 +179,7 @@ class OnlineAccumulatedMultiDeadlineWaypointNode(_OnlineRuntimeMixin, Accumulate
 
     def _maybe_generate(self):
         if self._c46_ready:
-            AccumulatedMultiDeadlineWaypointNode._maybe_generate(self)
+            self._process_new_active_set(); self._publish_schedule()
 
     def _publish_state(self):
         if self._c46_ready:
@@ -258,6 +258,10 @@ def _configure_runtime_mode(mode: str) -> None:
         "fixed_visibility_diagnostic",
     )
     manager_prefix = "/c4_4_verified_regime_manager"
+    # Research receding-horizon policy: resume certified task prefixes after
+    # a safe sensing move; unresolved regions stay UNKNOWN and final VBC still
+    # checks every executable prefix. No acquisition-complete event is forged.
+    opportunistic = _env_bool("CARE_RESEARCH_OPPORTUNISTIC_PROBE", False)
     rospy.set_param(manager_prefix + "/repair_completion_gate_enabled", bool(acquisition))
     rospy.set_param(manager_prefix + "/repair_completion_topic",
                     "/care_planner/active_sensing/visibility_acquisition_complete")

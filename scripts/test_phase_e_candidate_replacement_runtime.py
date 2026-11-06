@@ -900,6 +900,9 @@ class RuntimeReplacementTests(unittest.TestCase):
         n.per_sensor_replacement_min_conservative_g=-.02
         next(ob for ob in n._obligations if int(ob['id'])==1)[
             'per_sensor_selected_sensor_id']=1
+        # The failed target must actually be published before its trigger.
+        n._publish_schedule()
+        e['observation_token']=n._trace_published_target['observation_token']
         r.offer(e);self.grant(r)
         seen={}
         def generate(*args):
@@ -910,6 +913,28 @@ class RuntimeReplacementTests(unittest.TestCase):
         self.assertEqual(seen['excluded'],[1])
         self.assertEqual(seen['tried_mount_groups'],[0])
         self.assertEqual(seen['minimum_conservative_g'],-.02)
+
+    def test_shared_target_replacement_excludes_published_head(self):
+        n,r,e,s,events,clock,h=self.fixture()
+        owner=next(ob for ob in n._obligations if int(ob['id'])==1)
+        owner['per_sensor_selected_sensor_id']=6
+        owner['q_vis_joint_mask']=np.ones(7)
+        shared=dict(owner,per_sensor_selected_sensor_id=1,q_vis=np.full(7,.2),
+                    q_vis_joint_mask=np.array([1.,1.,0.,0.,0.,0.,0.]))
+        n._traced_waypoint(shared,shared['q_vis'])
+        e['observation_token']=n._trace_published_target['observation_token']
+        r.offer(e);self.grant(r)
+        observed={}
+        def generate(*args):
+            observed.update(n._candidate_replacement_override)
+            return dict(per_sensor_hybrid=dict(accepted=False,attempts=[dict(sensor_id=5)]))
+        n._generate_active_set_waypoint=generate
+        h.bounded(r.process)
+        self.assertEqual(observed['excluded'],[1])
+        self.assertEqual(observed['tried_mount_groups'],[0])
+        np.testing.assert_equal(observed['previous_q'],shared['q_vis'])
+        self.assertEqual(next(iter(r.families.values())),{1,5})
+        self.assertEqual(owner['per_sensor_selected_sensor_id'],6)
 
     def test_high_witness_replacement_exports_s7_s6_priority(self):
         n,r,e,s,events,*_=self.fixture()

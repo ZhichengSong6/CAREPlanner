@@ -1,0 +1,37 @@
+{
+  "candidate": "r1_near_prefix_observation_20261106",
+  "candidate_source_manifest_sha256": "cb260ca121dd8e3f291dc99a72f2477d1c1f222afbbfae5f7a3d7d1c62f30956",
+  "candidate_artifact_index_sha256": "60659e9bd15e8a84367d76a348250eea40db66836f0a473c733a9a7149c1cc52",
+  "selected_source_files": 1073,
+  "published_source_files": 1065,
+  "excluded": [
+    "scripts/fixtures/gcdf_case011.txt",
+    "scripts/fixtures/phase_e_case007_candidate.json",
+    "scripts/fixtures/phase_e_case012_sweep_refinement.json",
+    "scripts/fixtures/vbc_continuous_counterexamples.txt",
+    "scripts/fixtures/vbc_primitive_sweep_reference.hpp",
+    "src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt",
+    "src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt",
+    "src/egocentric_arm_planner/config/phase_c2_vbc_cases.json",
+    "src/egocentric_arm_planner/config/phase_e_obstacle_core12_v1.json"
+  ],
+  "source_identity": "Runtime algorithm sources match the frozen candidate. Listed publication adaptations change launch/output paths only.",
+  "validation": {
+    "development_windows": 10,
+    "wall_seconds": 60,
+    "strict_success": 9,
+    "qualified_success": 9,
+    "execution_audits": 6643,
+    "unknown_violations": 0,
+    "contacts": 0,
+    "raw_joint_limit_windows": 0,
+    "sampled_body_states": 14940,
+    "full_30_plus_18_rerun": false
+  },
+  "publication_adaptations": [
+    {
+      "path": "scripts/run_phase_e_case001_r1_mainline.sh",
+      "change": "Honor explicit GPU_SOCKET/TMPDIR so the demo does not create project sockets in /tmp."
+    }
+  ]
+}

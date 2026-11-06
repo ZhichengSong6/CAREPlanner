@@ -10,14 +10,17 @@ export CASE_ID="${CASE_ID:-case_001}" RUN_SECONDS="${RUN_SECONDS:-60}"
 # Use separate ROS/Gazebo masters; override the URIs if those ports are busy.
 export ROS_MASTER_URI="${ROS_MASTER_URI:-http://127.0.0.1:11497}"
 export GAZEBO_MASTER_URI="${GAZEBO_MASTER_URI:-http://127.0.0.1:11498}"
-export CONFIDENCE_MAP_CONFIG_FILE="${REPO}/src/care_confidence_map/config/confidence_map_case001_motion_prior.yaml"
+export CONFIDENCE_MAP_CONFIG_FILE="${REPO}/src/care_confidence_map/config/confidence_map_static_box_ray.yaml"
 export CANDIDATE_REPLACEMENT_ENABLED=true
 export CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_c2_vbc_cases.json}"
-export CHECKPOINT="${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt"
-export GPU_ENV=viscdf GPU_DEVICE=cuda NCDF_ENV=ncdf_l4c NCDF_DEVICE=cpu
-export GPU_SOCKET="/tmp/care_collision_cdf_gpu_${RUN_ID}.sock"
+export CHECKPOINT="${CHECKPOINT:?explicit model checkpoint required}"
+export CDF_ACTIVATION="${CDF_ACTIVATION:?explicit activation required}"
+export CDF_EXPECTED_SHA256="${CDF_EXPECTED_SHA256:?explicit checkpoint SHA256 required}"
+export CDF_CHECKPOINT_KEY="${CDF_CHECKPOINT_KEY:-latest}"
+export GPU_ENV="${GPU_ENV:-viscdf}" GPU_DEVICE=cuda NCDF_ENV="${NCDF_ENV:-ncdf_l4c}" NCDF_DEVICE=cpu
+export GPU_SOCKET="${GPU_SOCKET:-${TMPDIR:-/tmp}/care_collision_cdf_gpu_${RUN_ID}.sock}"
 export GAZEBO_GUI=false USE_RVIZ=false EARLY_STOP_ON_GOAL="${EARLY_STOP_ON_GOAL:-false}"
-export FORCE_ZERO_INITIAL_Q=false TOF_FUSION_ENABLED=false REQUIRE_REAL_TOF_READINESS=false
+export FORCE_ZERO_INITIAL_Q=false TOF_FUSION_ENABLED=true REQUIRE_REAL_TOF_READINESS=true
 export APPLY_INITIAL_JOINT_OVERRIDES=false
 export GEOMETRY_BACKEND=primitive GCDF_GEOMETRY_BACKEND=primitive
 export VBC_GEOMETRY_BACKEND=primitive BODY_PRIOR_GEOMETRY_BACKEND=primitive

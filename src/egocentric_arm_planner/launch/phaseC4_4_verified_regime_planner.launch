@@ -1,10 +1,4 @@
 <launch>
-  <arg name="enable_task_recovery" default="false" />
-  <arg name="enable_observation_context" default="$(arg enable_task_recovery)" />
-  <arg name="require_bound_recovery_policy" default="false" />
-  <!-- In this mode goals enter through explicit /care_planner/task_request. -->
-  <node if="$(arg enable_observation_context)" pkg="egocentric_arm_planner"
-        type="observation_task_owner_node.py" name="observation_task_owner" output="screen" />
   <!-- Optional bounded forensic sink; never changes certification thresholds. -->
   <arg name="rejection_snapshot_dir" default="" />
   <!-- Unified default for all geometry consumers; per-path A/B overrides remain supported. -->
@@ -119,14 +113,14 @@
   <!-- C5.9 commit-pipeline serialization. Legacy C4.x remains transparent.
        When enabled, raw planner candidates first pass a PROBE-only single-flight
        gate before entering the final GCDF -> exact VBC -> commit pipeline. -->
-  <arg name="probe_single_flight_enabled" default="$(arg enable_observation_context)" />
+  <arg name="probe_single_flight_enabled" default="false" />
   <arg name="commit_pipeline_candidate_topic"
        default="$(arg raw_mpc_trajectory_topic)" />
   <arg name="probe_single_flight_summary_topic"
        default="/care_planner/execution/probe_single_flight_summary" />
 
   <!-- C5.4 planner/controller split. Legacy C4.x keeps this false. -->
-  <arg name="use_local_sparse_scp" default="$(arg enable_observation_context)" />
+  <arg name="use_local_sparse_scp" default="false" />
   <arg name="local_scp_query_trajectory_topic"
        default="/care_planner/local_planner/scp_query_trajectory" />
   <arg name="local_scp_candidate_trajectory_topic"
@@ -164,6 +158,9 @@
   <arg name="vbc_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
   <!-- Initial unknown support may use a point-scoped recovery certificate.
        Ordinary candidates and the execution auditor retain their margins. -->
+  <arg name="fixed_start_recovery_enabled" default="false" />
+  <arg name="fixed_start_rebase_reaudit_enabled" default="false" />
+  <arg name="summary_state_clock_coherent" default="false" />
   <arg name="initial_shell_recovery_enabled"
        default="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('final_executable_gcdf_enabled')) and bool(arg('repair_prefix_verification_enabled')) and float(arg('vbc_swept_volume_margin_m')) > float(arg('execution_vbc_swept_volume_margin_m')))" />
 
@@ -229,8 +226,6 @@
 
   <!-- Original task intention. -->
   <include file="$(find egocentric_arm_planner)/launch/phase1_planner.launch">
-    <arg name="enable_observation_context" value="$(arg enable_observation_context)" />
-    <arg name="require_bound_regime" value="$(arg enable_task_recovery)" />
     <arg name="config_file" value="$(arg config_file)" />
     <arg name="base_frame" value="$(arg base_frame)" />
     <arg name="ee_frame" value="$(arg ee_frame)" />
@@ -258,6 +253,8 @@
     <param name="publish_rate" value="20.0" />
     <param name="safety_margin_s" value="$(arg vbc_min_margin_s)" />
     <param name="decision_stability_count" value="2" />
+    <param name="verified_commit_startup"
+           value="$(eval optenv('CARE_OCCLUSION_REROUTE_ENABLED', 'false') == 'true' and bool(arg('use_local_sparse_scp')) and bool(arg('final_executable_gcdf_enabled')) and bool(arg('probe_single_flight_enabled')))" />
     <param name="trial_label" value="$(arg trial_label)" />
     <param name="output_root" value="$(arg log_output_root)" />
     <param name="progress/enabled" value="$(arg nominal_progress_enabled)" />
@@ -275,8 +272,6 @@
   <node if="$(arg probe_single_flight_enabled)"
         pkg="egocentric_arm_planner" type="probe_single_flight_gate_node.py"
         name="probe_single_flight_gate" output="screen">
-    <param name="enable_observation_context" value="$(arg enable_observation_context)" />
-    <param name="require_bound_regime" value="$(arg enable_task_recovery)" />
     <param name="candidate_admission_enabled" value="true" />
     <param name="repair_prefix_binding_enabled" value="$(arg repair_prefix_binding_enabled)" />
     <param name="input_topic" value="$(arg raw_mpc_trajectory_topic)" />
@@ -294,8 +289,6 @@
   <!-- Serial executable safety gate and safe-plan commit memory. -->
   <node pkg="egocentric_arm_planner" type="optimized_trajectory_continuity_node.py"
         name="optimized_trajectory_continuity" output="screen">
-    <param name="enable_observation_context" value="$(arg enable_observation_context)" />
-    <param name="require_bound_regime" value="$(arg enable_task_recovery)" />
     <param name="candidate_admission_enabled" value="$(arg probe_single_flight_enabled)" />
     <param name="repair_prefix_binding_enabled" value="$(arg repair_prefix_binding_enabled)" />
     <param name="tcp_nodelay" value="$(arg verification_tcp_nodelay)" />
@@ -335,6 +328,9 @@
     <param name="final_gcdf_enabled"
            value="$(arg final_executable_gcdf_enabled)" />
     <param name="initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+    <param name="summary_state_clock_coherent" value="$(arg summary_state_clock_coherent)" />
+    <param name="fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
+    <param name="initial_shell_planning_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
     <param name="initial_shell_execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
     <param name="final_occupied_resolution_m" value="0.05" />
     <param name="final_occupied_hard_margin_m" value="$(arg execution_gcdf_hard_margin)" />
@@ -379,7 +375,6 @@
        verification outcomes, while execution safety consumes committed audit. -->
   <node pkg="egocentric_arm_planner" type="c4_4_verified_regime_manager_node.py"
         name="c4_4_verified_regime_manager" output="screen">
-    <param name="enable_observation_context" value="$(arg enable_task_recovery)" />
     <param name="rate" value="20.0" />
     <param name="candidate_unsafe_required" value="$(arg candidate_unsafe_required)" />
     <param name="execution_unsafe_required" value="$(arg execution_unsafe_required)" />
@@ -474,9 +469,6 @@
         type="local_sparse_scp_planner_node"
         name="local_sparse_scp_planner_node"
         output="screen">
-    <param name="enable_observation_context" value="$(arg enable_observation_context)" />
-    <param name="require_bound_regime" value="$(arg enable_task_recovery)" />
-    <param name="local_planner/require_bound_recovery_policy" value="$(arg require_bound_recovery_policy)" />
     <rosparam command="load" file="$(arg config_file)" />
     <param name="local_planner/probe_velocity_cap" value="$(arg probe_velocity_cap)" />
     <param name="local_planner/candidate_replacement_enabled"
@@ -490,6 +482,7 @@
     <param name="local_planner/primitive_observation_guard/base_frame" value="$(arg base_frame)" />
     <rosparam param="local_planner/primitive_observation_guard/ignored_links">[base_link, link1]</rosparam>
     <param name="local_planner/primitive_observation_guard/margin_m" value="$(arg vbc_swept_volume_margin_m)" />
+    <param name="local_planner/fixed_start_recovery_enabled" value="$(arg fixed_start_recovery_enabled)" />
     <param name="local_planner/initial_shell_recovery/enabled" value="$(arg initial_shell_recovery_enabled)" />
     <param name="local_planner/initial_shell_recovery/execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
     <param name="local_planner/repair_executable_view/enabled" type="bool"
@@ -889,6 +882,7 @@
       <arg name="min_visibility_before_sweep_margin_s" value="$(arg vbc_min_margin_s)" />
       <arg name="swept_volume_margin_m" value="$(arg vbc_swept_volume_margin_m)" />
       <arg name="initial_shell_recovery_enabled" value="$(arg initial_shell_recovery_enabled)" />
+      <arg name="fixed_start_rebase_reaudit_enabled" value="$(arg fixed_start_rebase_reaudit_enabled)" />
       <arg name="initial_shell_execution_margin_m" value="$(arg execution_vbc_swept_volume_margin_m)" />
       <arg name="initial_shell_occupied_margin_m" value="$(arg execution_gcdf_hard_margin)" />
       <arg name="continuous_motion_bound_enabled" value="$(arg vbc_continuous_motion_bound_enabled)" />
@@ -958,7 +952,7 @@
     <arg name="audit_warn_ms" value="5.0" />
   </include>
 
-  <node unless="$(arg enable_observation_context)" pkg="egocentric_arm_planner" type="phase_c4_3_continuous_trial_node.py"
+  <node pkg="egocentric_arm_planner" type="phase_c4_3_continuous_trial_node.py"
         name="phase_b2_controlled_trial" output="screen">
     <param name="base_frame" value="$(arg base_frame)" />
     <param name="goal_topic" value="/care_planner/ee_target_pose" />

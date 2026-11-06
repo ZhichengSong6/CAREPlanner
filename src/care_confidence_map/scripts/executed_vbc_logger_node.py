@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import math
 import re
 import sys
@@ -74,6 +75,7 @@ class ExecutedVBCLogger:
         self.target_change_tolerance = float(rospy.get_param("~target_change_tolerance", 1e-4))
         self.ignored_links = set(str(v) for v in rospy.get_param(
             "~ignored_links", ["base_link", "link1"]))
+        if os.environ.get('CARE_VBC_WHOLE_VOXEL')=='true':self.ignored_links=set()
         self.trial_label = str(rospy.get_param("~trial_label", "trial"))
         self.lambda_vis = float(rospy.get_param("~lambda_vis", 0.0))
         self.output_root = Path(rospy.get_param(
@@ -218,6 +220,8 @@ class ExecutedVBCLogger:
                     return None
                 for primitive in primitives:
                     clearance = primitive.distance(point)
+                    if os.environ.get('CARE_VBC_WHOLE_VOXEL')=='true':
+                        clearance-=math.sqrt(3.)*.025
                     if not math.isfinite(clearance):
                         return None
                     if clearance < best:

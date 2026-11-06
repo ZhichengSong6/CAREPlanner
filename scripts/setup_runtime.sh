@@ -3,6 +3,11 @@
 set -euo pipefail
 care_setup_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 care_setup_env="${CARE_RUNTIME_ENV:-careplanner}"
+care_visibility_env="${CARE_VISIBILITY_ENV:-careplanner_visibility}"
+if [[ "${care_setup_env}" == "${care_visibility_env}" ]]; then
+  echo 'Use separate GPU and CPU visibility environment names.' >&2
+  exit 2
+fi
 if [[ ! -f /opt/ros/noetic/setup.bash ]]; then
   echo 'Install ROS Noetic on Ubuntu 20.04 first; see README.md.' >&2
   exit 2
@@ -31,8 +36,24 @@ conda run -n "${care_setup_env}" python -m pip install \
   'torch==2.11.0' --index-url https://download.pytorch.org/whl/cu128
 conda run -n "${care_setup_env}" python -m pip install \
   'numpy==2.2.6' 'PyYAML==6.0.3' 'rospkg==1.6.1' 'catkin_pkg==1.1.0' 'urdf-parser-py==0.0.4'
+# Pin the NumPy BLAS implementation, not just its Python version. The validated
+# R1 CPU path uses MKL; a generic pip NumPy wheel is a different runtime.
+if ! conda run -n "${care_visibility_env}" python --version >/dev/null 2>&1; then
+  conda create -y -n "${care_visibility_env}" --override-channels -c defaults \
+    'python=3.10.20' pip 'numpy=2.2.5=py310h08c6c3d_3' \
+    'numpy-base=2.2.5=py310h00548fb_3' 'blas=1.0=mkl' 'mkl=2025.0.0'
+else
+  conda install -y -n "${care_visibility_env}" --override-channels -c defaults \
+    'python=3.10.20' 'numpy=2.2.5=py310h08c6c3d_3' \
+    'numpy-base=2.2.5=py310h00548fb_3' 'blas=1.0=mkl' 'mkl=2025.0.0'
+fi
+conda run -n "${care_visibility_env}" python -m pip install \
+  'torch==2.11.0+cpu' --index-url https://download.pytorch.org/whl/cpu
+conda run -n "${care_visibility_env}" python -m pip install \
+  'PyYAML==6.0.3' 'rospkg==1.6.1' 'catkin_pkg==1.1.0' 'urdf-parser-py==0.0.4'
 git -C "${care_setup_root}" submodule update --init --recursive
 git -C "${care_setup_root}" lfs install --local
 git -C "${care_setup_root}" lfs pull --include='src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt,src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt' --exclude=''
 printf '%s\n' "Runtime environment ready: ${care_setup_env}" \
-  "Next: bash scripts/run_demo.sh --env ${care_setup_env}"
+  "Visibility environment ready: ${care_visibility_env}" \
+  "Next: bash scripts/run_demo.sh --env ${care_setup_env} --visibility-env ${care_visibility_env}"

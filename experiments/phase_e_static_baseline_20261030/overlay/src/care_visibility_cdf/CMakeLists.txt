@@ -48,7 +48,11 @@ install(FILES
   scripts/observation_identity.py
   scripts/observation_task_rejoin.py
   scripts/observation_corridor_cost.py
+  scripts/rolling_task_observation.py
   scripts/rolling_visibility_guidance.py
+  scripts/observation_activation_refresh.py
+  scripts/observation_task_corridor.py
+  scripts/native_view_selection.py
   scripts/per_sensor_visibility_runtime.py
   scripts/r1_visibility_model.py
   scripts/candidate_replacement_runtime.py

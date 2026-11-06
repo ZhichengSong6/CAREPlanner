@@ -174,7 +174,7 @@ local_planner:
     # It may be read as rad-equivalent only if the CDF checkpoint documents
     # that scale; it is never inferred from a VBC meter value.
     visibility_obligation_cdf_margin: 0.05
-    # Each distinct VBC rejection advances only the rejected point by 0.15:
+    # Each distinct VBC rejection advances only the rejected point by0.15:
     # 0.05 -> 0.20 -> 0.30, then remains capped. Other observation
     # points retain their own 0.05 base.
     # Both active and queued points use this native CDF ladder, not meters.

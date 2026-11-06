@@ -24,18 +24,14 @@
   <depend>arm_model</depend>
   <depend>arm_trajectory</depend>
   <depend>care_collision_cdf</depend>
-  <depend>care_velocity_controller</depend>
   <build_depend>care_confidence_map</build_depend>
   <build_export_depend>care_confidence_map</build_export_depend>
 
   <depend>eigen</depend>
-  <depend>libssl-dev</depend>
 
   <!-- Runtime-only tools used by the Phase-A/B diagnostic launches. -->
   <exec_depend>rospy</exec_depend>
   <exec_depend>rosnode</exec_depend>
   <exec_depend>rosbag</exec_depend>
   <exec_depend>care_confidence_map</exec_depend>
-  <exec_depend>care_visibility_cdf</exec_depend>
-  <exec_depend>python3-rospkg</exec_depend>
 </package>

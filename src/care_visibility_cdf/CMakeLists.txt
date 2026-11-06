@@ -30,6 +30,8 @@ install(DIRECTORY launch
 # No checkpoints, datasets, generated libraries or output logs are bundled here.
 install(FILES
   scripts/bounded_tcpros.py
+  scripts/pending_vbc_blockers.py
+  scripts/pending_observation_relevance.py
   scripts/bounded_visibility_recovery.py
   scripts/check_visibility_self_occlusion.py
   scripts/evaluate_direct_vs_projection_ascent.py
@@ -44,17 +46,13 @@ install(FILES
   scripts/ncdf_stage3_trajectory_qp_node.py
   scripts/ncdf_stage3_trajectory_qp_runtime.py
   scripts/observation_identity.py
-  scripts/stopping_observation_demands.py
-  scripts/stopping_trajectory_prefix.py
-  scripts/stopping_observation_context.py
-  scripts/task_observation_binding.py
-  scripts/task_recovery_events.py
-  scripts/recovery_policy.py
-  scripts/pending_vbc_blockers.py
   scripts/observation_task_rejoin.py
-  scripts/observation_research_trace.py
   scripts/observation_corridor_cost.py
+  scripts/rolling_task_observation.py
   scripts/rolling_visibility_guidance.py
+  scripts/observation_activation_refresh.py
+  scripts/observation_task_corridor.py
+  scripts/native_view_selection.py
   scripts/per_sensor_visibility_runtime.py
   scripts/r1_visibility_model.py
   scripts/candidate_replacement_runtime.py
@@ -80,3 +78,5 @@ install(FILES
   scripts/ncdf_stage3_trajectory_qp_core.py
   scripts/ncdf_stage3_trajectory_qp_runtime.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(FILES scripts/pending_vbc_blockers.py scripts/pending_observation_relevance.py
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/scripts)

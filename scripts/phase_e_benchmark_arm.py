@@ -40,6 +40,11 @@ def prepare_arm(required_recorders, timeout_s=20.0, admission_ping_topic=None):
     last_ping = -float('inf')
     actuator = None
     observation = None
+    critical = None
+    topics = rospy.get_param('/care_planner/benchmark/critical_recorder_topics', []) if hasattr(rospy, 'get_param') else []
+    if topics:
+        from phase_e_critical_recorders import CriticalRecorderReadiness
+        critical = CriticalRecorderReadiness(required_recorders, topics, rospy, master.master_uri)
     if hasattr(rospy, 'get_param') and rospy.get_param('/care_planner/benchmark/observation_readiness_required', False):
         from phase_e_observation_readiness import ObservationReadiness
         observation = ObservationReadiness(required_recorders, rospy, master.master_uri)
@@ -55,6 +60,10 @@ def prepare_arm(required_recorders, timeout_s=20.0, admission_ping_topic=None):
         ready_sub = rospy.Subscriber(admission_ping_topic + '/ready', String, on_ready, queue_size=4)
         ping_pub = rospy.Publisher(admission_ping_topic, String, queue_size=4, latch=False)
     while not rospy.is_shutdown() and time.monotonic() < deadline:
+        from scene_guard_status import read as read_scene_guard
+        scene_guard = read_scene_guard()
+        if scene_guard.get('abort'):
+            raise RuntimeError('static_scene_guard_abort: '+json.dumps(scene_guard['abort']))
         try:
             now = time.monotonic()
             if retry_pub is not None and (retry_ready['sent'] is None or now - retry_ready['sent'] >= .25):
@@ -71,10 +80,14 @@ def prepare_arm(required_recorders, timeout_s=20.0, admission_ping_topic=None):
             publishers, subscribers, _ = master.getSystemState()
             registered = {name for _, nodes in subscribers for name in nodes}
             missing = set(required_recorders) - registered
+            critical_ready = critical is None or critical.check(deadline, publishers, subscribers)
             actuator_ready = actuator is None or actuator.check(deadline)
             observation_ready = observation is None or observation.check(deadline, subscribers)
             if (not missing and pub.get_num_connections() > 0 and admission_ready and
-                    actuator_ready and control_ready and observation_ready and time.monotonic() < deadline):
+                    actuator_ready and control_ready and observation_ready and critical_ready and scene_guard['ready'] and time.monotonic() < deadline):
+                if critical is not None:
+                    pub.care_critical_recorder_readiness = critical.last
+                    print('[BENCHMARK CRITICAL RECORDERS READY] ' + json.dumps(critical.last), flush=True)
                 if observation is not None:
                     pub.care_observation_readiness = observation.last
                     print('[BENCHMARK OBSERVATION READY] ' + json.dumps(observation.last), flush=True)
@@ -117,10 +130,11 @@ def prepare_arm(required_recorders, timeout_s=20.0, admission_ping_topic=None):
     if actuator is not None:
         actuator.close()
     raise RuntimeError('benchmark_not_armed: missing_recorders={} arm_subscribers={} '
-                       'publisher_registered={} connections={} refreshed={} admission_ready={} actuator_evidence={} qp_retry_ready={} observation_evidence={}'.format(
+                       'publisher_registered={} connections={} refreshed={} admission_ready={} actuator_evidence={} qp_retry_ready={} observation_evidence={} critical_recorder_evidence={}'.format(
                            sorted(missing), arm_subscribers, publisher_registered,
                            pub.get_num_connections(), refreshed,
                            ready['received'] is not None if ping_pub is not None else 'not_required',
                            actuator.last if actuator is not None else 'not_required',
                            retry_ready if retry_pub is not None else 'not_required',
-                           observation.last if observation is not None else 'not_required'))
+                           observation.last if observation is not None else 'not_required',
+                           critical.last if critical is not None else 'not_required'))

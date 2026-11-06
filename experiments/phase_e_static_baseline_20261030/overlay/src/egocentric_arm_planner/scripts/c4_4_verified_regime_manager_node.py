@@ -83,9 +83,28 @@ class C44VerifiedRegimeManager:
         self.probe_completed_prefixes_required = int(rospy.get_param(
             "~probe_completed_prefixes_required", legacy_probe_required))
         self.task_first_research = os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true'
+        self.repair_goal_stopping = os.environ.get('CARE_REPAIR_GOAL_STOPPING') == 'true'
+        self._goal_stop_execution = 0
+        self._goal_stop_feedback_time = None
         self.task_first_seen_count = 0
         self.task_first_seen_point_count = 0
         self.task_first_observation_returns = 0
+        self._rolling_release = None
+        self._rolling_request_pub = rospy.Publisher('/care_planner/rolling_task/consumed_request', String, queue_size=8)
+        self.matched_observation_release = os.environ.get('CARE_MATCHED_OBSERVATION_RELEASE') == 'true'
+        if self.matched_observation_release:
+            # catkin devel relays execute in a private namespace, so importing
+            # a sibling relay does not export its classes. __file__ points at
+            # this real source (or installed script); load the sibling itself.
+            import importlib.util
+            release_spec = importlib.util.spec_from_file_location(
+                'care_observation_release_identity',
+                os.path.join(os.path.dirname(__file__), 'observation_release_identity.py'))
+            release_module = importlib.util.module_from_spec(release_spec)
+            release_spec.loader.exec_module(release_module)
+            self._observation_release_identity = release_module.ObservationReleaseIdentity(allow_completed_gain=os.environ.get('CARE_ROLLING_TASK_OBSERVATION')=='true')
+            self._observation_handoff = release_module.ObservationHandoffIdentity()
+            self._observation_waypoint_region = None
         if self.task_first_research:
             self.probe_completed_prefixes_required = 1
         self.input_timeout = float(rospy.get_param("~input_timeout", 0.25))
@@ -470,11 +489,21 @@ class C44VerifiedRegimeManager:
         self.replan_request_pub.publish(Bool(data=True))
 
     def _transition_locked(self, new_state, reason, now):
+        if os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') == 'false' and new_state != self.NORMAL:
+            # Component ablation: preserve NORMAL task motion and every safety
+            # hold; do not admit a dedicated observation-motion episode.
+            self.passive_observation_suppressed = getattr(self, 'passive_observation_suppressed', 0) + 1
+            self.last_transition_reason = 'passive_observation_suppressed_' + reason
+            return
         if new_state == self.state:
             self.last_transition_reason = reason
             return
         old = self.state
+        if new_state not in (self.PROBE_NORMAL, self.NORMAL):
+            self._rolling_release = None
         self._retire_qp_retry_locked()
+        if old == self.REPAIR and hasattr(self, '_observation_handoff'):
+            self._observation_handoff.clear()
         self.state = new_state
         self.last_transition_reason = reason
         # Blocker rediscovery is a fail-closed substate used by NORMAL and
@@ -497,6 +526,11 @@ class C44VerifiedRegimeManager:
 
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
+            if hasattr(self, '_observation_handoff'):
+                self._observation_handoff.clear()
+                if self._observation_waypoint is not None and self._observation_waypoint_region is not None:
+                    self._observation_handoff.bind(self._observation_waypoint[0],self._observation_waypoint_region,
+                        (self._occlusion_goal,self.repair_entry_count))
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
@@ -646,6 +680,21 @@ class C44VerifiedRegimeManager:
         if hold is None:
             return
         with self._lock:
+            if getattr(self, 'repair_goal_stopping', False):
+                now = rospy.Time.now()
+                execution = _as_int(fields.get('goal_stop_execution_stamp_ns'), 0)
+                sample = _as_int(fields.get('goal_stop_sample_ros_ns'), 0)
+                tracker_fresh = (self.tracker_summary_time is not None and
+                    0 <= (now-self.tracker_summary_time).to_sec() <= self.input_timeout)
+                eligible = (execution > 0 and execution == self.tracker_execution_stamp_ns and
+                    execution != self.last_tracker_aborted_stamp_ns and
+                    execution != self.vbc_unsafe_execution_stamp_ns and tracker_fresh and
+                    self.tracker_source in ('active_trajectory', 'trajectory_complete_hold') and
+                    0 <= now.to_nsec()-sample <= 50000000)
+                self._goal_stop_execution = execution if eligible else 0
+                self._goal_stop_feedback_time = now
+                if eligible and self.execution_ready and self.state == self.REPAIR:
+                    self._transition_locked(self.NORMAL, 'certified_goal_stop_handoff', now)
             self.repair_final_vbc_hold = hold
             if hold and self.state == self.REPAIR:
                 self.last_transition_reason = "repair_final_vbc_no_progress_hold"
@@ -795,7 +844,12 @@ class C44VerifiedRegimeManager:
                     target[1] != regions[0][1] or labels[0] in self._observation_retired_tokens):
                 return
             self._observation_waypoint = (labels[0], now)
+            self._observation_waypoint_region = next(label for label in labels if label.startswith('care_region_v1_'))
             self._maybe_enter_observation_repair_locked(now, "waypoint")
+            if self.state == self.REPAIR and hasattr(self, '_observation_handoff'):
+                self._observation_handoff.bind(labels[0],self._observation_waypoint_region,
+                    (self._occlusion_goal,self.repair_entry_count))
+            self._maybe_release_matched_observation_locked(now)
 
     def _observation_acquisition_cb(self, msg):
         now = rospy.Time.now()
@@ -805,6 +859,10 @@ class C44VerifiedRegimeManager:
             if len(pairs) != len(f) or f.get("policy") != "visibility_acquisition":
                 self._observation_demand = None
                 return
+            if getattr(self, 'matched_observation_release', False):
+                self._observation_release_identity.observe(f, now.to_sec())
+                if self._maybe_release_matched_observation_locked(now):
+                    return
             if getattr(self, 'task_first_research', False):
                 count = _as_int(f.get('seen_obligation_count'), 0)
                 previous = self.task_first_seen_count
@@ -812,11 +870,16 @@ class C44VerifiedRegimeManager:
                 points = _as_int(f.get('acquired_point_count'), 0)
                 previous_points = self.task_first_seen_point_count
                 self.task_first_seen_point_count = max(previous_points, points)
-                if ((count > previous or points > previous_points) and
+                if (not getattr(self, 'matched_observation_release', False) and
+                        (count > previous or points > previous_points) and
                         self.state == self.REPAIR and self.execution_ready):
                     self.task_first_observation_returns += 1
                     # Pending regions remain UNKNOWN and can be rediscovered by
                     # the next task prefix. Completion does not require q_vis.
+                    self._observation_release_waypoint = self._observation_waypoint[0] if self._observation_waypoint else 'none'
+                    self._observation_release_gain_kind = 'point_gain' if points > previous_points else 'region_completion'
+                    self._observation_release_snapshot = f.get("acquisition_snapshot_id", "none")
+                    self._observation_release_stamp_ns = now.to_nsec()
                     self._transition_locked(self.PROBE_NORMAL,
                         'task_first_observation_acquired', now)
             if f.get("complete") == "1" and f.get("remaining_obligation_count") == "0":
@@ -839,6 +902,8 @@ class C44VerifiedRegimeManager:
                     self.repair_completion_time = now
                     self.repair_completion_armed = True
                     self.repair_completion_event_count += 1
+                    self._observation_release_snapshot = f.get("acquisition_snapshot_id", "none")
+                    self._observation_release_stamp_ns = now.to_nsec()
                     self._transition_locked(self.PROBE_NORMAL,
                         "actual_visibility_acquisition_complete", now)
                 return
@@ -854,6 +919,31 @@ class C44VerifiedRegimeManager:
                 return
             self._observation_demand = (token, now)
             self._maybe_enter_observation_repair_locked(now, "acquisition")
+            self._maybe_release_matched_observation_locked(now)
+
+    def _maybe_release_matched_observation_locked(self, now):
+        if (not getattr(self, 'matched_observation_release', False) or
+                not self.task_first_research or self.state != self.REPAIR or not self.execution_ready):
+            return False
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true' and hasattr(self,'_observation_handoff'):
+            event=self._observation_handoff.take(self._observation_release_identity,
+                (self._occlusion_goal,self.repair_entry_count),self._observation_retired_tokens,now.to_sec())
+            token=event['token'] if event is not None else None
+        else:
+            if self._observation_waypoint is None:return False
+            token,_received=self._observation_waypoint
+            event=self._observation_release_identity.take(token,self._observation_retired_tokens,now.to_sec())
+        if event is None:
+            return
+        self.task_first_observation_returns += 1
+        self._observation_release_waypoint = token
+        self._observation_release_gain_kind = 'matched_point_gain'
+        self._observation_release_snapshot = event['acquisition_snapshot_id']
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+            self._rolling_release = event.copy()
+        self._observation_release_stamp_ns = now.to_nsec()
+        self._transition_locked(self.PROBE_NORMAL, 'task_first_observation_acquired', now)
+        return True
 
     def _maybe_enter_observation_repair_locked(self, now, source, probe_boundary=False):
         """A live observation is a planning request in either arrival order.
@@ -862,6 +952,16 @@ class C44VerifiedRegimeManager:
         callback may yield to sensing; all three prefixes are still required
         before returning to NORMAL without an observation.
         """
+        if os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') == 'false':
+            return False
+        if (getattr(self, 'repair_goal_stopping', False) and self.state == self.NORMAL and
+                getattr(self, '_goal_stop_execution', 0) > 0 and
+                self._goal_stop_execution == self.tracker_execution_stamp_ns and
+                self._goal_stop_execution != self.last_tracker_aborted_stamp_ns and
+                self._goal_stop_feedback_time is not None and
+                0 <= (now-self._goal_stop_feedback_time).to_sec() <= self.input_timeout):
+            return False
+
         if (getattr(self, "task_first_research", False) or
                 getattr(self, "research_opportunistic_probe", False) or
                 not getattr(self, "repair_completion_gate_enabled", False) or
@@ -1564,6 +1664,16 @@ class C44VerifiedRegimeManager:
                 # certified PROBE prefix (full completion remains separately logged
                 # through last_tracker_complete_*).
                 self.probe_completed_execution_count += 1
+                release = self._rolling_release
+                if release is not None and os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+                    self._rolling_request_pub.publish(String(data=json.dumps(dict(
+                        observation_token=release['token'],
+                        region_token=release['point_gain_event']['region_token'],
+                        acquisition_snapshot_id=release['acquisition_snapshot_id'],
+                        point_gain_event=release['point_gain_event'],
+                        execution_stamp_ns=str(completed_stamp),
+                        consumed_after_actual_task_prefix=True),separators=(',',':'))))
+                    self._rolling_release = None
 
                 if self._maybe_enter_observation_repair_locked(
                         now, "probe_prefix_complete", probe_boundary=True):
@@ -1748,6 +1858,9 @@ class C44VerifiedRegimeManager:
             msg = String()
             msg.data = " ".join([
                 "state={}".format(self.state),
+                "active_observation={}".format(int(os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') != 'false')),
+                "passive_observation_suppressed={}".format(getattr(self, 'passive_observation_suppressed', 0)),
+                "goal_stop_execution_stamp_ns={}".format(getattr(self, '_goal_stop_execution', 0)),
                 "reason={}".format(self.last_transition_reason),
                 "execution_ready={}".format(int(self.execution_ready)),
                 "qp_retry_pending={}".format(int(bool(self.qp_retry_token))),
@@ -1863,6 +1976,16 @@ class C44VerifiedRegimeManager:
                 "repair_completion_gate_enabled={}".format(
                     int(self.repair_completion_gate_enabled)),
                 "repair_completion={}".format(int(self.repair_completion)),
+                "observation_return_policy={}".format('matched' if getattr(self, 'matched_observation_release', False) else 'legacy'),
+                "observation_release_waypoint={}".format(getattr(self, '_observation_release_waypoint', 'none')),
+                "observation_release_gain_kind={}".format(getattr(self, '_observation_release_gain_kind', 'none')),
+                "observation_return_observed_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'observed_gains', 0)),
+                "observation_return_unbound_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'unbound_gains', 0)),
+                "observation_return_expired_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'expired_gains', 0)),
+                "observation_return_retired_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'retired_gains', 0)),
+                "observation_return_released_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'released_gains', 0)),
+                "observation_release_snapshot={}".format(getattr(self, '_observation_release_snapshot', 'none')),
+                "observation_release_stamp_ns={}".format(getattr(self, '_observation_release_stamp_ns', 0)),
                 "repair_completion_armed={}".format(
                     int(self.repair_completion_armed)),
                 "repair_completion_event_count={}".format(

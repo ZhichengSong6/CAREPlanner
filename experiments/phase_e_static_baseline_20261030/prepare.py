@@ -99,7 +99,10 @@ def main():
     build_edits=[]
     for package in ('egocentric_arm_planner','care_confidence_map'):
         cmake=runtime/'src'/package/'CMakeLists.txt';original=digest(cmake)
-        cmake.write_text(cmake.read_text()+'\n'+(PACKAGE/'build_support'/(package+'.cmake')).read_text())
+        support=(PACKAGE/'build_support'/(package+'.cmake')).read_text()
+        # The promoted candidate already contains this build integration.
+        if support not in cmake.read_text():
+            cmake.write_text(cmake.read_text()+'\n'+support)
         build_edits.append(dict(path=str(cmake.relative_to(runtime)),original_sha256=original,prepared_sha256=digest(cmake)))
     for model in models:
         if args.without_models:continue

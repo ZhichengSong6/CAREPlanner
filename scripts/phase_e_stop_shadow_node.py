@@ -39,11 +39,6 @@ class BoundedQuery:
         self.call=call; self.timeout=timeout; self.thread=None
 
     def __call__(self,*args):
-        return self.call_with_timeout(self.timeout,*args)
-
-    def call_with_timeout(self,timeout,*args):
-        """A per-request cap never lengthens the configured RPC timeout."""
-        if not math.isfinite(timeout) or timeout<=0:raise RuntimeError('snapshot_service_timeout')
         if self.thread and self.thread.is_alive(): raise RuntimeError('snapshot_service_busy_after_timeout')
         result=[]; done=threading.Event()
         def work():
@@ -51,35 +46,10 @@ class BoundedQuery:
             except Exception as exc: result.append((False,str(exc)))
             finally: done.set()
         self.thread=threading.Thread(target=work,daemon=True); self.thread.start()
-        if not done.wait(min(self.timeout,timeout)): raise RuntimeError('snapshot_service_timeout')
+        if not done.wait(self.timeout): raise RuntimeError('snapshot_service_timeout')
         ok,value=result[0]
         if not ok: raise RuntimeError('snapshot_service_error: '+value)
         return value
-
-
-class PersistentServiceTransport:
-    """One persistent ROS service connection per bounded query channel.
-
-    Reconnect only on the next call after a transport error. The caller's
-    single-flight timeout still discards late responses; this object never
-    retries a request or reuses a response.
-    """
-    def __init__(self, proxy_factory, encode, decode):
-        self.factory=proxy_factory;self.encode=encode;self.decode=decode
-        self.proxy=None;self.lock=threading.Lock()
-
-    def __call__(self,*args):
-        if not self.lock.acquire(blocking=False):raise RuntimeError('snapshot_transport_busy')
-        try:
-            request=self.encode(*args)
-            if self.proxy is None:self.proxy=self.factory()
-            try:return self.decode(self.proxy(request))
-            except Exception:
-                try:self.proxy.close()
-                except Exception:pass
-                self.proxy=None
-                raise
-        finally:self.lock.release()
 
 
 def clean(value):
@@ -125,13 +95,11 @@ def main():
     rospy.Subscriber(args.state_topic,CommandStatus,state,queue_size=200,tcp_nodelay=True)
     rospy.Subscriber(args.command_topic,JointState,command,queue_size=500,tcp_nodelay=True)
     pub=rospy.Publisher('/care_planner/stop_shadow/report',String,queue_size=10)
-    def encode(points,horizon,expected):
+    def call(points,horizon,expected):
         req=QueryConfidenceSnapshotRequest(points=[Point(*p) for p in points],horizon_s=horizon,minimum_confidence=.8)
         if expected: req.expected_instance,req.expected_epoch,req.expected_revision=expected
-        return req
-    transport=PersistentServiceTransport(lambda:rospy.ServiceProxy(args.snapshot_service,
-        QueryConfidenceSnapshot,persistent=True),encode,snapshot_dict)
-    query=BoundedQuery(transport,args.query_timeout)
+        return snapshot_dict(rospy.ServiceProxy(args.snapshot_service,QueryConfidenceSnapshot)(req))
+    query=BoundedQuery(call,args.query_timeout)
     audit=ShadowAudit(buffer,PrimitiveEnclosure(urdf),query,lambda:rospy.Time.now().to_nsec(),config,
                       args.max_state_age,args.assumed_update_gap)
     count=0; histogram={}

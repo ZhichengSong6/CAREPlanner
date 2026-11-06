@@ -119,6 +119,21 @@ def publish_task_window(start_monotonic_s, timeout_s, ros_ns, arm_token):
 
 def completion_context(now=None):
     """Return an explicitly enabled, calibrated proposal-ranking context."""
+    if os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true':
+        try:
+            window = json.loads(Path(os.environ['CARE_TASK_WINDOW_FILE']).read_text())
+            now = time.monotonic() if now is None else now
+            deadline = float(window['deadline_monotonic_s'])
+            if not float(window['start_monotonic_s']) <= now < deadline:
+                return None
+            # Simple research proxy; no training/calibration prerequisite and
+            # no authority to block a motion that passes the normal checks.
+            return dict(approach_scale=1., rejoin_scale=1., acquisition_wall_s=.15,
+                return_overhead_wall_s=.5, tail_ros_s=.3, hold_ros_s=.1,
+                deadline_monotonic_s=deadline, measured_monotonic_s=now,
+                profile_id='task_first_uncalibrated_proxy_v1', arm_token=window['arm_token'])
+        except (OSError, KeyError, ValueError, TypeError):
+            return None
     if os.environ.get('CARE_COMPLETION_RANKING_ENABLED', 'false').lower() != 'true':
         return None
     try:

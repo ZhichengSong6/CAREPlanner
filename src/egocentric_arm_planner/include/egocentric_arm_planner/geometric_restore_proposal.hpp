@@ -36,19 +36,31 @@ inline bool geometricRestoreProposal(const Eigen::VectorXd& q0,
       objective->point_floor_m.size()!=distances.size() ||
       objective->point_reserve_m.size()!=distances.size()))return false;
   std::vector<double> slack;
+  std::vector<Eigen::VectorXd> steering_normals;
   for(std::size_t i=0;i<distances.size();++i) {
     const double d=distances[i];
     const double floor=objective ? objective->point_floor_m[i] : (d<=.020000000001 ? .01 : .02);
     const double reserve=objective ? objective->point_reserve_m[i] : 0.;
     if(!std::isfinite(d) || !std::isfinite(floor) || !std::isfinite(reserve) ||
-        floor<.01 || reserve<0. || d<=floor+1e-6)return false;
+        normals[i].size()!=7 || !normals[i].allFinite() || reserve<0.)return false;
+    // A satisfied zero-Jacobian row cannot steer a first-order proposal.
+    // Mounted ground rows legitimately have a zero/nonpenetration floor;
+    // their nanometre slack must not be interpreted as an UNKNOWN10mm floor.
+    // Reject a violated constant row. Full native ground/curve validation
+    // remains responsible for every body, including these mounting contacts.
+    if(normals[i].norm()<=1e-12) {
+      if(d<floor-1e-12)return false;
+      continue;
+    }
+    if(floor<.01 || d<=floor+1e-6)return false;
     // Reserve improves proposal quality; a deficient reserve at the fixed
     // measured start is not an additional hard constraint on that start.
     slack.push_back(d-floor-reserve);
+    steering_normals.push_back(normals[i]);
   }
   const Eigen::VectorXd gradient=objective ? objective->visibility_gradient : Eigen::VectorXd(desired-q0);
   const Eigen::VectorXd mask=objective ? objective->observation_mask : Eigen::VectorXd::Ones(7);
-  Eigen::VectorXd target=boundedObservationTarget(q0,desired,normals,slack,
+  Eigen::VectorXd target=boundedObservationTarget(q0,desired,steering_normals,slack,
       gradient,mask,failed,.03);
   if(target.size()!=7)return false;
   const int motion_intervals=prefix_s>0. ? std::max(1,std::min(intervals,int(std::floor(prefix_s/dt+1e-8)))) : intervals;

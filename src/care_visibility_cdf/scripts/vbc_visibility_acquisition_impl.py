@@ -31,7 +31,8 @@ which permits the regime manager to PROBE_NORMAL.
 from __future__ import annotations
 
 import math
-import copy
+import json
+import os
 import threading
 import time
 from typing import Dict, List
@@ -60,6 +61,9 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         self._acquisition_complete = False
         self._acquisition_started = False
         self._seen_obligation_count = 0
+        self._task_first_research = os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true'
+        self._task_first_seen_points = set()
+        self._task_first_initial_point_seen = {}
         self._last_visibility_check_s = -math.inf
         self._safe_repair_candidate_count = 0
         self._visibility_episode_reopen_count = 0
@@ -257,6 +261,15 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
 
         good = finite_inside & (conf >= self.seen_threshold)
         query_diag['point_seen'] = good.tolist()
+        query_diag['point_confidence'] = conf.tolist()
+        query_diag['point_current_visibility'] = current_vis.tolist()
+        query_diag['point_inside_map'] = inside.tolist()
+        if getattr(self, '_task_first_research', False):
+            # Inbox prechecks also call this query. Remember their baseline,
+            # but do not label already-known points as an observation gain.
+            for point, is_seen in zip(np.round(points, 6), good):
+                if np.isfinite(point).all():
+                    self._task_first_initial_point_seen.setdefault(tuple(point), bool(is_seen))
         fraction = float(np.mean(good)) if n else 0.0
         seen = fraction + 1e-12 >= self.required_seen_fraction
 
@@ -360,9 +373,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 oid, seen, point_count, frac, min_conf, mean_conf, max_vis,
                 q_dist_inf, np.asarray(worst_point, dtype=np.float64).copy(),
                 query_diag, geometry_diag))
-            # Current visibility alone does not discharge a stopping-prefix
-            # obligation for a later horizon. Its fresh prefix query owns that.
-            if seen and not ob.get('stopping_prefix_request'):
+            if seen:
                 seen_regions[oid] = observation_region_token(ob)
 
         if seen_regions:
@@ -371,8 +382,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 # A service response for an old point set cannot clear a newly
                 # refreshed region merely because its integer id is unchanged.
                 seen_ids = [int(ob["id"]) for ob in self._obligations
-                            if not ob.get('stopping_prefix_request') and
-                            seen_regions.get(int(ob["id"])) == observation_region_token(ob)]
+                            if seen_regions.get(int(ob["id"])) == observation_region_token(ob)]
                 self._obligations = [
                     ob for ob in self._obligations
                     if int(ob["id"]) not in set(seen_ids)]
@@ -526,13 +536,17 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 active_q_vis_text = ",".join(
                     f"{float(v):.4f}" for v in q_vis)
 
+        snapshot_id = "care_acq_v1_" + str(time.monotonic_ns())
+        point_gain_events = [row[-2]['point_gain_event'] for row in diagnostics if row[-2].get('point_gain_event')]
         msg.data = (
             "policy=visibility_acquisition"
+            f" acquisition_snapshot_id={snapshot_id}"
             f" started={int(self._acquisition_started)}"
             f" complete={int(self._acquisition_complete)}"
             f" remaining_obligation_count={len(remaining)}"
             f" remaining_ids={':'.join(str(int(ob['id'])) for ob in remaining) or 'none'}"
             f" seen_obligation_count={self._seen_obligation_count}"
+            f" acquired_point_count={len(getattr(self, '_task_first_seen_points', ()))}"
             f" seen_threshold={self.seen_threshold:.6f}"
             f" required_seen_fraction={self.required_seen_fraction:.6f}"
             f" safe_repair_candidate_count={self._safe_repair_candidate_count}"
@@ -591,7 +605,16 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             f" active_q_vis={active_q_vis_text}"
             f" region_checks={diag_text or 'none'}"
             f" geometry_checks={geometry_text or 'none'}"
+            f" point_gain_events={json.dumps(point_gain_events,separators=(',',':'))}"
         )
+        self._trace_observation('acquisition_published', acquisition_snapshot_id=snapshot_id,
+            active_observation_token=active_q_vis_token,
+            point_gain_events=point_gain_events,
+            active_feedback_token=active_query_diag.get('progress_observation_token','none'),
+            query_ros_s=float(active_query_diag.get('query_ros_s',math.nan)),
+            active_seen=bool(active_seen), complete=bool(self._acquisition_complete),
+            acquired_point_count=len(getattr(self,'_task_first_seen_points',())),
+            seen_obligation_count=self._seen_obligation_count)
         self.acquisition_summary_pub.publish(msg)
 
     # ------------------------------------------------------------------
@@ -622,12 +645,7 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
             return
 
         with self._schedule_publish_lock:
-            if getattr(self, '_stopping_context_enabled', False):
-                self._expire_stopping_context()
             obligations = self._ordered_obligations()
-            if getattr(self, '_require_task_binding', False):
-                obligations = self._task_current_obligations(obligations)
-                self._task_selected_obligations = copy.deepcopy(obligations)
             if obligations:
                 first = obligations[0]
 
@@ -695,15 +713,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                     label="care_visibility_obligation_points_v1",
                     size=len(msg.data), stride=len(msg.data))]
                 self.current_obligation_points_pub.publish(msg)
-            if getattr(self, '_require_task_binding', False):
-                if not getattr(self, '_c49_ready', False):
-                    self._publish_task_recovery_snapshot(obligations=obligations)
 
     def _maybe_generate(self) -> None:
         if not self._c47_ready:
             return
         # Reuse C4.6 accumulation/matching, but never clear from predicted SAFE.
-        self._process_stopping_prefix_demands()
         self._process_new_active_set()
         self._update_actual_visibility_completion()
         self._publish_schedule()
@@ -822,6 +836,19 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                     current["observation_token"] == published["observation_token"]):
                 query_diag["progress_observation_token"] = published["observation_token"]
                 if query_diag.get('status') == 'ok' and 'point_seen' in query_diag:
+                    if getattr(self, '_task_first_research', False):
+                        gained = [tuple(point) for point, is_seen in
+                            zip(np.round(np.asarray(ob['points']), 6), query_diag['point_seen'])
+                            if is_seen and np.isfinite(point).all() and
+                            self._task_first_initial_point_seen.get(tuple(point)) is False and
+                            tuple(point) not in self._task_first_seen_points]
+                        self._task_first_seen_points.update(gained)
+                        if gained:
+                            query_diag['point_gain_event'] = dict(
+                                event_id='care_point_gain_v1_'+str(time.monotonic_ns()),
+                                observation_token=published['observation_token'], region_token=region,
+                                obligation_id=int(ob['id']),query_ros_s=float(query_diag['query_ros_s']),
+                                points=[list(point) for point in gained])
                     self._guidance_feedback = dict(
                         token=published['observation_token'], region=region,
                         query_time=float(query_diag['query_ros_s']),
@@ -840,14 +867,23 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
         for role, token, q in targets:
             key = (int(ob["id"]), role)
             last = self._trace_seen_samples.get(key, (None, False, -math.inf))
-            if token == last[0] and bool(seen) == last[1] and now_wall-last[2] < 1.0:
+            point_signature = tuple(query_diag.get('point_seen', ()))
+            if (token == last[0] and bool(seen) == last[1] and
+                    len(last) > 3 and point_signature == last[3] and now_wall-last[2] < 1.0):
                 continue
-            self._trace_seen_samples[key] = (token, bool(seen), now_wall)
+            self._trace_seen_samples[key] = (token, bool(seen), now_wall, point_signature)
             distance = (float(np.max(np.abs(measured-q)))
                         if measured is not None and np.all(np.isfinite(measured)) else math.nan)
             self._trace_observation("seen_query", observation_token=token, region_token=region,
                 obligation_id=int(ob["id"]), actual_seen=bool(seen), seen_fraction=float(fraction),
                 query_status=str(query_diag.get("status")), q_distance_inf=distance,
+                points=np.asarray(ob['points']).tolist(),
+                point_seen=list(query_diag.get('point_seen', ())),
+                point_confidence=list(query_diag.get('point_confidence', ())),
+                point_current_visibility=list(query_diag.get('point_current_visibility', ())),
+                point_inside_map=list(query_diag.get('point_inside_map', ())),
+                acquired_point_count=len(getattr(self, '_task_first_seen_points', ())),
+                confidence_map_version_status='query_service_has_no_version',
                 measured_q=None if measured is None else measured.tolist(),
                 measured_ros_s=float(query_diag.get("measured_ros_s", math.nan)),
                 evidence_relation="same_exact_region_" + role,

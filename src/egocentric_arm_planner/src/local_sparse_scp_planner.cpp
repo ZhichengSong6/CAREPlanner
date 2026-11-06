@@ -1,3 +1,7 @@
+#include "egocentric_arm_planner/normal_executable_limits.hpp"
+#include "egocentric_arm_planner/normal_executable_curve.hpp"
+#include "egocentric_arm_planner/observation_local_decision.hpp"
+#include "egocentric_arm_planner/executable_task_objective.hpp"
 #include "egocentric_arm_planner/local_sparse_scp_planner.hpp"
 #include "egocentric_arm_planner/geometric_restore_proposal.hpp"
 #include "egocentric_arm_planner/visibility_objective_step.hpp"
@@ -12,6 +16,8 @@
 #include "egocentric_arm_planner/candidate_audit_context.hpp"
 #include <iomanip>
 
+#include <arm_trajectory/joint_trajectory.hpp>
+#include <care_collision_cdf/QueryCollisionCDFPairs.h>
 #include <piqp/piqp.hpp>
 #include <boost/property_tree/json_parser.hpp>
 
@@ -340,6 +346,7 @@ bool LocalSparseSCPPlanner::initialize(
   if (repair_prefix_binding_enabled_ && !repair_executable_view_enabled_) {
     ROS_ERROR("Selected-prefix binding requires the executable view"); return false;
   }
+  pnh_.param("local_planner/fixed_start_recovery_enabled", fixed_start_recovery_enabled_, false);
   pnh_.param("local_planner/initial_shell_recovery/enabled", initial_shell_recovery_enabled_, false);
   pnh_.param("local_planner/initial_shell_recovery/execution_margin_m", initial_shell_execution_margin_m_, 0.);
   if (initial_shell_recovery_enabled_ && (!primitive_observation_guard_enabled_ ||
@@ -375,44 +382,37 @@ bool LocalSparseSCPPlanner::initialize(
     }
   }
 
+  const char* probe_task_policy=std::getenv("CARE_PROBE_EXECUTABLE_TASK");
+  probe_task_objective_enabled_=probe_task_policy && std::string(probe_task_policy)=="true";
+  probe_task_settings_.acceleration=repair_executable_settings_.acceleration;
+  nh_.param("/optimized_trajectory_continuity/probe_execution_prefix_s",probe_task_settings_.prefix,.25);
+  nh_.param("/optimized_trajectory_continuity/probe_velocity_cap",probe_task_settings_.velocity_cap,.5);
+  nh_.param("/optimized_trajectory_continuity/probe_time_scale_max",probe_task_settings_.time_scale_max,5.);
+  nh_.param("/optimized_trajectory_continuity/repair_brake_dt_s",probe_task_settings_.brake_dt,.05);
+  nh_.param("/optimized_trajectory_continuity/repair_brake_max_steps",probe_task_settings_.brake_steps,20);
+  nh_.param("/optimized_trajectory_continuity/repair_hold_s",probe_task_settings_.hold,.1);
   latest_executed_command_ = Eigen::VectorXd::Zero(dof_);
   pnh_.param("local_planner/terminal_retention/enabled",terminal_retention_enabled_,false);
+  const char* repair_goal_policy=std::getenv("CARE_REPAIR_GOAL_STOPPING");
+  repair_goal_stopping_enabled_=repair_goal_policy && std::string(repair_goal_policy)=="true";
   pnh_.param<std::string>("base_frame",terminal_base_frame_,"base_link");
   pnh_.param<std::string>("ee_frame",terminal_ee_frame_,"EE_link");
   if(terminal_retention_enabled_ && !primitive_observation_guard_enabled_) {
     ROS_ERROR("Terminal retention requires the initialized objective FK model");return false;
   }
-  pnh_.param("enable_observation_context",task_context_enabled_,false);
-  pnh_.param("require_bound_regime",require_bound_regime_,false);
-  pnh_.param("local_planner/require_bound_recovery_policy",require_bound_recovery_policy_,false);
-  if(require_bound_recovery_policy_ && !require_bound_regime_) {
-    ROS_ERROR("Bound recovery policy requires bound regimes");return false;
+  if(terminal_retention_enabled_ || primitive_observation_guard_.knownGroundEnabled()) {
+    terminal_goal_sub_=nh_.subscribe("/care_planner/ee_target_pose",1,&LocalSparseSCPPlanner::terminalGoalCallback,this);
   }
-  if(require_bound_regime_ && !task_context_enabled_) {
-    ROS_ERROR("Bound regimes require explicit task contexts");return false;
-  }
-  if(require_bound_regime_) {
-    task_control_sub_=nh_.subscribe("/care_planner/c4_4/task_control",8,
-        &LocalSparseSCPPlanner::taskControlCallback,this);
-    task_recovery_sub_=nh_.subscribe("/care_planner/active_sensing/task_recovery_snapshot",8,
-        &LocalSparseSCPPlanner::taskRecoveryCallback,this);
-    task_status_pub_=nh_.advertise<std_msgs::String>("/care_planner/local_planner/task_event",32);
-    task_event_source_="planner-"+std::to_string(ros::WallTime::now().toNSec());
-  }
-  if(task_context_enabled_)task_context_sub_=nh_.subscribe(
-      "/care_planner/active_sensing/observation_context",32,&LocalSparseSCPPlanner::taskContextCallback,this);
   if(terminal_retention_enabled_) {
-    if(!task_context_enabled_)terminal_goal_sub_=nh_.subscribe("/care_planner/ee_target_pose",1,&LocalSparseSCPPlanner::terminalGoalCallback,this);
     terminal_audit_sub_=nh_.subscribe("/care_planner/optimized_trajectory",16,&LocalSparseSCPPlanner::terminalAuditCallback,this);
     terminal_commit_sub_=nh_.subscribe("/care_planner/committed_trajectory",16,&LocalSparseSCPPlanner::terminalCommitCallback,this);
   }
   if (repair_prefix_binding_enabled_) {
     repair_prefix_selection_sub_ = nh_.subscribe("/care_planner/repair_prefix_selection",8,
         &LocalSparseSCPPlanner::repairPrefixSelectionCallback,this);
-  }
-  if(repair_prefix_binding_enabled_ || task_context_enabled_)
     planned_candidate_pub_ = nh_.advertise<egocentric_arm_planner::CandidateTransfer>(
         candidate_trajectory_topic_+"/planned",1,false);
+  }
   latest_single_waypoint_q_ = Eigen::VectorXd::Zero(dof_);
   latest_single_waypoint_joint_mask_ = Eigen::VectorXd::Ones(dof_);
   latest_frontier_.q = Eigen::VectorXd::Zero(dof_);
@@ -423,9 +423,7 @@ bool LocalSparseSCPPlanner::initialize(
   joint_state_sub_ = nh_.subscribe(
       joint_state_topic_, 1,
       &LocalSparseSCPPlanner::jointStateCallback, this);
-  if(task_context_enabled_)bound_reference_sub_=nh_.subscribe(reference_topic_+"/bound",8,
-      &LocalSparseSCPPlanner::boundReferenceCallback,this);
-  else reference_sub_ = nh_.subscribe(
+  reference_sub_ = nh_.subscribe(
       reference_topic_, 1,
       &LocalSparseSCPPlanner::referenceCallback, this);
   task_reference_status_sub_ = nh_.subscribe(
@@ -446,6 +444,14 @@ bool LocalSparseSCPPlanner::initialize(
   single_waypoint_active_sub_ = nh_.subscribe(
       single_waypoint_active_topic_, 1,
       &LocalSparseSCPPlanner::singleWaypointActiveCallback, this);
+  if (std::getenv("CARE_NATIVE_VIEW_SELECTION") &&
+      std::string(std::getenv("CARE_NATIVE_VIEW_SELECTION")) == "true") {
+    const char* preview_mode=std::getenv("CARE_NATIVE_VIEW_MODE");
+    view_preview_aligned_enabled_=preview_mode && std::string(preview_mode)!="legacy";
+    view_preview_pub_=nh_.advertise<std_msgs::String>("/care_planner/view_preview/response",2,false);
+    view_preview_sub_=nh_.subscribe("/care_planner/view_preview/request",1,
+        &LocalSparseSCPPlanner::viewPreviewCallback,this);
+  }
   single_waypoint_q_sub_ = nh_.subscribe(
       single_waypoint_q_topic_, 1,
       &LocalSparseSCPPlanner::singleWaypointQCallback, this);
@@ -670,6 +676,12 @@ bool LocalSparseSCPPlanner::loadConfig() {
       rolling_visibility_guidance_enabled_, guidance_mode && std::string(guidance_mode)!="off");
   pnh_.param<bool>("local_planner/candidate_replacement_enabled",
                    candidate_replacement_enabled_, false);
+  const char* replacement_v2=std::getenv("CARE_REPLACEMENT_EXECUTION_V2");
+  candidate_replacement_execution_v2_=replacement_v2 && std::string(replacement_v2)=="true";
+  const char* task_first=std::getenv("CARE_TASK_FIRST_RESEARCH");
+  task_first_research_=task_first && std::string(task_first)=="true";
+  const char* executable_task=std::getenv("CARE_EXECUTABLE_TASK_RESEARCH");
+  executable_task_research_=executable_task && std::string(executable_task)=="true";
   // These margins live in the learned CDF output units. Keep the old
   // parameter names as a compatibility fallback; they were incorrectly
   // suffixed/documented as meters in earlier C5.5 configs.
@@ -967,7 +979,7 @@ void LocalSparseSCPPlanner::jointStateCallback(
     const bool was_blocked = task_no_progress_.blocked();
     if (!normal_task_stall_pending_ && task_no_progress_.observe(measured) && was_blocked) {
       std_msgs::String status; status.data = "status=reset reason=measured_progress";
-      task_stall_pub_.publish(status); publishTaskStatusLocked("stall",status.data);
+      task_stall_pub_.publish(status);
       requestPlanLocked("measured_progress_after_qp_stall");
     }
   } else vbc_failure_direction_memory_.reset();
@@ -977,7 +989,7 @@ void LocalSparseSCPPlanner::jointStateCallback(
 
 void LocalSparseSCPPlanner::taskReferenceStatusCallback(
     const std_msgs::StringConstPtr& msg) {
-  if (!msg || task_context_enabled_) return;
+  if (!msg) return;
   unsigned long long id = 0, stamp = 0;
   if (!parseUnsignedToken(msg->data, "request_id", &id) ||
       !parseUnsignedToken(msg->data, "request_ros_ns", &stamp)) return;
@@ -1011,194 +1023,20 @@ void LocalSparseSCPPlanner::taskReferenceStatusCallback(
   publishSummary(event);
 }
 
-void LocalSparseSCPPlanner::publishTaskStatusLocked(const std::string& name,const std::string& text) {
-  if(!require_bound_regime_ || task_regime_.empty())return;
-  const auto now=ros::Time::now();
-  if(!task_control_ready_ || now.toNSec()>task_control_until_)return;
-  const auto raw=taskPlanningStatus(name,text,task_context_,task_event_source_,++task_status_sequence_,now,task_regime_);
-  if(!raw.empty()) {std_msgs::String message;message.data=raw;task_status_pub_.publish(message);}
-}
-
-void LocalSparseSCPPlanner::taskControlCallback(const std_msgs::StringConstPtr& msg) {
+void LocalSparseSCPPlanner::referenceCallback(
+    const trajectory_msgs::JointTrajectoryConstPtr& msg) {
+  if (!msg || msg->points.empty()) return;
   std::lock_guard<std::mutex> lock(mutex_);
-  try {
-    const auto now=ros::Time::now();
-    const auto event=task_event_receiver_.parse(msg->data,task_context_,now,"regime_control");
-    const auto& p=event.payload;const auto mode=p.get<std::string>("mode");
-    const auto revision=p.get<std::uint64_t>("mode_revision");
-    const auto replan=p.get<std::uint64_t>("replan_seq");
-    const auto retry=p.get<std::string>("qp_retry");
-    const auto adopted_target=taskControlRecoveryTarget(p);
-    if((mode!="NORMAL" && mode!="REPAIR" && mode!="PROBE_NORMAL") ||
-       !revision || revision>=9007199254740992ULL || retry.size()>256 ||
-       (event.source==task_control_source_ && revision<task_control_revision_))return;
-    const bool ready=p.get<bool>("ready"),repair=ready && mode=="REPAIR",probe=ready && mode=="PROBE_NORMAL";
-    const auto identity=event.source+":"+std::to_string(revision)+":"+mode;
-    if(event.source==task_control_source_ && revision==task_control_revision_ &&
-       !task_regime_.empty() && (identity!=task_regime_ || adopted_target!=task_control_target_sha_))return;
-    task_event_receiver_.remember(event);
-    const bool changed=identity!=task_regime_ || ready!=task_control_ready_;
-    const bool was_probe=probe_mode_;
-    task_control_until_=event.until;task_control_source_=event.source;
-    task_control_revision_=revision;task_regime_=identity;task_control_ready_=ready;
-    task_control_target_sha_=adopted_target;
-    if(changed) {
-      ++mode_epoch_;++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;
-      pending_batch_.reset();plan_requested_=false;
-      repair_mode_=repair;probe_mode_=probe;
-      vbc_failure_direction_memory_.reset();normal_active_no_progress_.reset();
-      normal_unknown_no_progress_.reset();resetNormalTaskProgressLocked("bound_regime_changed");
-      if(repair) {task_no_progress_.reset();last_repair_completed_execution_stamp_ns_=latest_execution_stamp_ns_;}
-      if(probe)probe_reference_request_id_=task_reference_receipt_.id;
-      normal_reference_refresh_pending_=was_probe && !repair && !probe &&
-          !(has_reference_ && task_reference_receipt_.id>probe_reference_request_id_ &&
-            !task_reference_receipt_.pending && !task_reference_receipt_.failed);
-      if(ready && !normal_reference_refresh_pending_)requestPlanLocked("bound_regime_changed");
-    }
-    if(replan>task_replan_sequence_) {
-      task_replan_sequence_=replan;
-      if(ready && !normal_reference_refresh_pending_)requestPlanLocked("bound_replan_request");
-    }
-    if(!retry.empty())acceptQpRetryLocked(retry);
-  } catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,"[TaskControl planner] "<<e.what());}
-}
-
-void LocalSparseSCPPlanner::taskRecoveryCallback(const std_msgs::StringConstPtr& msg) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  try {
-    const auto event=task_event_receiver_.parse(msg->data,task_context_,ros::Time::now(),"recovery_snapshot");
-    const auto& p=event.payload;const auto pending=p.get<int>("pending_count");
-    const bool started=p.get<bool>("started"),complete=p.get<bool>("complete");
-    const auto episode=p.get<std::string>("episode_id");
-    const auto& target=p.get_child("target");const bool active=target.data()!="null";
-    if((p.size()!=5 && !(p.size()==6 && p.get_child_optional("selection"))) || pending<0 || pending>256 ||
-       (started && !std::regex_match(episode,std::regex("[0-9a-f]{32}"))) ||
-       (!started && (!episode.empty() || complete)) || (complete && (pending || active || !started)))return;
-    Eigen::VectorXd q,mask;std::vector<Eigen::Vector3d> points;
-    std::string token="none",region;long long id=-1;int sensor=-1;double deadline=0.;
-    if(active) {
-      id=target.get<long long>("obligation_id");sensor=target.get<int>("sensor_id");
-      token=target.get<std::string>("observation_token");region=target.get<std::string>("region_token");
-      const auto deadline_ns=target.get<std::uint64_t>("deadline_ns");deadline=deadline_ns*1e-9;
-      if(target.size()!=8 || id<0 || !started || pending<=0 || sensor< -1 || sensor>7 || !deadline_ns ||
-         !std::regex_match(token,std::regex("care_obs_v1_"+std::to_string(id)+"_[0-9a-f]{24}")) ||
-         !std::regex_match(region,std::regex("care_region_v1_"+std::to_string(id)+"_[0-9a-f]{24}")))return;
-      const auto vector=[&](const boost::property_tree::ptree& values,int size) {
-        Eigen::VectorXd value(size);int i=0;
-        for(const auto& cell:values) {if(i>=size || !cell.first.empty())throw std::runtime_error("invalid_task_vector");
-          value[i++]=cell.second.get_value<double>();}
-        if(i!=size || !value.allFinite())throw std::runtime_error("invalid_task_vector");return value;
-      };
-      q=vector(target.get_child("q_vis"),dof_);mask=vector(target.get_child("joint_mask"),dof_);
-      if((mask.array()<0.).any() || (mask.array()>1.).any() || mask.maxCoeff()==0.)return;
-      for(const auto& point:target.get_child("points")) {
-        if(points.size()>=256 || !point.first.empty())return;
-        points.emplace_back(vector(point.second,3));
-      }
-      if(points.empty())return;
-    }
-    auto policy=TaskRecoveryPolicy::parse(p,task_context_.binding);
-    if(policy.present) {
-      if(policy.measured_ns<task_context_.started || policy.measured_ns>ros::Time::now().toNSec())return;
-      policy.until=std::min({policy.until,event.until,task_context_.until});
-      if(policy.sha==task_recovery_policy_.sha)policy.until=std::min(policy.until,task_recovery_policy_.until);
-    }
-    task_event_receiver_.remember(event);task_recovery_until_=event.until;
-    const bool changed=active!=latest_single_waypoint_active_ || token!=latest_observation_token_ ||
-        policy.target_sha!=task_recovery_target_sha_;
-    task_recovery_target_sha_=policy.target_sha;task_recovery_policy_=policy;
-    latest_single_waypoint_active_=has_single_waypoint_q_=active;
-    latest_observation_token_=token;latest_observation_region_=region;latest_observation_sensor_=sensor;
-    latest_vbc_obligation_id_=id;latest_vbc_obligation_points_=std::move(points);
-    latest_vbc_obligation_points_seq_=event.sequence;latest_schedule_.clear();
-    if(active) {
-      latest_single_waypoint_q_=q;latest_single_waypoint_joint_mask_=mask;
-      // This is C4.7's single persistent observation target. Its original
-      // demand deadline is retained by the owner; the repair objective belongs
-      // at the terminal horizon, as in the existing single-waypoint path.
-    }
-    if(changed) {
-      ++mode_epoch_;++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;
-      pending_batch_.reset();normal_unknown_no_progress_.reset();
-      resetNormalTaskProgressLocked("bound_observation_changed");selectRepairTargetLocked();
-      if(active && repair_mode_)requestPlanLocked("bound_observation_changed");
-    }
-  } catch(const std::exception& e) {ROS_WARN_STREAM_THROTTLE(1.,"[TaskRecovery planner] "<<e.what());}
-}
-
-void LocalSparseSCPPlanner::taskContextCallback(const std_msgs::StringConstPtr& msg) {
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    try {
-      const bool changed=task_context_.update(msg->data,ros::Time::now());
-      if(changed) {
-      task_regime_.clear();task_control_until_=task_recovery_until_=task_replan_sequence_=0;
-      task_control_revision_=0;task_control_source_.clear();task_control_ready_=false;
-      task_control_target_sha_.clear();task_recovery_target_sha_.clear();
-      task_recovery_policy_=TaskRecoveryPolicy();
-      ++plan_sequence_;++mode_epoch_;plan_running_=false;waiting_for_cdf_=false;
-      pending_batch_.reset();plan_requested_=false;has_reference_=false;latest_reference_.points.clear();
-      latest_schedule_.clear();latest_single_waypoint_active_=false;has_single_waypoint_q_=false;
-      terminal_goal_valid_=false;terminal_retention_.invalidate("task_context_changed");
-      resetNormalTaskProgressLocked("task_context_changed");
-      if(task_context_.active) {
-        const auto& p=task_context_.target.pose.position;const auto& q=task_context_.target.pose.orientation;
-        if(task_context_.target.header.frame_id==terminal_base_frame_) {
-          terminal_goal_=Eigen::Isometry3d::Identity();
-          terminal_goal_.translation()=Eigen::Vector3d(p.x,p.y,p.z);
-          terminal_goal_.linear()=Eigen::Quaterniond(q.w,q.x,q.y,q.z).normalized().toRotationMatrix();
-          terminal_goal_valid_=true;++terminal_goal_revision_;
-        }
-      }
-      }
-      if(pending_bound_reference_) {
-        const auto now=ros::Time::now();const auto pending=pending_bound_reference_;
-        const auto stamp=pending->trajectory.header.stamp;
-        if(stamp>now)return;
-        pending_bound_reference_.reset();
-        const double age=(now-pending_bound_reference_received_).toSec();
-        if(age>=0. && age<=.5 && task_context_.current(pending->task_context,now) &&
-            pending->trajectory.header.frame_id==task_context_.target.header.frame_id)
-          acceptReferenceLocked(pending->trajectory,true);
-      }
-    } catch(const std::exception& e) {ROS_WARN_STREAM("[TaskContext] "<<e.what());return;}
-  }
-}
-
-void LocalSparseSCPPlanner::boundReferenceCallback(const CandidateTransferConstPtr& msg) {
-  if(!msg || msg->action!="reference" || msg->trajectory.points.empty())return;
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto now=ros::Time::now();
-  if(msg->task_context.size()>16384 || msg->trajectory.points.size()>2048 ||
-      msg->trajectory.header.stamp.isZero() || (msg->trajectory.header.stamp-now).toSec()>.05 ||
-      (now-msg->trajectory.header.stamp).toSec()>.5)return;
-  if(msg->trajectory.header.stamp>now || !task_context_.current(msg->task_context,now)) {
-    // One fresh, explicitly bound reference may precede its owner event.
-    // It cannot start work until that exact context has arrived.
-    pending_bound_reference_=msg;pending_bound_reference_received_=now;return;
-  }
-  if(msg->trajectory.header.frame_id!=task_context_.target.header.frame_id ||
-      (has_reference_ && msg->trajectory.header.stamp<=latest_reference_.header.stamp))return;
-  acceptReferenceLocked(msg->trajectory,true);
-}
-
-void LocalSparseSCPPlanner::referenceCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg) {
-  if (!msg || msg->points.empty() || task_context_enabled_) return;
-  std::lock_guard<std::mutex> lock(mutex_);
-  acceptReferenceLocked(*msg,false);
-}
-
-void LocalSparseSCPPlanner::acceptReferenceLocked(const trajectory_msgs::JointTrajectory& msg,bool bound) {
-  if (!bound && !task_reference_receipt_.reference(msg.header.stamp.toNSec())) {
-    if (msg.header.stamp.toNSec() >= task_reference_receipt_.min_stamp) {
+  if (!task_reference_receipt_.reference(msg->header.stamp.toNSec())) {
+    if (msg->header.stamp.toNSec() >= task_reference_receipt_.min_stamp) {
       // Buffer only; an exhausted request cannot authorize planning. A newer
       // request's status may arrive after its reference on the other topic.
-      latest_reference_ = msg;
+      latest_reference_ = *msg;
       latest_reference_received_ = ros::Time::now();
     }
     return;
   }
-  latest_reference_ = msg;
+  latest_reference_ = *msg;
   latest_reference_received_ = ros::Time::now();
   has_reference_ = true;
   task_no_progress_.reset();
@@ -1207,7 +1045,7 @@ void LocalSparseSCPPlanner::acceptReferenceLocked(const trajectory_msgs::JointTr
   resetNormalTaskProgressLocked("reference_changed");
   vbc_failure_direction_memory_.reset();
   std_msgs::String reset; reset.data = "status=reset reason=fresh_reference";
-  task_stall_pub_.publish(reset); publishTaskStatusLocked("stall",reset.data);
+  task_stall_pub_.publish(reset);
 
   if (normal_reference_refresh_pending_) {
     // C5.33: the first fresh /task_trajectory after PROBE->NORMAL is the
@@ -1226,7 +1064,6 @@ void LocalSparseSCPPlanner::acceptReferenceLocked(const trajectory_msgs::JointTr
 
 void LocalSparseSCPPlanner::waypointScheduleCallback(
     const std_msgs::Float64MultiArrayConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg) return;
   const bool has_joint_masks =
       !msg->layout.dim.empty() &&
@@ -1283,7 +1120,6 @@ void LocalSparseSCPPlanner::waypointScheduleCallback(
 
 void LocalSparseSCPPlanner::vbcObligationPointsCallback(
     const std_msgs::Float64MultiArrayConstPtr& msg) {
-  if(require_bound_regime_)return;
   // Message layout:
   // [publication_seq, active_obligation_id, point_count,
   //  x0, y0, z0, ...].  An id of -1 and count 0 clears the active target.
@@ -1361,7 +1197,6 @@ void LocalSparseSCPPlanner::vbcObligationPointsCallback(
 
 void LocalSparseSCPPlanner::visibilityFrontierCallback(
     const std_msgs::Float64MultiArrayConstPtr& msg) {
-  if(require_bound_regime_)return;
   // Message layout:
   // Legacy: [active, frontier_weight_scale, qvis_weight_scale, q_frontier(7)]
   // Masked: legacy fields followed by joint_mask(7).
@@ -1427,7 +1262,6 @@ void LocalSparseSCPPlanner::visibilityFrontierCallback(
 
 void LocalSparseSCPPlanner::visibilityGuidanceCallback(
     const egocentric_arm_planner::VisibilityGuidanceConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg || !rolling_visibility_guidance_enabled_) return;
   VisibilityGuidanceState g;
   g.token=msg->observation_token; g.region=msg->region_token;
@@ -1453,7 +1287,7 @@ void LocalSparseSCPPlanner::visibilityGuidanceCallback(
   latest_visibility_guidance_=g;
   if(g.geometry_valid && g.drive)
     safe_frontier_recovery_.noteGeometryFeedback(g.token,g.geometry_signature,g.stamp,
-        ros::Time::now().toSec(),g.conservative_fov_margin);
+        ros::Time::now().toSec(),g.conservative_fov_margin,g.q_eval);
   // Buffer while solving. New soft guidance cannot cancel its in-flight CDF query.
   if (changed && repair_mode_ && !plan_running_ && !waiting_for_cdf_)
     requestPlanLocked("visibility_guidance_ready");
@@ -1461,7 +1295,6 @@ void LocalSparseSCPPlanner::visibilityGuidanceCallback(
 
 void LocalSparseSCPPlanner::singleWaypointActiveCallback(
     const std_msgs::BoolConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg) return;
 
   std::lock_guard<std::mutex> lock(mutex_);
@@ -1481,7 +1314,6 @@ void LocalSparseSCPPlanner::singleWaypointActiveCallback(
 
 void LocalSparseSCPPlanner::singleWaypointQCallback(
     const std_msgs::Float64MultiArrayConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg ||
       msg->data.size() != static_cast<std::size_t>(dof_)) {
     return;
@@ -1536,14 +1368,21 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
 
 void LocalSparseSCPPlanner::recoveryCallback(
     const std_msgs::BoolConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg) return;
   bool clear_bootstrap = false;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (repair_mode_ != msg->data) {
+      const bool goal_handoff=repair_goal_stopping_enabled_ && repair_mode_ && !msg->data &&
+          terminal_retention_.armed && retainTerminalLocked();
       repair_mode_ = msg->data;
       ++mode_epoch_;
+      if(goal_handoff) {
+        // Same audited motion and goal; only its scheduling owner changes.
+        // This does not retire any observation obligation.
+        terminal_retention_.armed_context=terminalContextLocked();
+        repair_goal_handoff_execution_=terminal_retention_.armed;
+      }
       vbc_failure_direction_memory_.reset();
       normal_active_no_progress_.reset();
       normal_unknown_no_progress_.reset();
@@ -1551,7 +1390,7 @@ void LocalSparseSCPPlanner::recoveryCallback(
       if (repair_mode_) {
         task_no_progress_.reset();
         std_msgs::String reset; reset.data = "status=reset reason=real_repair_transition";
-        task_stall_pub_.publish(reset); publishTaskStatusLocked("stall",reset.data);
+        task_stall_pub_.publish(reset);
         // C5.32: the execution that was already active/completed before REPAIR
         // is not a REPAIR completion event. Baseline the stamp here so a
         // repeated latched complete=1 from the previous mode cannot trigger a
@@ -1562,7 +1401,7 @@ void LocalSparseSCPPlanner::recoveryCallback(
         // pending wait for a fresh NORMAL task reference is cancelled.
         normal_reference_refresh_pending_ = false;
       }
-      requestPlanLocked(
+      if(!goal_handoff)requestPlanLocked(
           repair_mode_ ? "enter_repair" : "leave_repair");
       clear_bootstrap = !repair_mode_;
     }
@@ -1576,7 +1415,6 @@ void LocalSparseSCPPlanner::recoveryCallback(
 
 void LocalSparseSCPPlanner::probeActiveCallback(
     const std_msgs::BoolConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg) return;
   std::lock_guard<std::mutex> lock(mutex_);
   if (probe_mode_ == msg->data) return;
@@ -1620,7 +1458,6 @@ void LocalSparseSCPPlanner::probeActiveCallback(
 
 void LocalSparseSCPPlanner::replanRequestCallback(
     const std_msgs::BoolConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg || !msg->data) return;
   std::lock_guard<std::mutex> lock(mutex_);
   if (normal_reference_refresh_pending_ && !repair_mode_ && !probe_mode_) {
@@ -1639,40 +1476,33 @@ void LocalSparseSCPPlanner::replanRequestCallback(
 void LocalSparseSCPPlanner::qpRetryRequestCallback(
     const std_msgs::StringConstPtr& msg) {
   if (!msg || msg->data.empty()) return;
-  if(require_bound_regime_ && msg->data.compare(0,6,"ready_")!=0)return;
   std::lock_guard<std::mutex> lock(mutex_);
-  acceptQpRetryLocked(msg->data);
-}
-
-void LocalSparseSCPPlanner::acceptQpRetryLocked(const std::string& token) {
   // A transport retransmission must never buy another solve. The ticket is
   // minted by one terminal failed QP, not by the requesting node or ROS time.
   std::string status = "stale";
-  if (token.compare(0, 6, "ready_") == 0) {
+  if (msg->data.compare(0, 6, "ready_") == 0) {
     // Benchmark-only round trip through the actual request/ack callbacks.
     // Readiness probes carry no planning or execution authority.
     status = "ready";
-  } else if (token == qp_retry_consumed_token_) {
+  } else if (msg->data == qp_retry_consumed_token_) {
     status = "duplicate";
-  } else if (token == qp_retry_token_ &&
+  } else if (msg->data == qp_retry_token_ &&
              qp_retry_plan_sequence_ == plan_sequence_ &&
              qp_retry_mode_epoch_ == mode_epoch_ && !repair_mode_ &&
              !plan_running_ && !plan_requested_ &&
              !normal_reference_refresh_pending_) {
-    qp_retry_consumed_token_ = token;
+    qp_retry_consumed_token_ = msg->data;
     requestPlanLocked("acknowledged_qp_retry");
     status = plan_requested_ ? "accepted" : "blocked";
   }
   std_msgs::String ack;
-  ack.data = "token=" + token + " status=" + status;
+  ack.data = "token=" + msg->data + " status=" + status;
   qp_retry_ack_pub_.publish(ack);
-  publishTaskStatusLocked("qp_retry_ack",ack.data);
   ROS_INFO_STREAM("[LocalSparseSCPPlanner] qp_retry " << ack.data);
 }
 
 void LocalSparseSCPPlanner::smoothReplanRequestCallback(
     const std_msgs::BoolConstPtr& msg) {
-  if(require_bound_regime_)return;
   if (!msg || !msg->data) return;
   std::lock_guard<std::mutex> lock(mutex_);
 
@@ -1691,10 +1521,12 @@ void LocalSparseSCPPlanner::smoothReplanRequestCallback(
 }
 
 std::string LocalSparseSCPPlanner::terminalContextLocked() const {
-  if(!terminal_retention_enabled_ || !terminal_goal_valid_ || repair_mode_ || probe_mode_ ||
-      !has_reference_ || normal_reference_refresh_pending_)return {};
+  if(!terminal_retention_enabled_ || !terminal_goal_valid_ || probe_mode_ ||
+      (repair_mode_ && !repair_goal_stopping_enabled_) ||
+      !has_reference_ || (!repair_mode_ && normal_reference_refresh_pending_))return {};
   return std::to_string(terminal_goal_revision_)+":"+std::to_string(mode_epoch_)+":"+
-      std::to_string(latest_reference_.header.stamp.toNSec());
+      (repair_mode_ ? "repair_goal_stop" :
+       std::to_string(latest_reference_.header.stamp.toNSec()));
 }
 
 bool LocalSparseSCPPlanner::terminalPoseInsideLocked(const Eigen::VectorXd& q) const {
@@ -1719,11 +1551,20 @@ void LocalSparseSCPPlanner::terminalGoalCallback(const geometry_msgs::PoseStampe
   goal.translation()=position;goal.linear()=orientation.toRotationMatrix();
   if(terminal_goal_valid_ && (goal.matrix()-terminal_goal_.matrix()).cwiseAbs().maxCoeff()<=1e-9)return;
   terminal_goal_=goal;terminal_goal_valid_=true;++terminal_goal_revision_;
+  known_ground_hold_.bind(terminal_goal_revision_);
+  ground_retry_goal_=terminal_goal_revision_;ground_resource_retries_=0;ground_resource_blocked_=false;ground_admission_.clear();
+  geometry_resource_blocked_reason_="ground_proof_unavailable_hold";
   resetNormalTaskProgressLocked("goal_changed");
   terminal_retention_.invalidate("goal_changed");
 }
 
 void LocalSparseSCPPlanner::armTerminalLocked() {
+  // A REPAIR goal-stop lease begins only after its tracker owns the actual
+  // committed motion. Earlier audit/outcome callbacks may precede that sample.
+  if(repair_goal_stopping_enabled_ && repair_mode_ &&
+      (!terminal_retention_.newest_commit || terminal_tracker_token_!=terminal_retention_.newest_commit ||
+       terminal_tracker_aborted_ || (terminal_tracker_source_!="active_trajectory" &&
+                                     terminal_tracker_source_!="trajectory_complete_hold")))return;
   const auto before=terminal_retention_.armed;
   terminal_retention_.tryArm(terminalContextLocked(),[&](const trajectory_msgs::JointTrajectory& t) {
     std::vector<int> mapping;Eigen::VectorXd q;
@@ -1732,6 +1573,12 @@ void LocalSparseSCPPlanner::armTerminalLocked() {
   });
   if(terminal_retention_.armed && terminal_retention_.armed!=before) {
     terminal_tracker_completed_=false;
+    if(repair_mode_ && repair_goal_stopping_enabled_) {
+      // A newer in-flight proposal must not replace this certified goal stop.
+      // Observation obligations and recovery budgets are retained.
+      ++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;
+      pending_batch_.reset();plan_requested_=false;
+    }
     ROS_INFO_STREAM("[NORMAL_TERMINAL] armed execution_stamp_ns="<<terminal_retention_.armed
         <<" context="<<terminal_retention_.armed_context);
   }
@@ -1884,6 +1731,8 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
   {
     std::lock_guard<std::mutex> lock(mutex_);
 
+    if(complete && has_execution_stamp && tracker_fields["execution_aborted"]=="0")
+      known_ground_hold_.completed(execution_stamp_ns);
     if(terminal_retention_enabled_ && execution_stamp_ns>=terminal_retention_.newest_commit && has_execution_stamp) {
       terminal_tracker_token_=execution_stamp_ns;terminal_tracker_received_=ros::Time::now();
       terminal_tracker_source_=tracker_fields["source"];
@@ -1902,6 +1751,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       if(terminal_tracker_source_!="last_reference_hold" || terminal_tracker_aborted_)
         terminal_retention_.invalidate("tracker_hold_changed");
     }
+    if(repair_goal_stopping_enabled_ && repair_mode_)armTerminalLocked();
     if (has_execution_stamp) {
       latest_execution_stamp_ns_ = execution_stamp_ns;
     }
@@ -1916,10 +1766,12 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
          limiter_age<=.2 && latest_limiter_intentional_hold_);
     intentional_execution_hold=intentional_hold;
     Eigen::VectorXd response_q;
+    bool response_state_fresh=false;
     if (has_joint_state_ && measured_age>=0. && measured_age<=.2 &&
         (now-latest_joint_state_received_).toSec()>=0. &&
         (now-latest_joint_state_received_).toSec()<=.2 &&
         extractMeasuredQ(latest_joint_state_,response_q)) {
+      response_state_fresh=true;
       const bool eligible=has_execution_stamp && execution_age>=0. && execution_age<=2. &&
           tracker_fields["execution_aborted"]=="0" &&
           (tracker_fields["active"]=="1" || complete) && !intentional_hold &&
@@ -1950,6 +1802,25 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       requestPlanLocked(intentional_hold ? "execution_response_safety_wait" : "execution_response_restored");
     if (has_execution_stamp && tracker_fields["execution_aborted"] == "1")
       safe_frontier_recovery_.abort(execution_stamp_ns);
+    // A failed execution is not a completed task. Once the tracker confirms
+    // its measured stop, request one fresh plan for this execution identity.
+    // Do not resurrect the old command or consume a lifetime retry allowance.
+    if (!execution_response_blocked && has_reference_ && terminal_goal_valid_ &&
+        has_execution_stamp && tracker_fields["execution_aborted"] == "1" &&
+        tracker_fields["execution_state"] == "STOPPED_HOLD" &&
+        tracker_fields["stop_execution_stamp_ns"] == std::to_string(execution_stamp_ns) &&
+        execution_stamp_ns > last_stopped_replan_stamp_ns_ &&
+        execution_stamp_ns >= terminal_retention_.newest_commit &&
+        !plan_running_ && !waiting_for_cdf_ && !plan_requested_ &&
+        response_state_fresh && response_q.size() == dof_ && !terminalPoseInsideLocked(response_q)) {
+      last_stopped_replan_stamp_ns_ = execution_stamp_ns;
+      ++stopped_execution_replan_count_;
+      requestPlanLocked("tracking_stop_replan_measured");
+      ROS_INFO_STREAM("[TASK_RECOVERY] event=stopped_execution execution_stamp_ns="
+          << execution_stamp_ns << " count=" << stopped_execution_replan_count_
+          << " measured_stamp_ns=" << latest_joint_state_.header.stamp.toNSec()
+          << " request=" << plan_request_reason_);
+    }
     if (!execution_response_blocked && !intentional_hold && safe_frontier_recovery_enabled_ && repair_mode_ && !probe_mode_ &&
         repair_observation_phase_ && latest_frontier_.active && has_execution_stamp &&
         tracker_fields["execution_aborted"] == "0" &&
@@ -1964,7 +1835,8 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       const auto certified = safe_frontier_recovery_.certified.find(execution_stamp_ns);
       const bool monitoring_observation = certified!=safe_frontier_recovery_.certified.end() &&
           (!safe_frontier_recovery_.active || certified->second.following_frontier ||
-           safe_frontier_recovery_.monitor_detour_observation);
+            safe_frontier_recovery_.monitor_detour_observation ||
+            safe_frontier_recovery_.persistent_observation_monitor);
       if (extractMeasuredQ(latest_joint_state_, measured))
         safe_recovery_changed = safe_frontier_recovery_.observe(
             execution_stamp_ns, now.toSec(), measured);
@@ -1987,7 +1859,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
             latest_observation_feedback_unseen_ &&
             recovery.observation_token == latest_observation_token_ &&
             recovery.observation_goal.size()==dof_ && measured.size()==dof_ &&
-            (recovery.monitor_detour_observation ||
+             (recovery.monitor_detour_observation || recovery.persistent_observation_monitor ||
              ((measured-recovery.observation_goal).cwiseProduct(recovery.observation_mask)).norm()<=.001) &&
             recovery.feedback_query_time>=0. && feedback_age>=0. && feedback_age<=.5 &&
             !current_query_stamp_.isZero() && query_age>=0. && query_age<=1.;
@@ -2102,7 +1974,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
           task_no_progress_.reset();
           normal_unknown_task_progress_.resetWindow("task_progress_after_stall");
           std_msgs::String reset;reset.data="status=reset reason=task_space_progress";
-          task_stall_pub_.publish(reset); publishTaskStatusLocked("stall",reset.data);
+          task_stall_pub_.publish(reset);
           requestPlanLocked("task_space_progress_after_stall");
         }
         normal_task_stall=normal_unknown_task_progress_.observe(now.toSec(),execution_stamp_ns,
@@ -2207,7 +2079,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       s << " task_position_error_m=" << normal_task_position_error
         << " task_orientation_error_rad=" << normal_task_orientation_error;
     msg.data = s.str();
-    task_stall_pub_.publish(msg); publishTaskStatusLocked("stall",msg.data);
+    task_stall_pub_.publish(msg);
     publishSummary("normal_certified_no_measured_progress");
     ROS_WARN_STREAM("[LocalSparseSCPPlanner] " << msg.data);
   }
@@ -2332,6 +2204,7 @@ void LocalSparseSCPPlanner::acceptCdfBatch(
         }
       }
     }
+    view_preview_batch_=msg; view_preview_batch_received_=ros::Time::now();
     pending_batch_ = msg;
     if (plan_repair_mode_ && repair_mode_ && plan_mode_epoch_ == mode_epoch_ &&
         repair_no_progress_.current(plan_repair_ticket_))
@@ -2527,23 +2400,52 @@ void LocalSparseSCPPlanner::updateRepairWitnessesLocked(
   }
 }
 
+std::string LocalSparseSCPPlanner::groundContextLocked() const {
+  if(!terminal_goal_valid_)return {};
+  return std::to_string(terminal_goal_revision_)+":"+std::to_string(mode_epoch_)+":"+
+      std::to_string(latest_reference_.header.stamp.toNSec());
+}
+
+void LocalSparseSCPPlanner::checkKnownGroundHoldLocked() {
+  if(!primitive_observation_guard_.knownGroundEnabled() || !known_ground_hold_.due(ros::WallTime::now().toSec()))return;
+  const double now=ros::Time::now().toSec(),wall=ros::WallTime::now().toSec();
+  Eigen::VectorXd q;double minimum=std::numeric_limits<double>::infinity();
+  const double stamp=latest_joint_state_.header.stamp.toSec();
+  bool valid=has_joint_state_ && stamp>0. && now>=stamp && now-stamp<=.05 &&
+      extractMeasuredQ(latest_joint_state_,q);
+  if(valid) {
+    Eigen::MatrixXd points=q;std::vector<PrimitiveObservationGuard::Row> rows;std::string error;
+    valid=primitive_observation_guard_.linearizeKnownGround(points,&rows,&error) && !rows.empty();
+    for(const auto& row:rows)minimum=std::min(minimum,row.distance_m-row.required_margin_m);
+  }
+  const auto before=known_ground_hold_.state;
+  const bool wake=known_ground_hold_.observe(groundContextLocked(),now,wall,stamp,valid,minimum,0.);
+  if(wake)requestPlanLocked("ground_clearance_restored");
+  if(wake || before!=known_ground_hold_.state)
+    ROS_INFO_STREAM("[GROUND_HOLD] event="<<known_ground_hold_.reason<<" goal="<<known_ground_hold_.goal
+        <<" minimum_m="<<minimum<<" wakeups="<<known_ground_hold_.wakeups<<" requested="<<plan_requested_);
+}
+
 void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
+  bool goal_stop_heartbeat=false;
   bool should_start = false;
   bool should_abort = false;
   std::string replacement_event;
 
   {
     std::unique_lock<std::mutex> lock(mutex_);
-    if(require_bound_regime_ && (!task_control_ready_ || task_regime_.empty() ||
-        ros::Time::now().toNSec()>task_control_until_ ||
-        !task_context_.current(task_context_.binding,ros::Time::now()) ||
-        (repair_mode_ && (!has_single_waypoint_q_ || ros::Time::now().toNSec()>task_recovery_until_)))) {
-      if(plan_running_ || waiting_for_cdf_) {++plan_sequence_;++mode_epoch_;}
-      plan_running_=waiting_for_cdf_=plan_requested_=false;pending_batch_.reset();return;
-    }
-
+    checkKnownGroundHoldLocked();
     if(terminal_retention_.armed && (terminal_tracker_token_==terminal_retention_.armed || terminal_tracker_completed_) &&
         !retainTerminalLocked())requestPlanLocked("terminal_retention_released");
+    goal_stop_heartbeat=repair_goal_stopping_enabled_ && repair_goal_handoff_execution_;
+    if(repair_goal_stopping_enabled_ && terminal_retention_.armed &&
+        (terminal_tracker_token_==terminal_retention_.armed || terminal_tracker_completed_) &&
+        retainTerminalLocked()) {
+      // Keep the receiver's certified stop while it is executing or holding.
+      // Replacement reservations remain recorded; their ordinary timer work
+      // must not schedule a competing motion or suppress this heartbeat.
+      lock.unlock();publishSummary("goal_stop_heartbeat");return;
+    }
     if(!state_evidence_retry_pending_.empty() && ros::WallTime::now()>=state_evidence_retry_deadline_) {
       const bool residual=state_residual_retry_raw_ && state_residual_retry_epoch_==mode_epoch_ &&
           state_residual_retry_token_==latest_observation_token_ && repair_mode_ && !probe_mode_ &&
@@ -2565,15 +2467,16 @@ void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
           latest_observation_token_ == candidate_replacement_new_token_;
       if (!applied && repair_mode_ && !probe_mode_ &&
           mode_epoch_ == candidate_replacement_epoch_ &&
-          ros::Time::now() < candidate_replacement_deadline_ &&
+          (candidate_replacement_execution_v2_ || ros::Time::now() < candidate_replacement_deadline_) &&
           ros::WallTime::now() < candidate_replacement_wall_deadline_) return;
       if(applied) {
         candidate_replacement_pending_ = false;
+        safe_frontier_recovery_.finishViewReplacement(true);
         requestPlanLocked("candidate_replacement_applied");
       } else {
         // Expiry retires this reservation, not its still-live observation.
         // A new measured query must authenticate the next charged attempt.
-        replacement_event=finishReplacementLocked(true,"candidate_replacement_expired");
+        replacement_event=finishReplacementLocked(true,"candidate_replacement_expired",true);
       }
     }
 
@@ -2613,6 +2516,7 @@ void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
     }
   }
 
+  if(goal_stop_heartbeat)publishSummary("goal_stop_heartbeat");
   if(!replacement_event.empty())publishSummary(replacement_event);
   if (should_abort) {
     abortPlan("cdf_wait_timeout");
@@ -2815,7 +2719,7 @@ void LocalSparseSCPPlanner::resetNormalTaskProgressLocked(const std::string& rea
   normal_task_stall_pending_=false;normal_task_stall_context_.clear();
   task_no_progress_.reset();
   std_msgs::String reset;reset.data="status=reset reason=normal_task_"+reason;
-  task_stall_pub_.publish(reset); publishTaskStatusLocked("stall",reset.data);
+  task_stall_pub_.publish(reset);
   if (!repair_mode_ && !probe_mode_ && has_reference_ && !normal_reference_refresh_pending_)
     requestPlanLocked("normal_task_"+reason);
 }
@@ -3005,6 +2909,11 @@ void LocalSparseSCPPlanner::selectRepairTargetLocked() {
       latest_single_waypoint_active_ && has_single_waypoint_q_ && latest_schedule_.empty()
           ? latest_observation_token_ : "none",
       latest_single_waypoint_q_, latest_single_waypoint_joint_mask_);
+  const char* monitor=std::getenv("CARE_OBSERVATION_PROGRESS_ENABLED");
+  safe_frontier_recovery_.persistent_observation_monitor=monitor && std::string(monitor)=="true";
+  const char* action_progress=std::getenv("CARE_OBSERVATION_ACTION_PROGRESS");
+  safe_frontier_recovery_.action_progress_enabled=action_progress && std::string(action_progress)=="true";
+  safe_frontier_recovery_.setObservationRegion(latest_observation_region_);
 }
 
 void LocalSparseSCPPlanner::observationProgressCallback(const std_msgs::StringConstPtr& msg) {
@@ -3054,17 +2963,27 @@ void LocalSparseSCPPlanner::observationProgressCallback(const std_msgs::StringCo
 }
 
 std::string LocalSparseSCPPlanner::finishReplacementLocked(
-    bool refresh_failed_target, const std::string& reason) {
+    bool refresh_failed_target, const std::string& reason, bool unapplied_resource) {
   candidate_replacement_pending_=false;
   candidate_replacement_retry_pending_=false;
+  safe_frontier_recovery_.finishViewReplacement(false);
   selectRepairTargetLocked();
+  if(candidate_replacement_execution_v2_ && unapplied_resource) {
+    const bool refunded=safe_frontier_recovery_.refundUnappliedReplacement(candidate_replacement_charge_);
+    ROS_WARN_STREAM("[replacement_unapplied] reason="<<reason<<" refunded="<<refunded
+        <<" attempts="<<safe_frontier_recovery_.attempts
+        <<" resource_failures="<<safe_frontier_recovery_.unapplied_replacements);
+  }
   candidate_replacement_retry_context_=candidate_replacement_reserved_failure_;
   const bool current_failure=candidate_replacement_reserved_qp_ && refresh_failed_target &&
       mode_epoch_==candidate_replacement_epoch_ &&
       candidate_replacement_retry_context_.blocks(repairTargetKeyLocked(),
           latest_observation_token_,mode_epoch_,repair_no_progress_.active.progress);
   std::string event=reason;
-  if(current_failure && qpReplacementRetryCurrentLocked()) {
+  if(current_failure && candidate_replacement_execution_v2_ &&
+      !safe_frontier_recovery_.canRetryUnappliedReplacement()) {
+    event="replacement_generation_resource_exhausted_hold";
+  } else if(current_failure && qpReplacementRetryCurrentLocked()) {
     candidate_replacement_retry_pending_=true;
     event="repair_qp_replacement_refresh_scheduled";
   } else if(current_failure && !safe_frontier_recovery_.canReserveReplacement()) {
@@ -3088,9 +3007,9 @@ void LocalSparseSCPPlanner::candidateReplacementCallback(const std_msgs::StringC
   std::unique_lock<std::mutex> lock(mutex_);
   if (fields["action"] == "finish") {
     if (!candidate_replacement_pending_ || id != candidate_replacement_id_) return;
-    if(ros::Time::now()>=candidate_replacement_deadline_ ||
+    if((!candidate_replacement_execution_v2_ && ros::Time::now()>=candidate_replacement_deadline_) ||
         ros::WallTime::now()>=candidate_replacement_wall_deadline_) {
-      const auto event=finishReplacementLocked(true,"candidate_replacement_expired");
+      const auto event=finishReplacementLocked(true,"candidate_replacement_expired",true);
       lock.unlock();publishSummary(event);return;
     }
     if (fields["new_token"].find("care_obs_v1_") == 0)
@@ -3100,7 +3019,14 @@ void LocalSparseSCPPlanner::candidateReplacementCallback(const std_msgs::StringC
           (fields["generation_result"] == "no_geometric_candidate" ||
            fields["generation_result"] == "candidate_not_distinct" ||
            fields["generation_result"] == "generation_expired");
-      const auto event=finishReplacementLocked(geometric_failure,"candidate_replacement_rejected");
+      const std::string outcome=fields["generation_result"];
+      const bool unapplied=outcome=="generation_expired" || outcome=="context_changed" ||
+          outcome=="stale_measured_state" || outcome=="invalid_measured_state" ||
+          outcome=="generation_error" || outcome=="no_trajectory" ||
+          outcome=="observation_already_seen" || outcome=="application_geometry_changed";
+      const auto event=finishReplacementLocked(geometric_failure ||
+          (candidate_replacement_execution_v2_ && unapplied),
+          "candidate_replacement_rejected",unapplied);
       lock.unlock();
       publishSummary(event);
     }
@@ -3167,13 +3093,17 @@ void LocalSparseSCPPlanner::candidateReplacementCallback(const std_msgs::StringC
   // the finite candidate-replacement attempts. The same authenticated
   // trigger/pending handshake still freezes planning until the new token is
   // published or the request expires.
-  const bool granted = valid && (owner_promotion_request
+  auto replacement_charge=safe_frontier_recovery_.replacementCharge();
+  const bool resource_available=!candidate_replacement_execution_v2_ || owner_promotion_request ||
+      safe_frontier_recovery_.canRetryUnappliedReplacement();
+  const bool granted = valid && resource_available && (owner_promotion_request
       ? owner_promotion_reason && safe_frontier_recovery_.authorizeOwnerPromotion()
       : final_vbc_request
       ? safe_frontier_recovery_.reserveReplacementAfterVbc(
             candidate_replacement_trigger_direction_advanced_)
       : safe_frontier_recovery_.reserveReplacement());
   const std::string denial = granted ? "none" : !valid ? "stale_context" :
+      !resource_available ? "generation_resource_exhausted" :
       owner_promotion_request ? "owner_unavailable" : "recovery_budget_exhausted";
   std_msgs::String reply;
   std::ostringstream s;
@@ -3183,16 +3113,22 @@ void LocalSparseSCPPlanner::candidateReplacementCallback(const std_msgs::StringC
     << " owner_promotion=" << static_cast<int>(owner_promotion_request)
     << " denial_reason=" << denial;
   if (granted) {
+    if(!owner_promotion_request)safe_frontier_recovery_.beginViewReplacement();
+    if(!owner_promotion_request)safe_frontier_recovery_.sealReplacementCharge(replacement_charge);
+    candidate_replacement_charge_=replacement_charge;
     candidate_replacement_reserved_qp_ = qp_request;
     candidate_replacement_reserved_failure_ = repair_candidate_failure_;
     candidate_replacement_trigger_pending_ = false;
     candidate_replacement_pending_=true; candidate_replacement_id_=id;
     candidate_replacement_epoch_=mode_epoch_; candidate_replacement_new_token_.clear();
-    candidate_replacement_deadline_=ros::Time::now()+ros::Duration(2.);
-    candidate_replacement_wall_deadline_=ros::WallTime::now()+ros::WallDuration(3.);
+    candidate_replacement_deadline_=ros::Time::now()+ros::Duration(candidate_replacement_execution_v2_?10.:2.);
+    candidate_replacement_wall_deadline_=ros::WallTime::now()+ros::WallDuration(candidate_replacement_execution_v2_?10.:3.);
     ++plan_sequence_; plan_running_=false; waiting_for_cdf_=false;
     pending_batch_.reset(); plan_requested_=false;
     s << " deadline_ns=" << candidate_replacement_deadline_.toNSec();
+    if(candidate_replacement_execution_v2_)
+      s << " lease_timing=wall_v2 wait_budget_s=3 generation_budget_s=6 deadline_wall_ns="
+        << candidate_replacement_wall_deadline_.toNSec();
   } else if (matches_pending_trigger) {
     candidate_replacement_trigger_pending_ = false;
     requestPlanLocked("candidate_replacement_denied");
@@ -3205,7 +3141,12 @@ void LocalSparseSCPPlanner::candidateReplacementCallback(const std_msgs::StringC
 }
 
 void LocalSparseSCPPlanner::admissionTerminalCallback(const CandidateTransferConstPtr& msg) {
-  if (!msg || msg->action!="preaudit_expired" || msg->remaining_budget_s!=0. || !msg->sequence) return;
+  if (!msg || (msg->action!="preaudit_expired" && msg->action!="preaudit_ground_rejected" && msg->action!="preaudit_ground_resource" && msg->action!="preaudit_metric_rejected" && msg->action!="preaudit_metric_resource") ||
+      msg->remaining_budget_s!=0. || !msg->sequence) return;
+  const bool metric=msg->action=="preaudit_metric_rejected" || msg->action=="preaudit_metric_resource";
+  const bool resource=msg->action=="preaudit_ground_resource" || msg->action=="preaudit_metric_resource";
+  const bool ground=msg->action=="preaudit_ground_rejected" || msg->action=="preaudit_ground_resource";
+  if((ground || metric) && !primitive_observation_guard_.knownGroundEnabled())return;
   const auto hex=[](const std::string& s,std::size_t n) {
     return s.size()==n && s.find_first_not_of("0123456789abcdef")==std::string::npos;
   };
@@ -3214,6 +3155,34 @@ void LocalSparseSCPPlanner::admissionTerminalCallback(const CandidateTransferCon
   {
     std::lock_guard<std::mutex> lock(mutex_);
     const auto raw=msg->trajectory.header.stamp.toNSec();
+    if(metric || (ground && (resource || !repair_mode_ || probe_mode_))) {
+      const auto it=ground_admission_.find(raw);
+      if(it==ground_admission_.end())return;
+      const auto original=it->second;
+      if(original.goal!=terminal_goal_revision_ || original.epoch!=mode_epoch_ ||
+          original.repair!=repair_mode_ || original.probe!=probe_mode_ ||
+          original.context!=groundContextLocked() || ros::WallTime::now()>=original.deadline ||
+          msg->planned_prefix_context!=original.planned.planned_prefix_context)return;
+      auto received=msg->trajectory,published=original.planned.trajectory;
+      received.header.seq=published.header.seq=0;if(received!=published)return;
+      ground_admission_.erase(it);admission_pending_.erase(raw);
+      final_vbc_no_progress_.pending.erase(raw);gcdf_feedback_pending_.erase(raw);
+      safe_frontier_recovery_.pending.erase(raw); // unknown proof is not a direction counterexample
+      if(ground_retry_goal_!=terminal_goal_revision_)return;
+      ++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;pending_batch_.reset();
+      if(ground_resource_retries_>=2 && !task_first_research_) {
+        geometry_resource_blocked_reason_=metric?"metric_proof_unavailable_hold":"ground_proof_unavailable_hold";
+        ground_resource_blocked_=true;plan_requested_=false;plan_request_reason_=geometry_resource_blocked_reason_;
+      } else {
+        ++ground_resource_retries_;
+        requestPlanLocked(metric ? (resource ? "metric_resource_retry" : "metric_candidate_retry") :
+            (resource ? "ground_resource_retry" : "ground_candidate_retry"));
+      }
+      ROS_INFO_STREAM("[GEOMETRY_RESOURCE] raw="<<raw<<" action="<<msg->action
+          <<" goal="<<terminal_goal_revision_<<" retries="<<ground_resource_retries_
+          <<" requested="<<plan_requested_<<" reason="<<plan_request_reason_);
+      return;
+    }
     const auto sent=admission_pending_.find(raw);
     const auto failure=final_vbc_no_progress_.pending.find(raw);
     const auto proposal=safe_frontier_recovery_.pending.find(raw);
@@ -3231,11 +3200,16 @@ void LocalSparseSCPPlanner::admissionTerminalCallback(const CandidateTransferCon
     received.header.seq=published.header.seq=0; // publisher-local, not identity
     if(received!=published)return;
     admission_pending_.erase(sent);final_vbc_no_progress_.pending.erase(failure);gcdf_feedback_pending_.erase(raw);
-    const bool advanced=safe_frontier_recovery_.reject(raw,true);
+    // An unexecuted scheduling timeout contains no geometric counterexample.
+    // The unchanged task watchdog bounds retries; retain all direction evidence.
+    const bool scheduling_only=task_first_research_ && msg->action=="preaudit_expired";
+    bool advanced=false;
+    if(scheduling_only) safe_frontier_recovery_.pending.erase(raw);
+    else advanced=safe_frontier_recovery_.reject(raw,true);
     ++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;pending_batch_.reset();
-    requestPlanLocked("preaudit_expired_proposal_retry");event=plan_request_reason_;
+    requestPlanLocked(ground ? "known_ground_preaudit_retry" : "preaudit_expired_proposal_retry");event=plan_request_reason_;
     ROS_INFO_STREAM("[ADMISSION_DISPOSITION] raw_candidate_stamp_ns="<<raw<<" session="<<msg->session
-        <<" sequence="<<msg->sequence<<" audit_started=0 direction_advanced="<<advanced
+        <<" sequence="<<msg->sequence<<" action="<<msg->action<<" audit_started=0 direction_advanced="<<advanced
         <<" attempts="<<safe_frontier_recovery_.attempts<<" segments="<<safe_frontier_recovery_.segments
         <<" requested="<<plan_requested_<<" reason="<<event);
   }
@@ -3258,7 +3232,9 @@ void LocalSparseSCPPlanner::finalVerificationCallback(const std_msgs::StringCons
     if (!parseUnsignedToken(msg->data, "raw_candidate_stamp_ns", &raw_safe) ||
         !parseUnsignedToken(msg->data, "execution_stamp_ns", &execution)) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if(fields["verification_view"]=="full_horizon" &&
+    if((fields["verification_view"]=="full_horizon" ||
+        (repair_goal_stopping_enabled_ && repair_mode_ && !probe_mode_ &&
+         fields["verification_view"]=="repair_prefix_brake_hold")) &&
         parseUnsignedToken(msg->data,"audited_trajectory_stamp_ns",&audited)) {
       terminal_retention_.certify(raw_safe,audited,execution,terminalContextLocked());armTerminalLocked();
     }
@@ -3787,10 +3763,41 @@ bool LocalSparseSCPPlanner::buildGeometricRestoreProposalLocked(
     });
     if(point==points.end())return false;
     gradients.push_back(row.gradient);distances.push_back(row.distance_m);
-    objective.point_floor_m.push_back(point->ordinary_path_guard ||
+    const bool fixed_start = std::any_of(failure.fixed_start_recovery_points.begin(),
+        failure.fixed_start_recovery_points.end(), [&](const Eigen::Vector3d& p) {
+          return (p-row.point).lpNorm<Eigen::Infinity>()<=1e-5;
+        });
+    // Only a deficient, explicitly declared point enters the escape proposal.
+    // The fixed-start QP remains rejected; full native proof is still required.
+    if(fixed_start && (!fixed_start_recovery_enabled_ ||
+        row.distance_m<=initial_shell_execution_margin_m_+1e-6))return false;
+    objective.point_floor_m.push_back((point->ordinary_path_guard && !fixed_start) ||
         row.distance_m>primitive_observation_margin_m_+1e-12 ?
         primitive_observation_margin_m_ : initial_shell_execution_margin_m_);
-    objective.point_reserve_m.push_back(point->ordinary_path_guard ? point->proposal_reserve_m : 0.);
+    objective.point_reserve_m.push_back(fixed_start ?
+        primitive_observation_margin_m_-objective.point_floor_m.back()+.002 :
+        point->ordinary_path_guard ? point->proposal_reserve_m : 0.);
+    if(fixed_start && row.distance_m<primitive_observation_margin_m_ && row.gradient.norm()>1e-9)
+      objective.visibility_gradient+=row.gradient.normalized()*
+          (primitive_observation_margin_m_-row.distance_m);
+  }
+  if(primitive_observation_guard_.knownGroundEnabled()) {
+    std::vector<PrimitiveObservationGuard::Row> ground_rows;
+    if(!primitive_observation_guard_.linearizeKnownGround(measured,&ground_rows,&error))return false;
+    for(const auto& row:ground_rows) {
+      gradients.push_back(row.gradient);distances.push_back(row.distance_m);
+      objective.point_floor_m.push_back(row.required_margin_m);
+      objective.point_reserve_m.push_back(0.);
+    }
+  }
+  if(!failure.fixed_start_recovery_points.empty()) {
+    // Escape steering uses the deficient-point normals, not a new sensor goal.
+    objective.visibility_gradient.setZero();
+    for(const auto& row:rows)for(const auto& p:failure.fixed_start_recovery_points)
+      if((p-row.point).lpNorm<Eigen::Infinity>()<=1e-5 && row.gradient.norm()>1e-9)
+        objective.visibility_gradient+=row.gradient.normalized()*
+            std::max(0.,primitive_observation_margin_m_-row.distance_m);
+    objective.observation_mask.setOnes();desired=measured+objective.visibility_gradient;
   }
   const bool proposed=geometricRestoreProposal(measured,desired,gradients,distances,
       safe_frontier_recovery_.failed_directions,q_min_,q_max_,velocity_limits_,joint_position_margin_,
@@ -3855,6 +3862,19 @@ std::string LocalSparseSCPPlanner::handleHandoffResidualLocked(unsigned long lon
   if(!safe_frontier_recovery_enabled_ || pending==safe_frontier_recovery_.pending.end() ||
       pending->second.generation!=safe_frontier_recovery_.generation)
     return "handoff_residual_context_unavailable_hold";
+  if(executable_task_research_ && failure.initial_state_changed) {
+    // The audited curve was never committed. A changed start invalidates that
+    // curve's certificate, not its sensor direction. Rebuild from live q/v;
+    // fresh GCDF, VBC and the unchanged live residual check still authorize it.
+    safe_frontier_recovery_.pending.erase(pending);
+    safe_frontier_recovery_.last_advance_reason="handoff_state_rebuild";
+    ROS_INFO_STREAM("[HANDOFF_REBUILD] raw_candidate_stamp_ns="<<raw
+        <<" audited_trajectory_stamp_ns="<<audit<<" required_m="<<failure.required_residual_m
+        <<" certified_m="<<failure.certified_residual_m
+        <<" attempts="<<safe_frontier_recovery_.attempts<<" direction_advanced=0");
+    requestPlanLocked("handoff_state_rebuild");
+    return plan_request_reason_;
+  }
   const auto scope=std::to_string(mode_epoch_)+":"+latest_observation_token_;
   if(primitive_observation_guard_enabled_ && failure.point.ordinary_path_guard) {
     if(restore_path_guard_scope_!=scope){restore_path_guard_scope_=scope;restore_path_guard_points_.clear();}
@@ -3941,17 +3961,35 @@ bool LocalSparseSCPPlanner::qpReplacementRetryCurrentLocked() const {
 
 void LocalSparseSCPPlanner::requestPlanLocked(
     const std::string& reason) {
+  if(primitive_observation_guard_.knownGroundEnabled() && ground_resource_blocked_ &&
+      ground_retry_goal_==terminal_goal_revision_) {
+    plan_requested_=false;plan_request_reason_=geometry_resource_blocked_reason_;return;
+  }
+  if(primitive_observation_guard_.knownGroundEnabled() && known_ground_hold_.blocked()) {
+    if(known_ground_hold_.goal==terminal_goal_revision_ && known_ground_hold_.context==groundContextLocked()) {
+      plan_requested_=false;plan_request_reason_=known_ground_hold_.reason;return;
+    }
+    known_ground_hold_.cancel("ground_context_changed");
+  }
   if(fixed_start_clearance_hold_.armed) {
     plan_requested_=false;plan_request_reason_="fixed_start_unknown_clearance_hold";return;
   }
-  const bool optional=reason=="smooth_handoff_normal" || reason=="normal_trajectory_complete";
+  const bool goal_observation_wakeup=repair_goal_stopping_enabled_ &&
+      (repair_mode_ || repair_goal_handoff_execution_==terminal_retention_.armed) &&
+      (reason.find("visibility")!=std::string::npos ||
+       reason=="vbc_obligation_points_changed" || reason=="repair_prefix_selection_changed" ||
+       reason.find("candidate_replacement")!=std::string::npos);
+  const bool optional=reason=="smooth_handoff_normal" || reason=="normal_trajectory_complete" ||
+      goal_observation_wakeup ||
+      (repair_goal_stopping_enabled_ && repair_mode_ &&
+       (reason=="smooth_handoff_repair" || reason=="repair_trajectory_complete"));
   if(optional && retainTerminalLocked()) {
     ++terminal_retention_.suppressed_count;
     ROS_INFO_STREAM("[NORMAL_TERMINAL] suppressed reason="<<reason<<" execution_stamp_ns="<<terminal_retention_.armed
         <<" count="<<terminal_retention_.suppressed_count);
     return;
   }
-  terminal_retention_.invalidate(reason);
+  terminal_retention_.replan(reason);
   // A different plan request supersedes any failed-QP retry ticket, including
   // reference/mode/progress changes. Its delayed delivery cannot preempt work.
   qp_retry_token_.clear();
@@ -4040,7 +4078,6 @@ bool LocalSparseSCPPlanner::startPlan() {
   bool probe = false;
   std::string reason;
   unsigned long long start_mode_epoch = 0;
-  std::string start_task_context,start_task_regime;
   RepairPrefixSelection start_prefix_selection;
 
   {
@@ -4069,19 +4106,6 @@ bool LocalSparseSCPPlanner::startPlan() {
       plan_requested_ = false;
       return false;
     }
-    if(task_context_enabled_ && !task_context_.current(task_context_.binding,ros::Time::now()))return false;
-    if(require_bound_regime_ && (!task_control_ready_ || task_regime_.empty() || ros::Time::now().toNSec()>task_control_until_))return false;
-    if(require_bound_regime_ && repair_mode_ && !task_recovery_target_sha_.empty() &&
-       task_recovery_target_sha_!=task_control_target_sha_)return false;
-    if(require_bound_recovery_policy_ && repair_mode_ && !probe_mode_) {
-      Eigen::VectorXd measured;
-      if(!has_joint_state_ || !extractMeasuredQ(latest_joint_state_,measured) ||
-         !task_recovery_policy_.current(task_context_.binding,task_regime_,task_control_target_sha_,
-                                       measured,ros::Time::now().toNSec()))return false;
-    }
-    start_task_context=task_context_.binding;
-    start_task_regime=task_regime_;plan_task_regime_=start_task_regime;
-    plan_task_context_=start_task_context;
     if (!has_joint_state_ || !has_reference_) {
       ROS_WARN_THROTTLE(
           1.0,
@@ -4104,25 +4128,6 @@ bool LocalSparseSCPPlanner::startPlan() {
     if (previous_command.size() != dof_)
       previous_command = Eigen::VectorXd::Zero(dof_);
     frontier = latest_frontier_;
-    plan_recovery_target_sha_=task_recovery_target_sha_;plan_recovery_policy_sha_.clear();
-    if(require_bound_regime_) {
-      frontier=FrontierObjective();
-      latest_visibility_guidance_=VisibilityGuidanceState();
-      Eigen::VectorXd policy_measured;
-      if(extractMeasuredQ(joint_state,policy_measured) &&
-         task_recovery_policy_.current(task_context_.binding,task_regime_,task_control_target_sha_,
-                                       policy_measured,ros::Time::now().toNSec())) {
-        const auto& p=task_recovery_policy_;plan_recovery_policy_sha_=p.sha;
-        frontier.active=true;frontier.q=p.target;frontier.joint_mask=p.mask;
-        frontier.frontier_weight_scale=p.frontier_weight;frontier.qvis_weight_scale=p.qvis_weight;
-        if(p.has_guidance) {
-          latest_visibility_guidance_=p.guidance;latest_visibility_guidance_.epoch=mode_epoch_;
-          if(p.guidance.geometry_valid && p.guidance.drive)
-            safe_frontier_recovery_.noteGeometryFeedback(p.guidance.token,p.guidance.geometry_signature,
-                p.guidance.stamp,ros::Time::now().toSec(),p.guidance.conservative_fov_margin);
-        }
-      }
-    }
     Eigen::VectorXd guidance_measured;
     if (rolling_visibility_guidance_enabled_ && extractMeasuredQ(joint_state, guidance_measured) &&
         latest_visibility_guidance_.compatible(latest_observation_token_, latest_observation_region_,
@@ -4240,7 +4245,9 @@ bool LocalSparseSCPPlanner::startPlan() {
     return false;
   }
 
-  if (repair_executable_view_enabled_ && !probe) {
+  const bool rolling_task = std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION")) == "true";
+  if (repair_executable_view_enabled_ && (!probe || rolling_task)) {
     // NORMAL optimizes the same acceleration ramp that will be certified.
     // Its boundary is the measured velocity, not an instantaneous setpoint.
     previous_command.resize(dof_);
@@ -4256,6 +4263,33 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
   }
 
+  if (rolling_task && !repair && !reference.points.empty()) {
+    std::vector<int> goal_mapping;
+    if (!buildTrajectoryMapping(reference, goal_mapping)) {
+      abortPlan("rolling_task_goal_mapping_failed"); return false;
+    }
+    Eigen::VectorXd goal(dof_);
+    for (int j=0;j<dof_;++j) goal[j]=reference.points.back().positions[goal_mapping[j]];
+    double duration=2.;
+    for (int j=0;j<dof_;++j) {
+      const double delta=std::abs(goal[j]-q_current[j]);
+      duration=std::max(duration,1.9*delta/velocity_limits_[j]);
+      duration=std::max(duration,std::sqrt(6.*delta/repair_executable_settings_.acceleration[j]));
+    }
+    const auto refreshed=arm_trajectory::JointTrajectory::makeQuinticBoundaryVelocityAcceleration(
+        q_current,previous_command,Eigen::VectorXd::Zero(dof_),goal,
+        Eigen::VectorXd::Zero(dof_),Eigen::VectorXd::Zero(dof_),duration,.02);
+    reference.header.stamp=ros::Time::now(); reference.joint_names=joint_names_;reference.points.clear();
+    for (std::size_t k=0;k<refreshed.size();++k) {
+      trajectory_msgs::JointTrajectoryPoint p;
+      const auto a=refreshed.positions()[k],b=refreshed.velocities()[k],c=refreshed.accelerations()[k];
+      p.positions.assign(a.data(),a.data()+dof_);p.velocities.assign(b.data(),b.data()+dof_);
+      p.accelerations.assign(c.data(),c.data()+dof_);p.time_from_start=ros::Duration(refreshed.times()[k]);
+      reference.points.push_back(p);
+    }
+    ROS_INFO_STREAM("[ROLLING_TASK_REFERENCE] goal_revision="<<terminal_goal_revision_
+        <<" probe="<<probe<<" duration_s="<<duration<<" measured_stamp_ns="<<joint_state.header.stamp.toNSec());
+  }
   Eigen::MatrixXd q_ref, u_ref, q_init, u_init;
   if (!buildReferenceHorizon(
           q_current, reference, ros::Time::now(), probe,
@@ -4288,9 +4322,7 @@ bool LocalSparseSCPPlanner::startPlan() {
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if ((require_bound_regime_ && (start_task_regime!=task_regime_ || !task_control_ready_ || ros::Time::now().toNSec()>task_control_until_)) ||
-        (task_context_enabled_ && !task_context_.current(start_task_context,ros::Time::now())) ||
-        start_mode_epoch != mode_epoch_ ||
+    if (start_mode_epoch != mode_epoch_ ||
         (repair_prefix_binding_enabled_ && repair && !probe &&
          !prefixSelectionCurrentLocked(start_prefix_selection)) ||
         (repair && !repair_no_progress_.targetCurrent(plan_repair_ticket_))) {
@@ -4316,6 +4348,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_qp_backtrack_policy_.reset();
     plan_normal_reseed_used_ = false;
     plan_repair_conflict_reseed_ = RepairConflictReseed{};
+    plan_normal_retained_q_.resize(0,0);plan_normal_retained_u_.resize(0,0);
     plan_executable_iterates_ = RepairExecutableIterates{};
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
@@ -4398,10 +4431,10 @@ void LocalSparseSCPPlanner::abortPlan(const std::string& reason) {
     // Transport failure is not evidence of collision or geometric infeasibility.
     // Remain fail-closed; no unbounded automatic retry of the same reference.
     std_msgs::Bool uncertified; uncertified.data = true;
-    task_uncertified_pub_.publish(uncertified); publishTaskStatusLocked("uncertified",(uncertified.data ? "1" : "0"));
+    task_uncertified_pub_.publish(uncertified);
     std_msgs::String status;
     status.data = "status=uncertified reason=cdf_wait_timeout action=hold_wait_external_replan";
-    task_stall_pub_.publish(status); publishTaskStatusLocked("stall",status.data);
+    task_stall_pub_.publish(status);
   }
   if (!trace.repair_feedback.empty()) publishSummary(trace.repair_feedback, &trace);
   ROS_WARN_STREAM(
@@ -4578,6 +4611,30 @@ void LocalSparseSCPPlanner::workerLoop() {
       slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
       expected_stamp = current_query_stamp_;
+      if(view_preview_aligned_enabled_ && batch->header.stamp==expected_stamp &&
+          witnesses_fresh && (!repair || observation_phase) && !probe &&
+          frontier.recovery_attempt==0 && !executable_recheck_only) {
+        auto context=std::make_shared<ViewLocalContext>();
+        context->batch=*batch;context->q_bar=q_bar;context->u_bar=u_bar;
+        context->q_ref=q_ref;context->u_ref=u_ref;context->previous=previous_command;
+        context->obligation_points=obligation_points;
+        context->prefix=solve_prefix_selection;
+        if(!prefixSelectionCompatible(context->prefix))context->prefix=latest_prefix_selection_;
+        context->trust=trust;context->slack=slack_linear_weight;
+        context->step_scale=executable_step_scale;context->iteration=iteration;
+        context->repair=repair;context->epoch=solve_mode_epoch;
+        context->plan_sequence=solve_plan_sequence;context->goal_revision=terminal_goal_revision_;
+        context->owner=latest_observation_token_;context->region=latest_observation_region_;
+        context->wall=ros::WallTime::now();context->measured_stamp=latest_joint_state_.header.stamp;
+        extractMeasuredQ(latest_joint_state_,context->measured);
+        context->snapshot.witnesses=repair_unknown_witnesses_;
+        context->snapshot.points=latest_vbc_obligation_points_;
+        if(restore_path_guard_scope_==std::to_string(mode_epoch_)+":"+latest_observation_token_)
+          context->snapshot.path_guards=restore_path_guard_points_;
+        context->snapshot.shell=initial_shell_recovery_;
+        context->snapshot.goal=terminal_goal_;context->snapshot.goal_valid=terminal_goal_valid_;
+        view_local_context_=context;
+      }
     }
 
     if (batch->header.stamp != expected_stamp) {
@@ -4586,50 +4643,91 @@ void LocalSparseSCPPlanner::workerLoop() {
 
     publishSummary("sparse_qp_started");
 
-    SparseSolveResult result;
-    if (repair && !witnesses_fresh) {
-      result.status = "repair_witness_missing_or_invalid";
-    } else if (repair && !observation_phase && cdf_slack_enabled_) {
-      result.status = "repair_retreat_requires_hard_gcdf";
-    } else {
-      result = solveSparseSubproblem(
-            *batch,
-            q_bar,
-            u_bar,
-            q_ref,
-            u_ref,
-            previous_command,
-            schedule,
-            frontier,
-            obligation_points,
-            repair,
-            probe,
-            trust,
-            slack_linear_weight, false, false,
-            executable_step_scale, executable_recheck_only,
-            repair_prefix_binding_enabled_ && repair && !probe ? &solve_prefix_selection : nullptr);
-    }
-    bool free_joint_trial_ran = false, free_joint_trial_used = false;
-    if (result.solved && result.primitive_executable_valid &&
-        !result.primitive_live_rebase_required && repair && !probe && observation_phase &&
-        iteration+2 <= max_scp_iterations_ && !executable_recheck_only &&
-        repair_free_joint_task_tracking_scale_ > 0. && frontier.active &&
-        frontier.recovery_attempt == 0 && schedule.size() == 1 &&
-        schedule[0].joint_mask.size() == dof_ &&
-        (schedule[0].joint_mask.array() == 0.).any()) {
-      free_joint_trial_ran = true;
-      const auto trial = solveSparseSubproblem(*batch, q_bar, u_bar, q_ref, u_ref,
-          previous_command, schedule, frontier, obligation_points, repair, probe,
-          trust, slack_linear_weight, false, false, executable_step_scale,
-          executable_recheck_only,
-          repair_prefix_binding_enabled_ ? &solve_prefix_selection : nullptr, true);
-      const double combined_ms = result.setup_and_solve_ms+trial.setup_and_solve_ms;
-      if (freeJointTaskImproves(result, trial, schedule, frontier, q_ref)) {
-        result = trial;
-        free_joint_trial_used = true;
+    ObservationDecisionPolicy decision_policy;
+    decision_policy.repair=repair;decision_policy.probe=probe;
+    decision_policy.observation_phase=observation_phase;
+    decision_policy.iteration=iteration;decision_policy.max_iterations=max_scp_iterations_;
+    decision_policy.recheck_only=executable_recheck_only;
+    decision_policy.free_joint_task_enabled=repair_free_joint_task_tracking_scale_>0.;
+    decision_policy.frontier_active=frontier.active;
+    decision_policy.recovery_attempt=frontier.recovery_attempt;
+    decision_policy.schedule_size=schedule.size();
+    decision_policy.mask_has_free_joint=schedule.size()==1 &&
+        schedule[0].joint_mask.size()==dof_ && (schedule[0].joint_mask.array()==0.).any();
+    if(repair && observation_phase)native_snapshot_observation_seen_=true;
+    auto decision=observationLocalDecision(decision_policy, [&](bool free_joint_task) {
+      SparseSolveResult value;
+      if (repair && !witnesses_fresh) value.status="repair_witness_missing_or_invalid";
+      else if (repair && !observation_phase && cdf_slack_enabled_)
+        value.status="repair_retreat_requires_hard_gcdf";
+      else {
+        const char* requested=std::getenv("CARE_NATIVE_TASK_SNAPSHOT");
+        auto& selected_seq=probe ? native_snapshot_probe_seq_ : native_snapshot_normal_seq_;
+        const bool capture_task=requested && std::string(requested)=="true" && !repair &&
+          !free_joint_task && native_snapshot_observation_seen_ && native_snapshot_count_<16 &&
+          (selected_seq==0 || selected_seq==solve_plan_sequence);
+        if(capture_task && selected_seq==0)selected_seq=solve_plan_sequence;
+        ViewPreviewSnapshot frozen;
+        value=solveSparseSubproblem(*batch,q_bar,u_bar,q_ref,u_ref,previous_command,
+          schedule,frontier,obligation_points,repair,probe,trust,slack_linear_weight,
+          false,false,executable_step_scale,executable_recheck_only,
+          repair_prefix_binding_enabled_ && repair && !probe ? &solve_prefix_selection : nullptr,
+          free_joint_task,nullptr,capture_task?&frozen:nullptr);
+        if(capture_task) {
+          ++native_snapshot_count_;ViewPreviewSnapshot echo_input;
+          const auto tic=ros::WallTime::now();
+          const auto echo=solveSparseSubproblem(*batch,q_bar,u_bar,q_ref,u_ref,previous_command,
+            schedule,frontier,obligation_points,repair,probe,trust,slack_linear_weight,
+            false,false,executable_step_scale,executable_recheck_only,nullptr,
+            free_joint_task,&frozen,&echo_input);
+          const char* root=std::getenv("ROOT_OUT");
+          if(root && *root) {
+            std::ofstream file(std::string(root)+"/native_task_"+std::to_string(native_snapshot_count_)+".json");
+            file<<"{\"schema\":1,\"plan_sequence\":"<<solve_plan_sequence<<",\"mode_epoch\":"<<solve_mode_epoch
+              <<",\"iteration\":"<<iteration<<",\"probe\":"<<(probe?"true":"false")<<",\"repair\":false,\"owner\":";
+            jsonString(file,solve_observation_token);file<<",\"query_ns\":\""<<batch->header.stamp.toNSec()<<"\",\"dt\":";jsonNumber(file,dt_);
+            file<<",\"probe_velocity_cap\":";jsonNumber(file,probe_velocity_cap_);
+            file<<",\"trust\":";jsonNumber(file,trust);file<<",\"q_bar\":";jsonTrajectory(file,q_bar);
+            file<<",\"u_bar\":";jsonTrajectory(file,u_bar);file<<",\"q_ref\":";jsonTrajectory(file,q_ref);
+            file<<",\"u_ref\":";jsonTrajectory(file,u_ref);file<<",\"previous_command\":";jsonVector(file,previous_command);
+            file<<",\"batch\":";auditBatch(file,*batch);
+            file<<",\"matrix_identical\":"<<(frozen.native_matrix_json==echo_input.native_matrix_json?"true":"false");
+            file<<",\"matrix\":"<<(frozen.native_matrix_json.empty()?"null":frozen.native_matrix_json);
+            file<<",\"normal_live_fresh\":"<<(frozen.normal_live_fresh?"true":"false")<<",\"normal_live_q\":";jsonVector(file,frozen.normal_live_q);
+            file<<",\"normal_live_v\":";jsonVector(file,frozen.normal_live_v);
+            file<<",\"primitive_live_fresh\":"<<(frozen.primitive_live_fresh?"true":"false")<<",\"primitive_live_q\":";jsonVector(file,frozen.primitive_live_q);
+            file<<",\"primitive_live_v\":";jsonVector(file,frozen.primitive_live_v);
+            file<<",\"active_observation_points\":[";int pi=0;
+            for(const auto& point:frozen.points){if(pi++)file<<',';jsonVector(file,point);}file<<']';
+            file<<",\"obligation_points\":[";pi=0;
+            for(const auto& point:obligation_points){if(pi++)file<<',';jsonVector(file,point);}file<<']';
+            file<<",\"q_min\":";jsonVector(file,q_min_);file<<",\"q_max\":";jsonVector(file,q_max_);
+            file<<",\"velocity_limits\":";jsonVector(file,velocity_limits_);file<<",\"acceleration_limits\":";jsonVector(file,acceleration_limits_);
+            file<<",\"goal_valid\":"<<(frozen.goal_valid?"true":"false")<<",\"goal_position\":";jsonVector(file,frozen.goal.translation());
+            file<<",\"schedule_size\":"<<schedule.size()<<",\"frontier_active\":"<<(frontier.active?"true":"false");
+            file<<",\"frontier_q\":";jsonVector(file,frontier.q);
+            file<<",\"witness_count\":"<<frozen.witnesses.size()<<",\"path_guard_count\":"<<frozen.path_guards.size();
+
+            auto write=[&](const SparseSolveResult& result) {
+              file<<"{\"status\":";jsonString(file,result.status);file<<",\"solved\":"<<(result.solved?"true":"false");
+              file<<",\"normal_curve_checked\":"<<(result.normal_curve_checked?"true":"false")<<",\"normal_curve_valid\":"<<(result.normal_curve_valid?"true":"false");
+              file<<",\"normal_live_checked\":"<<(result.normal_live_checked?"true":"false")<<",\"normal_live_valid\":"<<(result.normal_live_valid?"true":"false");
+              file<<",\"primitive_valid\":"<<(result.primitive_executable_valid?"true":"false");
+              file<<",\"q\":";jsonTrajectory(file,result.q);file<<",\"u\":";jsonTrajectory(file,result.u);file<<'}';
+            };
+            file<<",\"original\":";write(value);file<<",\"echo\":";write(echo);
+            file<<",\"diagnostic_extra_ms\":";jsonNumber(file,(ros::WallTime::now()-tic).toSec()*1000.);
+            file<<",\"motion_authorized\":false,\"scope\":\"Original native subproblem including nonlinear/live checks; not an end-to-end task certificate\"}\n";
+          }
+        }
       }
-      result.setup_and_solve_ms = combined_ms;
-    }
+      return value;
+    }, [&](const SparseSolveResult& primary,const SparseSolveResult& trial) {
+      return freeJointTaskImproves(primary,trial,schedule,frontier,q_ref);
+    });
+    SparseSolveResult result=std::move(decision.result);
+    const bool free_joint_trial_ran=decision.free_joint_trial_ran;
+    const bool free_joint_trial_used=decision.free_joint_trial_used;
     bool margin_cause_proven = false;
     if (!result.solved && repair && !probe && witnesses_fresh &&
         (result.status == "primal infeasible" || result.status == "max iterations reached") &&
@@ -4650,7 +4748,7 @@ void LocalSparseSCPPlanner::workerLoop() {
     // enabled it may only provide the next SCP linearization point.
     SparseSolveResult diagnostic;
     bool diagnostic_ran = false;
-    if (!result.solved && (!repair || result.first_step_conflicting_cdf_rows > 0) &&
+    if (!result.solved && result.status!="known_ground_start_clearance_hold" && (!repair || result.first_step_conflicting_cdf_rows > 0) &&
         task_failure_slack_diagnostic_enabled_) {
       diagnostic =
           solveSparseSubproblem(
@@ -4667,7 +4765,12 @@ void LocalSparseSCPPlanner::workerLoop() {
               probe,
               trust,
               task_failure_slack_diagnostic_weight_,
-              true);
+              true,
+              false,
+              executable_step_scale,
+              executable_recheck_only,
+              repair_prefix_binding_enabled_ && repair && !probe
+                  ? &solve_prefix_selection : nullptr);
       diagnostic_ran = true;
     }
 
@@ -4787,7 +4890,7 @@ void LocalSparseSCPPlanner::workerLoop() {
             <<" failed_directions="<<frontier.failed_directions.size());
       }
       if (!result.solved) {
-        ++solve_failure_count_;
+        if(result.status!="known_ground_start_clearance_hold")++solve_failure_count_;
         // A changed diagnostic center is queried and hard-solved within the
         // original SCP budget. A repeated measured hold cannot restore it.
         bool internal_restore=false;
@@ -4815,7 +4918,9 @@ void LocalSparseSCPPlanner::workerLoop() {
         }
         if(!internal_restore && repair && !probe && witnesses_fresh && !repair_witness_overflow_ &&
             repair_prefix_binding_enabled_ && initial_shell_recovery_enabled_ && primitive_observation_guard_enabled_ &&
-            (result.status=="primal infeasible" || result.status=="max iterations reached") &&
+            (result.status=="primal infeasible" || result.status=="max iterations reached" ||
+             (fixed_start_recovery_enabled_ && result.fixed_start_unknown_blocked &&
+              !result.fixed_start_recovery_points.empty())) &&
             result.first_step_conflicting_occupied_rows==0 &&
             !result.geometric_restore_guard_points.empty() && result.geometric_restore_guard_points.size()<=32 &&
             latest_observation_token_==solve_observation_token && has_single_waypoint_q_ &&
@@ -4830,7 +4935,7 @@ void LocalSparseSCPPlanner::workerLoop() {
               candidate_replacement_retry_pending_=false;
               safe_frontier_recovery_.detour_direction=result.q.col(result.q.cols()-1)-result.q.col(0);
               safe_frontier_recovery_.following_frontier=false;
-              result.repair_feedback="geometric_restore_proposal";
+              result.repair_feedback=result.fixed_start_recovery_points.empty() ? "geometric_restore_proposal" : "fixed_start_recovery_proposal";
               geometric_restore_applied=true;publish_candidate=true;plan_running_=false;waiting_for_cdf_=false;
               last_plan_finish_time_=ros::Time::now();
           }
@@ -4854,7 +4959,15 @@ void LocalSparseSCPPlanner::workerLoop() {
         // failed solve. Do not also replace its observation context before
         // the requery or independent certification can finish.
         if (!internal_restore && !geometric_restore_applied) {
-        if (result.fixed_start_unknown_blocked) {
+        if(result.status=="known_ground_start_clearance_hold") {
+          plan_running_=false;waiting_for_cdf_=false;pending_batch_.reset();plan_requested_=false;
+          known_ground_hold_.enter(terminal_goal_valid_ ? terminal_goal_revision_ : 0,
+              groundContextLocked(),ros::Time::now().toSec(),ros::WallTime::now().toSec(),latest_execution_stamp_ns_);
+          result.repair_feedback=known_ground_hold_.reason;
+          ROS_INFO_STREAM("[GROUND_HOLD] event=enter goal="<<known_ground_hold_.goal
+              <<" wakeups="<<known_ground_hold_.wakeups<<" ros_deadline="<<known_ground_hold_.ros_deadline
+              <<" wall_deadline="<<known_ground_hold_.wall_deadline<<" reason="<<known_ground_hold_.reason);
+        } else if (result.fixed_start_unknown_blocked) {
           plan_running_=false;waiting_for_cdf_=false;pending_batch_.reset();
           candidate_replacement_trigger_pending_=false;
           candidate_replacement_retry_pending_=false;
@@ -5069,6 +5182,10 @@ void LocalSparseSCPPlanner::workerLoop() {
         const bool exhausted =
             scp_iteration_ >= max_scp_iterations_;
 
+        if (!repair && !probe && result.normal_curve_checked && result.normal_curve_valid &&
+            (!result.normal_live_checked || result.normal_live_valid)) {
+          plan_normal_retained_q_=result.q;plan_normal_retained_u_=result.u;
+        }
         const bool executable_policy = !executable_context.empty() &&
             result.primitive_executable_samples > 0;
         if (executable_policy) {
@@ -5099,7 +5216,34 @@ void LocalSparseSCPPlanner::workerLoop() {
                       cdf_slack_penalty_multiplier_);
         }
 
-        if (result.primitive_live_rebase_required && !exhausted) {
+        if (!repair && !probe && result.normal_curve_checked &&
+            (!result.normal_curve_valid || (result.normal_live_checked && !result.normal_live_valid))) {
+          if (!exhausted) {
+            if (result.normal_curve_valid && result.normal_live_checked && !result.normal_live_valid) {
+              // Rebuild from one measured q/v snapshot. A different origin
+              // invalidates every old linearization; the next query is fresh.
+              Eigen::MatrixXd seed_q,seed_u;
+              if(buildNormalMotionSeed(result.normal_live_q,result.normal_live_v,result.q,seed_q,seed_u)) {
+                plan_q_current_=result.normal_live_q;plan_previous_command_=result.normal_live_v;
+                plan_q_bar_=seed_q;plan_u_bar_=seed_u;plan_q_ref_.col(0)=result.normal_live_q;
+                plan_normal_retained_q_.resize(0,0);plan_normal_retained_u_.resize(0,0);
+              }
+            } else if (scp_iteration_+1==max_scp_iterations_ && plan_normal_retained_q_.size()) {
+              // Reserve the final original iteration for an earlier feasible
+              // shape. It is a new query/solve, never reuse of a certificate.
+              plan_q_bar_=plan_normal_retained_q_;plan_u_bar_=plan_normal_retained_u_;
+            }
+            plan_has_hard_solution_=false;
+            previous_query_min_distance_=std::numeric_limits<double>::quiet_NaN();
+            plan_initialization_mode_="normal_curve_relinearization";
+            result.repair_feedback="normal_curve_relinearization";
+            publish_next_query=true;q_next=plan_q_bar_;u_next=plan_u_bar_;frame=current_frame_id_;
+          } else {
+            plan_running_=false;waiting_for_cdf_=false;last_plan_finish_time_=ros::Time::now();
+            result.repair_feedback="normal_curve_iteration_budget";
+            requestPlanLocked(result.repair_feedback);
+          }
+        } else if (result.primitive_live_rebase_required && !exhausted) {
           // The receiver rebases the newly proposed path to measured q before
           // certification. If that already destroys a known geometric row,
           // spend the next ORIGINAL SCP iteration at that measured origin.
@@ -5211,6 +5355,10 @@ void LocalSparseSCPPlanner::workerLoop() {
     if (result.solved && !result.repair_feedback.empty())
       publishSummary(result.repair_feedback,&result,total_ms);
 
+    if(result.status=="known_ground_start_clearance_hold") {
+      publishSummary("ground_wait_disposition",&result,total_ms);
+      continue; // no QP infeasibility or generic retry counter from a geometry wait
+    }
     if (!result.solved && !geometric_restore_applied) {
       ROS_WARN_STREAM(
           "[LocalSparseSCPPlanner] sparse PIQP failed: "
@@ -5299,7 +5447,7 @@ void LocalSparseSCPPlanner::workerLoop() {
           s << "status=stalled classification=QP_NO_PROGRESS_UNCERTIFIED"
             << " failures=" << failures << " query_stamp_ns=" << batch->header.stamp.toNSec()
             << " snapshot=disabled";
-          msg.data = s.str(); task_stall_pub_.publish(msg); publishTaskStatusLocked("stall",msg.data);
+          msg.data = s.str(); task_stall_pub_.publish(msg);
           ROS_ERROR_STREAM("[LocalSparseSCPPlanner] " << msg.data);
           // No infeasibility claim or soft candidate. The regime manager
           // requests same-query exact VBC; row presence is not blocker evidence.
@@ -5321,7 +5469,7 @@ void LocalSparseSCPPlanner::workerLoop() {
               qp_retry_token_ + " mode=" + (probe ? "PROBE_NORMAL" : "NORMAL") +
               " failures=" + std::to_string(failures) +
               " query_stamp_ns=" + std::to_string(batch->header.stamp.toNSec());
-          task_stall_pub_.publish(msg); publishTaskStatusLocked("stall",msg.data);
+          task_stall_pub_.publish(msg);
           ROS_WARN_STREAM("[LocalSparseSCPPlanner] " << msg.data
                           << " unknown_rows=" << result.selected_unknown_cdf_rows
                           << " occupied_rows=" << result.selected_occupied_cdf_rows
@@ -5331,7 +5479,7 @@ void LocalSparseSCPPlanner::workerLoop() {
             result.status.find("maximum iterations") != std::string::npos) {
           std_msgs::Bool uncertified_msg;
           uncertified_msg.data = true;
-          task_uncertified_pub_.publish(uncertified_msg); publishTaskStatusLocked("uncertified",(uncertified_msg.data ? "1" : "0"));
+          task_uncertified_pub_.publish(uncertified_msg);
           ROS_WARN_STREAM(
               "[LocalSparseSCPPlanner] task QP uncertified in "
               << (probe ? "PROBE_NORMAL" : "NORMAL")
@@ -5367,7 +5515,8 @@ void LocalSparseSCPPlanner::workerLoop() {
               result.q, result.u, current_frame_id_, solve_observation_token, *batch, q_bar, u_bar,
               result.normal_blocking_unknown_points,
               geometric_restore_applied ? result.geometric_restore_guard_points : result.primitive_margin_recovery_points,
-              !geometric_restore_applied && !result.primitive_margin_recovery_points.empty());
+              !geometric_restore_applied && !result.primitive_margin_recovery_points.empty(),
+              geometric_restore_applied ? result.fixed_start_recovery_points : std::vector<Eigen::Vector3d>{});
           if (repair && !observation_phase)
             requestPlanLocked("repair_observation_after_safe_retreat");
         }
@@ -5380,7 +5529,9 @@ void LocalSparseSCPPlanner::workerLoop() {
         continue;
       }
 
-      publishSummary(geometric_restore_applied ? "geometric_restore_candidate_published" : "candidate_published", &result, total_ms);
+      publishSummary(geometric_restore_applied ? (result.fixed_start_recovery_points.empty() ?
+          "geometric_restore_candidate_published" : "fixed_start_recovery_candidate_published") :
+          "candidate_published", &result, total_ms);
       continue;
     }
 
@@ -5464,8 +5615,15 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     double executable_step_scale,
     bool executable_recheck_only,
     const RepairPrefixSelection* prefix_selection,
-    bool free_joint_task) const {
+    bool free_joint_task, const ViewPreviewSnapshot* preview, ViewPreviewSnapshot* capture) const {
+  const auto& geometry_guard=preview ? *preview->guard : primitive_observation_guard_;
   SparseSolveResult out;
+  const char* recovery_policy = std::getenv("CARE_REPAIR_UNKNOWN_SOFT");
+  const bool repair_unknown_soft = repair_mode && !probe_mode && !force_diagnostic_slack &&
+      recovery_policy && std::string(recovery_policy) == "true";
+  const bool task_unknown_soft = executable_task_research_ && !force_diagnostic_slack;
+  const bool unknown_cdf_soft = repair_unknown_soft || task_unknown_soft;
+  out.repair_unknown_soft = unknown_cdf_soft;
   const bool normal_motion = repair_executable_view_enabled_ && !repair_mode && !probe_mode;
   const bool repair_motion = repair_executable_view_enabled_ && repair_mode && !probe_mode;
   const bool nodal_motion = normal_motion || repair_motion;
@@ -5474,6 +5632,26 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     out.status = normal_motion ? "normal_measured_velocity_missing" : "repair_measured_velocity_missing";
     return out;
   }
+  const char* prefix_objective_policy=std::getenv("CARE_PREFIX_TASK_OBJECTIVE");
+  const bool normal_prefix_task_objective=normal_motion && !force_diagnostic_slack &&
+      prefix_objective_policy && std::string(prefix_objective_policy)=="true";
+  Eigen::Isometry3d prefix_task_goal=Eigen::Isometry3d::Identity();
+  bool prefix_task_goal_valid=false;
+  if(preview) {prefix_task_goal=preview->goal;prefix_task_goal_valid=preview->goal_valid;}
+  else {std::lock_guard<std::mutex> lock(mutex_);
+    prefix_task_goal=terminal_goal_;prefix_task_goal_valid=terminal_goal_valid_;}
+  if(capture) {
+    capture->native_task_replay=true;capture->goal=prefix_task_goal;
+    capture->goal_valid=prefix_task_goal_valid;capture->guard=geometry_guard.cloneForPreview();
+  }
+  Eigen::Matrix<double,6,1> current_task_error;
+  // Five task tolerances define a soft objective activation zone. No motion
+  // is rejected by this condition, and far observation motions keep their cost.
+  const bool repair_prefix_task_objective=repair_goal_stopping_enabled_ &&
+      repair_motion && !force_diagnostic_slack && prefix_task_goal_valid &&
+      taskPoseResidual(geometry_guard,q_bar.col(0),terminal_ee_frame_,prefix_task_goal,&current_task_error) &&
+      current_task_error.head<3>().norm()<=1. && current_task_error.tail<3>().norm()<=1.;
+  const bool prefix_task_objective=normal_prefix_task_objective || repair_prefix_task_objective;
   auto executable_settings=repair_executable_settings_;
   if(repair_motion)executable_settings.initial_velocity=previous_command;
   if (repair_prefix_binding_enabled_ && repair_mode && !probe_mode) {
@@ -5493,20 +5671,30 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
   // Callbacks may retire or replace a witness while this worker is solving.
   // The entire subproblem uses one immutable witness snapshot.
+  care_confidence_map::InitialShellRecovery preview_shell;
+  if(preview)preview_shell=preview->shell;
   std::vector<RepairWitness> witnesses;
   std::vector<PrimitiveObservationPoint> path_guards;
   std::vector<Eigen::Vector3d> active_observation_points;
-  {
+  if(preview) {
+    witnesses=preview->witnesses;path_guards=preview->path_guards;
+    active_observation_points=preview->points;
+  } else {
     std::lock_guard<std::mutex> lock(mutex_);
     witnesses = repair_unknown_witnesses_;
     active_observation_points = latest_vbc_obligation_points_;
     if(restore_path_guard_scope_==std::to_string(mode_epoch_)+":"+latest_observation_token_)
       path_guards=restore_path_guard_points_;
   }
+  if(capture) {
+    capture->witnesses=witnesses;capture->path_guards=path_guards;
+    capture->points=active_observation_points;
+    std::lock_guard<std::mutex> lock(mutex_);capture->shell=initial_shell_recovery_;
+  }
   const bool slack_enabled =
-      cdf_slack_enabled_ || force_diagnostic_slack;
+      cdf_slack_enabled_ || force_diagnostic_slack || unknown_cdf_soft;
   const bool per_constraint_slack =
-      cdf_per_constraint_slack_ || force_diagnostic_slack;
+      cdf_per_constraint_slack_ || force_diagnostic_slack || unknown_cdf_soft;
   out.slack_linear_weight_used = slack_linear_weight;
   out.batch_pairs = batch.num_pairs;
   out.min_distance = std::numeric_limits<double>::infinity();
@@ -5531,6 +5719,13 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   const int n_pairs = batch.num_pairs;
+  if (unknown_cdf_soft && (batch.source_type.size() != static_cast<std::size_t>(n_pairs) ||
+      std::any_of(batch.source_type.begin(), batch.source_type.end(), [](uint8_t source) {
+        return source != care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN &&
+               source != care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED;
+      }))) {
+    out.status = "recovery_cdf_source_invalid"; return out;
+  }
   if (n_pairs < 0 ||
       batch.dof != dof_ ||
       batch.original_timestep.size() !=
@@ -5748,6 +5943,13 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   out.selected_cdf_rows = static_cast<int>(selected.size());
+  if (unknown_cdf_soft) {
+    // A proposal cost must not grow with the number of sampled knots/points.
+    // Occupied slacks stay zero. Use an average
+    // UNKNOWN penalty so repeated samples cannot overwhelm the view objective.
+    slack_linear_weight /= std::max(1, out.selected_unknown_cdf_rows);
+    out.slack_linear_weight_used = slack_linear_weight;
+  }
 
   if (!std::isfinite(out.min_distance))
     out.min_distance = std::numeric_limits<double>::quiet_NaN();
@@ -5849,7 +6051,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         geometry_q.conservativeResize(Eigen::NoChange,q_bar.cols()+executable_samples.size());
         for (std::size_t i=0;i<executable_samples.size();++i) geometry_q.col(q_bar.cols()+i)=executable_samples[i].q;
       }
-      if (!primitive_observation_guard_.linearize(geometry_q, primitive_points, &primitive_rows, &error)) {
+      if (!geometry_guard.linearize(geometry_q, primitive_points, &primitive_rows, &error)) {
         ROS_ERROR_STREAM("Primitive observation guard failed closed: " << error);
         out.status = "primitive_observation_geometry_error";
         return out;
@@ -5867,9 +6069,16 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         for (const auto& row : primitive_rows) if (row.timestep==0 &&
             (row.point-point.point).lpNorm<Eigen::Infinity>()<=1e-5) start=std::min(start,row.distance_m);
         double required=primitive_observation_margin_m_; bool recovering=false;
-        if (initial_shell_recovery_enabled_ && !point.ordinary_path_guard) {
+        // Fresh UNKNOWN provenance binds this point to the current query.
+        // Reuse the existing10mm execution floor and continuous certificate;
+        // the20mm proposal reserve remains an objective, not a fixed-q veto.
+        const bool ordinary_execution_floor=point.ordinary_path_guard && repair_prefix_binding_enabled_ &&
+            std::any_of(fresh_unknown_points.begin(),fresh_unknown_points.end(),
+                [&](const Eigen::Vector3d& p){return (p-point.point).lpNorm<Eigen::Infinity>()<=1e-5;});
+        if (initial_shell_recovery_enabled_ && (!point.ordinary_path_guard || ordinary_execution_floor)) {
           std::lock_guard<std::mutex> lock(mutex_);
-          if (!initial_shell_recovery_.floor(point.point,start,primitive_observation_margin_m_,
+          auto& shell=preview ? preview_shell : initial_shell_recovery_;
+          if (!shell.floor(point.point,start,primitive_observation_margin_m_,
                   initial_shell_execution_margin_m_,&required,&recovering,repair_prefix_binding_enabled_)) {
             out.status="primitive_observation_start_blocked"; return out;
           }
@@ -5881,10 +6090,37 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           out.status="fixed_start_unknown_clearance";
           out.fixed_start_unknown_blocked=true;out.fixed_start_unknown_point=point.point;
           out.fixed_start_unknown_distance_m=start;out.fixed_start_unknown_floor_m=required;
+          // Retain the failed fixed-start result. A separate, bounded geometry
+          // proposal may restore only fresh UNKNOWN points already in (10,20)mm.
+          // All ordinary guards survive this handoff with their original role.
+          if(fixed_start_recovery_enabled_ && repair_prefix_binding_enabled_ &&
+              initial_shell_recovery_enabled_ && !force_diagnostic_slack && !cdf_slack_enabled_) {
+            bool eligible=true;
+            for(const auto& guard:primitive_points) {
+              if(!guard.ordinary_path_guard)continue;
+              double distance=std::numeric_limits<double>::infinity();
+              for(const auto& row:primitive_rows)if(row.timestep==0 &&
+                  (row.point-guard.point).lpNorm<Eigen::Infinity>()<=1e-5)
+                distance=std::min(distance,row.distance_m);
+              if(!fixedStartUnknownBlocked(distance,primitive_observation_margin_m_,true))continue;
+              const bool fresh=std::any_of(fresh_unknown_points.begin(),fresh_unknown_points.end(),
+                  [&](const Eigen::Vector3d& p){return (p-guard.point).lpNorm<Eigen::Infinity>()<=1e-5;});
+              if(!fresh || distance<=initial_shell_execution_margin_m_+1e-6) {eligible=false;break;}
+              out.fixed_start_recovery_points.push_back(guard.point);
+            }
+            if(!eligible || out.fixed_start_recovery_points.size()>32)out.fixed_start_recovery_points.clear();
+            if(!out.fixed_start_recovery_points.empty()) {
+              out.geometric_restore_path_guards=primitive_points;
+              for(const auto& p:out.fixed_start_recovery_points)
+                if(std::none_of(out.geometric_restore_guard_points.begin(),out.geometric_restore_guard_points.end(),
+                    [&](const Eigen::Vector3d& old){return (old-p).lpNorm<Eigen::Infinity>()<=1e-5;}))
+                  out.geometric_restore_guard_points.push_back(p);
+            }
+          }
           return out; // fixed q_0 cannot satisfy this hard row; do not run PIQP.
         }
-        if(point.ordinary_path_guard && point.proposal_reserve_m>0.)
-          primitive_proposal_targets[key]=required+point.proposal_reserve_m;
+        if(point.ordinary_path_guard && (point.proposal_reserve_m>0. || ordinary_execution_floor))
+          primitive_proposal_targets[key]=std::max(required,primitive_observation_margin_m_)+point.proposal_reserve_m;
         if (recovering) shell_points.insert(key);
       }
       out.primitive_shell_recovery_points=shell_points.size();
@@ -5900,10 +6136,57 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       for (const auto& row : primitive_rows) if (row.timestep >= q_bar.cols()) ++out.primitive_executable_rows;
     }
   }
+  std::vector<Eigen::Vector3d> occupied_volume_points;
+  const char* volume_feature=std::getenv("CARE_OCCUPIED_VOLUME_QP_ENABLED");
+  const bool occupied_volume_enabled=volume_feature && std::string(volume_feature)=="true";
+  if(occupied_volume_enabled) {
+    if(batch.source_type.size()!=static_cast<std::size_t>(n_pairs) || batch.point_flat.size()!=static_cast<std::size_t>(3*n_pairs)) {
+      out.status="occupied_volume_source_identity_missing";return out;
+    }
+    for(int i=0;i<n_pairs;++i)if(batch.source_type[i]==care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED) {
+      Eigen::Vector3d point(batch.point_flat[3*i],batch.point_flat[3*i+1],batch.point_flat[3*i+2]);
+      if(!point.allFinite()){out.status="occupied_volume_nonfinite_point";return out;}
+      if(std::none_of(occupied_volume_points.begin(),occupied_volume_points.end(),[&](const Eigen::Vector3d& old){return (old-point).lpNorm<Eigen::Infinity>()<=1e-5;}))
+        occupied_volume_points.push_back(point);
+    }
+    if(occupied_volume_points.size()>32){out.status="occupied_volume_proposal_capacity";return out;}
+    if(!occupied_volume_points.empty()) {
+      Eigen::MatrixXd metric_q=q_bar;
+      metric_q.conservativeResize(Eigen::NoChange,q_bar.cols()+executable_samples.size());
+      for(std::size_t i=0;i<executable_samples.size();++i)metric_q.col(q_bar.cols()+i)=executable_samples[i].q;
+      std::vector<PrimitiveObservationGuard::Row> rows;std::string error;
+      if(!geometry_guard.linearizeOccupiedVoxels(metric_q,occupied_volume_points,.05,.02,.02,&rows,&error)) {
+        out.status=error;return out;
+      }
+      for(const auto& row:rows) {
+        if(row.timestep==0 && row.distance_m<row.required_margin_m-1e-9) {
+          out.status="occupied_volume_start_clearance_hold";return out;
+        }
+        if(row.timestep>0)primitive_rows.push_back(row);
+      }
+    }
+  }
+  if(geometry_guard.knownGroundEnabled()) {
+    Eigen::MatrixXd ground_q=q_bar;
+    ground_q.conservativeResize(Eigen::NoChange,q_bar.cols()+executable_samples.size());
+    for(std::size_t i=0;i<executable_samples.size();++i)ground_q.col(q_bar.cols()+i)=executable_samples[i].q;
+    std::vector<PrimitiveObservationGuard::Row> ground_rows;std::string error;
+    if(!geometry_guard.linearizeKnownGround(ground_q,&ground_rows,&error)) {
+      out.status="known_ground_geometry_error";return out;
+    }
+    for(const auto& row:ground_rows) {
+      if(row.timestep==0) {
+        if(row.distance_m<row.required_margin_m-1e-9) {
+          out.status="known_ground_start_clearance_hold";return out;
+        }
+      } else primitive_rows.push_back(row);
+    }
+  }
   out.primitive_observation_rows = static_cast<int>(primitive_rows.size());
   std::vector<int> shell_penalty_rows;
   for (std::size_t r=0;r<primitive_rows.size();++r) {
-    const auto& row=primitive_rows[r];const auto key=care_confidence_map::InitialShellRecovery::key(row.point);
+    const auto& row=primitive_rows[r];if(row.known_ground || row.occupied_volume)continue;
+    const auto key=care_confidence_map::InitialShellRecovery::key(row.point);
     const bool nominal=row.timestep>0 && row.timestep<q_bar.cols();
     const bool future=nominal || (row.timestep>=q_bar.cols() &&
         executable_samples.at(row.timestep-q_bar.cols()).time_s>0.);
@@ -5911,13 +6194,24 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       shell_penalty_rows.push_back(r);
   }
   out.primitive_shell_penalty_rows=shell_penalty_rows.size();
+  std::vector<NormalExecutableLimitRow> normal_limit_samples;
+  if(normal_motion && std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true") {
+    std::string error;
+    if(!normalExecutableLimitRows(q_bar,u_bar,dt_,repair_executable_settings_,
+        previous_command,&normal_limit_samples,&error)) {
+      out.status="normal_executable_limit_model_error";return out;
+    }
+  }
   const int n=n_q+n_u+n_s+shell_penalty_rows.size();
   std::set<int> executable_velocity_knots;
   for (const auto& sample : executable_samples) for (const auto& term : sample.u_weights)
     if (term.second.cwiseAbs().maxCoeff() > 1e-12) executable_velocity_knots.insert(term.first);
   for (const auto& sample : cdf_executable_samples) for (const auto& term : sample.u_weights)
     if (term.second.cwiseAbs().maxCoeff() > 1e-12) executable_velocity_knots.insert(term.first);
-  const int n_ineq = n_acc + n_cdf_rows + out.primitive_observation_rows + shell_penalty_rows.size();
+  // NORMAL joint-limit envelopes need no brake-derivative velocity trust box.
+  const int normal_limit_row_offset=n_acc+n_cdf_rows+out.primitive_observation_rows+shell_penalty_rows.size();
+  const int n_ineq = normal_limit_row_offset+normal_limit_samples.size()*dof_;
 
   using Triplet = Eigen::Triplet<double>;
   std::vector<Triplet> p_triplets;
@@ -5998,6 +6292,77 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  // The receiver may execute only a short prefix. Penalize the Cartesian
+  // goal error AFTER its entire braking tail, rather than assuming the QP's
+  // distant terminal improvement will actually be executed. Keep all original
+  // route/reference costs and hard constraints; a detour can still move away.
+  int prefix_task_targets=0;
+  if(prefix_task_objective && prefix_task_goal_valid) {
+    auto settings=repair_executable_settings_;
+    settings.initial_velocity=previous_command;settings.prefixes={.1,.15,.25,.5};
+    if(repair_prefix_task_objective) {
+      settings.prefixes=executable_settings.prefixes;
+    }
+    std::vector<ExecutableTaskTarget> targets;std::string error;
+    if(executableTaskTargets(primitive_observation_guard_,q_bar,u_bar,dt_,settings,
+        terminal_ee_frame_,prefix_task_goal,&targets,&error)) {
+      const double mass=(q_tracking_weight_+terminal_q_tracking_weight_)*num_intervals_;
+      // NORMAL uses 10cm/1rad objective units. Near-goal REPAIR uses
+      // the actual 2cm/.2rad task units (5^2), so observation/reference
+      // attraction does not dominate the feasible terminal stop.
+      const double weight=mass/targets.size()*(repair_prefix_task_objective ? 25. : 1.);
+      for(const auto& target:targets) {
+        std::map<int,Eigen::Matrix<double,6,1>> columns;
+        auto add=[&](int index,const Eigen::Matrix<double,6,1>& column) {
+          auto it=columns.find(index);
+          if(it==columns.end())columns.emplace(index,column);else it->second+=column;
+        };
+        for(const auto& term:target.stopped.q_weights)if(term.first>0)
+          for(int j=0;j<dof_;++j)add(qIndex(term.first,j),term.second*target.jacobian.col(j));
+        for(const auto& term:target.stopped.u_weights)
+          for(int j=0;j<dof_;++j)add(uIndex(term.first,j),term.second[j]*target.jacobian.col(j));
+        Eigen::Matrix<double,6,1> offset=target.error;
+        for(const auto& term:columns) {
+          const int index=term.first;
+          const double nominal=index<n_q ? q_bar(index%dof_,index/dof_+1) :
+              u_bar((index-n_q)%dof_,(index-n_q)/dof_);
+          offset-=term.second*nominal;
+        }
+        for(const auto& a:columns) {
+          c[a.first]+=2.*weight*a.second.dot(offset);
+          for(const auto& b:columns)
+            p_triplets.emplace_back(a.first,b.first,2.*weight*a.second.dot(b.second));
+        }
+      }
+      prefix_task_targets=targets.size();
+    } else {
+      // An unavailable optional objective is diagnosed; it is not a new
+      // feasibility or execution gate on the existing planner.
+      ROS_WARN_STREAM("[PREFIX_TASK_OBJECTIVE] unavailable reason="<<error);
+    }
+  }
+
+  if(probe_task_objective_enabled_ && probe_mode && !repair_mode &&
+      !force_diagnostic_slack && prefix_task_goal_valid) {
+    Eigen::Matrix<double,6,1> residual;Eigen::MatrixXd jacobian;
+    if(probeTaskResidualJacobian(geometry_guard,q_bar,u_bar,dt_,previous_command,
+        probe_task_settings_,terminal_ee_frame_,prefix_task_goal,&residual,&jacobian)) {
+      const double weight=(q_tracking_weight_+terminal_q_tracking_weight_)*num_intervals_;
+      std::vector<int> active;Eigen::Matrix<double,6,1> offset=residual;
+      for(int col=0;col<jacobian.cols();++col)if(jacobian.col(col).cwiseAbs().maxCoeff()>1e-10) {
+        active.push_back(col);
+        const double nominal=col<n_q ? q_bar(col%dof_,col/dof_+1) : u_bar((col-n_q)%dof_,(col-n_q)/dof_);
+        offset-=jacobian.col(col)*nominal;
+      }
+      for(int a:active) {
+        c[a]+=2.*weight*jacobian.col(a).dot(offset);
+        for(int b:active)p_triplets.emplace_back(a,b,2.*weight*jacobian.col(a).dot(jacobian.col(b)));
+      }
+      ROS_INFO_STREAM("[PROBE_EXECUTABLE_TASK] active_columns="<<active.size()
+          <<" weight="<<weight<<" stopped_task_cost="<<residual.squaredNorm());
+    } else ROS_WARN("[PROBE_EXECUTABLE_TASK] optional objective unavailable");
+  }
+
   // Visibility obligations are long-range trajectory objectives. A learned
   // frontier target may simultaneously lower their weight and add a short
   // local visibility-improvement objective; neither changes hard safety.
@@ -6021,6 +6386,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  int stopped_observation_targets = 0;
   if (repair_mode &&
       frontier.active &&
       frontier.q.size() == dof_ &&
@@ -6045,6 +6411,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     clearance_identity<<std::setprecision(17);
     for (const auto& row : selected) {
         if (row.k != k_frontier) continue;
+        // A soft UNKNOWN row is a cost, not a blocking halfspace. Using it
+        // here would recreate mandatory observation dependencies immediately
+        // after allowing the QP to cross its learned margin.
+        if (unknown_cdf_soft && batch.source_type[row.pair] ==
+            care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_UNKNOWN) continue;
         const double at_start = row.d + row.g.dot(q_bar.col(0)-row.qlin);
         if (row.g.norm()>1e-9 && row.pair>=0 &&
             batch.point_flat.size()>=static_cast<std::size_t>(3*(row.pair+1))) {
@@ -6080,6 +6451,35 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
           }
         }
     }
+    if (unknown_cdf_soft) {
+      // Under this research policy, actual analytic UNKNOWN guards, not the
+      // soft learned distance, own dependency and detour scheduling. Occupied
+      // and ground rows remain hard constraints and are never sensing targets.
+      for (const auto& row : primitive_rows) {
+        if (row.timestep != k_frontier || row.known_ground || row.occupied_volume ||
+            row.gradient.norm() <= 1e-9) continue;
+        const auto key=care_confidence_map::InitialShellRecovery::key(row.point);
+        const double margin=primitive_floors.at(key);
+        const double at_start=row.distance_m+row.gradient.dot(q_bar.col(0)-q_bar.col(k_frontier));
+        const double gap=at_start-margin;
+        clearance=std::min(clearance,gap/row.gradient.norm());
+        clearance_identity<<"metric:"<<row.point[0]<<':'<<row.point[1]<<':'<<row.point[2]<<':'<<margin<<';';
+        const double along=row.gradient.dot(frontier.q-q_bar.col(0));
+        if (gap < .005 && frontier.recovery_attempt > 0) {
+          ++out.recovery_tight_normals;
+          if (recoveryForwardBlocked(gap,along)) {
+            blocking_normals.push_back(row.gradient);blocking_slack.push_back(gap);
+          }
+        }
+        if (gap < .005 && along < -1e-9 && gap+along < 0. &&
+            std::none_of(obligation_points.begin(),obligation_points.end(),[&](const Eigen::Vector3d& p) {
+              return (p-row.point).lpNorm<Eigen::Infinity>()<=1e-5;
+            }) && out.observation_dependency_points.size()<32 &&
+            std::none_of(out.observation_dependency_points.begin(),out.observation_dependency_points.end(),
+                [&](const Eigen::Vector3d& p){return (p-row.point).lpNorm<Eigen::Infinity>()<=1e-5;}))
+          out.observation_dependency_points.push_back(row.point);
+      }
+    }
     if (frontier.visibility_gradient.size()==7 && std::isfinite(clearance)) {
       out.recovery_start_clearance=clearance;
       out.recovery_clearance_signature=clearance_identity.str();
@@ -6110,7 +6510,48 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       }
       out.recovery_frontier = objective_target;
     }
+    // Ordinary sensing must improve the pose the receiver actually reaches
+    // after its selected prefix and brake. A target at k_frontier alone can
+    // improve briefly, then reverse before the prefix stops. Use the same
+    // differentiated executable view already used by the geometric guards.
+    // This changes a soft objective only; detour objectives remain unchanged.
+    if (repair_motion && frontier.recovery_attempt == 0) {
+      std::vector<RepairExecutableSample> samples;
+      std::string error;
+      if (repairExecutableSamples(q_bar,u_bar,dt_,executable_settings,&samples,&error)) {
+        const double weight = frontier_weight / executable_settings.prefixes.size();
+        for (double prefix : executable_settings.prefixes) {
+          const auto stop = std::find_if(samples.rbegin(),samples.rend(),
+              [&](const RepairExecutableSample& sample) {
+                return std::abs(sample.prefix_s-std::min(prefix,num_intervals_*dt_))<1e-9;
+              });
+          if (stop == samples.rend()) continue;
+          for (int j=0;j<dof_;++j) {
+            if (objective_mask[j] <= 0.) continue;
+            std::map<int,double> columns;
+            for (const auto& term : stop->q_weights)
+              if (term.first > 0) columns[qIndex(term.first,j)] += term.second;
+            for (const auto& term : stop->u_weights)
+              columns[uIndex(term.first,j)] += term.second[j];
+            double offset = stop->q[j] - objective_target[j];
+            for (const auto& term : columns) {
+              const double nominal = term.first < n_q
+                  ? q_bar(j,term.first/dof_+1) : u_bar(j,(term.first-n_q)/dof_);
+              offset -= term.second * nominal;
+            }
+            const double w = weight * objective_mask[j];
+            for (const auto& a : columns) {
+              c[a.first] += 2.*w*a.second*offset;
+              for (const auto& b : columns)
+                p_triplets.emplace_back(a.first,b.first,2.*w*a.second*b.second);
+            }
+          }
+          ++stopped_observation_targets;
+        }
+      }
+    }
     for (int j = 0; j < dof_; ++j) {
+      if (!stopped_observation_targets)
       addQuadraticTarget(
           qIndex(k_frontier, j),
           frontier_weight * objective_mask[j],
@@ -6190,8 +6631,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     p_triplets.emplace_back(
         si, si, 2.0 * cdf_slack_quadratic_weight_);
     x_l[si] = 0.0;
-    if (cdf_slack_use_upper_bound_ && !force_diagnostic_slack)
-      x_u[si] = cdf_slack_upper_bound_;
+    // UNKNOWN is a proposal cost under this policy. A finite cap silently
+    // made it hard again (CASE025 needs >0.30 in model units). Known OCCUPIED
+    // rows are pinned to zero slack below; final exact audits are unchanged.
+    if (cdf_slack_use_upper_bound_ && !force_diagnostic_slack && !unknown_cdf_soft)
+      x_u[si] = std::min(x_u[si], cdf_slack_upper_bound_);
   }
 
   // Small diagonal regularization makes P strictly positive definite enough
@@ -6289,6 +6733,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       }
       g_triplets.emplace_back(
           row, slack0 + slack_slot, 1.0);
+      const char* soft_unknown=std::getenv("CARE_RESEARCH_SOFT_UNKNOWN");
+      if(!force_diagnostic_slack && (unknown_cdf_soft ||
+          (soft_unknown && std::string(soft_unknown)=="true")) &&
+          !batch.source_type.empty() && batch.source_type[row_data.pair]==care_collision_cdf::CollisionCDFConstraintBatch::SOURCE_OCCUPIED)
+        x_u[slack0+slack_slot]=0.; // Known occupied CDF remains hard.
     }
     h_l[row] =
         row_data.safety_margin - row_data.d +
@@ -6302,7 +6751,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   for (std::size_t r = 0; r < primitive_rows.size(); ++r) {
     const auto& geometry = primitive_rows[r];
     const int row = n_acc + n_cdf_rows + static_cast<int>(r);
-    h_l[row] = primitive_floors.at(care_confidence_map::InitialShellRecovery::key(geometry.point)) - geometry.distance_m;
+    h_l[row] = ((geometry.known_ground || geometry.occupied_volume) ? geometry.required_margin_m :
+        primitive_floors.at(care_confidence_map::InitialShellRecovery::key(geometry.point))) - geometry.distance_m;
     if (geometry.timestep < q_bar.cols()) {
       for (int j = 0; j < dof_; ++j)
         g_triplets.emplace_back(row,qIndex(geometry.timestep,j),geometry.gradient[j]);
@@ -6366,6 +6816,34 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  // Joint position bounds on the actual .25 s task prefix and its complete
+  // discrete stop, rather than only the unexecuted one-second nodal reference.
+  int normal_padding_reduced_rows=0;
+  const Eigen::VectorXd normal_lower=q_min_.array()+joint_position_margin_;
+  const Eigen::VectorXd normal_upper=q_max_.array()-joint_position_margin_;
+  for(std::size_t i=0;i<normal_limit_samples.size();++i) {
+    const auto& limit=normal_limit_samples[i];
+    const auto& sample=limit.sample;
+    for(int j=0;j<dof_;++j) {
+      const int row=normal_limit_row_offset+i*dof_+j;
+      double offset=sample.q[j];
+      for(const auto& term:sample.q_weights)if(term.first>0 && term.second!=0.) {
+        g_triplets.emplace_back(row,qIndex(term.first,j),term.second);
+        offset-=term.second*q_bar(j,term.first);
+      }
+      for(const auto& term:sample.u_weights)if(term.second[j]!=0.) {
+        g_triplets.emplace_back(row,uIndex(term.first,j),term.second[j]);
+        offset-=term.second[j]*u_bar(j,term.first);
+      }
+      const auto padding=normalExecutableLimitPadding(limit,j,q_bar.col(0),
+          previous_command,velocity_limits_,acceleration_limits_,normal_lower,
+          normal_upper,dt_,2.*piqp_eps_abs_);
+      if((limit.lower && padding.lower<2.*piqp_eps_abs_) ||
+          (limit.upper && padding.upper<2.*piqp_eps_abs_))++normal_padding_reduced_rows;
+      if(limit.lower)h_l[row]=normal_lower[j]+padding.lower-offset;
+      if(limit.upper)h_u[row]=normal_upper[j]-padding.upper-offset;
+    }
+  }
   Eigen::SparseMatrix<double> P(n, n);
   Eigen::SparseMatrix<double> A(n_eq, n);
   Eigen::SparseMatrix<double> G(n_ineq, n);
@@ -6420,12 +6898,17 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " u_vars=" << n_u
       << " cdf_slacks=" << n_s
       << " slack_enabled=" << (slack_enabled ? 1 : 0)
+      << " unknown_cdf_soft=" << (unknown_cdf_soft ? 1 : 0)
       << " per_constraint_slack=" << (per_constraint_slack ? 1 : 0)
       << " diagnostic_slack=" << (force_diagnostic_slack ? 1 : 0)
       << " accel_constraints="
       << (acceleration_constraints ? 1 : 0)
+      << " prefix_task_targets=" << prefix_task_targets
+      << " stopped_observation_targets=" << stopped_observation_targets
       << " normal_acceleration_motion=" << (normal_motion ? 1 : 0)
       << " repair_acceleration_motion=" << (repair_motion ? 1 : 0)
+      << " normal_executable_joint_limit_rows=" << normal_limit_samples.size()*dof_
+      << " normal_padding_reduced_rows=" << normal_padding_reduced_rows
       << " executable_cdf_samples=" << cdf_executable_samples.size()
       << " eq=" << n_eq
       << " ineq=" << n_ineq
@@ -6464,6 +6947,15 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   out.primal_residual = result.info.primal_res;
   out.dual_residual = result.info.dual_res;
   out.status = piqp::status_to_string(status);
+  if(capture) {
+    std::ostringstream m;m<<"{\"P\":";jsonSparse(m,P);
+    m<<",\"c\":";jsonVector(m,c);m<<",\"A\":";jsonSparse(m,A);
+    m<<",\"b\":";jsonVector(m,b);m<<",\"G\":";jsonSparse(m,G);
+    m<<",\"h_l\":";jsonVector(m,h_l);m<<",\"h_u\":";jsonVector(m,h_u);
+    m<<",\"x_l\":";jsonVector(m,x_l);m<<",\"x_u\":";jsonVector(m,x_u);m<<'}';
+    capture->native_matrix_json=m.str();
+  }
+
 
   if (!force_diagnostic_slack && status != piqp::PIQP_SOLVED) {
     out.box_conflicting_cdf_rows = lowerBoxConflicts(G, h_l, x_l, x_u, n_acc);
@@ -6590,9 +7082,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         });
         const bool executable=row.timestep>=q_bar.cols();
         s<<"{\"matrix_row\":"<<n_acc+n_cdf_rows+i<<",\"timestep\":"<<row.timestep<<",\"point\":";jsonVector(s,row.point);
-        s<<",\"ordinary\":"<<(point->ordinary_path_guard?"true":"false")<<",\"floor_m\":";
-        jsonNumber(s,primitive_floors.at(care_confidence_map::InitialShellRecovery::key(row.point)));
-        s<<",\"reserve_m\":";jsonNumber(s,point->proposal_reserve_m);
+        s<<",\"known_ground\":"<<(row.known_ground?"true":"false");
+        s<<",\"ordinary\":"<<(!row.known_ground && !row.occupied_volume && point->ordinary_path_guard?"true":"false")<<",\"floor_m\":";
+        jsonNumber(s,(row.known_ground || row.occupied_volume) ? row.required_margin_m :
+            primitive_floors.at(care_confidence_map::InitialShellRecovery::key(row.point)));
+        s<<",\"reserve_m\":";jsonNumber(s,(row.known_ground || row.occupied_volume)?0.:point->proposal_reserve_m);
         s<<",\"link\":";jsonString(s,row.link);s<<",\"collision_name\":";jsonString(s,row.collision_name);
         s<<",\"executable\":"<<(executable?"true":"false")<<",\"time_s\":";
         jsonNumber(s,executable?executable_samples.at(row.timestep-q_bar.cols()).time_s:row.timestep*dt_);
@@ -6728,6 +7222,48 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   out.solved = true;
+  if(occupied_volume_enabled && !occupied_volume_points.empty()) {
+    std::vector<PrimitiveObservationGuard::Row> rows;std::string error;
+    if(!geometry_guard.linearizeOccupiedVoxels(out.q,occupied_volume_points,.05,.02,.02,&rows,&error) ||
+        std::any_of(rows.begin(),rows.end(),[&](const PrimitiveObservationGuard::Row& row){return row.distance_m<row.required_margin_m-2.*piqp_eps_abs_;})) {
+      out.solved=false;out.status="occupied_volume_nonlinear_recheck_failed";return out;
+    }
+  }
+  if(geometry_guard.knownGroundEnabled()) {
+    std::vector<PrimitiveObservationGuard::Row> ground_rows;std::string error;
+    if(!geometry_guard.linearizeKnownGround(out.q,&ground_rows,&error) ||
+        std::any_of(ground_rows.begin(),ground_rows.end(),[&](const PrimitiveObservationGuard::Row& row) {
+          return row.distance_m<row.required_margin_m-2.*piqp_eps_abs_;
+        })) {
+      out.solved=false;out.status="known_ground_nonlinear_recheck_failed";return out;
+    }
+  }
+  if (normal_motion && !normal_limit_samples.empty() && !force_diagnostic_slack) {
+    out.normal_curve_checked=true;
+    const Eigen::VectorXd lo=q_min_.array()+joint_position_margin_,hi=q_max_.array()-joint_position_margin_;
+    std::vector<NormalCurveKnot> curve;std::string error;
+    out.normal_curve_valid=normalExecutableCurve(out.q,out.u,dt_,repair_executable_settings_,previous_command,
+        out.q.col(0),previous_command,&curve,&error);
+    if(out.normal_curve_valid){const auto range=normalCurveRange(curve,lo,hi,velocity_limits_);
+      out.normal_curve_valid=range.valid;out.normal_curve_violation=range.violation;}
+    if(!preview || preview->native_task_replay) {
+      Eigen::VectorXd measured,velocity(dof_);bool fresh=false;
+      if(preview){fresh=preview->normal_live_fresh;measured=preview->normal_live_q;velocity=preview->normal_live_v;}
+      else
+      {std::lock_guard<std::mutex> lock(mutex_);
+        const double age=(ros::Time::now()-latest_joint_state_.header.stamp).toSec();
+        fresh=has_joint_state_ && !latest_joint_state_.header.stamp.isZero() && age>=0. && age<=.05 && extractMeasuredQ(latest_joint_state_,measured);
+        for(int j=0;fresh && j<dof_;++j){const auto it=std::find(latest_joint_state_.name.begin(),latest_joint_state_.name.end(),joint_names_[j]);
+          const auto k=std::distance(latest_joint_state_.name.begin(),it);
+          fresh=it!=latest_joint_state_.name.end() && k<static_cast<long>(latest_joint_state_.velocity.size()) && std::isfinite(latest_joint_state_.velocity[k]);
+          if(fresh)velocity[j]=latest_joint_state_.velocity[k];}}
+      if(capture){capture->normal_live_fresh=fresh;capture->normal_live_q=measured;capture->normal_live_v=velocity;}
+      if(fresh){out.normal_live_checked=true;out.normal_live_q=measured;out.normal_live_v=velocity;
+        out.normal_live_valid=normalExecutableCurve(out.q,out.u,dt_,repair_executable_settings_,previous_command,measured,velocity,&curve,&error);
+        if(out.normal_live_valid){const auto range=normalCurveRange(curve,lo,hi,velocity_limits_);
+          out.normal_live_valid=range.valid;out.normal_live_violation=range.violation;}}
+    }
+  }
   std::set<care_confidence_map::InitialShellRecovery::Key> consumed_margin_points;
   if (repair_executable_view_enabled_ && !primitive_points.empty()) {
     std::vector<RepairExecutableSample> samples;
@@ -6738,7 +7274,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     } else {
       Eigen::MatrixXd q(dof_,samples.size());
       for (std::size_t i=0;i<samples.size();++i) q.col(i)=samples[i].q;
-      if (!primitive_observation_guard_.linearize(q,primitive_points,&rows,&error)) {
+      if (!geometry_guard.linearize(q,primitive_points,&rows,&error)) {
         out.primitive_executable_valid = false;
       } else {
         double min_distance = std::numeric_limits<double>::infinity();
@@ -6751,10 +7287,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         out.primitive_executable_valid=std::all_of(rows.begin(),rows.end(),[&](const PrimitiveObservationGuard::Row& row) {
           return row.distance_m>=primitive_floors.at(care_confidence_map::InitialShellRecovery::key(row.point));
         });
-        if (out.primitive_executable_valid && !force_diagnostic_slack && !previous_vbc_margins) {
+        if (out.primitive_executable_valid && !force_diagnostic_slack && !previous_vbc_margins && (!preview || preview->native_task_replay)) {
           Eigen::VectorXd measured,velocity(dof_);
           bool fresh = false;
-          {
+          if(preview){fresh=preview->primitive_live_fresh;measured=preview->primitive_live_q;velocity=preview->primitive_live_v;}
+          else {
             std::lock_guard<std::mutex> lock(mutex_);
             const double age=(ros::Time::now()-latest_joint_state_.header.stamp).toSec();
             fresh=has_joint_state_ && !latest_joint_state_.header.stamp.isZero() &&
@@ -6767,6 +7304,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
               if(fresh)velocity[j]=latest_joint_state_.velocity[index];
             }
           }
+          if(capture){capture->primitive_live_fresh=fresh;capture->primitive_live_q=measured;capture->primitive_live_v=velocity;}
           if (fresh) {
             const Eigen::VectorXd shift=measured-out.q.col(0);
             out.primitive_live_rebase_shift_inf=shift.lpNorm<Eigen::Infinity>();
@@ -6778,7 +7316,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
             Eigen::MatrixXd rebased(dof_,live.size());
             for(std::size_t i=0;i<live.size();++i)rebased.col(i)=live[i].q;
             rows.clear();
-            if (primitive_observation_guard_.linearize(rebased,primitive_points,&rows,&error)) {
+            if (geometry_guard.linearize(rebased,primitive_points,&rows,&error)) {
               out.primitive_live_rebase_checked=true;
               out.primitive_live_rebase_min_m=std::numeric_limits<double>::infinity();
               for (const auto& row:rows) {
@@ -7120,15 +7658,15 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
     const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u,
     const std::vector<Eigen::Vector3d>& normal_blocking_unknown_points,
     const std::vector<Eigen::Vector3d>& geometric_restore_points,
-    bool margin_recovery) {
-  if(task_context_enabled_ && !task_context_.current(plan_task_context_,ros::Time::now()))return;
-  if(require_bound_regime_ && (plan_task_regime_!=task_regime_ || !task_control_ready_ || ros::Time::now().toNSec()>task_control_until_))return;
+    bool margin_recovery,
+    const std::vector<Eigen::Vector3d>& fixed_start_recovery_points) {
   if (repair_prefix_binding_enabled_ && plan_repair_mode_ && !plan_probe_mode_ &&
       !prefixSelectionCurrentLocked(plan_prefix_selection_))return;
   const auto* normal_initial_velocity =
       repair_executable_view_enabled_ && !plan_probe_mode_ && (geometric_restore_points.empty() || margin_recovery) ? &plan_previous_command_ : nullptr;
   const auto msg = makeTrajectoryMessage(q, u, frame_id, ros::Time::now(), normal_initial_velocity);
-  if(!plan_repair_mode_ && !plan_probe_mode_ && plan_terminal_context_==terminalContextLocked())
+  if((!plan_repair_mode_ || repair_goal_stopping_enabled_) && !plan_probe_mode_ &&
+      plan_terminal_context_==terminalContextLocked())
     terminal_retention_.candidate(msg.header.stamp.toNSec(),plan_terminal_context_);
   if (!plan_repair_mode_ && !plan_probe_mode_) {
     const double age = (ros::Time::now()-last_query_ros_time_).toSec();
@@ -7176,7 +7714,8 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
         FinalVbcNoProgress::Candidate{plan_repair_ticket_,mode_epoch_,plan_sequence_},observation_token,
         msg.header.stamp,ros::WallTime::now()+ros::WallDuration(cdf_wait_timeout_s_)});
   }
-  if (rejection_snapshots_enabled_) {
+  if (rejection_snapshots_enabled_ || (std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true")) {
     std::ostringstream out;
     out << "{\"schema\":1,\"raw_candidate_stamp_ns\":\"" << msg.header.stamp.toNSec()
         << "\",\"plan_seq\":" << plan_sequence_ << ",\"mode_epoch\":" << mode_epoch_
@@ -7184,6 +7723,13 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
         << ",\"progress_epoch\":" << final_vbc_no_progress_.progress.active.progress
         << ",\"observation_token\":";
     auditString(out,observation_token);
+    if (std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+        std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true") {
+      out << ",\"rolling_task\":true,\"goal_revision\":"<<terminal_goal_revision_
+          <<",\"repair\":"<<(plan_repair_mode_?"true":"false")
+          <<",\"probe\":"<<(plan_probe_mode_?"true":"false")
+          <<",\"candidate_trajectory\":"; auditTrajectory(out,msg);
+    }
     out << ",\"query_trajectory\":";
     auto query_message=makeTrajectoryMessage(query_q,query_u,frame_id,batch.header.stamp,
         repair_executable_view_enabled_ && !plan_probe_mode_ ? &plan_previous_command_ : nullptr);
@@ -7206,22 +7752,14 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
   std_msgs::String identity;
   identity.data = "observation_token=" + observation_token +
       " raw_candidate_stamp_ns=" + std::to_string(msg.header.stamp.toNSec());
-  if(require_bound_regime_) {
-    identity.data += " recovery_target_sha256="+(plan_recovery_target_sha_.empty() ? std::string("none") : plan_recovery_target_sha_)+
-        " recovery_policy_sha256="+(plan_recovery_policy_sha_.empty() ? std::string("none") : plan_recovery_policy_sha_)+
-        " plan_seq="+std::to_string(plan_sequence_);
-    publishTaskStatusLocked("summary","event=recovery_policy_candidate "+identity.data);
-  }
   observation_identity_pub_.publish(identity);
   ROS_INFO_STREAM("[OBS_CANDIDATE] observation_token=" << observation_token
                   << " raw_candidate_stamp_ns=" << msg.header.stamp.toNSec());
   candidate_trajectory_pub_.publish(msg);
-  if (repair_prefix_binding_enabled_ || task_context_enabled_) {
+  if (repair_prefix_binding_enabled_) {
     CandidateTransfer planned;
-    if(task_context_enabled_)planned.task_context=plan_task_context_;
-    if(require_bound_regime_)planned.task_regime=plan_task_regime_;
     planned.action="planned";planned.trajectory=msg;
-    if (plan_repair_mode_ && !plan_probe_mode_ && repair_prefix_binding_enabled_) {
+    if (plan_repair_mode_ && !plan_probe_mode_) {
       const auto& c=plan_prefix_selection_;
       std::ostringstream out;out<<std::setprecision(17)<<"{\"schema\":1,\"session\":\""<<c.session
           <<"\",\"revision\":"<<c.revision<<",\"prefix_s\":"<<c.prefix_s
@@ -7236,14 +7774,28 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
         for(std::size_t i=0;i<geometric_restore_points.size();++i){if(i)out<<',';const auto& p=geometric_restore_points[i];out<<'['<<p.x()<<','<<p.y()<<','<<p.z()<<']';}
         out<<']';
         if(margin_recovery)out<<",\"margin_recovery\":true";
+        if(!fixed_start_recovery_points.empty()) {
+          out<<",\"fixed_start_recovery_points\":[";
+          for(std::size_t i=0;i<fixed_start_recovery_points.size();++i) {
+            if(i)out<<',';const auto& p=fixed_start_recovery_points[i];out<<'['<<p.x()<<','<<p.y()<<','<<p.z()<<']';
+          }
+          out<<']';
+        }
         out<<'}';
       }
       out<<'}';planned.planned_prefix_context=out.str();
     }
-    if(plan_repair_mode_ && !plan_probe_mode_ && !geometric_restore_points.empty()) {
+    if(plan_repair_mode_ && !plan_probe_mode_ &&
+        (!geometric_restore_points.empty() || primitive_observation_guard_.knownGroundEnabled())) {
       while(admission_pending_.size()>=FinalVbcNoProgress::max_pending)admission_pending_.erase(admission_pending_.begin());
       admission_pending_.emplace(msg.header.stamp.toNSec(),AdmissionCandidate{
           planned,plan_prefix_selection_,mode_epoch_,observation_token,safe_frontier_recovery_.key});
+    }
+    if(primitive_observation_guard_.knownGroundEnabled() && terminal_goal_valid_) {
+      while(ground_admission_.size()>=64)ground_admission_.erase(ground_admission_.begin());
+      ground_admission_.emplace(msg.header.stamp.toNSec(),GroundAdmission{
+          planned,terminal_goal_revision_,mode_epoch_,plan_repair_mode_,plan_probe_mode_,
+          groundContextLocked(),ros::WallTime::now()+ros::WallDuration(cdf_wait_timeout_s_)});
     }
     planned_candidate_pub_.publish(planned);
   }
@@ -7366,7 +7918,6 @@ void LocalSparseSCPPlanner::publishSummary(
     const std::string& event,
     const SparseSolveResult* result,
     double total_plan_ms) {
-  std::string summary_task_binding,summary_task_regime;
   unsigned long long plan_seq = 0;
   unsigned long long batches = 0;
   unsigned long long misses = 0;
@@ -7377,6 +7928,7 @@ void LocalSparseSCPPlanner::publishSummary(
   bool running = false;
   bool repair = false;
   bool probe = false;
+  unsigned long long goal_stop_execution=0,goal_stop_sample=0;
   int probe_restore_attempts = 0;
   bool observation_phase = true;
   int witness_count = 0;
@@ -7435,14 +7987,15 @@ void LocalSparseSCPPlanner::publishSummary(
   int observation_window_commits = 0;
   int view_window_commits=0;
   double view_window_age=-1.,view_fov_best=0.;
-  std::string recovery_advance_reason;
+  std::string recovery_advance_reason, action_progress_decision;
+  double action_progress_elapsed=0.,action_progress_budget=0.,action_fov_gain=0.;
+  int action_progress_commits=0,executed_view_trials=0;
   bool execution_response_blocked = false;
   unsigned long long execution_response_faults = 0;
   double execution_requested_travel = 0., execution_measured_motion = 0.;
 
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    summary_task_binding=task_context_.binding;summary_task_regime=task_regime_;
     plan_seq = plan_sequence_;
     execution_response_blocked = execution_response_monitor_.blocked;
     execution_response_faults = execution_response_monitor_.faults;
@@ -7467,6 +8020,10 @@ void LocalSparseSCPPlanner::publishSummary(
     view_window_commits=safe_frontier_recovery_.view_window_commits;
     view_fov_best=safe_frontier_recovery_.geometry_best;
     recovery_advance_reason=safe_frontier_recovery_.last_advance_reason;
+    const auto& action=safe_frontier_recovery_.action_progress;
+    action_progress_decision=action.decision;action_progress_elapsed=action.elapsed;
+    action_progress_budget=action.budget;action_fov_gain=action.fov_gain;action_progress_commits=action.commits;
+    executed_view_trials=safe_frontier_recovery_.executed_view_trials;
     if(safe_frontier_recovery_.view_window_start>=0.)
       view_window_age=ros::Time::now().toSec()-safe_frontier_recovery_.view_window_start;
     if (safe_frontier_recovery_.observation_window_start>=0.)
@@ -7474,6 +8031,12 @@ void LocalSparseSCPPlanner::publishSummary(
     safe_stall_active = safe_frontier_recovery_enabled_ && safe_frontier_recovery_.active;
     safe_stall_reselect = safe_stall_active && (safe_frontier_recovery_.blocked() ||
         final_vbc_no_progress_.progress.blocked() || repair_no_progress_.blocked());
+    if(repair_goal_stopping_enabled_ && terminal_retention_.armed) {
+      if(retainTerminalLocked()) {
+        goal_stop_execution=terminal_retention_.armed;
+        goal_stop_sample=latest_joint_state_.header.stamp.toNSec();
+      } else requestPlanLocked("terminal_retention_released");
+    }
     observation_token = plan_observation_token_;
     batches = cdf_batch_received_;
     query_stamp_ns = current_query_stamp_.toNSec();
@@ -7591,6 +8154,12 @@ void LocalSparseSCPPlanner::publishSummary(
       << " view_window_commits=" << view_window_commits
       << " view_window_age_s=" << view_window_age
       << " view_fov_best_m=" << view_fov_best
+      << " action_progress_decision=" << action_progress_decision
+      << " action_progress_elapsed_s=" << action_progress_elapsed
+      << " action_progress_budget_s=" << action_progress_budget
+      << " action_progress_commits=" << action_progress_commits
+      << " executed_view_trials=" << executed_view_trials
+      << " action_executed_fov_gain_m=" << action_fov_gain
       << " recovery_advance_reason=" << recovery_advance_reason
       << " safe_stall_reselect=0"
       << " observation_dependency_policy=" << static_cast<int>(safe_frontier_recovery_enabled_)
@@ -7688,6 +8257,7 @@ void LocalSparseSCPPlanner::publishSummary(
       << " stamp_miss=" << misses
       << " solves=" << solves
       << " solve_failures=" << failures;
+  oss << " fixed_start_recovery_enabled=" << static_cast<int>(fixed_start_recovery_enabled_);
   oss << " fixed_start_unknown_hold=" << static_cast<int>(fixed_start_unknown_hold);
 
   if (result) {
@@ -7729,11 +8299,18 @@ void LocalSparseSCPPlanner::publishSummary(
         << " executable_recheck_only=" << (result->executable_recheck_only ? 1 : 0)
         << " executable_trial_restored=" << (result->executable_trial_restored ? 1 : 0)
         << " executable_retained_available=" << (result->executable_retained_available ? 1 : 0)
+        << " normal_curve_checked=" << result->normal_curve_checked
+        << " normal_curve_valid=" << result->normal_curve_valid
+        << " normal_curve_violation=" << result->normal_curve_violation
+        << " normal_live_checked=" << result->normal_live_checked
+        << " normal_live_valid=" << result->normal_live_valid
+        << " normal_live_violation=" << result->normal_live_violation
         << " primitive_live_rebase_checked=" << result->primitive_live_rebase_checked
         << " primitive_live_rebase_required=" << result->primitive_live_rebase_required
         << " primitive_live_rebase_shift_inf=" << result->primitive_live_rebase_shift_inf
         << " primitive_live_rebase_min_m=" << result->primitive_live_rebase_min_m
         << " primitive_observation_start_distance_m=" << result->primitive_observation_start_distance_m
+        << " fixed_start_recovery_points=" << result->fixed_start_recovery_points.size()
         << " fixed_start_unknown_blocked=" << static_cast<int>(result->fixed_start_unknown_blocked)
         << " fixed_start_unknown_distance_m=" << result->fixed_start_unknown_distance_m
         << " fixed_start_unknown_floor_m=" << result->fixed_start_unknown_floor_m
@@ -7750,6 +8327,8 @@ void LocalSparseSCPPlanner::publishSummary(
         << " qlin_error_inf=" << result->qlin_error_inf
         << " min_d=" << result->min_distance
         << " max_slack=" << result->max_slack
+        << " repair_unknown_soft=" << (result->repair_unknown_soft ? 1 : 0)
+        << " observation_dependency_basis=" << (result->repair_unknown_soft ? "analytic_unknown" : "learned_unknown")
         << " mean_slack=" << result->mean_slack
         << " slack_mu_used=" << result->slack_linear_weight_used
         << " step_inf=" << result->step_inf
@@ -7770,13 +8349,13 @@ void LocalSparseSCPPlanner::publishSummary(
   }
   std_msgs::String msg;
   msg.data = oss.str();
+  msg.data+=" goal_stop_execution_stamp_ns="+std::to_string(goal_stop_execution)+
+      " goal_stop_sample_ros_ns="+std::to_string(goal_stop_sample);
   summary_pub_.publish(msg);
-  {std::lock_guard<std::mutex> lock(mutex_);
-   if(summary_task_binding==task_context_.binding && summary_task_regime==task_regime_)
-     publishTaskStatusLocked("summary",msg.data);}
-
   ROS_INFO_STREAM_THROTTLE(
       0.25, "[LocalSparseSCPPlanner] " << msg.data);
 }
 
+#include "native_view_preview.inc"
+#include "aligned_view_preview.inc"
 }  // namespace egocentric_arm_planner

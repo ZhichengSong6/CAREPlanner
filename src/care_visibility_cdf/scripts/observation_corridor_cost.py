@@ -89,7 +89,8 @@ def approach_visibility_order(runtime, points, q_start, q_end, sensor_id):
         minimum=np.minimum(minimum,distance)
         for j in range(len(points)):
             if not seen[j] and distance[j]<.01 and first_entry[j] is None:first_entry[j]=k
-        view=runtime._candidate_geometry(points,q,sensor_id)
+        geometry=getattr(runtime,'_approach_order_geometry',runtime._candidate_geometry)
+        view=geometry(points,q,sensor_id)
         for j,p in enumerate(view['per_point']):
             if p['nominal_margin']>=0. and not p['primitive_self_occluded']:
                 seen[j]=True
@@ -127,3 +128,28 @@ def snapshot_cost(response, points, approach, rejoin, now_ns, threshold):
             snapshot_stamp_ns=stamp,query_points=n)
     except (AttributeError,KeyError,ValueError,TypeError,OverflowError):
         return dict(status='invalid_or_stale')
+
+
+def paired_legacy_corridor_costs(runtime, candidates, context, query, now_ns, threshold):
+    """The existing four-sample legs, compared on one optional map response.
+
+    No upcoming-reference objective, extra probes per leg, or map update is
+    introduced. Invalid/late responses remove this optional feature for both.
+    """
+    if len(candidates) != 2:
+        return [dict(status='unavailable', reason='not_a_pair') for _ in candidates]
+    paths = [(body_path_probes(runtime, context['q_start'], q),
+              body_path_probes(runtime, q, context['q_task'])) for q in candidates]
+    points = sorted(set(p for pair in paths for leg in pair for p in leg))
+    if not points:
+        return [dict(status='unavailable', reason='no_body_probes') for _ in candidates]
+    response = query(points)
+    captured_now = now_ns()
+    costs = [snapshot_cost(response, points, approach, rejoin, captured_now, threshold)
+             for approach, rejoin in paths]
+    if any(cost.get('status') != 'valid' for cost in costs):
+        return [dict(status='unavailable', reason='common_snapshot_unavailable') for _ in candidates]
+    for cost in costs:
+        cost.update(corridor_kind='legacy_common_snapshot', motion_authorized=False,
+                    predicted_map_update=False)
+    return costs

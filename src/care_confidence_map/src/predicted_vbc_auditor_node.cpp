@@ -1,4 +1,7 @@
 #include <care_confidence_map/trajectory_risk_evaluator.hpp>
+#include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/analytic_ground_support.hpp>
+#include <cstdlib>
 #include <care_confidence_map/body_geometry_params.hpp>
 
 #include <ros/ros.h>
@@ -72,6 +75,20 @@ public:
       ROS_ERROR_STREAM("[predicted_vbc_auditor] fast audit preparation failed: "
                        << error_msg);
       return false;
+    }
+    const char* whole=std::getenv("CARE_VBC_WHOLE_VOXEL");whole_voxel_=whole && std::string(whole)=="true";
+    if(whole_voxel_) {
+      std::string primitive_urdf;pnh_.getParam("predicted_vbc/primitive_urdf_file",primitive_urdf);
+      if(primitive_urdf.empty() || !full_model_.load(primitive_urdf,{},&error_msg))return false;
+      const char* apply=std::getenv("CARE_ANALYTIC_GROUND_APPLY");
+      if(apply && std::string(apply)=="true") {
+        const char* file=std::getenv("CARE_ANALYTIC_GROUND_FILE");
+        if(!file || !*file)return false;
+        try {analytic_support_=care_confidence_map::AnalyticGroundSupport::load(file);}
+        catch(const std::exception& e){ROS_ERROR_STREAM(e.what());return false;}
+        if(!analytic_support_.association_enabled || analytic_support_.frame!=base_frame_)return false;
+        clip_analytic_support_=true;
+      }
     }
     fast_sensor_poses_.reserve(evaluator_.fastAuditSensorCount());
 
@@ -216,6 +233,17 @@ private:
       const Eigen::Vector3d& point_base,
       const std::vector<care_confidence_map::FastAuditSensorPose>& poses) const
   {
+    if(whole_voxel_) {
+      Eigen::Vector3d center=point_base,half=Eigen::Vector3d::Constant(.025);
+      if(clip_analytic_support_) {
+        const auto residual=analytic_support_.residual(point_base,.05,analytic_support_.supportUpper());
+        if(residual.empty)return false;
+        center=(residual.minimum+residual.maximum)/2.;half=(residual.maximum-residual.minimum)/2.;
+      }
+      for(const auto& pose:poses)if(care_confidence_map::supportAabbInsideFrustum(center,half,pose.rotation_base,pose.translation_base,
+          forward_dir_,right_dir_,up_dir_,tof_min_range_,tof_max_range_,tan_half_h_fov_,tan_half_v_fov_))return true;
+      return false;
+    }
     for (const auto& pose : poses)
     {
       if (pointVisibleFromSensor(point_base, pose))
@@ -386,6 +414,12 @@ private:
             1.0, "[predicted_vbc_auditor] fast FK/audit error: " << error_msg);
         return;
       }
+      if(whole_voxel_) {
+        std::vector<care_confidence_map::VbcPrimitiveFrame> body;
+        if(!full_model_.computeTrajectory(evaluator_,{q},&body,&error_msg) || body.size()!=1){publishError("voxel_fk_error",elapsedMs(tic),evaluated_q);return;}
+        clearance=std::numeric_limits<double>::infinity();
+        for(const auto& primitive:body.front().primitives)clearance=std::min(clearance,primitive.signedDistance(target)-.5*std::sqrt(3.)*.05);
+      }
       evaluated_q += 1;
 
       if (!std::isfinite(first_see_s) &&
@@ -539,6 +573,10 @@ private:
   ros::Publisher audit_time_pub_;
 
   care_confidence_map::TrajectoryRiskEvaluator evaluator_;
+  care_confidence_map::VbcPrimitiveModel full_model_;
+  bool whole_voxel_=false;
+  care_confidence_map::AnalyticGroundSupport analytic_support_;
+  bool clip_analytic_support_=false;
 
   std::string robot_urdf_file_;
   std::string body_samples_file_;

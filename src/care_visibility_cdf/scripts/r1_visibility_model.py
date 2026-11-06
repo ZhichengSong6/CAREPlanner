@@ -12,6 +12,7 @@ No ROS, Gazebo, checkpoint download, repository mutation, or execution at import
 from __future__ import annotations
 
 import hashlib
+import os
 from pathlib import Path
 from typing import Tuple, Union
 
@@ -164,6 +165,12 @@ def load_r1_checkpoint(
     weights_only=False. SHA256 is verified BEFORE deserialization. This loader
     deliberately does not accept arbitrary downloaded checkpoints.
     """
+    backend = os.environ.get('CARE_VISIBILITY_BACKEND', 'r1')
+    if backend == 'geometry':
+        from geometry_visibility_backend import load_geometry
+        return load_geometry(checkpoint_path, device)
+    if backend != 'r1':
+        raise ValueError('Unknown visibility backend: '+backend)
     path = Path(checkpoint_path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -186,4 +193,12 @@ def load_r1_checkpoint(
         raise RuntimeError("Unexpected R1 parameter count")
     full = full.to(device=device, dtype=torch.float32).eval().requires_grad_(False)
     # Freezing parameters does not disable input-q autograd.
+    from geometry_visibility_backend import audit
+    audit('backend_loaded', neural_loads=1, checkpoint_sha256=R1_SHA256, value_kind='learned_cspace_distance_rad')
+    def count_forward(module, inputs, outputs):
+        count_forward.calls += 1
+        if count_forward.calls == 1 or count_forward.calls % 64 == 0:
+            audit('neural_forward', calls=count_forward.calls, neural_loads=1)
+    count_forward.calls=0
+    full.register_forward_hook(count_forward)
     return HierarchicalSensorView(full).eval(), checkpoint

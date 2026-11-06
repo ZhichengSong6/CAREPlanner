@@ -27,7 +27,6 @@ class ExpiringVelocityCore {
   Joints output{};
   double command_stamp = 0., fault_stamp = 0., stopped_stamp = 0.;
   uint32_t command_sequence = 0;
-  uint64_t command_ingress = 0;
   uint64_t rejected = 0, rearm_successes = 0, rearm_rejections = 0;
 
   void validate() const {
@@ -42,11 +41,9 @@ class ExpiringVelocityCore {
     validate();
     mode=WAITING; clock_fault=false; output.fill(0.); latest_=Command(); target_.fill(0.);
     last_time_=floor_=last_stamp_=now;
-    command_stamp=fault_stamp=stopped_stamp=0.; command_sequence=0; command_ingress=0;
+    command_stamp=fault_stamp=stopped_stamp=0.; command_sequence=0;
     last_ingress_=0; rejected=rearm_successes=rearm_rejections=0;
   }
-  // The lease wrapper uses the same latched bounded-rate braking policy.
-  void requestStop(double now) { fault(now); }
   void update(double now, double period, const Command& incoming, bool rearm,
               const Joints& measured) {
     const bool bad_clock = !std::isfinite(now) || now < last_time_ ||
@@ -96,7 +93,7 @@ class ExpiringVelocityCore {
     return true;
   }
   void accept(const Command& c) {
-    target_=c.velocity; command_stamp=c.stamp; command_sequence=c.sequence; command_ingress=c.ingress; mode=TRACKING;
+    target_=c.velocity; command_stamp=c.stamp; command_sequence=c.sequence; mode=TRACKING;
   }
   void fault(double now) {
     if (mode != BRAKING && mode != LATCHED) { mode=BRAKING; fault_stamp=now; }

@@ -46,6 +46,14 @@ struct NormalTerminalRetention {
       if(t.points[k].time_from_start<=t.points[k-1].time_from_start)return false;
     return covered;
   }
+  // A planning request revokes a scheduling lease, but does not revoke an
+  // already published audit/commit fact. Keep bounded in-flight provenance so
+  // delayed callbacks can join it; context, newest token, exact motion, tail
+  // and the caller's tracker/pose checks still decide whether it can arm.
+  void replan(const std::string& why) {
+    if(armed)++revoke_count;
+    armed=0;armed_context.clear();reason=why;
+  }
   void invalidate(const std::string& why) {
     if(armed)++revoke_count;
     armed=0;armed_context.clear();pending.clear();proofs.clear();audits.clear();commits.clear();reason=why;

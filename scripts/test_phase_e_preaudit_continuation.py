@@ -9,7 +9,7 @@ from test_phase_e_handoff_schedule import ScheduleTests, String, rospy
 class PreauditTests(ScheduleTests):
     def expired(self):
         self.waiting()
-        self.g.sender.replan_used = True
+        self.g.sender.replan_count = 1
         self.advance(.751, ros=False)
         self.n._admission_tick()
         self.pump()
@@ -25,7 +25,7 @@ class PreauditTests(ScheduleTests):
         self.assertEqual(e.trajectory,self.raw)
         self.assertEqual(e.planned_prefix_context,self.context)
         self.assertEqual(e.payload_sha256,self.entry['digest'])
-        self.assertTrue(self.g.sender.replan_used)
+        self.assertTrue(self.g.sender.replan_count)
         self.assertFalse(self.g.replan_request_pub.messages)
         self.assertFalse(self.n.final_gcdf_query_pub.messages or self.n.committed_pub.messages)
         self.g._admission_status_cb(copy.deepcopy(self.entry['status']))
@@ -52,13 +52,13 @@ class PreauditTests(ScheduleTests):
             self.context=json.dumps(c,separators=(',',':'))
             original(raw,self.context)
         with patch.object(self.g,'_candidate_cb',side_effect=submit):self.waiting()
-        self.g.sender.replan_used=True
+        self.g.sender.replan_count=1
         self.advance(.751,ros=False);self.n._admission_tick();self.pump()
 
     def test_postaudit_expiry_cannot_become_preaudit(self):
         self.start();self.g.sender.active['prefix_context']='bound'
         self.assertEqual(next(iter(self.n._admission_entries.values()))['audit_started'],True)
-        self.g.sender.replan_used=True
+        self.g.sender.replan_count=1
         self.advance(.751,ros=False);self.n._admission_tick();self.pump()
         self.assertFalse(self.g.admission_terminal_pub.messages)
 
@@ -81,11 +81,11 @@ class PreauditTests(ScheduleTests):
             'context_prefix_session={} context_prefix_revision={} context_prefix_s={}'.format(
                 self.n._outstanding.header.stamp.to_nsec(),*key,c['session'],c['revision'],c['prefix_s'])))
         self.pump();self.assertFalse(self.n.committed_pub.messages)
-        self.assertTrue(self.g.sender.replan_used)
+        self.assertTrue(self.g.sender.replan_count)
 
     def test_wrong_or_duplicate_receipt_cannot_release(self):
         self.waiting();self.g.sender.active['prefix_context']='{"geometric_restore":{}}'
-        self.g.sender.replan_used=True
+        self.g.sender.replan_count=1
         self.advance(.751,ros=False);self.n._admission_tick()
         status=self.n.admission_status_pub.messages[-1]
         for suffix in [' session=bad',' sequence=0',' payload_sha256=bad']:

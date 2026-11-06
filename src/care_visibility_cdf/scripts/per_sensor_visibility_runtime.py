@@ -53,6 +53,7 @@ from check_visibility_self_occlusion import (
     load_collision_primitives,
     q_row_to_map,
     raycast_self_occlusion,
+    raycast_self_occlusion_many,
 )
 from candidate_replacement_runtime import replacement_mount_group_pool
 from observation_task_rejoin import candidate_cost, improves_candidate, alternative_can_improve
@@ -247,6 +248,15 @@ def _parse_skips(raw) -> Tuple[int, ...]:
 
 
 def build_per_sensor_model(checkpoint_path: str, device: torch.device, r1_bundle=None):
+    if os.environ.get('CARE_VISIBILITY_BACKEND', 'r1') == 'geometry':
+        from geometry_visibility_backend import AnalyticGeometry
+        if r1_bundle is None:
+            model,ckpt=load_r1_checkpoint(checkpoint_path,device)
+        else:
+            model,ckpt=r1_bundle
+        if not isinstance(model.full_model,AnalyticGeometry):
+            raise TypeError('Geometry backend must not contain learned R1')
+        return model,ckpt
     # Hash before unpickling.  H9 V1 is a fixed runtime artifact and must match
     # the reviewed final.pt byte-for-byte regardless of its filename.
     checkpoint_sha256 = _checkpoint_sha256(checkpoint_path)
@@ -417,6 +427,10 @@ class PerSensorVisibilityRuntime:
             raise ValueError("max_branch_attempts must be in [1,8]")
 
         self.device = device
+        reuse = os.environ.get('CARE_POSE_TRANSFORM_REUSE_ENABLED', 'false').lower()
+        if reuse not in ('true', 'false'):
+            raise ValueError('CARE_POSE_TRANSFORM_REUSE_ENABLED must be true or false')
+        self.pose_transform_reuse_enabled = reuse == 'true'
         self.checkpoint_path = str(checkpoint_path)
         self.reference_urdf_path = str(reference_urdf_path)
         self.self_filter_urdf_path = str(self_filter_urdf_path)
@@ -747,6 +761,9 @@ class PerSensorVisibilityRuntime:
         geometry_guided: bool = False, geometry_threshold: float = 0.0,
     ) -> Dict[str, object]:
         """Legacy-scalar-style per-head projection -> root -> ascent."""
+        if os.environ.get('CARE_VISIBILITY_BACKEND', 'r1') == 'geometry':
+            from geometry_visibility_backend import optimize_branch
+            return optimize_branch(self,points,q_start,sensor_id)
         sensor_id = int(sensor_id)
         q0, initial_clamped = self._clamp(
             q_start.detach().clone().reshape(1, 7)
@@ -977,6 +994,26 @@ class PerSensorVisibilityRuntime:
         score,gradient=self.branch_value_and_grad(points,q,sensor_id)
         return score,gradient,'learned_visibility'
 
+    def _approach_order_geometry(self, points_xyz, q_row, sensor_id):
+        """Only the nominal FOV/LOS fields used by soft approach ordering.
+
+        A pose-local ray cache preserves the original intersection arithmetic.
+        This return value has no acceptance field and cannot certify a proposal.
+        Final candidates still pass the full _candidate_geometry below.
+        """
+        points=np.asarray(points_xyz,dtype=np.float64).reshape(-1,3)
+        q=np.asarray(q_row,dtype=np.float64).reshape(7)
+        if not len(points) or not np.all(np.isfinite(points)) or not np.all(np.isfinite(q)):
+            raise ValueError('invalid approach-order geometry')
+        q_map=q_row_to_map(DEFAULT_JOINT_NAMES,q)
+        transform=fk_transform(self.sensor_chains[int(sensor_id)],q_map)
+        rays=(raycast_self_occlusion_many(self.self_filter_robot,self.collision_chains,
+            self.primitives,transform,points,q_map,self.ray_args) if self.require_primitive_los
+            else [(False,None) for _ in points])
+        return dict(per_point=[dict(nominal_margin=float(sensor_margin(point,transform,
+            self.nom_hfov,self.nom_vfov,self.nom_z_min,self.nom_z_max)[0]),
+            primitive_self_occluded=bool(ray[0])) for point,ray in zip(points,rays)])
+
     def _candidate_geometry(
         self, points_xyz, q_row, sensor_id: int,
         minimum_conservative_g=None,
@@ -998,7 +1035,11 @@ class PerSensorVisibilityRuntime:
         min_nom_margin = math.inf
         any_occluded = False
 
-        for point in points:
+        ray_rows = (raycast_self_occlusion_many(
+            self.self_filter_robot, self.collision_chains, self.primitives,
+            sensor_transform, points, q_map, self.ray_args)
+            if self.require_primitive_los and self.pose_transform_reuse_enabled else None)
+        for point_index, point in enumerate(points):
             cons_margin, cons_plane, _ = sensor_margin(
                 point,
                 sensor_transform,
@@ -1019,7 +1060,9 @@ class PerSensorVisibilityRuntime:
 
             occluded = False
             hit = None
-            if self.require_primitive_los:
+            if ray_rows is not None:
+                occluded, hit = ray_rows[point_index]
+            elif self.require_primitive_los:
                 occluded, hit = raycast_self_occlusion(
                     self.self_filter_robot,
                     self.collision_chains,
@@ -1068,6 +1111,14 @@ class PerSensorVisibilityRuntime:
         else:
             reject_reason = "accepted"
 
+        external = None
+        external_check = getattr(self, 'external_occlusion_check', None)
+        if external_check is not None:
+            external = external_check(points, q, sensor_id)
+            if external.get('blocked', False):
+                accepted = False
+                reject_reason = 'external_occupied_occlusion'
+
         return {
             "accepted": accepted,
             "conservative_passes": bool(conservative_passes),
@@ -1078,6 +1129,7 @@ class PerSensorVisibilityRuntime:
             "minimum_conservative_g_required": float(threshold),
             "min_nominal_margin": float(min_nom_margin),
             "any_primitive_self_occluded": bool(any_occluded),
+            "external_occlusion": external,
             "per_point": point_rows,
         }
 
@@ -1093,7 +1145,7 @@ class PerSensorVisibilityRuntime:
     ) -> Dict[str, object]:
         """Return a bounded FOV/LOS proposal with optional task-return ranking.
 
-        Sensor ranking is performed at scalar q_zero.  Every branch solve starts
+        Sensor ranking is performed at branch_seed_row. Every branch solve starts
         independently from branch_seed_row; if omitted, q_zero is used.
         """
         if self.device.type == "cuda":
@@ -1309,19 +1361,52 @@ class PerSensorVisibilityRuntime:
                     break
                 pose = fk_transform(self.task_ee_chain,
                     q_row_to_map(DEFAULT_JOINT_NAMES, branch['q_candidate']))
-                cost = candidate_cost(branch['q_candidate'], task_rejoin, pose, task_pose)
+                cost_context=task_rejoin
+                paired=task_rejoin.get('paired_corridor_evaluator')
+                if paired is not None and attempt is not first_accepted:
+                    # First-candidate pruning retains its original information.
+                    # Replace the second legacy RPC with one common pair query.
+                    cost_context=dict(task_rejoin)
+                    cost_context.pop('corridor_evaluator',None)
+                cost = candidate_cost(branch['q_candidate'], cost_context, pose, task_pose)
+                approach_tic = time.perf_counter()
                 try:
                     approach_order=approach_visibility_order(self,points_np,task_rejoin['q_start'],
                         branch['q_candidate'],int(sensor_id))
                 except Exception as exc:
                     approach_order=dict(status='unavailable',reason=str(exc))
+                attempt['approach_visibility_order_ms'] = 1000.*(time.perf_counter()-approach_tic)
                 cost['approach_visibility_order']=approach_order
                 if approach_order['status']=='valid':cost['approach_requires_detour']=approach_order['requires_detour']
                 attempt['branch_latency_ms'] = 1000.*(time.perf_counter()-branch_tic)
+                if paired is not None and attempt is not first_accepted:
+                    from observation_task_corridor import replace_corridor_costs
+                    pair_context=dict(task_rejoin,paired_remaining_s=max(0.,1.5-(time.perf_counter()-rejoin_start)))
+                    try:
+                        previews=paired([first_accepted['q_candidate'],branch['q_candidate']],pair_context)
+                    except Exception as exc:
+                        previews=[dict(status='unavailable',reason=str(exc)) for _ in range(2)]
+                    prior_first_cost=first_accepted['task_rejoin_cost']
+                    alternative_without_corridor=cost
+                    first_cost,cost=replace_corridor_costs([prior_first_cost,cost],previews)
+                    first_accepted['task_rejoin_cost']=first_cost
+                    rejoin_diagnostic['candidates'][0]=dict(sensor_id=int(first_accepted['sensor_id']),**first_cost)
+                    rejoin_diagnostic['task_corridor_pair']=dict(mode=task_rejoin.get('corridor_pair_kind','reference_pair'),
+                        original_task_reference=task_rejoin.get('upcoming_task_reference'),
+                        reference_error=task_rejoin.get('upcoming_task_reference_error'),
+                        costs=previews,common_map_used=bool(first_cost['corridor_used'] and cost['corridor_used']),
+                        first_legacy_cost=prior_first_cost,
+                        alternative_cost_without_corridor=alternative_without_corridor,
+                        remaining_budget_s=pair_context['paired_remaining_s'])
                 attempt['task_rejoin_cost'] = cost
                 rejoin_diagnostic['candidates'].append(dict(sensor_id=int(sensor_id), **cost))
+                # Once both branches have been computed, their elapsed search
+                # time is shared. Charge it when deciding whether to search
+                # another branch, not asymmetrically to a completed alternative.
+                comparison_elapsed = (0. if os.environ.get('CARE_REPAIR_UNKNOWN_SOFT','false')=='true'
+                                      else time.perf_counter()-rejoin_start)
                 if attempt is not first_accepted and improves_candidate(cost,
-                        first_accepted['task_rejoin_cost'], time.perf_counter()-rejoin_start):
+                        first_accepted['task_rejoin_cost'], comparison_elapsed):
                     selected = attempt
                     rejoin_diagnostic['selected_by'] = ('sampled_observation_before_entry' if
                         first_accepted['task_rejoin_cost'].get('approach_requires_detour') is True and
@@ -1339,6 +1424,9 @@ class PerSensorVisibilityRuntime:
 
         return {
             "enabled": True,
+            "visibility_backend": os.environ.get('CARE_VISIBILITY_BACKEND','r1'),
+            "observation_selector": os.environ.get('CARE_OBSERVATION_SELECTOR','task'),
+            "value_kind": ('local_linearized_joint_margin_rad' if os.environ.get('CARE_VISIBILITY_BACKEND')=='geometry' else 'learned_cspace_distance_rad'),
             "accepted": bool(selected is not None),
             "selected_sensor_id": (
                 int(selected["sensor_id"]) if selected is not None else -1
@@ -1385,6 +1473,7 @@ class PerSensorVisibilityRuntime:
             ],
             "compute_ms": float(compute_ms),
             "config": {
+                "pose_transform_reuse_enabled": self.pose_transform_reuse_enabled,
                 "branch_solver": (
                     "per_head_projection_root_ascent_from_branch_seed"
                 ),

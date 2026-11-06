@@ -82,6 +82,20 @@ class FenceTests(unittest.TestCase):
         self.assertIsNotNone(self.n._gcdf_outstanding);self.assertIsNotNone(self.n._pending_raw)
         self.grant();self.assertIsNone(self.n._gcdf_outstanding);self.assertIsNone(self.n._pending_raw)
         self.n._raw_cb(self.raw(18.9));self.assertIsNone(self.n._pending_raw)
+    def test_v2_uses_planner_wall_lease_even_if_ros_runs_ahead(self):
+        text=('request_id=6 granted=1 mode_epoch=2 query_stamp_ns=18776000000 '
+              'deadline_ns=20810000000 lease_timing=wall_v2 '
+              'wait_budget_s=3 generation_budget_s=6 deadline_wall_ns=1010000000000')
+        with patch.object(production.time,'time',return_value=1000.):
+            self.n._replacement_grant_cb(String(data=text))
+            deadline=self.n._replacement_fence['wall_deadline']
+            self.now=100.;self.wall=104.
+            self.assertTrue(self.n._replacement_active_locked(rospy.Time.now()))
+            self.n._replacement_grant_cb(String(data=text))
+            self.assertEqual(self.n._replacement_fence['wall_deadline'],deadline)
+            self.wall=110.001
+            self.assertFalse(self.n._replacement_active_locked(rospy.Time.now()))
+
     def test_duplicates_do_not_extend_deadline_and_wrong_finish_does_not_release(self):
         text=self.grant();wall=self.n._replacement_fence['wall_deadline']
         self.wall+=1;self.n._replacement_grant_cb(String(data=text))

@@ -61,7 +61,7 @@ def main():
     sem=dict(line.split('=',1) for line in (base/'run/runtime_semantics.txt').read_text().splitlines() if '=' in line)
     for k,v in {'vbc_swept_volume_margin_m':.02,'execution_vbc_swept_volume_margin_m':.01,'tracker_certified_margin_m':.02}.items():assert float(sem[k])==v
     controlled=RT/'logs/c5_5_vbc_gcdf_regime'/runid/'run/controlled.log';sources.append(controlled)
-    socket_path=f'/tmp/care_collision_cdf_gpu_{runid}.sock'
+    socket_path=os.environ.get('GPU_SOCKET',f'{os.environ.get("TMPDIR", "/tmp")}/care_collision_cdf_gpu_{runid}.sock')
     routing=[line for line in controlled.read_text(errors='replace').splitlines() if socket_path in line]
     assert routing,'No runtime shared socket evidence'
     report=dict(status='COMPLETE_RECONCILED',clock_reversals=clock_reversals,clock_boundary_check='Same boot/time namespace; original monotonic score bounds; request emission membership',monotonic_partition=partition,session=session,task_by_request_monotonic_time=domain(task),

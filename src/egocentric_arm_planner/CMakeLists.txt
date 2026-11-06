@@ -21,17 +21,15 @@ find_package(catkin REQUIRED COMPONENTS
   arm_trajectory
   care_collision_cdf
   care_confidence_map
-  care_velocity_controller
 )
 
 find_package(Eigen3 REQUIRED)
 find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
 
 add_message_files(FILES CandidateTransfer.msg RepairPrefixSelection.msg VisibilityGuidance.msg)
 generate_messages(DEPENDENCIES trajectory_msgs)
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/PreparePIQP.cmake")
+set(PIQP_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/piqp/include")
 if(NOT EXISTS "${PIQP_INCLUDE_DIR}/piqp/piqp.hpp")
   message(FATAL_ERROR
     "PIQP headers are missing. Run: git submodule update --init --recursive")
@@ -55,7 +53,6 @@ catkin_package(
     arm_trajectory
     care_collision_cdf
     care_confidence_map
-    care_velocity_controller
   DEPENDS EIGEN3
 )
 
@@ -75,12 +72,10 @@ add_library(egocentric_arm_planner
 )
 
 add_dependencies(egocentric_arm_planner
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 
 target_link_libraries(egocentric_arm_planner
-  OpenSSL::Crypto
   ${catkin_LIBRARIES}
 )
 
@@ -88,7 +83,6 @@ add_executable(receding_horizon_planner_node
   src/receding_horizon_planner_node.cpp
 )
 add_dependencies(receding_horizon_planner_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(receding_horizon_planner_node
@@ -100,7 +94,6 @@ add_executable(trajectory_visualizer_node
   src/trajectory_visualizer_node.cpp
 )
 add_dependencies(trajectory_visualizer_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(trajectory_visualizer_node
@@ -112,7 +105,6 @@ add_executable(trajectory_execution_manager_node
   src/trajectory_execution_manager_node.cpp
 )
 add_dependencies(trajectory_execution_manager_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(trajectory_execution_manager_node
@@ -125,7 +117,6 @@ add_executable(velocity_qp_mpc_node
   src/velocity_qp_mpc.cpp
 )
 add_dependencies(velocity_qp_mpc_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(velocity_qp_mpc_node PRIVATE
@@ -150,7 +141,6 @@ add_executable(velocity_qp_mpc_waypoint_node
   src/velocity_qp_mpc_waypoint.cpp
 )
 add_dependencies(velocity_qp_mpc_waypoint_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(velocity_qp_mpc_waypoint_node PRIVATE
@@ -177,7 +167,6 @@ add_executable(local_sparse_scp_planner_node
 )
 add_dependencies(local_sparse_scp_planner_node
   ${${PROJECT_NAME}_EXPORTED_TARGETS}
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(local_sparse_scp_planner_node PRIVATE
@@ -190,7 +179,6 @@ target_compile_definitions(local_sparse_scp_planner_node PRIVATE
   NDEBUG
 )
 target_link_libraries(local_sparse_scp_planner_node
-  OpenSSL::Crypto
   ${catkin_LIBRARIES}
   ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -202,7 +190,6 @@ add_executable(frozen_snapshot_repair_diagnostic_node
   src/frozen_snapshot_repair_diagnostic_node.cpp
 )
 add_dependencies(frozen_snapshot_repair_diagnostic_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_include_directories(frozen_snapshot_repair_diagnostic_node PRIVATE
@@ -222,7 +209,6 @@ add_executable(ee_interactive_marker_node
   src/ee_interactive_marker_node.cpp
 )
 add_dependencies(ee_interactive_marker_node
-  ${${PROJECT_NAME}_EXPORTED_TARGETS}
   ${catkin_EXPORTED_TARGETS}
 )
 target_link_libraries(ee_interactive_marker_node
@@ -230,25 +216,22 @@ target_link_libraries(ee_interactive_marker_node
   ${catkin_LIBRARIES}
 )
 
+install(FILES scripts/known_ground.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 catkin_install_python(PROGRAMS
   scripts/phase_b2_controlled_trial_node.py
   scripts/phase_c4_3_continuous_trial_node.py
   scripts/c4_3_planner_regime_handoff_node.py
   scripts/c4_4_verified_regime_manager_node.py
+  scripts/observation_release_identity.py
   scripts/optimized_trajectory_continuity_node.py
   scripts/gcdf_rejection_feedback.py
   scripts/occupied_clearance.py
   scripts/initial_shell_recovery.py
   scripts/recovery_motion.py
   scripts/execution_motion_limits.py
-  scripts/execution_command_lease.py
-  scripts/execution_preparation.py
-  scripts/execution_handoff.py
-  scripts/execution_preparation_handoff_node.py
   scripts/handoff_schedule.py
   scripts/geometric_restore.py
   scripts/candidate_admission.py
-  scripts/observation_task_owner_node.py
   scripts/repair_prefix_contract.py
   scripts/probe_single_flight_gate_node.py
   scripts/joint_velocity_rate_limiter_node.py
@@ -277,3 +260,12 @@ install(TARGETS egocentric_arm_planner receding_horizon_planner_node
 install(DIRECTORY include/${PROJECT_NAME}/
   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
 install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+
+# Publication build integration for sources previously compiled independently.
+find_package(OpenSSL REQUIRED)
+find_package(hpp-fcl REQUIRED)
+target_link_libraries(local_sparse_scp_planner_node OpenSSL::Crypto hpp-fcl::hpp-fcl)
+add_library(known_ground SHARED src/known_ground_kernel.cpp)
+set_target_properties(known_ground PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}")
+install(TARGETS known_ground LIBRARY DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})

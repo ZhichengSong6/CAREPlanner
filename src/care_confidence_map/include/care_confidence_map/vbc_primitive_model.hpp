@@ -131,9 +131,10 @@ template <class Voxel>
 std::vector<Voxel> buildPrimitiveSweptVoxels(
     const std::vector<VbcPrimitiveFrame>& frames,
     const std::vector<int>& original_indices, const std::vector<double>& times,
-    const VbcGrid& grid, double margin) {
+    const VbcGrid& grid, double margin, double voxel_support_radius = 0.) {
   if (!grid.min.allFinite() || !grid.max.allFinite() ||
       !std::isfinite(grid.resolution) || grid.resolution <= 0 ||
+      !std::isfinite(voxel_support_radius) || voxel_support_radius<0. ||
       !std::isfinite(margin) || margin < 0 || (grid.max.array() < grid.min.array()).any() ||
       frames.empty() || frames.size() != times.size() || frames.size() != original_indices.size())
     throw std::invalid_argument("Invalid primitive sweep grid/timing/margin");
@@ -168,7 +169,7 @@ std::vector<Voxel> buildPrimitiveSweptVoxels(
       const auto& p = frames[k].primitives[pi];
       const double bound = frames[k].motion_bounds.empty() ? 0.0 : frames[k].motion_bounds[pi];
       if (!std::isfinite(bound) || bound < 0) throw std::invalid_argument("Invalid motion bound");
-      const double effective_margin = margin + bound;
+      const double effective_margin = margin + bound + voxel_support_radius;
       // Bounds must include the same floating-point tolerance as the SDF test,
       // otherwise ceil/floor can discard an exactly-on-surface grid center.
       const Eigen::Vector3d extent = p.aabbHalfExtent(effective_margin + 1e-12);
@@ -214,7 +215,7 @@ std::vector<Voxel> buildPrimitiveSweptVoxels(
             v.sample_center_base = p.center;
             v.raw_sample_radius_m = v.swept_radius_m = std::numeric_limits<double>::quiet_NaN();
             v.point_center_distance_m = (point - p.center).norm();
-            v.primitive_signed_distance_m = distance;
+            v.primitive_signed_distance_m = distance - voxel_support_radius;
             v.sweep_eval_timestep = frames[k].original_eval_timestep >= 0
                 ? frames[k].original_eval_timestep : static_cast<int>(k);
             v.sweep_original_timestep = original_indices[k];

@@ -39,6 +39,7 @@ class RejoinTests(unittest.TestCase):
 
     def test_first_candidate_survives_alternative_failure(self):
         r=object.__new__(mod.PerSensorVisibilityRuntime)
+        r.pose_transform_reuse_enabled=False
         r.device=torch.device('cpu');r.max_branch_attempts=4;r.min_conservative_g=0.
         r.task_ee_chain=[];r.sensor_masks_np=np.ones((8,7))
         r.rank_sensors=lambda *a:(torch.zeros(8),torch.arange(8))

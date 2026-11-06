@@ -47,6 +47,71 @@ from pending_observation_relevance import PendingObservationRelevance, attach_pe
 from rolling_visibility_guidance import RollingVisibilityGuidance
 
 
+def near_prefix_regions(regions, evidence, owners, cell_key):
+    """Partition proposal work, retaining every original point and live owner.
+
+    Only the exact VBC packet's original trajectory interval orders new work.
+    This does not certify a prefix or mark a deferred point observed. Existing
+    owned points stay together; unrelated/delayed evidence keeps original work.
+    """
+    timing = {}
+    for v in (evidence or {}).get('violations', []):
+        try:
+            key = cell_key(np.asarray(v['point'], dtype=float))
+            k = int(v['sweep_original_k'])
+            t = float(v['sweep_s'])
+            if k < 0 or float(v['sweep_original_k']) != k or not math.isfinite(t) or t < 0:
+                continue
+            timing[key] = min(timing.get(key, (k, t)), (k, t))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    ownership = sorted(owners, key=lambda ob: (len(ob['points']), int(ob['id'])))
+    result, decisions = [], []
+    for region in regions:
+        points = np.asarray(region['points'], dtype=float).reshape(-1, 3)
+        original = {cell_key(p): p.copy() for p in points}
+        remaining = dict(original)
+        groups = []
+        # Preserve already established identities even if the next packet's
+        # spatial clustering joins several temporal subregions back together.
+        for owner in ownership:
+            selected = set(remaining).intersection(cell_key(p) for p in owner['points'])
+            if selected:
+                groups.append((selected, bool(owner.get('near_prefix_partition')), 'existing_owner'))
+                for key in selected:
+                    remaining.pop(key)
+        keys = set(remaining)
+        if len(keys) > 1 and keys.issubset(timing):
+            first = min(timing[key][0] for key in keys)
+            focus = {key for key in keys if timing[key][0] == first}
+            later = keys - focus
+            if later:
+                groups.extend([(focus, True, 'earliest_interval'), (later, True, 'later_intervals')])
+                decisions.append(dict(original_points=points.tolist(),
+                    earliest_original_interval=first,
+                    focus_points=[original[k].tolist() for k in sorted(focus)],
+                    deferred_points=[original[k].tolist() for k in sorted(later)],
+                    all_points_retained=True, observation_completed=False, motion_authorized=False))
+            else:
+                groups.append((keys, False, 'same_interval'))
+        elif keys:
+            groups.append((keys, False, 'unbound_or_single'))
+        covered=set()
+        for keys, partition, why in groups:
+            assert not covered.intersection(keys)
+            covered.update(keys)
+            # Unchanged spatial work preserves every inherited metadata field.
+            row = dict(region)
+            pts = np.asarray([original[k] for k in sorted(keys)], dtype=float)
+            row.update(points=pts, keys=tuple(sorted(keys)), centroid=np.mean(pts, axis=0))
+            if partition:
+                row['near_prefix_partition'] = True
+            row['near_prefix_group_reason'] = why
+            result.append(row)
+        assert covered == set(original)
+    return result, decisions
+
+
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
     def __init__(self) -> None:
         self._c49_ready = False
@@ -60,6 +125,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # subscribed for diagnostics, but they do not own obligation lifetime.
         self._coherent_bundle_enabled = True
         self._coherent_bundle_lock = threading.Lock()
+        self._near_prefix_evidence = OrderedDict()
+        self._near_prefix_last_trace = None
         self._coherent_bundle_seq = 0
         # Candidate and execution-audit selectors each start their publisher
         # sequence at one.  Keep a local monotonically increasing generation
@@ -497,6 +564,16 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._external_occlusion = attach_occlusion_reroute(self)
         if self._external_occlusion is not None:
             self._per_sensor_runtime.external_occlusion_check = self._external_occlusion.candidate_check
+        self._activation_refresh = None
+        activation_mode = str(rospy.get_param('~activation_refresh_mode',
+            os.environ.get('CARE_ACTIVATION_REFRESH', 'off')))
+        if activation_mode != 'off':
+            from observation_activation_refresh import ActivationRefresh
+            self._activation_refresh = ActivationRefresh(self, mode=activation_mode)
+        self._rolling_task = None
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+            from rolling_task_observation import RollingTaskObservation
+            self._rolling_task = RollingTaskObservation(self)
         self._c49_ready = True
         self._prune_or_initialize_stack()
         self._publish_schedule()
@@ -509,6 +586,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self.progressive_shared_path_association_only,
             self.active_set_bundle_topic,
             self.execution_active_set_bundle_topic or "disabled")
+
+    def _candidate_vbc_summary_callback(self, msg: String) -> None:
+        super()._candidate_vbc_summary_callback(msg)
+        if msg is None:
+            return
+        fields = dict(self._tokenize_summary(str(msg.data)))
+        if fields.get('trajectory_source') != 'predicted':
+            return
+        try:
+            record = json.loads(fields.get('vbc_evidence', 'null'))
+            identity = (str(int(record['trajectory_stamp_ns'])), int(record['bundle_seq']))
+            if identity[1] <= 0 or int(identity[0]) <= 0 or not isinstance(record['violations'], list):
+                return
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        with self._coherent_bundle_lock:
+            self._near_prefix_evidence[identity] = record
+            self._near_prefix_evidence.move_to_end(identity)
+            while len(self._near_prefix_evidence) > 64:
+                self._near_prefix_evidence.popitem(last=False)
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         """Ignore the legacy split active-set stream in C5.26 blocker mode.
@@ -1616,6 +1713,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         check. New points require the published/pinned sensor proposal's
         physical FOV/LOS, or the legacy scalar visibility condition.
         """
+        # A temporal partition must not immediately absorb its deferred sibling
+        # merely because their spatial centroids are close. Exact ownership is
+        # handled by _match_existing before this proposal-compatibility check.
+        if (ob.get('near_prefix_partition') or region.get('near_prefix_partition')) and not set(region_key(region['points'])).issubset(
+                set(region_key(ob['points']))):
+            return False
         self._qvis_match_check_count += 1
         oid = int(ob.get("id", -1))
         self._qvis_match_last_obligation_id = oid
@@ -3324,6 +3427,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
 
         regions = self._cluster_regions(raw)
+        if bundle_source == 'candidate' and trace_identity is not None:
+            identity = (trace_identity['trajectory_stamp_ns'], trace_identity['bundle_seq'])
+            with self._coherent_bundle_lock:
+                evidence = self._near_prefix_evidence.get(identity)
+            with self._obligation_lock:
+                owners = [dict(ob) for ob in self._obligations]
+            regions, decisions = near_prefix_regions(regions, evidence, owners, self._cell_key)
+            if decisions and identity != self._near_prefix_last_trace:
+                self._near_prefix_last_trace = identity
+                self._trace_observation('near_prefix_partition', vbc_identity=trace_identity,
+                    decisions=decisions, all_points_retained=True,
+                    observation_completed=False, motion_authorized=False)
         trace_routes = []
         trace_stack_before = list(self._repair_stack)
         active_ids: List[int] = []
@@ -3394,6 +3509,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     new_ob = self._generate_new_obligation(
                         region, trajectory, float(sweep), trajectory_received,
                         trajectory_source)
+                if region.get('near_prefix_partition'):
+                    new_ob['near_prefix_partition'] = True
                 if broker is not None:
                     broker.save_result(new_ob,'reused' if restored else 'generation_completed',generation_revision)
                     if broker.reuse_enabled and generation_revision!=broker.goal_revision:
@@ -3422,6 +3539,14 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                         self._obligations.append(new_ob)
                         self._schedule_new_obligations += 1
                         oid = int(new_ob["id"])
+                        if new_ob.get('near_prefix_partition'):
+                            self._trace_observation('near_prefix_materialized',
+                                vbc_identity=trace_identity, obligation_id=oid,
+                                generation_event_id=new_ob['generation_event_id'],
+                                observation_token=observation_token(new_ob),
+                                points=np.asarray(new_ob['points']).tolist(),
+                                group_reason=region.get('near_prefix_group_reason'),
+                                observation_completed=False, motion_authorized=False)
                         trace_routes.append(dict(points=region['points'].tolist(), obligation_id=oid, route='reused_result' if restored else 'generated'))
                         active_ids.append(oid)
                         new_ids.append(oid)
@@ -3508,7 +3633,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
+    def _activation_ros_now(self):
+        return rospy.Time.now().to_sec()
+
+    def _activation_union_min(self, points, q):
+        x = torch.as_tensor(np.asarray(points).reshape(-1, 3), device=self.device, dtype=torch.float32)
+        goal = torch.as_tensor(np.asarray(q).reshape(1, 7), device=self.device, dtype=torch.float32)
+        return float(np.min(self._per_point_values(x, goal)))
+
     def _publish_schedule(self) -> None:
+        refresh = getattr(self, '_activation_refresh', None)
+        if getattr(self, '_c49_ready', False) and refresh is not None:
+            refresh.before_publish()
         super()._publish_schedule()
         if getattr(self, "_c49_ready", False):
             self._publish_visibility_frontier()

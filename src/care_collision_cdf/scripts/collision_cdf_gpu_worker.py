@@ -37,6 +37,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from collision_cdf_model import CollisionCDF  # noqa: E402
+from cdf_input_audit import InputAudit, attest_model, sha_file
 
 
 REQ_MAGIC = b"CQ01"
@@ -61,7 +62,11 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--checkpoint-key", default="latest")
-    p.add_argument("--activation", choices=("gelu", "relu"), default="gelu")
+    p.add_argument("--activation", choices=("gelu", "relu"), required=True)
+    p.add_argument("--expected-checkpoint-sha256", required=True)
+    p.add_argument("--model-attestation", required=True)
+    p.add_argument("--domain-audit", required=True)
+    p.add_argument("--diagnostic-cpu", action="store_true")
     p.add_argument("--device", default="cuda")
     p.add_argument(
         "--socket",
@@ -75,9 +80,9 @@ def parse_args():
 
 class Worker:
     def __init__(self, args):
-        if not str(args.device).startswith("cuda"):
+        if not str(args.device).startswith("cuda") and not (args.device == "cpu" and args.diagnostic_cpu):
             raise ValueError("C5.2g GPU worker requires a CUDA device")
-        if not torch.cuda.is_available():
+        if str(args.device).startswith("cuda") and not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA requested but torch.cuda.is_available() is False"
             )
@@ -88,7 +93,17 @@ class Worker:
         self.device = torch.device(args.device)
         self.socket_path = os.path.abspath(os.path.expanduser(args.socket))
         self.stop = False
+        self.active_connection = None
 
+        for path in (args.model_attestation, args.domain_audit):
+            resolved = Path(path).resolve()
+            if resolved.exists():
+                raise ValueError("Refusing to overwrite audit artifact: " + str(resolved))
+            if any((p / "artifact_sha256.json").exists() for p in resolved.parents):
+                raise ValueError("Refusing to write inside a sealed study")
+        before_sha = sha_file(args.checkpoint)
+        if before_sha != args.expected_checkpoint_sha256:
+            raise ValueError("Checkpoint SHA256 differs from declaration")
         self.cdf = CollisionCDF(
             checkpoint_path=os.path.abspath(
                 os.path.expanduser(args.checkpoint)
@@ -101,22 +116,28 @@ class Worker:
             activation=args.activation,
         )
 
+        attest_model(args, self.cdf, before_sha, __file__, SCRIPT_DIR / "collision_cdf_model.py")
         b = max(1, min(int(args.warmup_pairs), int(args.max_pairs)))
         p = torch.zeros((b, 3), dtype=torch.float32, device=self.device)
         q = torch.zeros((b, 7), dtype=torch.float32, device=self.device)
         with torch.enable_grad():
             self.cdf.pair_distance_and_gradient(p, q)
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
 
+        self.audit = InputAudit(args.domain_audit, args.model_attestation)
         print(
             "[C5.2g GPU worker] READY "
-            f"gpu={torch.cuda.get_device_name(self.device)} "
+            f"device={self.device} name={torch.cuda.get_device_name(self.device) if self.device.type == 'cuda' else 'CPU_DIAGNOSTIC'} "
             f"torch={torch.__version__} cuda={torch.version.cuda} "
             f"activation={self.cdf.architecture.get('activation')} "
             f"checkpoint={self.cdf.selected_checkpoint} "
             f"max_pairs={args.max_pairs} socket={self.socket_path}",
             flush=True,
         )
+
+    def _synchronize(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _handle_request(self, conn, pair_count, payload):
         if pair_count <= 0 or pair_count > self.args.max_pairs:
@@ -133,6 +154,7 @@ class Worker:
         worker_t0 = time.perf_counter()
 
         rows = np.frombuffer(payload, dtype="<f4").reshape(pair_count, 10)
+        input_audit_ms = self.audit.begin(rows, payload)
         points_cpu = torch.from_numpy(
             np.ascontiguousarray(rows[:, :3])
         )
@@ -140,18 +162,18 @@ class Worker:
             np.ascontiguousarray(rows[:, 3:])
         )
 
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
         t0 = time.perf_counter()
         points_gpu = points_cpu.to(self.device)
         q_gpu = q_cpu.to(self.device)
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
         t1 = time.perf_counter()
 
         with torch.enable_grad():
             distance_gpu, gradient_gpu = self.cdf.pair_distance_and_gradient(
                 points_gpu, q_gpu
             )
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
         t2 = time.perf_counter()
 
         distance = (
@@ -160,7 +182,7 @@ class Worker:
         gradient = (
             gradient_gpu.cpu().numpy().astype("<f4", copy=False)
         )
-        torch.cuda.synchronize(self.device)
+        self._synchronize()
         t3 = time.perf_counter()
 
         h2d_ms = (t1 - t0) * 1000.0
@@ -168,6 +190,8 @@ class Worker:
         d2h_ms = (t3 - t2) * 1000.0
         worker_total_ms = (t3 - worker_t0) * 1000.0
 
+        self.audit.finish(distance, gradient, pair_count, input_audit_ms, worker_total_ms)
+        worker_total_ms = (time.perf_counter() - worker_t0) * 1000.0
         header = RESP_HEADER.pack(
             RESP_MAGIC,
             pair_count,
@@ -187,7 +211,7 @@ class Worker:
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server.bind(self.socket_path)
         server.listen(int(self.args.socket_backlog))
-        server.settimeout(0.5)
+        server.settimeout(0.05)
 
         try:
             while not self.stop:
@@ -197,6 +221,7 @@ class Worker:
                     continue
 
                 print("[C5.2g GPU worker] client connected", flush=True)
+                self.active_connection = conn
                 with conn:
                     while not self.stop:
                         try:
@@ -210,12 +235,16 @@ class Worker:
                                 f"bad request magic: {magic!r}"
                             )
 
+                        if not 0 < pair_count <= self.args.max_pairs:
+                            raise ValueError("Invalid pair count before receiving payload")
                         payload = recv_exact(
                             conn, int(pair_count) * 10 * 4
                         )
-                        self._handle_request(
-                            conn, int(pair_count), payload
-                        )
+                        try:
+                            self._handle_request(conn, int(pair_count), payload)
+                        except Exception as exc:
+                            self.audit.error(exc)
+                            raise
 
                 print("[C5.2g GPU worker] client disconnected", flush=True)
         finally:
@@ -225,6 +254,11 @@ class Worker:
 
     def request_stop(self, *_args):
         self.stop = True
+        if self.active_connection is not None:
+            try:
+                self.active_connection.shutdown(socket.SHUT_RD)
+            except OSError:
+                pass
 
 
 def main():
@@ -232,7 +266,14 @@ def main():
     worker = Worker(args)
     signal.signal(signal.SIGINT, worker.request_stop)
     signal.signal(signal.SIGTERM, worker.request_stop)
-    worker.serve()
+    try:
+        worker.serve()
+    except Exception as exc:
+        if worker.audit.failed == 0:
+            worker.audit.error(exc)
+        raise
+    finally:
+        worker.audit.close()
 
 
 if __name__ == "__main__":

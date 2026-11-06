@@ -47,7 +47,7 @@ def main():
     out=args.output_dir.resolve();out.mkdir(parents=True,exist_ok=False)
     cdf_socket=out/'cdf.sock'
     if len(str(cdf_socket).encode())>100:cdf_socket=out.parent/('cdf_'+str(args.port)+'.sock')
-    if args.actual_cdf:assert not cdf_socket.exists(),'CDF socket already owned'
+    if args.actual_cdf:assert not cdf_socket.exists(),'CDF socket already owned' 
     before=protected()
     with socket.socket() as s:assert s.connect_ex(('127.0.0.1',args.port))!=0
     uri='http://127.0.0.1:'+str(args.port)

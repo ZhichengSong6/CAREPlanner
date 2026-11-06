@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CASE_ID="${CASE_ID:-case_003}"
 if [[ -z "${RUN_ID:-}" ]]; then
   _RUN_STAMP="$(date +%Y%m%d-%H%M%S-%3N)"
@@ -13,7 +13,10 @@ RUN_SECONDS="${RUN_SECONDS:-20.0}"
 
 GPU_ENV="${GPU_ENV:-viscdf}"
 GPU_DEVICE="${GPU_DEVICE:-cuda}"
-CHECKPOINT="${CHECKPOINT:-${REPO}/src/care_collision_cdf/checkpoints/yiming_cdf/model_dict_signed.pt}"
+export CHECKPOINT="${CHECKPOINT:?explicit model checkpoint required}"
+export CDF_ACTIVATION="${CDF_ACTIVATION:?explicit activation required}"
+export CDF_EXPECTED_SHA256="${CDF_EXPECTED_SHA256:?explicit checkpoint SHA256 required}"
+export CDF_CHECKPOINT_KEY="${CDF_CHECKPOINT_KEY:-latest}"
 GPU_SOCKET="${GPU_SOCKET:-/tmp/care_collision_cdf_gpu_c5_4.sock}"
 LOCAL_SCP_PROXIMITY_MARGIN="${LOCAL_SCP_PROXIMITY_MARGIN:-0.025}"
 VBC_SWEPT_VOLUME_MARGIN_M="${VBC_SWEPT_VOLUME_MARGIN_M:-0.0}"
@@ -40,6 +43,9 @@ RUN_LOG="${ROOT_LOG}/run"
 SELECTOR_JSONL="${ROOT_OUT}/local_scp_selector.jsonl"
 ZIP_PATH="${ZIP_PATH:-${REPO}/CAREPlanner_C5_RESULT_${RUN_ID}.zip}"
 SUMMARY_JSON="${ROOT_OUT}/c5_4_local_sparse_scp_summary.json"
+export CDF_MODEL_ATTESTATION="${ROOT_OUT}/cdf_model_attestation.json"
+export CDF_INPUT_AUDIT="${ROOT_OUT}/cdf_input_domain.jsonl"
+export GPU_DEVICE GPU_SOCKET
 
 cd "${REPO}"
 
@@ -63,7 +69,9 @@ if [[ ! -f "${CHECKPOINT}" ]]; then
   exit 2
 fi
 
-if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
+if [[ -n "${CONDA_SH:-}" && -f "${CONDA_SH}" ]]; then
+  :
+elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
 elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
@@ -72,7 +80,7 @@ else
   exit 3
 fi
 
-catkin build care_confidence_map care_collision_cdf egocentric_arm_planner
+# Isolated research runtime is prebuilt; never discover/build a parent workspace.
 source devel/setup.bash
 python3 -m py_compile \
   src/egocentric_arm_planner/scripts/c4_4_verified_regime_manager_node.py \
@@ -118,7 +126,14 @@ kill_group() {
   fi
   if kill -0 "${pid}" 2>/dev/null; then
     kill -TERM -- "-${pid}" 2>/dev/null || true
-    sleep 0.20
+    if [[ "${CDF_GPU_WORKER_PID:-}" == "${pid}" ]]; then
+      for _ in $(seq 1 200); do
+        if ! kill -0 "${pid}" 2>/dev/null; then break; fi
+        sleep 0.01
+      done
+    else
+      sleep 0.20
+    fi
   fi
   if kill -0 "${pid}" 2>/dev/null; then
     kill -KILL -- "-${pid}" 2>/dev/null || true
@@ -149,6 +164,10 @@ pack_debug_bundle() {
   if [[ -f "${SELECTOR_JSONL}" ]]; then
     cp -f "${SELECTOR_JSONL}" "${stage}/root/"
   fi
+
+  for f in cdf_model_attestation.json cdf_input_domain.jsonl cdf_worker_readiness.json; do
+    if [[ -f "${ROOT_OUT}/${f}" ]]; then cp -f "${ROOT_OUT}/${f}" "${stage}/root/"; fi
+  done
 
   # Keep full key logs. Raw high-rate CSVs (joint states, tracker/actuator
   # streams, etc.) are already included via RUN_OUT above.
@@ -947,14 +966,9 @@ setsid bash -lc "
   source '${CONDA_SH}'
   conda activate '${GPU_ENV}'
   cd '${REPO}'
-  exec python -u src/care_collision_cdf/scripts/collision_cdf_gpu_worker.py \
-    --checkpoint '${CHECKPOINT}' \
-    --activation gelu \
-    --device '${GPU_DEVICE}' \
-    --socket '${GPU_SOCKET}' \
-    --max-pairs 8000 \
-    --warmup-pairs 2048
+  exec python -u scripts/cdf_worker_launch.py
 " >"${ROOT_LOG}/gpu_worker.log" 2>&1 &
+CDF_GPU_WORKER_PID="$!"
 PIDS+=("$!")
 
 READY=0
@@ -968,6 +982,11 @@ if [[ "${READY}" != "1" ]]; then
   tail -n 160 "${ROOT_LOG}/gpu_worker.log" || true
   exit 4
 fi
+
+python3 scripts/verify_cdf_worker.py \
+  --attestation "${CDF_MODEL_ATTESTATION}" --audit "${CDF_INPUT_AUDIT}" \
+  --expected-sha "${CDF_EXPECTED_SHA256}" --activation "${CDF_ACTIVATION}" --socket "${GPU_SOCKET}" \
+  > "${ROOT_OUT}/cdf_worker_readiness.json"
 
 # C5.4-specific ROS diagnostics are recorded by the common runner itself.
 # Do not start recorders here: that runner clears RUN_OUT at startup, which
@@ -1216,7 +1235,11 @@ probe_mode=task_objective_plus_executable_horizon_gcdf
 cdf_constraint_horizon_steps=from_config:${CONFIG_FILE}
 normal_cdf_horizon=full_planning_horizon
 cdf_variant=signed
-cdf_activation=gelu
+cdf_activation=${CDF_ACTIVATION}
+cdf_checkpoint_sha256=${CDF_EXPECTED_SHA256}
+cdf_checkpoint_key=${CDF_CHECKPOINT_KEY}
+cdf_model_attestation=${CDF_MODEL_ATTESTATION}
+cdf_input_audit=${CDF_INPUT_AUDIT}
 scp_max_iterations=from_config:${CONFIG_FILE}
 solver=piqp_sparse
 initial_planner_latency_goal_ms=200

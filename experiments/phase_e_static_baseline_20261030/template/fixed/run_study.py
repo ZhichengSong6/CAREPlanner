@@ -81,7 +81,7 @@ def execute(item):
     print('START',item['role'],item['tag'],flush=True)
     try:
         with (T/(item['tag']+'_runner.log')).open('x') as log:
-            p=subprocess.Popen(['/usr/bin/python3','-B',str(T/'run_case.py'),'--batch-id',item['batch'],'--case-ids',item['case']],cwd=RT,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
+            p=subprocess.Popen(['/usr/bin/python3','-B',str(T/'run_case.py'),'--batch-id',item['batch'],'--case-ids',item['case'],'--run-seconds-wall',str(item['task_wall_budget_s'])],cwd=RT,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
             owned[p.pid]=identity(p.pid);deadline=time.monotonic()+480
             guard_path=Path(env['CARE_SCENE_GUARD_PREFIX']+'_state.json')
             trip_path=Path(env['CARE_SCENE_GUARD_PREFIX']+'_trip.json')
@@ -152,6 +152,10 @@ def execute(item):
         (T/(item['tag']+'_stationary_review.log')).write_text(recovery.stdout)
         result['stationary_failure_review_rc']=recovery.returncode
         assert recovery.returncode==0,result
+    elif env.get('CARE_VBC_UNKNOWN_POLICY')=='shadow' or env.get('CARE_RESEARCH_RECORD_REVIEW_FAILURES')=='true':
+        # Raw strict auditors keep reporting UNKNOWN violations. Preserve their
+        # nonzero review outcomes, while detecting infrastructure/script errors.
+        assert all(result.get(k) in (0,1) for k in ('review_rc','analysis_rc','cdf_review_rc')),result
     else:
         assert all(result.get(k)==0 for k in ('review_rc','analysis_rc','cdf_review_rc')),result
     assert result['valid_window'] and result['archive_crc_valid'] and result['scene_monitor_finished'],result

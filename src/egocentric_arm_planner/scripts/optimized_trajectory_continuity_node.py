@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import math
 import re
 import threading
@@ -45,23 +46,20 @@ from std_msgs.msg import Bool, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import PoseStamped
 from egocentric_arm_planner.msg import CandidateTransfer, RepairPrefixSelection
-from care_velocity_controller.msg import CommandStatus
 # catkin devel relay modules execute in a private context and do not export
 # helpers to importers. __file__ here names this actual source (or install) file.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gcdf_rejection_feedback import rejection_points
 from occupied_clearance import occupied_violations
-from candidate_admission import payload_sha256, WallWorker, TaskContextReceiver
-from task_recovery_events import (TaskEventSource, TaskEventReceiver, VERIFICATION_TOPIC,
-                                 CONTROL_TOPIC, RECOVERY_TOPIC, canonical, validate_regime_control,
-                                 validate_recovery_snapshot, regime_identity)
+from candidate_admission import payload_sha256, WallWorker
 from initial_shell_recovery import context as shell_context, commit_check as shell_commit_check
 from recovery_motion import ramp_step, interpolate_motion, has_nodal_motion
 from handoff_schedule import terminal_hold_start, state_variation_ready, predict_held_motion
+from task_continuation import next_task_prefix
+from candidate_discovery import CandidateDiscovery
 from repair_prefix_contract import parse as parse_prefix_contract, make as make_prefix_contract, construction as prefix_construction
-from geometric_restore import permits_unknown_conflicts
+from geometric_restore import permits_unknown_conflicts, validate_fixed_start_reaudit
 from execution_motion_limits import effective_limits, violation as motion_limit_violation
-from execution_preparation import ExecutionPreparationLedger
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -82,6 +80,11 @@ def _as_bool(value):
 class OptimizedTrajectoryContinuityNode:
     def __init__(self) -> None:
         self._lock = threading.RLock()
+        self._timeline = None
+        if os.environ.get('ROOT_OUT'):
+            from ground_timeline import GroundTimeline
+            self._timeline=GroundTimeline(os.environ['ROOT_OUT'])
+            rospy.on_shutdown(self._timeline.close)
         self._replacement_fence = None
         self._replacement_closed_id = 0
         self._replacement_raw_floor_ns = 0
@@ -95,36 +98,31 @@ class OptimizedTrajectoryContinuityNode:
         self._admission_boot_id = uuid.uuid4().hex
         self._admission_session = None
         self._admission_high_sequence = 0
+        self._candidate_discovery = (CandidateDiscovery() if
+            os.environ.get('CARE_TERMINAL_CANDIDATE_DISCOVERY') == 'true' else None)
         self._admission_entries = OrderedDict()
         self._admission_events = deque(maxlen=128)
         self._admission_queries = deque()
         self._admission_summary_pending = None
+        self._metric_curve = None
+        if os.environ.get('CARE_METRIC_CURVE_ENABLED','false')=='true':
+            from metric_curve_runtime import LiveMetricCurve
+            self._metric_curve=LiveMetricCurve(Path(__file__).resolve().parents[3])
+        self._known_ground = None
+        self._known_ground_capture_count = 0
+        self._ground_capture = None
+        if os.environ.get('CARE_KNOWN_GROUND_ENABLED','false')=='true':
+            from known_ground import KnownGround
+            geometry_file=os.environ['CARE_KNOWN_GROUND_FILE']
+            from pathlib import Path
+            urdf=Path(__file__).resolve().parents[2]/'arm_description/urdf/Arm.urdf'
+            self._known_ground=KnownGround(str(urdf),geometry_file,backend=os.environ.get('CARE_GROUND_BACKEND','python'))
+            if os.environ.get('ROOT_OUT'):
+                from ground_capture import GroundCapture
+                self._ground_capture=GroundCapture(os.environ['ROOT_OUT'],geometry_file,rospy.logwarn)
+                rospy.on_shutdown(self._ground_capture.close)
         self._pending_transfer_key = None
         self._admission_goal_identity = None
-        self.task_context_enabled = bool(rospy.get_param("~enable_observation_context", False))
-        if self.task_context_enabled and not self.admission_enabled:
-            raise ValueError("Task context requires candidate admission")
-        self.task_context = TaskContextReceiver()
-        self._task_commit_bindings = OrderedDict()
-        self._task_commit_regimes = {}
-        self._task_verification_events = OrderedDict()
-        self._task_event_source = TaskEventSource()
-        self.require_bound_regime = bool(rospy.get_param('~require_bound_regime', False))
-        if self.require_bound_regime and not self.task_context_enabled:
-            raise ValueError('Bound regimes require task contexts')
-        self.require_execution_preparation = bool(rospy.get_param('~require_execution_preparation', self.require_bound_regime))
-        if self.require_bound_regime and not self.require_execution_preparation:
-            raise ValueError('Task-bound automatic recovery requires qualified execution preparation')
-        if self.require_execution_preparation and not self.require_bound_regime:
-            raise ValueError('Execution preparation requires bound task and regime identities')
-        self._execution_preparations = ExecutionPreparationLedger()
-        self._execution_prepared_to_publish = None
-        self._execution_prepared_count = 0
-        self._task_control_receiver = TaskEventReceiver()
-        self._task_control_dispatch = threading.local()
-        self._task_control_until_ns = 0
-        self._task_control_event = None
-        self._task_regime_identity = ''
         self._admission_receive_count = 0
         self._admission_duplicate_count = 0
         self._admission_expiry_count = 0
@@ -143,7 +141,14 @@ class OptimizedTrajectoryContinuityNode:
         self.verification_topic = str(rospy.get_param(
             "~output_topic", "/care_planner/optimized_trajectory"))
         self.initial_shell_recovery_enabled = bool(rospy.get_param("~initial_shell_recovery_enabled", False))
+        self.summary_state_clock_coherent = bool(rospy.get_param("~summary_state_clock_coherent", False))
         self.initial_shell_execution_margin_m = float(rospy.get_param("~initial_shell_execution_margin_m", 0.))
+        self.fixed_start_rebase_reaudit_enabled = bool(rospy.get_param("~fixed_start_rebase_reaudit_enabled", False))
+        self.initial_shell_planning_margin_m = float(rospy.get_param("~initial_shell_planning_margin_m", .02))
+        if self.fixed_start_rebase_reaudit_enabled and (not self.initial_shell_recovery_enabled or
+                not math.isfinite(self.initial_shell_planning_margin_m) or
+                self.initial_shell_planning_margin_m<=self.initial_shell_execution_margin_m):
+            raise ValueError('Invalid fixed-start re-audit configuration')
         self.shell_context_pub = rospy.Publisher(self.verification_topic + '/initial_shell_context', String, queue_size=4)
         self.shell_quality_pub = rospy.Publisher(self.verification_topic + '/initial_shell_quality', String, queue_size=4)
         self.committed_topic = str(rospy.get_param(
@@ -224,7 +229,7 @@ class OptimizedTrajectoryContinuityNode:
         self.continuation_timeout_s = float(rospy.get_param(
             "~continuation_timeout_s", 0.50))
         self.verification_timeout_s = float(rospy.get_param(
-            "~verification_timeout_s", 0.25))
+            "~verification_timeout_s", float(os.environ.get("CARE_RESEARCH_VERIFY_TIMEOUT_S", "0.25"))))
         self.final_gcdf_enabled = bool(rospy.get_param(
             "~final_gcdf_enabled", False))
         self.final_gcdf_timeout_s = float(rospy.get_param(
@@ -365,12 +370,6 @@ class OptimizedTrajectoryContinuityNode:
         self.handoff_prediction_enabled = bool(rospy.get_param('~repair_handoff_prediction_enabled', True))
         self._latest_actuator_stamp_ns = 0
         self._latest_actuator_velocity = {}
-        self._controller_session = 0
-        self._retired_controller_sessions = set()
-        self._controller_joint_names = list(rospy.get_param('~controller_joint_names',
-            ['joint1','joint2','joint3','joint4','wrist_joint1','wrist_joint2','wrist_joint3']))
-        if len(self._controller_joint_names) != 7 or len(set(self._controller_joint_names)) != 7:
-            raise ValueError('The controller must report seven uniquely ordered joints')
         self.tracking_feedback_gain = float(rospy.get_param('~execution/position_feedback_gain',
             rospy.get_param('/trajectory_execution_manager_node/execution/position_feedback_gain',1.)))
         self.recovery_position_limits = dict(rospy.get_param('~mpc/joint_position_limits',
@@ -518,8 +517,6 @@ class OptimizedTrajectoryContinuityNode:
             Float64MultiArray, queue_size=1, latch=True)
         self.verification_pub = rospy.Publisher(
             self.verification_topic, JointTrajectory, queue_size=1)
-        self.task_stop_pub = (rospy.Publisher("/care_planner/execution/vbc_stop_request", String, queue_size=16)
-                              if self.task_context_enabled else None)
         self.committed_pub = rospy.Publisher(
             self.committed_topic, JointTrajectory, queue_size=1)
         self.execution_audit_pub = rospy.Publisher(
@@ -530,15 +527,12 @@ class OptimizedTrajectoryContinuityNode:
             self.summary_topic, String, queue_size=1, latch=True)
         self.verification_event_pub = rospy.Publisher(
             self.verification_event_topic, String, queue_size=20, latch=False)
-        self.task_verification_pub = (rospy.Publisher(VERIFICATION_TOPIC, String, queue_size=32)
-                                      if self.task_context_enabled else None)
-        self.execution_prepared_pub = (rospy.Publisher('/care_planner/execution/prepared_trajectory',
-            CandidateTransfer, queue_size=1) if self.require_execution_preparation else None)
-        self.execution_prepared_status_pub = (rospy.Publisher('/care_planner/execution/preparation_status',
-            String, queue_size=1, latch=True) if self.require_execution_preparation else None)
-        if self.require_bound_regime:
-            rospy.Subscriber(CONTROL_TOPIC, String, self._task_control_cb, queue_size=8)
-            rospy.Subscriber(RECOVERY_TOPIC, String, self._task_recovery_cb, queue_size=8)
+        if self._candidate_discovery is not None:
+            self.candidate_discovery_pub = rospy.Publisher(
+                '/care_planner/terminal_candidate_vbc_bundle', Float64MultiArray, queue_size=16)
+            self.candidate_discovery_sub = rospy.Subscriber(
+                '/care_planner/trajectory_risk/vbc_active_set_bundle', Float64MultiArray,
+                self._candidate_discovery_cb, queue_size=32)
         self.replacement_ack_pub = rospy.Publisher(
             '/care_planner/local_planner/candidate_replacement_commit_ack', String, queue_size=8)
         self.replacement_grant_sub = rospy.Subscriber(
@@ -555,12 +549,8 @@ class OptimizedTrajectoryContinuityNode:
             self.raw_sub = rospy.Subscriber(
                 self.input_topic + "/transfer", CandidateTransfer, self._transfer_cb,
                 queue_size=10, tcp_nodelay=verification_tcp_nodelay)
-            if self.task_context_enabled:
-                rospy.Subscriber("/care_planner/active_sensing/observation_context", String,
-                                 self._task_context_cb, queue_size=32)
-            else:
-                rospy.Subscriber("/care_planner/ee_target_pose", PoseStamped,
-                                 self._admission_goal_cb, queue_size=1)
+            rospy.Subscriber("/care_planner/ee_target_pose", PoseStamped,
+                             self._admission_goal_cb, queue_size=1)
             rospy.Subscriber('/care_planner/active_sensing/visibility_acquisition_summary',
                              String, self._preflight_owner_cb, queue_size=1)
         else:
@@ -587,10 +577,6 @@ class OptimizedTrajectoryContinuityNode:
         self.actuator_state_sub = rospy.Subscriber(
             rospy.get_param('~actuator_state_topic', '/care_arm/arm_group_velocity_controller/command_stamped'),
             JointState, self._actuator_state_cb, queue_size=1, tcp_nodelay=True)
-        if self.require_bound_regime:
-            rospy.Subscriber(rospy.get_param('~controller_state_topic',
-                '/care_arm/arm_group_velocity_controller/state'), CommandStatus,
-                self._controller_state_cb, queue_size=8, tcp_nodelay=True)
         self._execution_tracker_state = None
         self._execution_tracker_received = None
         self.execution_tracker_sub = rospy.Subscriber(
@@ -623,7 +609,76 @@ class OptimizedTrajectoryContinuityNode:
             ":".join("{:.3f}".format(v) for v in self.cycle_recovery_prefixes_s),
             self.verification_timeout_s)
 
+    def _state_guard(self,scope):
+        recorder=getattr(self,'_timeline',None)
+        return self._lock if recorder is None else recorder.hold(self._lock,scope,self)
+
+    def _timing(self,kind,**fields):
+        recorder=getattr(self,'_timeline',None)
+        if recorder is not None:recorder.mark(kind,**fields)
+
+    def _capture_ground_locked(self,raw,candidate,ground,key,deadline):
+        capture=getattr(self,'_ground_capture',None)
+        if capture is None:return
+        record=dict(raw_candidate_stamp_ns=str(raw.header.stamp.to_nsec()),
+            decision_ros_ns=str(rospy.Time.now().to_nsec()),result=ground,
+            transfer_key=str(key),original_admission_deadline=deadline,
+            measured_stamp_ns=str(getattr(self,'_latest_measured_stamp_ns',0)),
+            actuator_stamp_ns=str(getattr(self,'_latest_actuator_stamp_ns',0)),
+            measured_q=dict(getattr(self,'_latest_measured_q_by_name',{})),
+            measured_v=dict(getattr(self,'_latest_measured_velocity_by_name',{})),
+            actuator_v=dict(getattr(self,'_latest_actuator_velocity',{})),
+            candidate_payload_sha256=payload_sha256(candidate),
+            header_seq=candidate.header.seq,header_stamp_ns=str(candidate.header.stamp.to_nsec()),
+            frame_id=candidate.header.frame_id,joint_names=list(candidate.joint_names),
+            points=[dict(q=list(p.positions),v=list(p.velocities),a=list(p.accelerations),effort=list(p.effort),
+                         time_ns=str(p.time_from_start.to_nsec())) for p in candidate.points])
+        capture.submit(record)
+
+    def _discovery_trace(self, event, **fields):
+        path=os.environ.get('CARE_DISCOVERY_TRACE_FILE')
+        if not path:return
+        record=dict(event=event,ros_ns=rospy.Time.now().to_nsec(),monotonic_s=time.monotonic(),**fields)
+        try:
+            with open(path,'a') as stream:stream.write(json.dumps(record,separators=(',',':'))+'\n')
+        except OSError as exc:rospy.logwarn('Discovery diagnostic write failed: %s',exc)
+
+    def _candidate_discovery_cb(self, msg):
+        try:
+            prefix, stamp, seq = msg.layout.dim[0].label.rsplit('_',2)
+            stamp,seq=int(stamp),int(seq)
+            if prefix!='care_vbc_v1' or stamp<=0 or seq!=int(msg.data[0]):raise ValueError()
+            nonempty=len(msg.data)>=3 and int(msg.data[2])>0
+        except (AttributeError,IndexError,TypeError,ValueError):
+            # Legacy/unowned discoveries keep their original consumer checks.
+            self.candidate_discovery_pub.publish(msg)
+            return
+        with self._state_guard('_candidate_discovery_cb'):
+            gate=self._candidate_discovery
+            owned=stamp in gate.audits
+            gate.push(stamp,seq,msg,nonempty)
+            messages=gate.drain()
+            self._discovery_trace('bundle',audit_stamp_ns=stamp,bundle_seq=seq,
+                owned=owned,nonempty=nonempty,forwarded=bool(messages),counts=gate.counts.copy())
+        for message in messages:self.candidate_discovery_pub.publish(message)
+
     def _admission_status_locked(self, entry, stage, tail=""):
+        gate=getattr(self,'_candidate_discovery',None)
+        if gate is not None:
+            key=(entry['session'],entry['sequence'])
+            if (stage=='vbc' and self._outstanding is not None and
+                    not self._outstanding_repair and not self._outstanding_probe):
+                gate.register(key,self._outstanding.header.stamp.to_nsec())
+            elif stage in ('terminal','expired','cancelled','rejected'):
+                fields=_tokens(tail)
+                try:audit=int(fields.get('audited_trajectory_stamp_ns',0))
+                except ValueError:audit=0
+                try:sequence=json.loads(fields.get('vbc_evidence','{}')).get('bundle_seq')
+                except (ValueError,AttributeError):sequence=None
+                result=fields.get('result',stage)
+                gate.finish(key,result,audit,sequence,fields.get('safety_gate')=='vbc')
+                self._discovery_trace('terminal',raw_stamp_ns=entry['raw_stamp'],audit_stamp_ns=audit,
+                    result=result,counts=gate.counts.copy())
         if stage in ("gcdf", "vbc"):
             entry["audit_started"] = True
         entry["stage"] = stage
@@ -671,20 +726,9 @@ class OptimizedTrajectoryContinuityNode:
         if not self.admission_enabled:
             return
         wall = time.monotonic()
-        regime_expired = getattr(self, 'require_bound_regime', False) and not self._task_regime_current_locked()
-        if self.require_execution_preparation:
-            try:
-                self._execution_preparations.snapshot(rospy.Time.now().to_nsec(),
-                    (self.task_context.snapshot(rospy.Time.now().to_nsec()) or {}).get('candidate_binding',''),
-                    self._task_regime_identity if not regime_expired else '')
-            except ValueError:
-                self._execution_preparations.cancel('preparation_clock_fault')
-        if (self.task_context_enabled and self.task_context.snapshot(rospy.Time.now().to_nsec()) is None) or regime_expired:
-            self._task_stop_committed_locked()
         for key, entry in list(self._admission_entries.items()):
             if (entry["stage"] not in ("terminal", "cancelled", "expired", "rejected") and
-                    (regime_expired or wall >= entry["deadline"] or (self.task_context_enabled and not self.task_context.accepts(
-                        entry.get("task_context", ""), rospy.Time.now().to_nsec())))):
+                    wall >= entry["deadline"]):
                 self._admission_expiry_count += 1
                 self._admission_cancel_locked(key, "expired")
 
@@ -695,43 +739,20 @@ class OptimizedTrajectoryContinuityNode:
                         "terminal", "cancelled", "expired", "rejected"):
                     self._admission_cancel_locked(key)
 
-    def _task_stop_committed_locked(self):
-        if self._committed_master is not None:
-            token = self._committed_master.header.stamp.to_nsec()
-            if token and self.task_stop_pub is not None:
-                self.task_stop_pub.publish(String(data='execution_stamp_ns='+str(token)))
-        self._committed_master = self._committed_received = None
-
-    def _task_context_cb(self, msg):
-        try:
-            with self._lock:
-                before = self.task_context.snapshot(rospy.Time.now().to_nsec())
-                after = self.task_context.update(json.loads(msg.data), rospy.Time.now().to_nsec())
-                if (before or {}).get('candidate_binding') != (after or {}).get('candidate_binding') or after is None:
-                    self._execution_preparations.cancel('task_context_changed')
-                    self._execution_prepared_to_publish = None
-                    self._admission_invalidate_locked()
-                    self._task_stop_committed_locked()
-            self._flush_admission()
-        except (ValueError, KeyError, TypeError) as exc:
-            rospy.logwarn('[TaskContext continuity] %s', exc)
-
     def _admission_goal_cb(self, msg):
         p, q = msg.pose.position, msg.pose.orientation
         identity = (msg.header.frame_id, p.x, p.y, p.z, q.x, q.y, q.z, q.w)
-        with self._lock:
+        with self._state_guard('_admission_goal_cb'):
             if identity != self._admission_goal_identity:
                 self._admission_goal_identity = identity
                 self._admission_invalidate_locked()
         self._flush_admission()
 
     def _preflight_owner_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False) and not getattr(self._task_control_dispatch, 'active', False):
-            return
         token = _tokens(msg.data).get('active_q_vis_token')
         if token != 'none' and (not token or not token.startswith('care_obs_v1_')):
             return
-        with self._lock:
+        with self._state_guard('_preflight_owner_cb'):
             self._preflight_owner_token = token
             if (self._preflight_wait_key is not None and
                     self._preflight_wait_owner is not None and
@@ -743,7 +764,7 @@ class OptimizedTrajectoryContinuityNode:
     def _resume_preflight(self):
         if not self.admission_enabled:
             return
-        with self._lock:
+        with self._state_guard('_resume_preflight'):
             if self._preflight_wait_key is None:
                 return
             candidate, route = self._dispatch_pending_locked(rospy.Time.now())
@@ -774,7 +795,7 @@ class OptimizedTrajectoryContinuityNode:
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", msg.session):
                 return
             # Readiness response requires acquiring the actual admission mutex.
-            with self._lock:
+            with self._state_guard('_transfer_cb'):
                 self._admission_events.append(String(data=(
                     "action=pong ready_nonce={} receiver_boot_id={}".format(
                         msg.session, self._admission_boot_id))))
@@ -789,7 +810,7 @@ class OptimizedTrajectoryContinuityNode:
         if not raw.points or raw.header.stamp.to_nsec() <= 0:
             return
         key = (msg.session, int(msg.sequence))
-        with self._lock:
+        with self._state_guard('_transfer_cb'):
             self._admission_expire_locked()
             if self._admission_session is None:
                 self._admission_session = msg.session
@@ -802,8 +823,7 @@ class OptimizedTrajectoryContinuityNode:
                     return
                 self._admission_high_sequence = int(msg.sequence)
                 entry = dict(session=msg.session, sequence=int(msg.sequence),
-                             digest=msg.payload_sha256, task_context=getattr(msg,"task_context",""),
-                             task_regime=getattr(msg, 'task_regime', ''),
+                             digest=msg.payload_sha256,
                              raw_stamp=raw.header.stamp.to_nsec(), stage="new",
                              deadline=time.monotonic(),
                              view=("probe_prefix_brake_hold" if self._probe_active else
@@ -820,20 +840,24 @@ class OptimizedTrajectoryContinuityNode:
                         self._admission_cancel_locked(old_key)
                         del self._admission_entries[old_key]
                 self._admission_entries[key] = entry
-                valid_offer = (msg.action == "offer" and
-                    math.isfinite(msg.remaining_budget_s) and msg.remaining_budget_s > 0 and
-                    payload_sha256(raw, msg.planned_prefix_context, getattr(msg,"task_context",""), getattr(msg,'task_regime','')) == msg.payload_sha256 and
-                    (not self.require_bound_regime or (self._task_regime_current_locked() and
-                                                       entry['task_regime'] == self._task_regime_identity)) and
-                    self._offer_prefix_valid_locked(entry, msg.planned_prefix_context) and
-                    (not self.task_context_enabled or self.task_context.accepts(
-                        entry["task_context"], rospy.Time.now().to_nsec(), raw.header.frame_id)) and
-                    not self._replacement_active_locked(rospy.Time.now()) and
-                    raw.header.stamp.to_nsec() > self._replacement_raw_floor_ns)
+                invalid_reason = None
+                if msg.action != "offer":
+                    invalid_reason = "offer_action_invalid"
+                elif not math.isfinite(msg.remaining_budget_s) or msg.remaining_budget_s <= 0:
+                    invalid_reason = "offer_budget_expired"
+                elif payload_sha256(raw, msg.planned_prefix_context) != msg.payload_sha256:
+                    invalid_reason = "offer_payload_digest_mismatch"
+                elif not self._offer_prefix_valid_locked(entry, msg.planned_prefix_context):
+                    invalid_reason = entry.get('context_error', 'offer_prefix_context_invalid')
+                elif self._replacement_active_locked(rospy.Time.now()):
+                    invalid_reason = "offer_replacement_in_progress"
+                elif raw.header.stamp.to_nsec() <= self._replacement_raw_floor_ns:
+                    invalid_reason = "offer_before_replacement_floor"
+                valid_offer = invalid_reason is None
                 if msg.action == "cancel":
                     self._admission_cancel_locked(key)
                 elif not valid_offer:
-                    self._admission_cancel_locked(key, "rejected", "invalid_offer_or_context")
+                    self._admission_cancel_locked(key, "rejected", invalid_reason)
                 else:
                     entry["deadline"] = time.monotonic() + min(
                         msg.remaining_budget_s,
@@ -841,7 +865,7 @@ class OptimizedTrajectoryContinuityNode:
                     self._admission_status_locked(entry, "offered")
             elif (entry["digest"] != msg.payload_sha256 or
                   entry["raw_stamp"] != raw.header.stamp.to_nsec() or
-                  payload_sha256(raw, msg.planned_prefix_context, getattr(msg,"task_context",""), getattr(msg,'task_regime','')) != entry["digest"]):
+                  payload_sha256(raw, msg.planned_prefix_context) != entry["digest"]):
                 self._admission_cancel_locked(key, "rejected", "payload_identity_mismatch")
             elif msg.action == "cancel":
                 self._admission_cancel_locked(key)
@@ -857,10 +881,11 @@ class OptimizedTrajectoryContinuityNode:
         self._flush_admission()
 
     def _flush_admission(self):
-        self._flush_execution_preparations()
         if not self.admission_enabled:
             return
-        with self._lock:
+        with self._state_guard('_flush_admission'):
+            discoveries=(self._candidate_discovery.drain() if
+                getattr(self,'_candidate_discovery',None) is not None else [])
             events = list(self._admission_events)
             self._admission_events.clear()
             queries = list(self._admission_queries)
@@ -869,6 +894,7 @@ class OptimizedTrajectoryContinuityNode:
             self._admission_summary_pending = None
         for msg in events:
             self.admission_status_pub.publish(msg)
+        for msg in discoveries:self.candidate_discovery_pub.publish(msg)
         for route, msg in queries:
             (self.final_gcdf_query_pub if route == "gcdf" else self.verification_pub).publish(msg)
         if summary is not None:
@@ -929,7 +955,7 @@ class OptimizedTrajectoryContinuityNode:
             ancestor_blocks_target)
         signature = "{}|{}".format(stack, target)
 
-        with self._lock:
+        with self._state_guard('_blocker_stack_summary_cb'):
             previously_active = self._cycle_recovery_active
             previous_signature = self._cycle_recovery_signature
 
@@ -969,15 +995,18 @@ class OptimizedTrajectoryContinuityNode:
         return bool(contract is not None and prefix_construction(contract) == self._prefix_context)
 
     def _offer_prefix_valid_locked(self, entry, raw_context):
+        entry['context_error'] = 'offer_prefix_context_invalid'
         if not getattr(self, 'prefix_binding_enabled', False):
             return not raw_context
         if entry['view'] != 'repair_prefix_brake_hold':
+            entry['context_error'] = 'offer_prefix_context_mode_changed'
             return not raw_context
         try:
             contract = parse_prefix_contract(raw_context)
         except (ValueError, TypeError):
             return False
         if not self._prefix_current_locked(contract):
+            entry['context_error'] = 'offer_prefix_context_revision_changed'
             return False
         restore=contract.get('geometric_restore')
         if restore is not None:
@@ -1049,7 +1078,7 @@ class OptimizedTrajectoryContinuityNode:
                 return
         except (KeyError, ValueError):
             return
-        with self._lock:
+        with self._state_guard('_execution_tracker_cb'):
             self._execution_tracker_state = state
             self._execution_tracker_received = rospy.Time.now()
             self._handoff_tracker_fields = values
@@ -1063,44 +1092,19 @@ class OptimizedTrajectoryContinuityNode:
         self._resume_preflight()
 
     def _actuator_state_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False):
-            return
+        self._timing('callback_receipt',callback='_actuator_state_cb',source_stamp_ns=msg.header.stamp.to_nsec(),ros_ns=rospy.Time.now().to_nsec())
         if len(msg.name)!=len(msg.velocity) or len(set(msg.name))!=len(msg.name):
             return
         if not all(math.isfinite(v) for v in msg.velocity):
             return
-        with self._lock:
+        with self._state_guard('_actuator_state_cb'):
             self._latest_actuator_stamp_ns=msg.header.stamp.to_nsec()
             self._latest_actuator_velocity=dict(zip(msg.name,msg.velocity))
         self._resume_preflight()
 
-    def _controller_state_cb(self, msg):
-        now = rospy.Time.now().to_nsec()
-        stamp = msg.header.stamp.to_nsec()
-        if (not msg.execution_lease_required or not msg.controller_session or msg.clock_fault or
-                not 0 < stamp <= now or now-stamp > 50000000 or
-                len(msg.applied_velocity) != 7 or len(msg.velocity_limits) != 7 or
-                any(not math.isfinite(v) for v in msg.applied_velocity) or
-                any(not math.isfinite(v) or v <= 0 for v in msg.velocity_limits) or
-                any(abs(v) > cap+1e-12 for v,cap in zip(msg.applied_velocity,msg.velocity_limits))):
-            return
-        with self._lock:
-            if stamp <= self._latest_actuator_stamp_ns or msg.controller_session in self._retired_controller_sessions:
-                return
-            if self._controller_session and self._controller_session != msg.controller_session:
-                if len(self._retired_controller_sessions) >= 16:
-                    self._admission_invalidate_locked()
-                    self._task_stop_committed_locked()
-                    return
-                self._retired_controller_sessions.add(self._controller_session)
-                self._admission_invalidate_locked()
-                self._task_stop_committed_locked()
-            self._controller_session = msg.controller_session
-            self._latest_actuator_stamp_ns = stamp
-            self._latest_actuator_velocity = dict(zip(self._controller_joint_names,msg.applied_velocity))
-        self._resume_preflight()
-
     def _joint_state_cb(self, msg):
+        if msg is not None:
+            self._timing('callback_receipt',callback='_joint_state_cb',source_stamp_ns=msg.header.stamp.to_nsec(),ros_ns=rospy.Time.now().to_nsec())
         if msg is None or len(msg.name) != len(msg.position):
             return
         now = rospy.Time.now()
@@ -1110,7 +1114,7 @@ class OptimizedTrajectoryContinuityNode:
                 measured[str(name)] = float(position)
         except Exception:
             return
-        with self._lock:
+        with self._state_guard('_joint_state_cb'):
             self._handoff_previous_measured = (
                 self._latest_measured_stamp_ns,
                 dict(self._latest_measured_q_by_name),
@@ -1124,7 +1128,7 @@ class OptimizedTrajectoryContinuityNode:
 
     def _publish_verification(self, candidate):
         if getattr(self, 'initial_shell_recovery_enabled', False):
-            with self._lock:
+            with self._state_guard('_publish_verification'):
                 if self._outstanding is None or self._outstanding.header.stamp != candidate.header.stamp:
                     return
                 eligible = bool(self.final_gcdf_enabled and self._outstanding_repair and
@@ -1165,7 +1169,7 @@ class OptimizedTrajectoryContinuityNode:
         event = None
         dispatched = None
         route = 'none'
-        with self._lock:
+        with self._state_guard('_verification_protocol_cb'):
             if self.admission_enabled:
                 self._admission_expire_locked()
             if (self._outstanding is not None and self._outstanding_sent is not None and
@@ -1212,7 +1216,7 @@ class OptimizedTrajectoryContinuityNode:
                     dispatched, route = self._dispatch_pending_locked(now)
                 self._publish_summary_locked()
         if event is not None:
-            self._publish_verification_event(event)
+            self.verification_event_pub.publish(event)
         if dispatched is not None:
             if route == 'gcdf':
                 self.final_gcdf_query_pub.publish(dispatched)
@@ -1365,22 +1369,18 @@ class OptimizedTrajectoryContinuityNode:
             self.smooth_handoff_joint_state_max_age_s)
 
     def _repair_active_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False) and not getattr(self._task_control_dispatch, 'active', False):
-            return
         if msg is None:
             return
-        with self._lock:
+        with self._state_guard('_repair_active_cb'):
             if self._repair_active != bool(msg.data):
                 self._admission_invalidate_locked()
             self._repair_active = bool(msg.data)
         self._flush_admission()
 
     def _probe_active_cb(self, msg):
-        if getattr(self, 'require_bound_regime', False) and not getattr(self._task_control_dispatch, 'active', False):
-            return
         if msg is None:
             return
-        with self._lock:
+        with self._state_guard('_probe_active_cb'):
             if self._probe_active != bool(msg.data):
                 self._admission_invalidate_locked()
             self._probe_active = bool(msg.data)
@@ -1574,6 +1574,16 @@ class OptimizedTrajectoryContinuityNode:
             normal_velocity_reference=False, motion_start=None):
         def fail(reason):
             self._last_prefix_build_reason=reason
+            if normal_velocity_reference and reason=='continuous_joint_limit' and getattr(self,'_normal_context_count',0)<6:
+                self._normal_context_count=getattr(self,'_normal_context_count',0)+1
+                names=list(candidate.joint_names)
+                rospy.logwarn('[NORMAL_LIMIT_CONTEXT] %s',json.dumps(dict(raw_stamp_ns=candidate.header.stamp.to_nsec(),
+                    now_ns=rospy.Time.now().to_nsec(),source_stamp_ns=self._latest_measured_stamp_ns,
+                    measured_q=[self._latest_measured_q_by_name[n] for n in names],
+                    measured_v=[self._latest_measured_velocity_by_name[n] for n in names],
+                    applied_v=[self._latest_actuator_velocity[n] for n in names],
+                    applied_stamp_ns=self._latest_actuator_stamp_ns,normal_velocity_reference=True,
+                    prefix_s=requested_prefix_s,forecast=motion_start is not None),separators=(',',':')))
             return None
         self._last_prefix_build_reason="none"
         if candidate is None or not candidate.points:
@@ -1584,7 +1594,9 @@ class OptimizedTrajectoryContinuityNode:
         requested_prefix_s = (
             self.repair_execution_prefix_s
             if prefix_duration_s is None else float(prefix_duration_s))
-        prefix_t = min(max(1e-6, requested_prefix_s), duration)
+        prefix_ns = min(max(1000, int(round(requested_prefix_s * 1e9))),
+                        candidate.points[-1].time_from_start.to_nsec())
+        prefix_t = prefix_ns * 1e-9
         endpoint = self._point_at_time(candidate, prefix_t)
         if endpoint is None or not endpoint.positions:
             return fail("missing_endpoint")
@@ -1637,18 +1649,20 @@ class OptimizedTrajectoryContinuityNode:
                 start=JointTrajectoryPoint(positions=q,velocities=vel,accelerations=[0.]*n,
                     time_from_start=rospy.Duration(0.))
                 out.points=[start]
-                t=0.
-                # Use original knot boundaries; build a single reference ramp.
-                ends=sorted(set([p.time_from_start.to_sec() for p in candidate.points
-                    if 0.<p.time_from_start.to_sec()<prefix_t]+[prefix_t]))
-                for end in ends:
-                    while t<end-1e-9:
-                        dt=min(self.repair_brake_dt_s,end-t)
-                        next_time=rospy.Duration.from_sec(t+dt)
-                        dt=next_time.to_sec()-t
-                        if dt<=0:return fail("invalid_knot_time")
-                        p0=self._point_at_time(candidate,t)
-                        p1=self._point_at_time(candidate,t+dt)
+                # The serialized nanosecond clock owns both integration and
+                # knot labels. Float truncation previously left a 1 ns gap at
+                # the prefix/brake join and changed ramp interpolation to a chord.
+                t_ns=0
+                step_ns=max(1, int(round(self.repair_brake_dt_s * 1e9)))
+                ends=sorted(set([p.time_from_start.to_nsec() for p in candidate.points
+                    if 0<p.time_from_start.to_nsec()<prefix_ns]+[prefix_ns]))
+                for end_ns in ends:
+                    while t_ns<end_ns:
+                        dt_ns=min(step_ns,end_ns-t_ns)
+                        next_time=rospy.Duration(0,t_ns+dt_ns)
+                        dt=dt_ns*1e-9
+                        p0=self._point_at_time(candidate,t_ns*1e-9)
+                        p1=self._point_at_time(candidate,next_time.to_sec())
                         # A NORMAL ramp QP supplies endpoint velocities. Using
                         # its secant as the next velocity integrates a second
                         # ramp and moves the goal. Legacy proposals still get
@@ -1657,7 +1671,7 @@ class OptimizedTrajectoryContinuityNode:
                             [(b-a)/dt for a,b in zip(p0.positions,p1.positions)])
                         next_vel=ramp_step(vel,desired,self.repair_acceleration_limits,dt)
                         q=[x+.5*dt*(v+w) for x,v,w in zip(q,vel,next_vel)]
-                        t=next_time.to_sec()
+                        t_ns=next_time.to_nsec()
                         out.points.append(JointTrajectoryPoint(positions=q,velocities=next_vel,
                             accelerations=[(w-v)/dt for v,w in zip(vel,next_vel)],time_from_start=next_time))
                         vel=next_vel
@@ -1690,14 +1704,15 @@ class OptimizedTrajectoryContinuityNode:
 
         self._last_prefix_endpoint_max_abs_velocity = (
             max(abs(v) for v in vel) if vel else 0.0)
-        t = prefix_t
+        t_ns = endpoint.time_from_start.to_nsec()
+        t = t_ns * 1e-9
         brake_start = t
         for _ in range(self.repair_brake_max_steps):
             if max(abs(v) for v in vel) <= 1e-6:
                 break
-            dt = self.repair_brake_dt_s
-            next_time=rospy.Duration.from_sec(t+dt)
-            dt=next_time.to_sec()-t
+            dt_ns=max(1, int(round(self.repair_brake_dt_s * 1e9)))
+            next_time=rospy.Duration(0,t_ns+dt_ns)
+            dt=dt_ns*1e-9
             next_vel = []
             accel = []
             for j, v in enumerate(vel):
@@ -1712,6 +1727,7 @@ class OptimizedTrajectoryContinuityNode:
                 accel.append((vn - v) / dt)
             q = [q[j] + 0.5 * (vel[j] + next_vel[j]) * dt
                  for j in range(n)]
+            t_ns = next_time.to_nsec()
             t = next_time.to_sec()
             p = JointTrajectoryPoint()
             p.positions = list(q)
@@ -1729,12 +1745,13 @@ class OptimizedTrajectoryContinuityNode:
             return fail("brake_or_acceleration_contract")
 
         if self.repair_hold_s > 1e-9:
-            t += self.repair_hold_s
+            t_ns += int(round(self.repair_hold_s*1e9))
+            t = t_ns*1e-9
             hold = JointTrajectoryPoint()
             hold.positions = list(q)
             hold.velocities = [0.0] * n
             hold.accelerations = [0.0] * n
-            hold.time_from_start = rospy.Duration(t)
+            hold.time_from_start = rospy.Duration(0,t_ns)
             out.points.append(hold)
 
         self._last_repair_prefix_duration_s = prefix_t
@@ -1764,7 +1781,8 @@ class OptimizedTrajectoryContinuityNode:
 
     def _replacement_active_locked(self, now):
         fence = self._replacement_fence
-        if fence is not None and (now.to_nsec() >= fence['deadline_ns'] or
+        if fence is not None and ((not fence.get('wall_v2', False) and
+                                   now.to_nsec() >= fence['deadline_ns']) or
                                   time.monotonic() >= fence['wall_deadline']):
             self._replacement_close_locked(now)
         return self._replacement_fence is not None
@@ -1787,13 +1805,18 @@ class OptimizedTrajectoryContinuityNode:
                      ('request_id', 'mode_epoch', 'query_stamp_ns', 'deadline_ns')}
             if min(fence.values()) <= 0:
                 return
+            wall_v2 = fields.get('lease_timing') == 'wall_v2'
+            if wall_v2:
+                remaining = int(fields['deadline_wall_ns'])/1e9-time.time()
+                if not 0 < remaining <= 10.:
+                    return
         except (KeyError, ValueError):
             return
-        with self._lock:
+        with self._state_guard('_replacement_grant_cb'):
             now = rospy.Time.now()
             self._replacement_active_locked(now)
             if (fence['request_id'] <= self._replacement_closed_id or
-                    now.to_nsec() >= fence['deadline_ns']):
+                    (not wall_v2 and now.to_nsec() >= fence['deadline_ns'])):
                 return
             current = self._replacement_fence
             if (current is not None and fence['request_id'] > current['request_id'] and
@@ -1808,7 +1831,8 @@ class OptimizedTrajectoryContinuityNode:
                 if any(current[k] != fence[k] for k in fence):
                     return
             else:
-                fence['wall_deadline'] = time.monotonic() + 3.
+                fence['wall_deadline'] = time.monotonic() + (remaining if wall_v2 else 3.)
+                fence['wall_v2'] = wall_v2
                 self._admission_invalidate_locked()
                 self._replacement_fence = fence
                 self._replacement_raw_floor_ns = max(self._replacement_raw_floor_ns, now.to_nsec())
@@ -1842,7 +1866,7 @@ class OptimizedTrajectoryContinuityNode:
                 return
         except (KeyError, ValueError):
             return
-        with self._lock:
+        with self._state_guard('_replacement_finish_cb'):
             # Different ROS topics can reorder finish and grant.
             self._replacement_closed_id = max(self._replacement_closed_id, rid)
             if self._replacement_fence is not None and self._replacement_fence['request_id'] == rid:
@@ -1856,7 +1880,7 @@ class OptimizedTrajectoryContinuityNode:
         gcdf_to_publish = None
         verification_to_publish = None
 
-        with self._lock:
+        with self._state_guard('_raw_cb'):
             if self.admission_enabled and _transfer_key is None:
                 return  # The raw diagnostic topic cannot bypass admission.
             if (self._replacement_active_locked(now) or
@@ -1998,6 +2022,11 @@ class OptimizedTrajectoryContinuityNode:
                 # only when measured/applied samples support the held-state
                 # forecast. A small speed alone cannot cover a thin reserve.
                 low_speed = all(math.isfinite(x) and abs(x) <= .01 for x in v+u)
+                if (os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true' and
+                        stationary_reference and low_speed):
+                    # Rebuild from fresh measured q/v; the new curve is audited
+                    # normally. An old near-zero reserve cannot forbid rebuilding.
+                    ready = True
                 settled = entry.get('handoff_settle_start')
                 stamp = self._latest_measured_stamp_ns
                 if (not low_speed or not all(math.isfinite(x) for x in q)):
@@ -2016,6 +2045,7 @@ class OptimizedTrajectoryContinuityNode:
             return 'handoff_state_unavailable'
 
     def _dispatch_pending_locked(self, now):
+        dispatch_entered=time.monotonic()
         self._admission_expire_locked()
         if self._replacement_active_locked(now):
             return None, "none"
@@ -2025,6 +2055,7 @@ class OptimizedTrajectoryContinuityNode:
             return None, "none"
 
         raw = self._pending_raw
+        self._timing('dispatch_prepare',raw=str(raw.header.stamp.to_nsec()),ros_ns=rospy.Time.now().to_nsec())
         transfer_key = self._pending_transfer_key
         raw_received = self._pending_raw_received
         pending_repair = bool(self._pending_repair or self._repair_active)
@@ -2047,6 +2078,10 @@ class OptimizedTrajectoryContinuityNode:
         # No audit starts, and neither first-offer deadline nor recovery ledger
         # changes. State callbacks/tick resume this exact pending identity.
         entry = self._admission_entries.get(transfer_key)
+        if os.environ.get('CARE_CONTINUATION_RESEARCH') == 'true' and entry is not None:
+            # Preserve the immutable native proposal, identity and first-offer
+            # deadline while trying another fully audited executable curve.
+            entry.setdefault('continuation_raw', copy.deepcopy(raw))
         needs_live = self.repair_motion_consistency_enabled
         if self.admission_enabled and entry is not None and needs_live:
             now_ns = rospy.Time.now().to_nsec()
@@ -2090,6 +2125,7 @@ class OptimizedTrajectoryContinuityNode:
         self._pending_repair = False
         self._pending_probe = False
 
+        self._timing('construction_begin',raw=str(raw.header.stamp.to_nsec()))
         age = max(0.0, (now - raw_received).to_sec())
         self._last_raw_to_safety_dispatch_ms = 1000.0 * age
         raw_start_positions = (
@@ -2294,8 +2330,15 @@ class OptimizedTrajectoryContinuityNode:
             # NORMAL also starts at the measured actuator state and ends in a
             # physically feasible stop. A raw QP's last zero-velocity marker
             # cannot stop a moving actuator; certify the complete ramp and tail.
+            task_duration = self._duration(candidate)
+            task_prefix = min(task_duration, (entry or {}).get('continuation_prefix_s', task_duration))
+            if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+                task_prefix = min(task_prefix, .25)
+                diag['rolling_task_prefix_s'] = task_prefix
+            diag['task_reference_duration_s'] = task_duration
+            diag['task_execution_prefix_s'] = task_prefix
             candidate = self._repair_prefix_with_braking_tail(
-                candidate, prefix_duration_s=self._duration(candidate),
+                candidate, prefix_duration_s=task_prefix,
                 consistent_motion=True, normal_velocity_reference=True)
             if candidate is None or not candidate.points:
                 self._last_source = "normal_motion_build_failed"
@@ -2322,6 +2365,58 @@ class OptimizedTrajectoryContinuityNode:
                 if transfer_key in self._admission_entries:
                     self._admission_cancel_locked(transfer_key, 'rejected', self._last_source)
                 return None, 'none'
+
+        self._timing('construction_end',raw=str(raw.header.stamp.to_nsec()))
+        if getattr(self,'_metric_curve',None) is not None:
+            entry=self._admission_entries.get(transfer_key)
+            metric=self._metric_curve.check(candidate,deadline=entry.get('deadline') if entry else None)
+            diag['metric_curve']=metric
+            trace=os.environ.get('CARE_METRIC_CURVE_TRACE_FILE')
+            if trace:
+                with open(trace,'a') as stream:stream.write(json.dumps(metric,separators=(',',':'))+'\n')
+            if not metric['valid']:
+                reason=metric['reason'] if metric['reason'].startswith('metric_') else 'metric_'+metric['reason']
+                self._last_source=reason
+                if entry is not None:self._admission_cancel_locked(transfer_key,'rejected',reason)
+                return None,'none'
+            self._admission_expire_locked()
+            if entry is not None and entry.get('stage') in ('terminal','cancelled','expired','rejected'):
+                return None,'none'
+        if self._known_ground is not None:
+            ground_started=time.monotonic()
+            self._timing('ground_begin',raw=str(raw.header.stamp.to_nsec()),ros_ns=rospy.Time.now().to_nsec())
+            ground_entry=self._admission_entries.get(transfer_key)
+            ground_deadline=ground_entry.get('deadline') if ground_entry is not None else None
+            ground=self._known_ground.check(candidate,deadline=ground_deadline)
+            self._timing('ground_end',raw=str(raw.header.stamp.to_nsec()),ros_ns=rospy.Time.now().to_nsec(),result=dict(ground))
+            ground['locked_dispatch_to_check_end_s']=time.monotonic()-dispatch_entered
+            ground['before_ground_s']=ground_started-dispatch_entered
+            rospy.loginfo('[KNOWN_GROUND] raw_candidate_stamp_ns=%s result=%s',
+                raw.header.stamp.to_nsec(),json.dumps(ground,separators=(',',':')))
+            if not ground['valid']:
+                self._capture_ground_locked(raw,candidate,ground,transfer_key,ground_deadline)
+                self._last_source=ground['reason']
+                if transfer_key in self._admission_entries:
+                    self._admission_cancel_locked(transfer_key,'rejected',ground['reason'])
+                return None,'none'
+            # Numerical work and diagnostics consumed wall/ROS time. Preserve the
+            # original admission lease and require fresh state before any audit.
+            self._admission_expire_locked()
+            if ground_entry is not None and ground_entry.get('stage') in ('terminal','cancelled','expired','rejected'):
+                return None,'none'
+            now=rospy.Time.now()
+            if ground_entry is not None and self.repair_motion_consistency_enabled:
+                measured_age=now.to_nsec()-self._latest_measured_stamp_ns
+                actuator_age=now.to_nsec()-self._latest_actuator_stamp_ns
+                self._timing('freshness',raw=str(raw.header.stamp.to_nsec()),ros_ns=now.to_nsec(),
+                    measured_age_ns=measured_age,actuator_age_ns=actuator_age)
+                if not (0<=measured_age<=50000000 and 0<=actuator_age<=50000000):
+                    self._capture_ground_locked(raw,candidate,dict(ground,valid=False,reason='ground_state_stale',
+                        original_ground_reason=ground['reason']),transfer_key,ground_deadline)
+                    self._admission_cancel_locked(transfer_key,'rejected','ground_state_stale')
+                    return None,'none'
+            diag['known_ground']=ground
+            diag['known_ground_total_wall_s']=time.monotonic()-ground_started
 
         seq = self._next_verification_seq
         self._next_verification_seq += 1
@@ -2375,29 +2470,12 @@ class OptimizedTrajectoryContinuityNode:
         self.execution_audit_pub.publish(msg)
 
     def _publish_committed(self, msg, source, age_s):
-        if getattr(self, 'require_execution_preparation', False):
-            return  # Geometry-verified requests await qualified issuance/application.
         if msg is None or not msg.points:
             return
-        with self._lock:
-            if (getattr(self, 'require_bound_regime', False) and
-                    (not self._task_regime_current_locked() or
-                     self._task_commit_regimes.get(msg.header.stamp.to_nsec()) != self._task_regime_identity)):
-                return
+        with self._state_guard('_publish_committed'):
             if (self._replacement_active_locked(rospy.Time.now()) or
                     msg.header.stamp.to_nsec() <= self._replacement_raw_floor_ns):
                 return
-            if self.task_context_enabled and not self.task_context.accepts(
-                    self._task_commit_bindings.get(msg.header.stamp.to_nsec(), ""),
-                    rospy.Time.now().to_nsec(), msg.header.frame_id):
-                return
-            if self.task_context_enabled:
-                from stopping_trajectory_prefix import trajectory_sha256
-                context = self.task_context.snapshot(rospy.Time.now().to_nsec())
-                event = self._task_event_source.event('execution_binding', context,
-                    dict(execution_stamp_ns=msg.header.stamp.to_nsec(),
-                         trajectory_sha256=trajectory_sha256(msg)), rospy.Time.now().to_nsec())
-                self.task_verification_pub.publish(String(data=canonical(event)))
             self.committed_pub.publish(msg)
             if self.execution_audit_enabled:
                 self._publish_execution_audit(
@@ -2527,8 +2605,12 @@ class OptimizedTrajectoryContinuityNode:
             (diag or {}).get('normal_motion_consistent', 0),
             (diag or {}).get('normal_nodal_motion', 0),
             (diag or {}).get('repair_nodal_motion', 0))
+        entry = self._admission_entries.get((diag or {}).get('transfer_key'), {})
+        msg.data += " task_reference_duration_s={} task_execution_prefix_s={} task_prefix_retries={} handoff_rebuilds={}".format(
+            (diag or {}).get('task_reference_duration_s', 0.),
+            (diag or {}).get('task_execution_prefix_s', 0.),
+            entry.get('continuation_attempts', 0), entry.get('continuation_handoff_rebuilds', 0))
         msg.data += " rejection_snapshot=disabled"
-        msg.data += " prepared_execution_stamp_ns={}".format(int((diag or {}).get("prepared_execution_stamp_ns", 0)))
         msg.data += " vbc_protocol_reason={}".format((diag or {}).get('vbc_protocol_reason', 'none'))
         msg.data += " path_counterexample_evidence={}".format(
             (diag or {}).get('path_counterexample_evidence', 'none'))
@@ -2548,100 +2630,7 @@ class OptimizedTrajectoryContinuityNode:
             entry = self._admission_entries[key]
             msg.data += " transfer_session={} transfer_sequence={}".format(*key)
             self._admission_status_locked(entry, "terminal", msg.data)
-        if getattr(self, 'task_context_enabled', False):
-            entry = self._admission_entries.get(key, {})
-            now = rospy.Time.now().to_nsec()
-            context = self.task_context.snapshot(now)
-            if context and context['candidate_binding'] == entry.get('task_context'):
-                event = self._task_event_source.event('candidate_outcome', context,
-                    dict(text=msg.data, task_regime=entry.get('task_regime', '')), now)
-                self._task_verification_events[msg.data] = event
-                while len(self._task_verification_events) > 64:
-                    self._task_verification_events.popitem(last=False)
         return msg
-
-    def _publish_verification_event(self, msg):
-        self._flush_execution_preparations()
-        self.verification_event_pub.publish(msg)
-        if not getattr(self, 'task_context_enabled', False):
-            return
-        with self._lock:
-            event = self._task_verification_events.pop(msg.data, None)
-            now = rospy.Time.now().to_nsec()
-            if (event is not None and event['valid_until_ns'] >= now and
-                    self.task_context.accepts(event['task_context'], now)):
-                self.task_verification_pub.publish(String(data=canonical(event)))
-
-    def _task_control_cb(self, msg):
-        try:
-            with self._lock:
-                now = rospy.Time.now().to_nsec()
-                event = self._task_control_receiver.parse(msg.data,
-                    self.task_context.snapshot(now), now, 'regime_control')
-                payload = validate_regime_control(event['payload'])
-                identity = regime_identity(event)
-                changed = identity != self._task_regime_identity
-                self._task_control_receiver.remember(event)
-                self._task_control_until_ns = event['valid_until_ns']
-                self._task_control_event = event
-                self._task_regime_identity = identity
-                self._task_control_dispatch.active = True
-                try:
-                    self._repair_active_cb(Bool(data=payload['ready'] and payload['mode'] == 'REPAIR'))
-                    self._probe_active_cb(Bool(data=payload['ready'] and payload['mode'] == 'PROBE_NORMAL'))
-                finally:
-                    self._task_control_dispatch.active = False
-                if changed:
-                    self._admission_invalidate_locked()
-                    self._execution_preparations.cancel('regime_changed')
-                    self._execution_prepared_to_publish = None
-                if not payload['ready']:
-                    self._task_stop_committed_locked()
-            self._flush_admission()
-        except (ValueError, TypeError, KeyError, OverflowError):
-            return
-
-    def _task_regime_current_locked(self):
-        event = self._task_control_event
-        now = rospy.Time.now().to_nsec()
-        return bool(event and event['stamp_ns'] <= now <= event['valid_until_ns'] and
-                    event['payload']['ready'] and self.task_context.accepts(event['task_context'], now))
-
-    def _task_recovery_cb(self, msg):
-        try:
-            with self._lock:
-                now = rospy.Time.now().to_nsec()
-                event = self._task_control_receiver.parse(msg.data,
-                    self.task_context.snapshot(now), now, 'recovery_snapshot')
-                payload = validate_recovery_snapshot(event['payload'], event['task_context'])
-                self._task_control_receiver.remember(event)
-                token = (payload['target']['observation_token'] if payload['target'] is not None else 'none')
-                self._task_control_dispatch.active = True
-                try:
-                    self._preflight_owner_cb(String(data='active_q_vis_token='+token))
-                finally:
-                    self._task_control_dispatch.active = False
-        except (ValueError, TypeError, KeyError, OverflowError):
-            return
-
-    def _flush_execution_preparations(self):
-        if not getattr(self, 'require_execution_preparation', False):
-            return
-        with self._lock:
-            try:
-                now = rospy.Time.now().to_nsec()
-                context = self.task_context.snapshot(now)
-                message = self._execution_preparations.snapshot(now,
-                    (context or {}).get('candidate_binding',''),
-                    self._task_regime_identity if self._task_regime_current_locked() else '')
-                queued = self._execution_prepared_to_publish
-                self._execution_prepared_to_publish = None
-                if message is not None and queued is not None and message.payload_sha256 == queued.payload_sha256:
-                    self.execution_prepared_pub.publish(message)
-                self.execution_prepared_status_pub.publish(String(data=canonical(self._execution_preparations.status())))
-            except ValueError:
-                self._execution_prepared_to_publish = None
-                self._execution_preparations.cancel('preparation_clock_fault')
 
     def _classify_final_gcdf_unsafe(self, batch, distances, geometry_unsafe=()):
         """Return semantic blocker class for violated final-GCDF rows."""
@@ -2769,7 +2758,7 @@ class OptimizedTrajectoryContinuityNode:
         gcdf_recovery_event_to_publish = None
         rejection_feedback_to_publish = None
 
-        with self._lock:
+        with self._state_guard('_final_gcdf_batch_cb'):
             self._admission_expire_locked()
             if (self._gcdf_outstanding is None or
                     self._gcdf_outstanding_sent is None):
@@ -2819,14 +2808,42 @@ class OptimizedTrajectoryContinuityNode:
                 malformed = True
             if diag is None:
                 diag = {}
+            # Explicit research variant: UNKNOWN learned distance is a soft
+            # proposal cost; the subsequent exact VBC still audits every
+            # executable prefix against the unchanged UNKNOWN map. Keep all
+            # raw distances in the capture and all occupied guards hard.
+            # Use the audited candidate's captured mode, never a later live
+            # regime message. The executable-task research variant uses the
+            # same UNKNOWN proposal semantics in NORMAL, PROBE and REPAIR;
+            # occupied CDF/geometry and exact VBC still authorize every motion.
+            repair_unknown_soft=(os.environ.get('CARE_REPAIR_UNKNOWN_SOFT','false')=='true'
+                                 and was_repair and not was_probe)
+            research_soft_unknown=(os.environ.get('CARE_RESEARCH_SOFT_UNKNOWN','false')=='true'
+                                   or repair_unknown_soft
+                                   or os.environ.get('CARE_EXECUTABLE_TASK_RESEARCH','false')=='true')
+            hard_min_d=min_d
+            if research_soft_unknown:
+                if len(msg.source_type)!=len(distances) or any(int(s) not in (0,1) for s in msg.source_type):
+                    malformed=True
+                else:
+                    hard_distances=[d for d,s in zip(distances,msg.source_type) if int(s)==CollisionCDFConstraintBatch.SOURCE_OCCUPIED]
+                    hard_min_d=min(hard_distances) if hard_distances else math.inf
+            diag['research_soft_unknown']=research_soft_unknown
+            diag['repair_unknown_soft']=repair_unknown_soft
+            diag['task_unknown_soft']=(research_soft_unknown and not repair_unknown_soft)
+            diag['raw_learned_min_d']=min_d
+            diag['hard_occupied_learned_min_d']=hard_min_d
             diag['occupied_volume_min_m'] = geometry_min
             diag['occupied_geometry_unsafe_count'] = len(geometry_unsafe)
             diag['occupied_geometry_malformed'] = int(malformed)
+            if os.environ.get('CARE_CAPTURE_ALL_FINAL_BATCHES','false')=='true' or malformed or geometry_unsafe or min_d < self.final_gcdf_safety_margin:
+                from rejection_evidence import capture
+                capture(candidate,msg,diag,geometry_unsafe,geometry_min,malformed,self.final_gcdf_safety_margin)
 
             gcdf_safe = (
                 not malformed and not geometry_unsafe and
                 (int(msg.num_pairs) == 0 or
-                 min_d >= self.final_gcdf_safety_margin))
+                 hard_min_d >= self.final_gcdf_safety_margin))
             restore=diag.get('geometric_restore')
             geometry_request=False
             if restore is not None and was_repair and not was_probe and not malformed and not geometry_unsafe:
@@ -2940,12 +2957,17 @@ class OptimizedTrajectoryContinuityNode:
         if verification_to_publish is not None:
             self._publish_verification(verification_to_publish)
         if event_to_publish is not None:
-            self._publish_verification_event(event_to_publish)
+            self.verification_event_pub.publish(event_to_publish)
         if next_gcdf_to_publish is not None:
             self.final_gcdf_query_pub.publish(next_gcdf_to_publish)
         self._flush_admission()
 
     def _shell_commit_valid_locked(self, evidence, stamp, now, diagnostics):
+        diagnostics.update(decision_ros_ns=str(now.to_nsec()),
+            live_state_stamp_ns=str(self._latest_measured_stamp_ns),
+            actuator_state_stamp_ns=str(getattr(self, '_latest_actuator_stamp_ns', 0)),
+            actuator_state_age_ms=(now.to_nsec()-getattr(self, '_latest_actuator_stamp_ns', 0))/1e6,
+            summary_state_clock_coherent=int(getattr(self, 'summary_state_clock_coherent', False)))
         try:
             value=json.loads(evidence)
             if not isinstance(value,dict):
@@ -2953,8 +2975,15 @@ class OptimizedTrajectoryContinuityNode:
                 return False
             restore=(self._outstanding_diag or {}).get('geometric_restore')
             if restore is not None and (value.get('schema')!=2 or value.get('contract')!='geometric_restore' or
-                                        value.get('restoration_points')!=restore['points']):
+                                        value.get('restoration_points')!=restore['points'] or
+                                        value.get('fixed_start_recovery_points',[])!=restore.get('fixed_start_recovery_points',[])):
                 diagnostics['reason']='geometric_restore_certificate_mismatch'
+                return False
+            try:
+                validate_fixed_start_reaudit(restore,value,self.initial_shell_planning_margin_m,
+                    self.fixed_start_rebase_reaudit_enabled)
+            except (KeyError,ValueError,TypeError):
+                diagnostics['reason']='fixed_start_reaudit_certificate_mismatch'
                 return False
             if value.get('schema')==2:
                 first=self._outstanding.points[0]
@@ -2970,11 +2999,14 @@ class OptimizedTrajectoryContinuityNode:
         if 0<=now.to_nsec()-getattr(self,'_latest_actuator_stamp_ns',0)<=50000000:
             actuator=getattr(self,'_latest_actuator_velocity',None)
         gain=getattr(self,'tracking_feedback_gain',1.)
+        recovery_age_policy=(os.environ.get('CARE_REPAIR_UNKNOWN_SOFT','false')=='true'
+                             and self._outstanding_repair and not self._outstanding_probe)
         accepted=shell_commit_check(evidence,stamp,now.to_nsec(),self._latest_measured_stamp_ns,
             list(self._outstanding.joint_names),self._latest_measured_q_by_name,
             self._latest_measured_velocity_by_name,self.repair_acceleration_limits,
             self.repair_brake_dt_s,self.repair_brake_max_steps,self.initial_shell_execution_margin_m,
-            diagnostics=diagnostics,feedback_gain=gain,actuator_velocity=actuator)
+            diagnostics=diagnostics,feedback_gain=gain,actuator_velocity=actuator,
+            certificate_max_age_ns=250000000 if recovery_age_policy else 50000000)
         restore=(self._outstanding_diag or {}).get('geometric_restore')
         if restore is not None and value.get('schema') == 2 and 'certified_residual_m' in diagnostics:
             scheduling = copy.deepcopy(value)
@@ -2998,6 +3030,77 @@ class OptimizedTrajectoryContinuityNode:
             except (KeyError,ValueError,TypeError):pass
         return accepted
 
+    def _retry_uncommitted_curve_locked(self, diag, received, was_repair, was_probe):
+        """Keep one admitted proposal while rebuilding its executable view.
+
+        A retry is not a safe verdict or a new lease. Mode/goal cancellation,
+        source identity, physical checks and both audits remain in force.
+        """
+        if (os.environ.get('CARE_CONTINUATION_RESEARCH') != 'true' or
+                not self.admission_enabled or was_probe or
+                self._pending_raw is not None or self._probe_active or
+                bool(self._repair_active) != was_repair):
+            return False
+        key = diag.get('transfer_key')
+        entry = self._admission_entries.get(key)
+        if (entry is None or entry['stage'] in ('terminal', 'cancelled', 'expired', 'rejected') or
+                time.monotonic() >= entry['deadline']):
+            return False
+        raw = entry.get('continuation_raw')
+        if raw is None or raw.header.stamp.to_nsec() != diag.get('raw_candidate_stamp_ns'):
+            return False
+        reason = None
+        if not was_repair and diag.get('failure_kind', 'none') == 'none':
+            attempts = entry.get('continuation_attempts', 0)
+            prefix = next_task_prefix(diag.get('vbc_evidence', 'none'),
+                diag.get('audited_trajectory_stamp_ns'), diag.get('task_execution_prefix_s', 0.),
+                self.repair_brake_dt_s, attempts)
+            if prefix is None:
+                return False
+            entry['continuation_prefix_s'] = prefix
+            entry['continuation_attempts'] = attempts + 1
+            reason = 'task_prefix_reaudit'
+        elif was_repair and diag.get('failure_kind') == 'geometric_certificate_state_changed':
+            # The native planner already owns measured-state reconstruction.
+            # Do not consume the remainder of this lease with a redundant audit.
+            if os.environ.get('CARE_RECEIVER_HANDOFF_RETRY', 'true') != 'true':
+                return False
+            if entry.get('continuation_handoff_rebuilds', 0) >= 1:
+                return False
+            try:
+                evidence = json.loads(diag.get('handoff_residual_evidence', 'none'))
+                if (evidence.get('initial_state_changed') is not True or
+                        str(evidence.get('trajectory_stamp_ns')) != str(diag.get('audited_trajectory_stamp_ns')) or
+                        str(evidence.get('raw_candidate_stamp_ns')) != str(raw.header.stamp.to_nsec())):
+                    return False
+            except (ValueError, TypeError):
+                return False
+            entry['continuation_handoff_rebuilds'] = 1
+            reason = 'handoff_curve_rebuild_reaudit'
+        if reason is None:
+            return False
+        self._pending_raw = copy.deepcopy(raw)
+        self._pending_raw_received = received
+        self._pending_transfer_key = key
+        self._pending_repair = was_repair
+        self._pending_probe = False
+        self._last_source = reason
+        record = dict(event=reason,ros_ns=rospy.Time.now().to_nsec(),monotonic_s=time.monotonic(),
+            raw_stamp_ns=raw.header.stamp.to_nsec(),rejected_audit_stamp_ns=diag.get('audited_trajectory_stamp_ns'),
+            original_deadline_wall=entry['deadline'],task_prefix_s=entry.get('continuation_prefix_s'),
+            task_prefix_retries=entry.get('continuation_attempts',0),
+            handoff_rebuilds=entry.get('continuation_handoff_rebuilds',0),
+            rejected_vbc_evidence=diag.get('vbc_evidence','none'),
+            rejected_handoff_evidence=diag.get('handoff_residual_evidence','none'))
+        rospy.loginfo('[CONTINUATION_REAUDIT] %s',json.dumps(record,separators=(',',':')))
+        path=os.environ.get('CARE_CONTINUATION_TRACE_FILE')
+        if path:
+            try:
+                with open(path,'a') as stream:stream.write(json.dumps(record,separators=(',',':'))+'\n')
+            except OSError as exc:
+                rospy.logwarn('Continuation diagnostic write failed: %s',exc)
+        return True
+
     def _global_summary_cb(self, msg):
         if msg is None:
             return
@@ -3017,7 +3120,7 @@ class OptimizedTrajectoryContinuityNode:
         # binding. A reply from another admission session cannot decide this
         # candidate, even if its stamp was copied or a publisher restarted.
         if self.initial_shell_recovery_enabled and source == 'predicted':
-            with self._lock:
+            with self._state_guard('_global_summary_cb'):
                 identity_mismatch = False
                 if (self._outstanding is not None and
                         trajectory_stamp_ns == self._outstanding.header.stamp.to_nsec()):
@@ -3043,9 +3146,14 @@ class OptimizedTrajectoryContinuityNode:
                 return
 
         now = rospy.Time.now()
+        received_now = now
         refresh=None
         if source=='predicted' and not violation and self.initial_shell_recovery_enabled:
-            with self._lock:
+            with self._state_guard('_global_summary_cb'):
+                # Sample time after locking the state used by this decision.
+                # A newer snapshot must not be compared with a pre-lock clock.
+                if getattr(self, 'summary_state_clock_coherent', False):
+                    now = rospy.Time.now()
                 detail={}
                 diag=self._outstanding_diag or {}
                 if (self._outstanding is not None and self._outstanding.header.stamp.to_nsec()==trajectory_stamp_ns and
@@ -3056,7 +3164,7 @@ class OptimizedTrajectoryContinuityNode:
                     shell_valid=self._shell_commit_valid_locked(
                         fields.get('shell_recovery_evidence','none'),trajectory_stamp_ns,now,detail)
                     rospy.loginfo('[SHELL_HANDOFF] %s',json.dumps(dict(
-                        audit_stamp_ns=str(trajectory_stamp_ns),receive_ros_ns=str(now.to_nsec()),
+                        audit_stamp_ns=str(trajectory_stamp_ns),receive_ros_ns=str(received_now.to_nsec()),decision_ros_ns=str(now.to_nsec()),
                         raw_stamp_ns=str(diag.get('raw_candidate_stamp_ns','none')),
                         accepted=bool(shell_valid),diagnostics=detail),separators=(',',':')))
                     if (detail.get('failure_kind') in ('certificate_state_stale', 'map_snapshot_stale',
@@ -3081,7 +3189,10 @@ class OptimizedTrajectoryContinuityNode:
         event_to_publish = None
         verification_to_publish = None
         gcdf_to_publish = None
-        with self._lock:
+        with self._state_guard('_global_summary_cb'):
+            # State callbacks may have run since the earlier refresh check.
+            if getattr(self, 'summary_state_clock_coherent', False):
+                now = rospy.Time.now()
             if getattr(self, "admission_enabled", False):
                 self._admission_expire_locked()
             self._selector_cycle_count += 1
@@ -3191,7 +3302,14 @@ class OptimizedTrajectoryContinuityNode:
                     self._last_verification_view = view
                     self._verification_outcome_count += 1
 
-                    if violation:
+                    if violation and self._retry_uncommitted_curve_locked(
+                            diag, raw_received, was_repair, was_probe):
+                        # The failed view never executes. The next dispatch
+                        # rebuilds from fresh q/v, runs ground/occupied/GCDF,
+                        # then requests VBC under a new audit stamp. Only the
+                        # final result may end the original admission request.
+                        self._verification_outcome_count -= 1
+                    elif violation:
                         state_failure = diag.get('failure_kind') in (
                             'certificate_state_stale', 'live_state_stale', 'state_order_invalid',
                             'map_snapshot_stale', 'geometric_certificate_state_changed', 'missing_actuator_state')
@@ -3326,50 +3444,17 @@ class OptimizedTrajectoryContinuityNode:
                                 execution_stamp_ns = int(
                                     committed.header.stamp.to_nsec())
                                 self._last_execution_stamp_ns = execution_stamp_ns
-                                if self.require_execution_preparation:
-                                    key = (diag or {}).get('transfer_key')
-                                    entry = self._admission_entries.get(key, {})
-                                    prepare_now = rospy.Time.now().to_nsec()
-                                    context = self.task_context.snapshot(prepare_now)
-                                    if context is None or not self._task_regime_current_locked():
-                                        self._last_source = 'execution_preparation_context_expired'
-                                        event_to_publish = self._make_verification_event(
-                                            seq, 'timeout', False, verification_age, view,
-                                            safety_gate='execution_preparation', diag=diag)
-                                    else:
-                                        prepared = self._execution_preparations.prepare(committed,
-                                            context['candidate_binding'],entry.get('task_regime',''),key,
-                                            entry['digest'],seq,prepare_now,
-                                            min(prepare_now+250000000,context['valid_until_ns'],
-                                                self._task_control_until_ns))
-                                        self._execution_prepared_to_publish = prepared
-                                        self._execution_prepared_count += 1
-                                        self._last_source = 'geometry_verified_waiting_stopping_qualification'
-                                        self._last_verification_result = 'safe_awaiting_execution'
-                                        diag = dict(diag or {}, prepared_execution_stamp_ns=execution_stamp_ns)
-                                        event_to_publish = self._make_verification_event(
-                                            seq, 'safe', False, verification_age, view,
-                                            safety_gate='execution_preparation', diag=diag)
-                                else:
-                                    if self.task_context_enabled:
-                                        key = (diag or {}).get("transfer_key")
-                                        binding = self._admission_entries.get(key, {}).get("task_context", "")
-                                        self._task_commit_bindings[execution_stamp_ns] = binding
-                                        self._task_commit_regimes[execution_stamp_ns] = self._admission_entries.get(key, {}).get('task_regime', '')
-                                        while len(self._task_commit_bindings) > 64:
-                                            retired, _ = self._task_commit_bindings.popitem(last=False)
-                                            self._task_commit_regimes.pop(retired, None)
-                                    self._committed_master = copy.deepcopy(committed)
-                                    self._committed_received = now
-                                    self._commit_count += 1
-                                    self._last_committed_age_s = 0.0
-                                    self._last_source = (
-                                        "candidate_verified_safe_committed")
-                                    committed_to_publish = copy.deepcopy(committed)
-                                    event_to_publish = self._make_verification_event(
-                                        seq, "safe", True, verification_age, view,
-                                        execution_stamp_ns=execution_stamp_ns,
-                                        diag=diag)
+                                self._committed_master = copy.deepcopy(committed)
+                                self._committed_received = now
+                                self._commit_count += 1
+                                self._last_committed_age_s = 0.0
+                                self._last_source = (
+                                    "candidate_verified_safe_committed")
+                                committed_to_publish = copy.deepcopy(committed)
+                                event_to_publish = self._make_verification_event(
+                                    seq, "safe", True, verification_age, view,
+                                    execution_stamp_ns=execution_stamp_ns,
+                                    diag=diag)
                         else:
                             self._verification_timeout_count += 1
                             self._last_verification_result = "expired_safe"
@@ -3391,7 +3476,7 @@ class OptimizedTrajectoryContinuityNode:
                 self._publish_committed(
                     committed_to_publish, "candidate_verified_safe_committed", 0.0)
         if event_to_publish is not None:
-            self._publish_verification_event(event_to_publish)
+            self.verification_event_pub.publish(event_to_publish)
         if verification_to_publish is not None:
             self._publish_verification(verification_to_publish)
         if gcdf_to_publish is not None:
@@ -3410,7 +3495,7 @@ class OptimizedTrajectoryContinuityNode:
         next_verification_to_publish = None
         continuation_age = math.nan
 
-        with self._lock:
+        with self._state_guard('_timer_cb'):
             self._admission_expire_locked()
             if (self._gcdf_outstanding is not None and
                     self._gcdf_outstanding_sent is not None):
@@ -3522,16 +3607,16 @@ class OptimizedTrajectoryContinuityNode:
         if execution_audit_to_publish is not None:
             self._publish_execution_audit(
                 execution_audit_to_publish, execution_audit_token)
-            with self._lock:
+            with self._state_guard('_timer_cb'):
                 self._execution_audit_publish_count += 1
                 self._publish_summary_locked()
         if continuation_to_publish is not None:
             self._publish_committed(
                 continuation_to_publish, "committed_continuation", continuation_age)
         if timeout_event is not None:
-            self._publish_verification_event(timeout_event)
+            self.verification_event_pub.publish(timeout_event)
         if gcdf_timeout_event is not None:
-            self._publish_verification_event(gcdf_timeout_event)
+            self.verification_event_pub.publish(gcdf_timeout_event)
         if next_gcdf_to_publish is not None:
             self.final_gcdf_query_pub.publish(next_gcdf_to_publish)
         if next_verification_to_publish is not None:
@@ -3542,6 +3627,7 @@ class OptimizedTrajectoryContinuityNode:
         msg = String()
         msg.data = " ".join([
             "source={}".format(self._last_source),
+            "summary_state_clock_coherent={}".format(int(getattr(self, "summary_state_clock_coherent", False))),
             "raw_input_count={}".format(self._raw_input_count),
             "pending_candidate={}".format(int(self._pending_raw is not None)),
             "preflight_waiting={}".format(int(self._preflight_wait_key is not None)),
@@ -3732,7 +3818,7 @@ class OptimizedTrajectoryContinuityNode:
             self.summary_pub.publish(msg)
 
     def _publish_summary(self):
-        with self._lock:
+        with self._state_guard('_publish_summary'):
             self._publish_summary_locked()
         self._flush_admission()
 

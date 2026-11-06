@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # ROS Noetic/Gazebo scripts use /usr/bin/env python3. If CAREPlanner is
 # launched from a research conda env (e.g. viscdf), spawn_model and controller

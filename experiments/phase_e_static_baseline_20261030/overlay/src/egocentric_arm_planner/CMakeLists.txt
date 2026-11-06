@@ -222,6 +222,7 @@ catkin_install_python(PROGRAMS
   scripts/phase_c4_3_continuous_trial_node.py
   scripts/c4_3_planner_regime_handoff_node.py
   scripts/c4_4_verified_regime_manager_node.py
+  scripts/observation_release_identity.py
   scripts/optimized_trajectory_continuity_node.py
   scripts/gcdf_rejection_feedback.py
   scripts/occupied_clearance.py
@@ -259,3 +260,12 @@ install(TARGETS egocentric_arm_planner receding_horizon_planner_node
 install(DIRECTORY include/${PROJECT_NAME}/
   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
 install(DIRECTORY launch config DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+
+# Publication build integration for sources previously compiled independently.
+find_package(OpenSSL REQUIRED)
+find_package(hpp-fcl REQUIRED)
+target_link_libraries(local_sparse_scp_planner_node OpenSSL::Crypto hpp-fcl::hpp-fcl)
+add_library(known_ground SHARED src/known_ground_kernel.cpp)
+set_target_properties(known_ground PROPERTIES
+  LIBRARY_OUTPUT_DIRECTORY "${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}")
+install(TARGETS known_ground LIBRARY DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})

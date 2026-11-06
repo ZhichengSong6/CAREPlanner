@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CASE_ID="${CASE_ID:-case_003}"
 if [[ -z "${RUN_ID:-}" ]]; then
   _RUN_STAMP="$(date +%Y%m%d-%H%M%S-%3N)"
@@ -69,7 +69,9 @@ if [[ ! -f "${CHECKPOINT}" ]]; then
   exit 2
 fi
 
-if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
+if [[ -n "${CONDA_SH:-}" && -f "${CONDA_SH}" ]]; then
+  :
+elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
 elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"

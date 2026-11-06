@@ -2,4 +2,10 @@ geometry_msgs/Point[] points
 ---
 float32[] confidence
 float32[] current_visibility
-uint8[] inside_map
+uint8[] inside_map# Diagnostic metadata from the SAME locked query. Original result fields unchanged.
+string evidence_instance
+uint64 evidence_revision
+time evidence_stamp
+float32[] evidence_occupancy
+float64[] evidence_last_seen_s
+float32[] evidence_prior

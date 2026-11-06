@@ -1,5 +1,6 @@
 #pragma once
 #include <Eigen/Core>
+#include "egocentric_arm_planner/observation_action_progress.hpp"
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -32,11 +33,36 @@ struct SafeFrontierRecovery {
   static constexpr int max_segments = 6;
   struct Candidate { int generation; double span; bool following_frontier; };
   struct Budget { int attempts, segments; bool active, final_stage_replacement_used;
-    std::vector<Eigen::VectorXd> failed_directions; std::string direction_token; };
+    std::vector<Eigen::VectorXd> failed_directions; std::string direction_token;
+    int unapplied_replacements = 0; };
   std::string key;
   unsigned long long epoch = 0, last_execution = 0;
   int attempts = 0, generation = 0, tiny_commits = 0, rejected = 0;
   int segments = 0;
+  int unapplied_replacements = 0;
+  struct ReplacementCharge {
+    std::string key; unsigned long long epoch = 0;
+    int before = 0, after = 0, generation = 0, segments = 0;
+    bool final_before = false, final_after = false, valid = false;
+  };
+  ReplacementCharge replacementCharge() const {
+    ReplacementCharge c; c.key=key; c.epoch=epoch; c.before=attempts;
+    c.final_before=final_stage_replacement_used; return c;
+  }
+  void sealReplacementCharge(ReplacementCharge& c) const {
+    c.after=attempts; c.final_after=final_stage_replacement_used;
+    c.generation=generation; c.segments=segments; c.valid=true;
+  }
+  bool canRetryUnappliedReplacement() const { return unapplied_replacements < 3; }
+  bool refundUnappliedReplacement(ReplacementCharge& c) {
+    if(!c.valid || c.key!=key || c.epoch!=epoch || c.after!=attempts ||
+        c.final_after!=final_stage_replacement_used || c.generation!=generation ||
+        c.segments!=segments)return false;
+    // Retain a genuine earlier direction failure (including initial activation).
+    // Only the unused reservation is refunded; motion/segment evidence is kept.
+    attempts=std::max(1,c.before); final_stage_replacement_used=c.final_before;
+    ++unapplied_replacements; c.valid=false; return true;
+  }
   bool active = false, following_frontier = false;
   bool final_stage_replacement_used = false;
   double window_start = -1.0;
@@ -66,6 +92,37 @@ struct SafeFrontierRecovery {
   int view_window_commits=0;
   std::string last_advance_reason="none";
   bool observation_replacement_due=false;
+  bool persistent_observation_monitor=false;
+  bool action_progress_enabled=false;
+  ObservationActionProgress action_progress;
+  std::map<std::string,ObservationActionProgress> action_budgets;
+  bool view_replacement_waiting=false, view_trial_pending=false;
+  std::string view_replacement_key;
+  unsigned long long view_replacement_epoch=0;
+  int executed_view_trials=0;
+  // Only an authenticated sensor/view replacement can arm a new trial.
+  // Publishing another token or suspending the same view cannot renew it.
+  void beginViewReplacement() {
+    action_progress.suspend();
+    view_replacement_waiting=true;view_trial_pending=false;
+    view_replacement_key=key;view_replacement_epoch=epoch;
+  }
+  void finishViewReplacement(bool applied) {
+    if(!view_replacement_waiting)return;
+    action_progress.suspend();
+    view_trial_pending=applied && view_replacement_waiting &&
+        view_replacement_key==key && view_replacement_epoch==epoch;
+    view_replacement_waiting=false;
+  }
+  Eigen::VectorXd geometry_measured_q;
+  double geometry_latest_margin=0.;
+  std::string observation_region;
+  double unseen_window_start=-1.,unseen_best_fraction=-1.,unseen_best_gap=-1.;
+  int unseen_window_commits=0;
+  void setObservationRegion(const std::string& region) {
+    if(region==observation_region)return;
+    observation_region=region;unseen_window_start=-1.;unseen_best_fraction=-1.;unseen_best_gap=-1.;unseen_window_commits=0;
+  }
   double progress_paused_at = -1.;
   Eigen::VectorXd anchor, window_anchor, target;
   std::map<unsigned long long, Candidate> pending, certified;
@@ -78,7 +135,9 @@ struct SafeFrontierRecovery {
       if (window_start>=0.) window_start+=dt;
       if (observation_window_start>=0.) observation_window_start+=dt;
       if (view_window_start>=0.) view_window_start+=dt;
+      if (unseen_window_start>=0.) unseen_window_start+=dt;
     }
+    if(action_progress_enabled)action_progress.suspend();
     progress_paused_at=now;
   }
   void resumeProgress(double now) {
@@ -106,6 +165,7 @@ struct SafeFrontierRecovery {
     if(token!=failed_direction_token) {
       failed_directions.clear();detour_direction.resize(0);failed_direction_token=token;
     }
+    unseen_best_gap=-1.; // changed steering pose changes the distance metric, not the region budget
     observation_token=token; observation_goal=q; observation_mask=mask;
     geometry_signature.clear();geometry_query_time=-1.;geometry_progress_pending=false;
     clearance_token.clear(); clearance_query_time=-1.; clearance_progress_pending=false;
@@ -140,7 +200,8 @@ struct SafeFrontierRecovery {
     return true;
   }
   bool noteGeometryFeedback(const std::string& token,const std::string& signature,
-                            double query_time,double now,double margin) {
+                            double query_time,double now,double margin,
+                            const Eigen::VectorXd& measured_q=Eigen::VectorXd()) {
     if(token!=observation_token || token.empty() || signature.size()!=64 ||
         signature.find_first_not_of("0123456789abcdef")!=std::string::npos ||
         !std::isfinite(query_time) || !std::isfinite(now) || !std::isfinite(margin) ||
@@ -151,6 +212,7 @@ struct SafeFrontierRecovery {
     } else if(margin-geometry_best>=.001) {
       geometry_best=margin;geometry_progress_pending=true;
     }
+    geometry_measured_q=measured_q;geometry_latest_margin=margin;
     geometry_query_time=query_time;return true;
   }
   bool observeGoalProgress(bool new_execution, double now, const Eigen::VectorXd& q) {
@@ -201,12 +263,23 @@ struct SafeFrontierRecovery {
 
   void select(const std::string& next, unsigned long long mode) {
     if (next == key && mode == epoch) return;
+    view_replacement_waiting=false;view_trial_pending=false;
+    if(action_progress_enabled) {
+      action_progress.suspend();
+      if(mode!=epoch)action_budgets.clear();
+      else if(!key.empty() && (action_budgets.count(key)||action_budgets.size()<64))
+        action_budgets[key]=action_progress;
+      const auto saved=action_budgets.find(next);
+      action_progress=saved==action_budgets.end() ? ObservationActionProgress() : saved->second;
+      action_progress.suspend();
+    }
     if (mode != epoch) budgets.clear();
     else if (!key.empty() && (budgets.count(key) || budgets.size()<64))
-      budgets[key] = Budget{attempts, segments, active, final_stage_replacement_used, failed_directions, failed_direction_token};
+      budgets[key] = Budget{attempts, segments, active, final_stage_replacement_used, failed_directions, failed_direction_token, unapplied_replacements};
     key = next; epoch = mode;
+    observation_region.clear();unseen_window_start=-1.;unseen_best_fraction=-1.;unseen_best_gap=-1.;unseen_window_commits=0;
     monitor_detour_observation=false;observation_replacement_due=false;
-    attempts = segments = rejected = 0; active = false; following_frontier = false;
+    attempts = segments = rejected = unapplied_replacements = 0; active = false; following_frontier = false;
     final_stage_replacement_used = false;
     failed_directions.clear();failed_direction_token.clear(); detour_direction.resize(0);
     last_stall_duration = last_stall_motion = last_raw_span = 0.; last_stall_commits = 0;
@@ -214,6 +287,7 @@ struct SafeFrontierRecovery {
     if (saved != budgets.end()) {
       attempts = saved->second.attempts; segments = saved->second.segments;
       active = saved->second.active;
+      unapplied_replacements = saved->second.unapplied_replacements;
       final_stage_replacement_used = saved->second.final_stage_replacement_used;
       failed_directions=saved->second.failed_directions;
       failed_direction_token=saved->second.direction_token;
@@ -337,8 +411,46 @@ struct SafeFrontierRecovery {
     // stable published q_vis, not the rolling local frontier or any wrist motion.
     // A bounded detour keeps the existing whole-arm segment/stall accounting.
     const bool observation_monitor=observation_goal.size()==7 &&
-        (!active || c.following_frontier || monitor_detour_observation);
-    if (observation_monitor && observeGoalProgress(new_execution,now,q)) return true;
+        (!active || c.following_frontier || monitor_detour_observation || persistent_observation_monitor);
+    // A geometry-only restore still serves the same unseen region. Candidate
+    // generations and local clearance gains cannot reset this actual-map window.
+    if(action_progress_enabled && observation_monitor && !observation_region.empty() &&
+        feedback_query_time>=0. && now-feedback_query_time>=0. && now-feedback_query_time<=.5) {
+      if(view_replacement_waiting) { action_progress.suspend(); return false; }
+      if(view_trial_pending) {
+        action_progress.nextTrial();view_trial_pending=false;++executed_view_trials;
+      }
+      const double gap=((q-observation_goal).cwiseProduct(observation_mask)).norm();
+      const bool geometry_live=geometry_query_time>=0. && now-geometry_query_time>=0. &&
+          now-geometry_query_time<=.2 && geometry_measured_q.size()==7 &&
+          (q-geometry_measured_q).lpNorm<Eigen::Infinity>()<=.02;
+      if(!blocked() && action_progress.observe(new_execution,now,gap,feedback_best[0],
+          observation_token+geometry_signature,geometry_latest_margin,geometry_live)) {
+        last_stall_duration=action_progress.elapsed;last_stall_commits=action_progress.commits;
+        last_stall_motion=0.;last_stall_reason="observation_no_progress";
+        advanceObservation(true,"executed_view_no_progress");
+        action_progress.nextTrial();return true;
+      }
+    }
+    if(!action_progress_enabled && persistent_observation_monitor && active && !c.following_frontier &&
+        observation_goal.size()==7 && !observation_region.empty() &&
+        feedback_query_time>=0. && now-feedback_query_time>=0. && now-feedback_query_time<=.5 && feedback_best[0]<1.) {
+      const double gap=((q-observation_goal).cwiseProduct(observation_mask)).norm();
+      if(unseen_window_start<0. || feedback_best[0]-unseen_best_fraction>=.001 ||
+          (unseen_best_gap>=0. && unseen_best_gap-gap>=.001)) {
+        unseen_window_start=now;unseen_window_commits=0;
+        unseen_best_fraction=std::max(unseen_best_fraction,feedback_best[0]);
+      }
+      unseen_best_gap=unseen_best_gap<0. ? gap : std::min(unseen_best_gap,gap);
+      if(new_execution)++unseen_window_commits;
+      if(unseen_window_commits>=6 && now-unseen_window_start>=1. && !blocked()) {
+        last_stall_duration=now-unseen_window_start;last_stall_commits=unseen_window_commits;
+        last_stall_reason="observation_no_progress";
+        unseen_window_start=now;unseen_window_commits=0;
+        advanceObservation(true,"unseen_execution_window");return true;
+      }
+    }
+    if (!action_progress_enabled && observation_monitor && observeGoalProgress(new_execution,now,q)) return true;
     if (!observation_monitor) clearObservationWindow(false);
     if (anchor.size() != 7) anchor = q;
     // Movement is a local waypoint transition, NEVER observation completion.

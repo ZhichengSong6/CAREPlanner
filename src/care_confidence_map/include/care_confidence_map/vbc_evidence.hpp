@@ -36,7 +36,8 @@ std::string vbcEvidence(unsigned long long stamp, unsigned long long bundle,
                         double required_margin, double resolution,
                         const Candidates& candidates, const Layers& layers,
                         const std::string& geometry_backend = "samples",
-                        bool continuous_motion_bounds = false) {
+                        bool continuous_motion_bounds = false,
+                        double voxel_support_radius = 0.) {
   std::ostringstream s;
   s.imbue(std::locale::classic());
   s << "{\"schema\":1,\"trajectory_stamp_ns\":\"" << stamp
@@ -44,7 +45,9 @@ std::string vbcEvidence(unsigned long long stamp, unsigned long long bundle,
     << ",\"required_margin_s\":" << evidenceNumber(required_margin)
     << ",\"voxel_resolution_m\":" << evidenceNumber(resolution)
     << ",\"geometry_backend\":" << evidenceString(geometry_backend)
-    << ",\"spatial_semantics\":" << evidenceString(geometry_backend == "primitive"
+    << ",\"voxel_support_radius_m\":" << evidenceNumber(voxel_support_radius)
+    << ",\"spatial_semantics\":" << evidenceString(voxel_support_radius>0.
+        ? "whole_voxel_sphere_enclosure" : geometry_backend == "primitive"
         ? (continuous_motion_bounds ? "voxel_centers_piecewise_linear_enclosure"
                                     : "voxel_centers_sampled_midpoints")
         : "voxel_centers_discrete_knots")

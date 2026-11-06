@@ -14,19 +14,11 @@ import math
 import threading
 import time
 import uuid
-import sys
-from pathlib import Path
-try:
-    from task_observation_binding import TaskContextReceiver
-except ModuleNotFoundError:
-    import rospkg
-    sys.path.insert(0,str(Path(rospkg.RosPack().get_path('care_visibility_cdf'))/'scripts'))
-    from task_observation_binding import TaskContextReceiver
 
 from egocentric_arm_planner.msg import CandidateTransfer
 
 
-def payload_sha256(raw, prefix_context="", task_context="", task_regime=""):
+def payload_sha256(raw, prefix_context=""):
     normalized = copy.deepcopy(raw)
     normalized.header.seq = 0  # ROS publisher-local; never an identity.
     stream = io.BytesIO()
@@ -34,19 +26,15 @@ def payload_sha256(raw, prefix_context="", task_context="", task_regime=""):
     data = stream.getvalue()
     if prefix_context:
         data += b'\x00repair_prefix_context\x00' + prefix_context.encode('utf-8')
-    if task_context:
-        data += b"\x00task_observation_context\x00" + task_context.encode("utf-8")
-    if task_regime:
-        data += b"\x00task_regime\x00" + task_regime.encode("utf-8")
     return hashlib.sha256(data).hexdigest()
 
 
 def transfer_message(action, session, sequence=0, boot="", raw=None,
-                     digest="", remaining=0.0, prefix_context="", task_context="", task_regime=""):
+                     digest="", remaining=0.0, prefix_context=""):
     msg = CandidateTransfer(action=action, session=session, sequence=sequence,
                             receiver_boot_id=boot, payload_sha256=digest,
                             remaining_budget_s=remaining,
-                            planned_prefix_context=prefix_context, task_context=task_context, task_regime=task_regime)
+                            planned_prefix_context=prefix_context)
     if raw is not None:
         msg.trajectory = copy.deepcopy(raw)
     return msg
@@ -80,11 +68,9 @@ class CandidateSender:
         self.active = None
         self.waiting = None  # Same latest-only bound as the existing pipeline.
         self.waiting_prefix_context = ""
-        self.waiting_task_context = ""
-        self.waiting_task_regime = ""
         self.waiting_boot_wall = None
         self.fault = False
-        self.replan_used = False  # At most one transport recovery per node run.
+        self.replan_count = 0  # One fresh request per authenticated terminal identity.
         self.receipt_count = self.resend_count = self.cancel_count = 0
         self.timeout_count = self.completed_count = self.stale_status_count = 0
         self.last_stage = "idle"
@@ -111,27 +97,24 @@ class CandidateSender:
             raw = self.waiting
             self.waiting = None
             self.waiting_boot_wall = None
-            return self._begin(raw, now, self.waiting_prefix_context, self.waiting_task_context, self.waiting_task_regime)
+            return self._begin(raw, now, self.waiting_prefix_context)
         return []
 
-    def forward(self, raw, now, prefix_context="", task_context="", task_regime=""):
+    def forward(self, raw, now, prefix_context=""):
         if self.fault:
             return []
         if self.active is not None or not self.receiver_boot_id:
             self.waiting = copy.deepcopy(raw)
             self.waiting_prefix_context = prefix_context
-            self.waiting_task_context = task_context
-            self.waiting_task_regime = task_regime
             if not self.receiver_boot_id and self.waiting_boot_wall is None:
                 self.waiting_boot_wall = now
             return []
-        return self._begin(raw, now, prefix_context, task_context, task_regime)
+        return self._begin(raw, now, prefix_context)
 
-    def _begin(self, raw, now, prefix_context="", task_context="", task_regime=""):
+    def _begin(self, raw, now, prefix_context=""):
         self.sequence += 1
         self.active = dict(sequence=self.sequence, raw=copy.deepcopy(raw),
-                           digest=payload_sha256(raw, prefix_context, task_context, task_regime), prefix_context=prefix_context,
-                           task_context=task_context, task_regime=task_regime, first_wall=now,
+                           digest=payload_sha256(raw, prefix_context), prefix_context=prefix_context, first_wall=now,
                            deadline=now + self.pipeline_timeout,
                            receipt_deadline=now + self.receipt_timeout,
                            stage="offering", received=False, audit_started=False, resent=False,
@@ -144,7 +127,7 @@ class CandidateSender:
         a = self.active
         return transfer_message(action, self.session, a["sequence"],
                                 self.receiver_boot_id, a["raw"], a["digest"],
-                                max(0.0, a["deadline"] - now), a["prefix_context"], a["task_context"], a["task_regime"])
+                                max(0.0, a["deadline"] - now), a["prefix_context"])
 
     def cancel(self, now, recover=False):
         a = self.active
@@ -197,7 +180,7 @@ class CandidateSender:
         recover = (a["recover"] or stage in ("expired", "rejected")) and not committed
         # This is a terminal disposition of the exact received proposal, not
         # an audit failure. Let the planner's finite proposal ledger own its
-        # continuation instead of relying on the transport's one Bool retry.
+        # continuation instead of relying on the transport's generic retry.
         try:
             restore = json.loads(a.get("prefix_context", "")).get("geometric_restore")
         except (ValueError, TypeError, AttributeError):
@@ -208,7 +191,30 @@ class CandidateSender:
                     fields.get("committed") == "0" and
                     fields.get("result") == "timeout" and a["received"] and not a.get("audit_started", False) and
                     bool(a["prefix_context"]))
-        disposition = self._message("preaudit_expired", now) if preaudit else None
+        try:
+            prefix = json.loads(a.get('prefix_context', ''))
+        except (ValueError, TypeError):
+            prefix = None
+        ground_rejected = (not self.fault and stage == 'rejected' and
+            fields.get('reason') in ('ground_knot_margin', 'ground_curve_margin',
+                                    'ground_interval_unresolved', 'ground_check_budget', 'ground_wall_budget', 'ground_fk_budget', 'ground_state_stale') and
+            fields.get('audit_started') == '0' and fields.get('committed') == '0' and
+            fields.get('result') == 'rejected' and a['received'] and not a.get('audit_started', False) and
+            ((not a.get('prefix_context')) or (isinstance(prefix, dict) and type(prefix.get('schema')) is int and prefix.get('schema') == 1 and
+            isinstance(prefix.get('session'), str) and len(prefix['session']) == 32 and
+            type(prefix.get('revision')) is int and prefix['revision'] > 0)))
+        resource = fields.get('reason') in ('ground_interval_unresolved', 'ground_check_budget', 'ground_wall_budget', 'ground_fk_budget', 'ground_state_stale')
+        metric_rejected = (not self.fault and stage == 'rejected' and
+            fields.get('reason', '').startswith('metric_') and
+            fields.get('audit_started') == '0' and fields.get('committed') == '0' and
+            fields.get('result') == 'rejected' and a['received'] and not a.get('audit_started', False) and
+            ((not a.get('prefix_context')) or (isinstance(prefix, dict) and type(prefix.get('schema')) is int and prefix.get('schema') == 1 and
+            isinstance(prefix.get('session'), str) and len(prefix['session']) == 32 and
+            type(prefix.get('revision')) is int and prefix['revision'] > 0)))
+        metric_resource = fields.get('reason') != 'metric_cube_distance_within_margin'
+        action = (('preaudit_metric_resource' if metric_resource else 'preaudit_metric_rejected') if metric_rejected else
+                  ('preaudit_ground_resource' if resource else 'preaudit_ground_rejected') if ground_rejected else 'preaudit_expired')
+        disposition = self._message(action, now) if preaudit or ground_rejected or metric_rejected else None
         if disposition is not None:
             disposition.remaining_budget_s = 0.0
         self.completed_count += 1
@@ -218,11 +224,14 @@ class CandidateSender:
         if not self.fault and self.waiting is not None:
             raw = self.waiting
             self.waiting = None
-            actions += self._begin(raw, now, self.waiting_prefix_context, self.waiting_task_context, self.waiting_task_regime)
+            actions += self._begin(raw, now, self.waiting_prefix_context)
         elif disposition is not None:
             actions.append(("preaudit_terminal", disposition))
-        elif recover and not self.replan_used and not self.fault:
-            self.replan_used = True
+        elif recover and not self.fault:
+            # Clearing active above consumes this exact terminal identity.
+            # Duplicate or late receipts cannot request another plan; a new
+            # candidate may independently fail and must retain recovery.
+            self.replan_count += 1
             actions.append(("replan", None))
         return actions, True
 

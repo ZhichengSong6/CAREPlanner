@@ -132,6 +132,15 @@ class VBCExecutionReferenceGate:
         self._replan_ready_pending = False
         self._replan_count = 0
 
+        # The C5 verified pipeline can commit a new candidate while this legacy
+        # bootstrap gate still waits for a waypoint from the initial nominal
+        # route. A real commit is stronger startup evidence than that obsolete
+        # bootstrap obligation. This only starts regime bookkeeping; it does
+        # not admit a trajectory or complete an observation.
+        self._verified_commit_startup = bool(rospy.get_param(
+            "~verified_commit_startup", False))
+        self._verified_commit_stamp_ns = 0
+
         self.reference_pub = rospy.Publisher(
             self.output_reference_topic, JointTrajectory, queue_size=1)
         self.ready_pub = rospy.Publisher(
@@ -162,6 +171,10 @@ class VBCExecutionReferenceGate:
         rospy.Subscriber(
             self.recovery_complete_topic, Bool,
             self._recovery_complete_callback, queue_size=1)
+        if self._verified_commit_startup:
+            rospy.Subscriber(
+                "/care_planner/committed_trajectory", JointTrajectory,
+                self._verified_commit_callback, queue_size=1)
 
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / self.publish_rate), self._timer_callback)
@@ -182,6 +195,13 @@ class VBCExecutionReferenceGate:
         if msg is None or not msg.points:
             return -1.0
         return float(msg.points[-1].time_from_start.to_sec())
+
+    def _verified_commit_callback(self, msg: JointTrajectory) -> None:
+        if msg is None or not msg.points or msg.header.stamp.to_nsec() <= 0:
+            return
+        with self._lock:
+            if not self._released:
+                self._verified_commit_stamp_ns = msg.header.stamp.to_nsec()
 
     def _reference_callback(self, msg: JointTrajectory) -> None:
         if msg is None or not msg.points:
@@ -304,7 +324,11 @@ class VBCExecutionReferenceGate:
                     "[vbc_exec_gate] frozen nominal sweep time received: %.6f s", value)
 
     def _can_release_locked(self) -> bool:
-        if self._released or self._master_reference is None or self._decision is None:
+        if self._released or self._master_reference is None:
+            return False
+        if self._verified_commit_startup and self._verified_commit_stamp_ns > 0:
+            return True
+        if self._decision is None:
             return False
         if not self._decision:
             return True
@@ -315,7 +339,10 @@ class VBCExecutionReferenceGate:
         self._execution_start_ros_s = now
         self._released = True
 
-        if self._decision:
+        if self._verified_commit_startup and self._verified_commit_stamp_ns > 0:
+            self._synced_deadline_ros_s = None
+            self._release_reason = "verified_candidate_commit_startup"
+        elif self._decision:
             deadline_from_start = max(
                 0.0, float(self._frozen_sweep_time_s) - self.safety_margin_s)
             self._synced_deadline_ros_s = now + deadline_from_start

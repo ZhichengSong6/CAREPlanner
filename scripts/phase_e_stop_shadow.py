@@ -70,9 +70,9 @@ class PrimitiveEnclosure:
         self.qindices=[self.model.joints[self.model.getJointId(j)].idx_q for j in JOINTS]
         self.key=None; self.max_grid_cells=max_grid_cells
 
-    def prepare_grid(self,meta):
-        """Validate and cache geometry only; confidence answers are never cached."""
+    def raster(self,q,travel,meta,margin=.020):
         from scipy.spatial import cKDTree
+        from audit_case001_motion_prior import frame_placements,collision_sdf
         key=geometry_key(meta)
         if meta['frame']!='base_link': raise ValueError('unsupported_map_frame')
         low=np.array(meta['map_min']); high=np.array(meta['map_max']); dims=np.array(meta['grid_size'])
@@ -86,11 +86,6 @@ class PrimitiveEnclosure:
             axes=[lo+resolution*np.arange(int(n)) for lo,n in zip(low,dims)]
             self.points=np.stack(np.meshgrid(*axes,indexing='ij'),axis=-1).reshape(-1,3)
             self.tree=cKDTree(self.points); self.key=key
-        return low,high,dims.astype(int),resolution
-
-    def raster(self,q,travel,meta,margin=.020):
-        from audit_case001_motion_prior import frame_placements,collision_sdf
-        low,high,_,_=self.prepare_grid(meta)
         full=np.zeros(self.model.nq); full[self.qindices]=q
         placements=frame_placements(self.model,self.data,self.shapes,full)
         bounds=self.radii@travel; mask=np.zeros(len(self.points),dtype=bool); inside=True

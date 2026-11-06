@@ -10,9 +10,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'experiments/phase_e_static_baseline_20261030'
+PROFILE = json.loads((PACKAGE / 'demo/runtime.json').read_text())
 
 
 def run(command, **kwargs):
@@ -41,8 +43,13 @@ def check_environment(env):
             'x=torch.ones(7,device="cuda",requires_grad=True); '
             'torch.autograd.grad((x*x).sum(),x); torch.cuda.synchronize(); '
             'print(json.dumps(dict(torch=torch.__version__,gpu=torch.cuda.get_device_name(0))))')
-    visibility_code = ('import numpy,yaml,torch,rospkg,rospy; '
-                       'from urdf_parser_py.urdf import URDF; print("Visibility Python imports OK")')
+    visibility_code = ('import json,numpy,yaml,torch,rospkg,rospy; '
+                       'from urdf_parser_py.urdf import URDF; '
+                       'blas=numpy.__config__.CONFIG["Build Dependencies"]["blas"]["name"]; '
+                       'assert "mkl" in blas.lower(), "R1 requires the frozen MKL NumPy environment; run scripts/setup_runtime.sh"; '
+                       'assert numpy.__version__ == "2.2.5" and torch.__version__ == "2.11.0+cpu", "Use the pinned CPU visibility environment"; '
+                       'assert torch.get_num_threads() == 2; '
+                       'print(json.dumps(dict(visibility_env="OK",numpy=numpy.__version__,torch=torch.__version__,blas=blas,threads=torch.get_num_threads())))')
     for name, snippet in ((env['GPU_ENV'], code), (env['NCDF_ENV'], visibility_code)):
         run(['bash', '--noprofile', '--norc', '-c',
              'set -e; source "$1"; conda activate "$2"; exec python -c "$3"',
@@ -51,10 +58,13 @@ def check_environment(env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--scene', choices=('baseline', 'nonblocking_box', 'detour_box'), default='nonblocking_box')
+    parser.add_argument('--scene', choices=('baseline', 'nonblocking_box', 'detour_box'), default='detour_box')
+    parser.add_argument('--unknown-vbc', choices=('enforce', 'shadow'), default='enforce',
+                        help='enforce (default): require original VBC gates; shadow: constraint-removal ablation only, permits unobserved-space motion')
     parser.add_argument('--output', type=Path, help='New output directory; default outputs/demo_TIMESTAMP')
     parser.add_argument('--env', default='careplanner', help='Conda environment for inference')
-    parser.add_argument('--visibility-env', help='Optional separate CPU inference environment')
+    parser.add_argument('--visibility-env', default='careplanner_visibility', help='CPU/MKL R1 environment')
+    parser.add_argument('--seed', type=int, default=20263007, help='Gazebo noise seed; asynchronous timing can still vary')
     parser.add_argument('--build-only', action='store_true', help='Build without model assets or a GPU check')
     parser.add_argument('--preflight-only', action='store_true', help='Prepare/build/check without starting Gazebo')
     args = parser.parse_args()
@@ -72,10 +82,11 @@ def main():
         parser.error('Use checkout/output paths without whitespace or quote characters')
     if out.exists():
         parser.error('Choose a new output directory; existing runs are retained')
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1')
+    env = dict(os.environ, **PROFILE['environment'])
+    env.update(PYTHONDONTWRITEBYTECODE='1', PYTHONUNBUFFERED='1', CARE_SIM_SEED=str(args.seed))
     if not args.build_only:
         env.update(CONDA_SH=conda_setup(), GPU_ENV=args.env,
-                   NCDF_ENV=args.visibility_env or args.env)
+                   NCDF_ENV=args.visibility_env, VISIBILITY_ENV=args.visibility_env)
         if any(c in env['CONDA_SH'] for c in "'\n\r"):
             parser.error('The Conda setup path must not contain single quotes or newlines')
         check_environment(env)
@@ -97,9 +108,15 @@ def main():
     if args.build_only:
         print('BUILD COMPLETE: ' + str(out), flush=True)
         return
-    command = ['/usr/bin/python3', '-B', out / 'run.py', '--model', 'new', '--case', '007',
-               '--configuration', args.scene, '--tag', 'demo', '--handoff-retry', 'disabled',
-               '--view-selection', 'current', '--role', 'development']
+    command = ['/usr/bin/python3', '-B', out / 'run.py', '--case', '007',
+               '--configuration', args.scene, '--tag', 'demo', '--unknown-vbc', args.unknown_vbc]
+    for option, value in PROFILE['arguments'].items():
+        command.extend(['--' + option, str(value)])
+    # Prepared outputs may live outside the checkout; Git is used only for
+    # provenance in the legacy launch wrappers, never as a source dependency.
+    env['GIT_DIR'] = subprocess.check_output(
+        ['git', '-C', str(ROOT), 'rev-parse', '--absolute-git-dir'], text=True).strip()
+    env['GIT_WORK_TREE'] = str(ROOT)
     run(command + ['--preflight'], env=env)
     if not args.preflight_only:
         run(command, env=env)
@@ -107,4 +124,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    scratch = ROOT / '.runtime_tmp'
+    scratch.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+        os.environ.update(TMPDIR=temporary, TMP=temporary, TEMP=temporary,
+                          GPU_SOCKET=str(Path(temporary) / 'cdf.sock'))
+        if len(os.fsencode(os.environ['GPU_SOCKET'])) >= 108:
+            raise RuntimeError('Checkout path is too long for the local CDF Unix socket; use a shorter path.')
+        main()

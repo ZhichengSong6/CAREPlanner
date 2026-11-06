@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from cdf_monotonic_clock import validate_clock_records
 
 
 def analyze(audit_path, attestation_path):
@@ -13,6 +14,8 @@ def analyze(audit_path, attestation_path):
         rows = [json.loads(line) for line in stream]
     assert rows and rows[0]['event'] == 'session'
     session = rows[0]
+    if session.get('schema') == 2:
+        validate_clock_records(rows)
     assert session['attestation_sha256'] == hashlib.sha256(model_raw).hexdigest()
     assert session['pid'] == model['pid']
     assert session['domain_min_m'] == [-.8, -.8, 0.]

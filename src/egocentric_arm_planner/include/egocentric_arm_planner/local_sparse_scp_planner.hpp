@@ -1,7 +1,6 @@
 #pragma once
-#include "egocentric_arm_planner/task_observation_context.hpp"
-#include <egocentric_arm_planner/CandidateTransfer.h>
 #include "egocentric_arm_planner/fixed_start_clearance.hpp"
+#include "egocentric_arm_planner/known_ground_hold.hpp"
 
 #include <ros/ros.h>
 
@@ -28,7 +27,6 @@
 #include "egocentric_arm_planner/final_vbc_no_progress.hpp"
 #include "egocentric_arm_planner/vbc_failure_direction_memory.hpp"
 #include "egocentric_arm_planner/safe_frontier_recovery.hpp"
-#include "egocentric_arm_planner/task_recovery_policy.hpp"
 #include "egocentric_arm_planner/state_evidence_retry.hpp"
 #include "egocentric_arm_planner/execution_response_monitor.hpp"
 #include "egocentric_arm_planner/repair_candidate_failure.hpp"
@@ -38,6 +36,7 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <care_confidence_map/initial_shell_recovery.hpp>
 #include "egocentric_arm_planner/repair_executable_view.hpp"
+#include "egocentric_arm_planner/probe_executable_task.hpp"
 #include "egocentric_arm_planner/repair_executable_iterates.hpp"
 #include <trajectory_msgs/JointTrajectory.h>
 
@@ -64,6 +63,7 @@ public:
   bool initialize(const ros::NodeHandle& nh, const ros::NodeHandle& pnh);
 
 private:
+  friend struct KnownGroundFixture;
   struct DeadlineWaypoint {
     long long id = 0;
     double deadline_abs_s = 0.0;
@@ -89,6 +89,7 @@ private:
 
   struct SparseSolveResult {
     bool solved = false;
+    bool repair_unknown_soft = false;
     std::string status = "not_solved";
     int box_conflicting_cdf_rows = 0;
     int reachable_conflicting_cdf_rows = 0;
@@ -100,6 +101,7 @@ private:
     std::vector<PrimitiveObservationPoint> geometric_restore_path_guards;
     int primitive_conflicting_rows = 0;
     std::vector<Eigen::Vector3d> primitive_margin_recovery_points;
+    std::vector<Eigen::Vector3d> fixed_start_recovery_points;
     int reachable_conflicting_repair_witness_rows = 0;
     int first_step_conflicting_repair_witness_rows = 0;
     int later_conflicting_repair_witness_rows = 0;
@@ -127,6 +129,10 @@ private:
     int primitive_executable_rows = 0;
     int primitive_executable_samples = 0;
     bool primitive_executable_valid = true;
+    bool normal_curve_checked=false,normal_curve_valid=true,normal_live_checked=false,normal_live_valid=true;
+    double normal_curve_violation=0.,normal_live_violation=0.;
+    Eigen::VectorXd normal_live_q,normal_live_v;
+
     bool primitive_live_rebase_checked = false;
     bool primitive_live_rebase_required = false;
     Eigen::VectorXd primitive_live_rebase_start;
@@ -177,31 +183,6 @@ private:
   void repairPrefixSelectionCallback(const egocentric_arm_planner::RepairPrefixSelectionConstPtr& msg);
   bool prefixSelectionCompatible(const egocentric_arm_planner::RepairPrefixSelection& msg) const;
   bool prefixSelectionCurrentLocked(const egocentric_arm_planner::RepairPrefixSelection& msg) const;
-  bool task_context_enabled_=false;
-  TaskObservationContext task_context_;
-  std::string plan_task_context_;
-  bool require_bound_regime_=false,task_control_ready_=false;
-  bool require_bound_recovery_policy_=false;
-  TaskPlanningEventReceiver task_event_receiver_;
-  std::string task_regime_,plan_task_regime_,task_event_source_;
-  std::uint64_t task_control_until_=0,task_recovery_until_=0,task_replan_sequence_=0;
-  std::uint64_t task_status_sequence_=0,task_control_revision_=0;
-  std::string task_control_source_;
-  std::string task_control_target_sha_,task_recovery_target_sha_;
-  std::string plan_recovery_target_sha_,plan_recovery_policy_sha_;
-  TaskRecoveryPolicy task_recovery_policy_;
-  ros::Subscriber task_control_sub_,task_recovery_sub_;
-  ros::Publisher task_status_pub_;
-  void taskControlCallback(const std_msgs::StringConstPtr& msg);
-  void taskRecoveryCallback(const std_msgs::StringConstPtr& msg);
-  void publishTaskStatusLocked(const std::string& name,const std::string& text);
-  void acceptQpRetryLocked(const std::string& token);
-  CandidateTransferConstPtr pending_bound_reference_;
-  ros::Time pending_bound_reference_received_;
-  ros::Subscriber task_context_sub_,bound_reference_sub_;
-  void taskContextCallback(const std_msgs::StringConstPtr& msg);
-  void boundReferenceCallback(const CandidateTransferConstPtr& msg);
-  void acceptReferenceLocked(const trajectory_msgs::JointTrajectory& msg, bool bound);
   void referenceCallback(
       const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void taskReferenceStatusCallback(const std_msgs::StringConstPtr& msg);
@@ -287,6 +268,21 @@ private:
   void stopWorker();
   void workerLoop();
 
+  struct ViewPreviewSnapshot;
+  struct ViewLocalContext;
+  void alignedViewPreview(const std_msgs::StringConstPtr& message);
+  bool view_preview_aligned_enabled_=false;
+  std::mutex view_preview_request_mutex_;
+  std::shared_ptr<const ViewLocalContext> view_local_context_;
+  std::shared_ptr<const ViewLocalContext> view_pending_context_;
+  std::string view_pending_id_;
+  ros::WallTime view_pending_started_;
+  void viewPreviewCallback(const std_msgs::StringConstPtr& msg);
+  ros::Subscriber view_preview_sub_;
+  ros::Publisher view_preview_pub_;
+  care_collision_cdf::CollisionCDFConstraintBatchConstPtr view_preview_batch_;
+  ros::Time view_preview_batch_received_;
+
   SparseSolveResult solveSparseSubproblem(
       const care_collision_cdf::CollisionCDFConstraintBatch& batch,
       const Eigen::MatrixXd& q_bar,
@@ -306,7 +302,8 @@ private:
       double executable_step_scale = 1.,
       bool executable_recheck_only = false,
       const egocentric_arm_planner::RepairPrefixSelection* selected_prefix = nullptr,
-      bool free_joint_task = false) const;
+      bool free_joint_task = false,
+      const ViewPreviewSnapshot* preview = nullptr, ViewPreviewSnapshot* capture = nullptr) const;
   bool freeJointTaskImproves(const SparseSolveResult& primary,
       const SparseSolveResult& trial, const std::vector<DeadlineWaypoint>& schedule,
       const FrontierObjective& frontier, const Eigen::MatrixXd& q_ref) const;
@@ -329,7 +326,8 @@ private:
       const Eigen::MatrixXd& query_q, const Eigen::MatrixXd& query_u,
       const std::vector<Eigen::Vector3d>& normal_blocking_unknown_points,
       const std::vector<Eigen::Vector3d>& geometric_restore_points = {},
-      bool margin_recovery = false);
+      bool margin_recovery = false,
+      const std::vector<Eigen::Vector3d>& fixed_start_recovery_points = {});
   bool publishLocalGcdfRecoveryEvidence(
       const care_collision_cdf::CollisionCDFConstraintBatch& batch,
       const SparseSolveResult& result,
@@ -375,6 +373,8 @@ private:
   ros::Subscriber smooth_replan_request_sub_;
   ros::Subscriber terminal_goal_sub_,terminal_audit_sub_,terminal_commit_sub_;
   bool terminal_retention_enabled_=false,terminal_goal_valid_=false;
+  bool repair_goal_stopping_enabled_=false;
+  unsigned long long repair_goal_handoff_execution_=0;
   NormalTerminalRetention terminal_retention_;
   std::string plan_terminal_context_;
   Eigen::Isometry3d terminal_goal_=Eigen::Isometry3d::Identity();
@@ -407,9 +407,28 @@ private:
   bool requestQpReplacementLocked(const std::string& reason,
       unsigned long long rejected_raw = 0, unsigned long long rejected_audit = 0);
   bool qpReplacementRetryCurrentLocked() const;
-  std::string finishReplacementLocked(bool refresh_failed_target, const std::string& reason);
+  std::string finishReplacementLocked(bool refresh_failed_target, const std::string& reason,
+                                      bool unapplied_resource = false);
   RepairCandidateFailure repair_candidate_failure_;
   FixedStartClearanceHold fixed_start_clearance_hold_;
+  KnownGroundHold known_ground_hold_;
+  unsigned long long ground_retry_goal_=0;
+  unsigned ground_resource_retries_=0;
+  bool task_first_research_=false;
+  bool executable_task_research_=false;
+  bool ground_resource_blocked_=false;
+  std::string geometry_resource_blocked_reason_="ground_proof_unavailable_hold";
+  std::string groundContextLocked() const;
+  void checkKnownGroundHoldLocked();
+  struct GroundAdmission {
+    CandidateTransfer planned;
+    unsigned long long goal=0,epoch=0;
+    bool repair=false,probe=false;
+    std::string context;
+    ros::WallTime deadline;
+  };
+  std::map<unsigned long long,GroundAdmission> ground_admission_;
+
   RepairCandidateFailure candidate_replacement_reserved_failure_;
   RepairCandidateFailure candidate_replacement_retry_context_;
   bool candidate_replacement_reserved_qp_ = false;
@@ -418,6 +437,8 @@ private:
   std::string candidate_replacement_trigger_reason_ = "final_vbc_repeat";
   std::string candidate_replacement_trigger_observation_token_;
   bool candidate_replacement_enabled_ = false;
+  bool candidate_replacement_execution_v2_ = false;
+  SafeFrontierRecovery::ReplacementCharge candidate_replacement_charge_;
   bool candidate_replacement_pending_ = false;
   bool candidate_replacement_trigger_pending_ = false;
   bool candidate_replacement_trigger_direction_advanced_ = false;
@@ -544,6 +565,7 @@ private:
   // execution stamp rather than relying on a potentially dropped complete=0
   // sample between two fast executions.
   unsigned long long latest_execution_stamp_ns_ = 0;
+  unsigned long long last_stopped_replan_stamp_ns_ = 0, stopped_execution_replan_count_ = 0;
   unsigned long long last_repair_completed_execution_stamp_ns_ = 0;
   unsigned long long repair_completion_replan_count_ = 0;
   unsigned long long repair_completion_duplicate_count_ = 0;
@@ -615,6 +637,7 @@ private:
   bool plan_normal_reseed_used_ = false;
   RepairConflictReseed plan_repair_conflict_reseed_;
   RepairExecutableIterates plan_executable_iterates_;
+  Eigen::MatrixXd plan_normal_retained_q_,plan_normal_retained_u_;
   std::atomic<int> repair_hard_qp_snapshots_written_{0};
   // One replayable failed hard QP before and after a live obligation appears.
   mutable std::atomic<bool> normal_qp_snapshot_unowned_written_{false};
@@ -644,6 +667,36 @@ private:
     bool has_primitive_guard = false;
     PrimitiveObservationPoint primitive_guard;
   };
+  unsigned long long native_snapshot_probe_seq_=0,native_snapshot_normal_seq_=0;
+  int native_snapshot_count_=0;
+  bool native_snapshot_observation_seen_=false;
+  struct ViewPreviewSnapshot {
+    bool native_task_replay=false,normal_live_fresh=false,primitive_live_fresh=false;
+    Eigen::VectorXd normal_live_q,normal_live_v,primitive_live_q,primitive_live_v;
+    std::string native_matrix_json;
+    std::vector<RepairWitness> witnesses;
+    std::vector<PrimitiveObservationPoint> path_guards;
+    std::vector<Eigen::Vector3d> points;
+    Eigen::Isometry3d goal = Eigen::Isometry3d::Identity();
+    bool goal_valid = false;
+    care_confidence_map::InitialShellRecovery shell;
+    std::shared_ptr<PrimitiveObservationGuard> guard;
+  };
+  struct ViewLocalContext {
+    care_collision_cdf::CollisionCDFConstraintBatch batch;
+    Eigen::MatrixXd q_bar,u_bar,q_ref,u_ref;
+    Eigen::VectorXd previous,measured;
+    std::vector<Eigen::Vector3d> obligation_points;
+    RepairPrefixSelection prefix;
+    ViewPreviewSnapshot snapshot;
+    double trust=0.,slack=0.,step_scale=1.;
+    int iteration=0;
+    bool repair=false;
+    unsigned long long epoch=0,plan_sequence=0,goal_revision=0;
+    std::string owner,region;
+    ros::Time measured_stamp;
+    ros::WallTime wall;
+  };
   std::vector<RepairWitness> repair_unknown_witnesses_;
   bool primitive_observation_guard_enabled_ = false;
   bool unknown_corridor_guard_enabled_ = true;
@@ -652,9 +705,12 @@ private:
   std::string restore_path_guard_scope_;
   std::vector<PrimitiveObservationPoint> restore_path_guard_points_;
   bool initial_shell_recovery_enabled_ = false;
+  bool fixed_start_recovery_enabled_ = false;
   double initial_shell_execution_margin_m_ = 0.;
   mutable care_confidence_map::InitialShellRecovery initial_shell_recovery_;
   bool repair_executable_view_enabled_ = false;
+  bool probe_task_objective_enabled_ = false;
+  ProbeTaskSettings probe_task_settings_;
   RepairExecutableSettings repair_executable_settings_;
   bool repair_prefix_binding_enabled_ = false;
   ros::Subscriber repair_prefix_selection_sub_;

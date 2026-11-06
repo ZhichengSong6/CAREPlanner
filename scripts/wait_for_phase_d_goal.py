@@ -14,6 +14,7 @@ import os
 import time
 
 import numpy as np
+from cdf_monotonic_clock import annotate_status
 import rospy
 from sensor_msgs.msg import JointState
 from urdf_parser_py.urdf import URDF
@@ -54,7 +55,7 @@ def write_status(path, payload):
         return
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
-        json.dump(payload, f, indent=2)
+        json.dump(annotate_status(payload), f, indent=2)
 
 
 def main():
@@ -137,6 +138,8 @@ def main():
         window['qp_retry_readiness'] = arm_pub.care_qp_retry_readiness
     if arm_pub is not None and hasattr(arm_pub, 'care_observation_readiness'):
         window['observation_readiness'] = arm_pub.care_observation_readiness
+    if arm_pub is not None and hasattr(arm_pub, 'care_critical_recorder_readiness'):
+        window['critical_recorder_readiness'] = arm_pub.care_critical_recorder_readiness
     previous_stamp = None
     inside_since_ros_ns = None
     success_hold_start_ns = None
@@ -162,7 +165,15 @@ def main():
         )
     )
 
+    scene_guard_abort = None
+    from scene_guard_status import read as read_scene_guard
     while not rospy.is_shutdown():
+        scene_guard_state = read_scene_guard()
+        scene_guard_abort = scene_guard_state.get('abort')
+        if window['first_measured_q'] is not None and not scene_guard_state.get('ready'):
+            scene_guard_abort = scene_guard_abort or dict(reason='contact_guard_lost_readiness')
+        if scene_guard_abort:
+            break
         wall_elapsed = time.monotonic() - wall_start
         remaining = args.timeout_s - wall_elapsed
         if remaining <= 0.0:
@@ -221,6 +232,10 @@ def main():
                 window["first_sample_ros_s"] = now_ros
                 window["first_sample_ros_ns"] = now_ros_ns
                 if arm_pub is not None:
+                    guard_state = read_scene_guard()
+                    if not guard_state.get('ready'):
+                        scene_guard_abort = guard_state.get('abort') or dict(reason='guard_not_ready_before_arm')
+                        break
                     # Capture measured q BEFORE the broker sends the first goal.
                     # Planning/gate wait is inside the unchanged task budget.
                     wall_start = time.monotonic()
@@ -228,7 +243,6 @@ def main():
                     window["watchdog_start_wall_unix_s"] = time.time()
                     window["arm_token"] = args.arm_token
                     if os.environ.get('CARE_TASK_WINDOW_FILE'):
-                        from pathlib import Path
                         import sys
                         sys.path.insert(0, os.path.join(repo, 'src/care_visibility_cdf/scripts'))
                         from observation_research_trace import publish_task_window
@@ -334,9 +348,13 @@ def main():
     # close to the hard watchdog limit. Settling never extends task metrics.
     goal_reached = success_wall_s is not None
     reason = "goal_tolerance_stable" if goal_reached else "max_timeout"
+    if scene_guard_abort:
+        reason = 'static_scene_guard_abort'
+        window['terminated_early_by_scene_guard'] = True
     status = {
         "goal_reached": bool(goal_reached),
         "reason": reason,
+        "scene_guard_abort": scene_guard_abort,
         "elapsed_wall_s": elapsed,
         "success_elapsed_wall_s": success_wall_s,
         "max_timeout_s": args.timeout_s,

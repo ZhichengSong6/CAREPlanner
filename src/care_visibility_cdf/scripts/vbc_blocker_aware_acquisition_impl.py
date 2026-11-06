@@ -43,19 +43,90 @@ from observation_identity import observation_target_state, restore_observation_t
 from bounded_visibility_recovery import VisibilityRecoveryBudget, region_key, certified_distinct_q
 from candidate_replacement_runtime import attach_candidate_replacement
 from pending_vbc_blockers import PendingVbcBlockers
-from stopping_observation_demands import inherit_stopping_request
+from pending_observation_relevance import PendingObservationRelevance, attach_pending_relevance
 from rolling_visibility_guidance import RollingVisibilityGuidance
+
+
+def near_prefix_regions(regions, evidence, owners, cell_key):
+    """Partition proposal work, retaining every original point and live owner.
+
+    Only the exact VBC packet's original trajectory interval orders new work.
+    This does not certify a prefix or mark a deferred point observed. Existing
+    owned points stay together; unrelated/delayed evidence keeps original work.
+    """
+    timing = {}
+    for v in (evidence or {}).get('violations', []):
+        try:
+            key = cell_key(np.asarray(v['point'], dtype=float))
+            k = int(v['sweep_original_k'])
+            t = float(v['sweep_s'])
+            if k < 0 or float(v['sweep_original_k']) != k or not math.isfinite(t) or t < 0:
+                continue
+            timing[key] = min(timing.get(key, (k, t)), (k, t))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+    ownership = sorted(owners, key=lambda ob: (len(ob['points']), int(ob['id'])))
+    result, decisions = [], []
+    for region in regions:
+        points = np.asarray(region['points'], dtype=float).reshape(-1, 3)
+        original = {cell_key(p): p.copy() for p in points}
+        remaining = dict(original)
+        groups = []
+        # Preserve already established identities even if the next packet's
+        # spatial clustering joins several temporal subregions back together.
+        for owner in ownership:
+            selected = set(remaining).intersection(cell_key(p) for p in owner['points'])
+            if selected:
+                groups.append((selected, bool(owner.get('near_prefix_partition')), 'existing_owner'))
+                for key in selected:
+                    remaining.pop(key)
+        keys = set(remaining)
+        if len(keys) > 1 and keys.issubset(timing):
+            first = min(timing[key][0] for key in keys)
+            focus = {key for key in keys if timing[key][0] == first}
+            later = keys - focus
+            if later:
+                groups.extend([(focus, True, 'earliest_interval'), (later, True, 'later_intervals')])
+                decisions.append(dict(original_points=points.tolist(),
+                    earliest_original_interval=first,
+                    focus_points=[original[k].tolist() for k in sorted(focus)],
+                    deferred_points=[original[k].tolist() for k in sorted(later)],
+                    all_points_retained=True, observation_completed=False, motion_authorized=False))
+            else:
+                groups.append((keys, False, 'same_interval'))
+        elif keys:
+            groups.append((keys, False, 'unbound_or_single'))
+        covered=set()
+        for keys, partition, why in groups:
+            assert not covered.intersection(keys)
+            covered.update(keys)
+            # Unchanged spatial work preserves every inherited metadata field.
+            row = dict(region)
+            pts = np.asarray([original[k] for k in sorted(keys)], dtype=float)
+            row.update(points=pts, keys=tuple(sorted(keys)), centroid=np.mean(pts, axis=0))
+            if partition:
+                row['near_prefix_partition'] = True
+            row['near_prefix_group_reason'] = why
+            result.append(row)
+        assert covered == set(original)
+    return result, decisions
 
 
 class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypointNode):
     def __init__(self) -> None:
         self._c49_ready = False
+        self._external_occlusion = None
+        self._pending_relevance_enabled = os.environ.get(
+            'CARE_PENDING_RELEVANCE_ENABLED', 'false').lower() in ('1', 'true', 'yes')
+        self._pending_relevance = PendingObservationRelevance()
 
         # C5.26: candidate VBC active-set geometry and sweep time are consumed
         # as one coherent message. Legacy split active-set/sweep topics remain
         # subscribed for diagnostics, but they do not own obligation lifetime.
         self._coherent_bundle_enabled = True
         self._coherent_bundle_lock = threading.Lock()
+        self._near_prefix_evidence = OrderedDict()
+        self._near_prefix_last_trace = None
         self._coherent_bundle_seq = 0
         # Candidate and execution-audit selectors each start their publisher
         # sequence at one.  Keep a local monotonically increasing generation
@@ -376,6 +447,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # recovery blocker and is handled immediately, while ordinary
         # candidate VBC discoveries retain the bounded queue/confirmation
         # policy above.
+        if os.environ.get('CARE_TERMINAL_CANDIDATE_DISCOVERY') == 'true':
+            self.active_set_bundle_topic = '/care_planner/terminal_candidate_vbc_bundle'
         self.execution_active_set_bundle_topic = str(rospy.get_param(
             "~execution_active_set_bundle_topic", "")).strip()
         self.gcdf_recovery_trajectory_topic = str(rospy.get_param(
@@ -485,6 +558,22 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 '/care_planner/local_planner/observation_dependency', String,
                 self._observation_dependency_cb, queue_size=8)
         self._candidate_replacement = attach_candidate_replacement(self)
+        if self._pending_relevance_enabled:
+            attach_pending_relevance(self)
+        from occlusion_reroute_runtime import attach_occlusion_reroute
+        self._external_occlusion = attach_occlusion_reroute(self)
+        if self._external_occlusion is not None:
+            self._per_sensor_runtime.external_occlusion_check = self._external_occlusion.candidate_check
+        self._activation_refresh = None
+        activation_mode = str(rospy.get_param('~activation_refresh_mode',
+            os.environ.get('CARE_ACTIVATION_REFRESH', 'off')))
+        if activation_mode != 'off':
+            from observation_activation_refresh import ActivationRefresh
+            self._activation_refresh = ActivationRefresh(self, mode=activation_mode)
+        self._rolling_task = None
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+            from rolling_task_observation import RollingTaskObservation
+            self._rolling_task = RollingTaskObservation(self)
         self._c49_ready = True
         self._prune_or_initialize_stack()
         self._publish_schedule()
@@ -497,6 +586,26 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self.progressive_shared_path_association_only,
             self.active_set_bundle_topic,
             self.execution_active_set_bundle_topic or "disabled")
+
+    def _candidate_vbc_summary_callback(self, msg: String) -> None:
+        super()._candidate_vbc_summary_callback(msg)
+        if msg is None:
+            return
+        fields = dict(self._tokenize_summary(str(msg.data)))
+        if fields.get('trajectory_source') != 'predicted':
+            return
+        try:
+            record = json.loads(fields.get('vbc_evidence', 'null'))
+            identity = (str(int(record['trajectory_stamp_ns'])), int(record['bundle_seq']))
+            if identity[1] <= 0 or int(identity[0]) <= 0 or not isinstance(record['violations'], list):
+                return
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        with self._coherent_bundle_lock:
+            self._near_prefix_evidence[identity] = record
+            self._near_prefix_evidence.move_to_end(identity)
+            while len(self._near_prefix_evidence) > 64:
+                self._near_prefix_evidence.popitem(last=False)
 
     def _active_set_callback(self, msg: Float64MultiArray) -> None:
         """Ignore the legacy split active-set stream in C5.26 blocker mode.
@@ -582,9 +691,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._coherent_bundle_sweep_s = (
                 float(sweep) if canonical.shape[0] else math.nan)
             self._coherent_bundle_points = canonical
+            if source == 'execution':
+                self._pending_relevance.execution_blocked = bool(canonical.shape[0])
             if canonical.shape[0]:
                 outcome = self._pending_vbc_blockers.add(dict(
                     generation=generation, source=source, source_seq=seq,
+                    task_revision=self._pending_relevance.revision,
                     identity=self._trace_coherent_bundle_identity,
                     points=canonical.copy(), sweep=float(sweep)))
                 if outcome == 'capacity_hold':
@@ -617,11 +729,38 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._coherent_bundle_lock:
             return self._pending_vbc_blockers.contains(audit_stamp, points)
 
+    def _retire_irrelevant_pending_locked(self, work, phase):
+        # Caller holds coherent_bundle_lock: task/commit/tracker callbacks cannot
+        # change the relevance decision before the subsequent result insertion.
+        if not self._pending_relevance_enabled or work is None:
+            return False
+        now = rospy.Time.now().to_sec()
+        measured, stamp = getattr(self, '_trace_measured', (None, math.nan))
+        inside = (measured is not None and math.isfinite(stamp) and 0 <= now-stamp <= .1 and
+                  self._pending_relevance_pose_inside(measured))
+        live = bool(self._obligations) or any(r['source'] == 'execution'
+            for r in self._pending_vbc_blockers.records.values())
+        decision, reason = self._pending_relevance.decide(work, now, inside, live)
+        if decision != 'obsolete':
+            return False
+        retired = self._pending_vbc_blockers.retire_obsolete(work['generation'])
+        self._coherent_bundle_pending_nonempty = self._pending_vbc_blockers.pending
+        if retired:
+            self._trace_observation('pending_work_obsolete', phase=phase, reason=reason,
+                generation=work['generation'], source=work['source'],
+                vbc_identity=work['identity'], task_revision=work.get('task_revision'),
+                current_execution_stamp_ns=self._pending_relevance.newest_commit,
+                actual_observation_completed=False)
+        return retired
+
     def _set_acquisition_completion(self, complete):
         # Keep the final publication atomic with admission of new blocker work.
         # Confidence queries remain outside this short lock.
         with self._coherent_bundle_lock:
             complete = bool(complete and not self._pending_vbc_blockers.pending)
+            # Deferred work is not an actual observation success.
+            if self._external_occlusion is not None and self._external_occlusion.deferred:
+                complete = False
             self._acquisition_complete = complete
             self.acquisition_complete_pub.publish(Bool(data=complete))
 
@@ -798,6 +937,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                     sweep_s,
                     trajectory_received,
                     "gcdf_rejected")
+                new_ob['obligation_bundle_source'] = 'candidate'
+                new_ob['obligation_candidate_stamp_ns'] = trajectory.header.stamp.to_nsec()
             except Exception as exc:
                 self._schedule_generation_failures += 1
                 all_regions_handled = False
@@ -1468,8 +1609,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 child = self._generate_new_obligation(
                     region, trajectory, float(sweep_s),
                     trajectory_received, trajectory_source)
-                if by_id[int(region['parent_obligation_id'])].get('stopping_prefix_request'):
-                    inherit_stopping_request(by_id[int(region['parent_obligation_id'])],child)
                 children.append(child)
         except Exception as exc:
             self._adaptive_refinement_failure_count += 1
@@ -1574,6 +1713,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         check. New points require the published/pinned sensor proposal's
         physical FOV/LOS, or the legacy scalar visibility condition.
         """
+        # A temporal partition must not immediately absorb its deferred sibling
+        # merely because their spatial centroids are close. Exact ownership is
+        # handled by _match_existing before this proposal-compatibility check.
+        if (ob.get('near_prefix_partition') or region.get('near_prefix_partition')) and not set(region_key(region['points'])).issubset(
+                set(region_key(ob['points']))):
+            return False
         self._qvis_match_check_count += 1
         oid = int(ob.get("id", -1))
         self._qvis_match_last_obligation_id = oid
@@ -1843,21 +1988,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return False
         return any(int(oid) in earliest for oid in stack[:-1])
 
-    def _compute_visibility_frontier(self, selected_obligations=None):
+    def _compute_visibility_frontier(self):
         if not self.frontier_steering_enabled:
             return None
 
         with self._obligation_lock:
-            copied = [dict(ob) for ob in (self._obligations if selected_obligations is None else selected_obligations)]
+            copied = [dict(ob) for ob in self._obligations]
             stack = [
                 int(oid) for oid in self._repair_stack
-                if any(int(ob["id"]) == int(oid) for ob in copied)
+                if any(int(ob["id"]) == int(oid) for ob in self._obligations)
             ]
         by_id = {int(ob["id"]): ob for ob in copied}
         if not by_id:
             return None
-        active_id = (int(selected_obligations[0]['id']) if selected_obligations else
-                     (stack[-1] if stack else min(by_id)))
+        active_id = stack[-1] if stack else min(by_id)
         allowed_ids = self._shared_path_candidate_ids(by_id, active_id)
         copied = [ob for ob in copied if int(ob["id"]) in allowed_ids]
         by_id = {int(ob["id"]): ob for ob in copied}
@@ -1948,9 +2092,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 stack, self._last_active_layer_ids)
             result = {
                 "active": True,
-                "q_eval": measured.copy(),
-                "measured_stamp": measured_snapshot[1] if measured_snapshot[0] is not None and
-                    np.array_equal(measured_snapshot[0], measured) else math.nan,
                 "target": target,
                 "q_vis_joint_mask": joint_mask.copy(),
                 "frontier_weight_scale": 1.0,
@@ -2129,17 +2270,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             if cycle_active else "base_softmin_frontier")
         result = {
             "active": True,
-            "q_eval": measured.copy(),
-            "measured_stamp": measured_snapshot[1] if measured_snapshot[0] is not None and
-                np.array_equal(measured_snapshot[0], measured) else math.nan,
             "target": target,
             "frontier_weight_scale": float(frontier_weight_scale),
             "qvis_weight_scale": float(qvis_weight_scale),
             "cycle_active": bool(cycle_active),
             "mode": mode,
-            "observation_token": observation_token(by_id[active_id]),
-            "region_token": observation_region_token(by_id[active_id]),
-            "q_vis_joint_mask": np.asarray(by_id[active_id].get('q_vis_joint_mask',[1.]*7),dtype=np.float64).copy(),
             "considered_ids": list(valid_ids),
             "f_values": {
                 int(oid): float(fv)
@@ -2168,11 +2303,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._frontier_last_cycle_active = bool(cycle_active)
         return result
 
-    def _publish_visibility_frontier(self, result=None, computed=False) -> None:
+    def _publish_visibility_frontier(self) -> None:
         if not hasattr(self, "frontier_target_pub"):
             return
-        if not computed:
-            result = self._compute_visibility_frontier()
+        result = self._compute_visibility_frontier()
         with self._frontier_lock:
             self._frontier_last_observation_token = (
                 "none" if result is None else
@@ -2498,11 +2632,6 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._progressive_shared_last_slacks = {}
 
         first = dict(by_id[active_id])
-        if getattr(self, '_require_task_binding', False):
-            # Shared/pinned q_vis is a derived selection, not necessarily the
-            # stored individual pose. Retain its source for the late recheck.
-            first['_task_storage_target'] = self._task_target(by_id[active_id])
-            first['_task_storage_stack'] = list(stack)
         if pinned:
             stored_mask = first.get('q_vis_joint_mask', [1.] * 7)
             stored_mask_explicit = 'q_vis_joint_mask' in first
@@ -2883,6 +3012,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 with self._progressive_shared_lock:
                     child = self._generate_new_obligation(
                         region, trajectory, .1, received, 'unknown_constraint_dependency')
+                    child['obligation_bundle_source'] = parent.get('obligation_bundle_source','legacy')
+                    child['obligation_candidate_stamp_ns'] = int(event['query_stamp_ns'])
             except Exception as exc:
                 self._dependency_reason = 'dependency_generation_failed'
                 rospy.logwarn('observation dependency generation failed: %s', exc)
@@ -3227,6 +3358,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if self._coherent_bundle_enabled:
             with self._coherent_bundle_lock:
                 work = self._pending_vbc_blockers.peek()
+                if (work is not None and self._external_occlusion is not None and
+                        self._external_occlusion.superseded(work['source'],work['identity'])):
+                    self._pending_vbc_blockers.retire_obsolete(work['generation'])
+                    self._coherent_bundle_pending_nonempty=self._pending_vbc_blockers.pending
+                    self._trace_observation('pending_work_obsolete',phase='before_generation',
+                        reason='accepted_task_prefix',vbc_identity=work['identity'],
+                        actual_observation_completed=False)
+                    return
+                if self._retire_irrelevant_pending_locked(work, 'before_generation'):
+                    self._last_process_reason = 'obsolete_candidate_discovery'
+                    return
                 if work is None and self._pending_vbc_blockers.overflow:
                     self._last_process_reason = 'pending_blocker_capacity_hold'
                     return
@@ -3285,12 +3427,44 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             return
 
         regions = self._cluster_regions(raw)
+        if bundle_source == 'candidate' and trace_identity is not None:
+            identity = (trace_identity['trajectory_stamp_ns'], trace_identity['bundle_seq'])
+            with self._coherent_bundle_lock:
+                evidence = self._near_prefix_evidence.get(identity)
+            with self._obligation_lock:
+                owners = [dict(ob) for ob in self._obligations]
+            regions, decisions = near_prefix_regions(regions, evidence, owners, self._cell_key)
+            if decisions and identity != self._near_prefix_last_trace:
+                self._near_prefix_last_trace = identity
+                self._trace_observation('near_prefix_partition', vbc_identity=trace_identity,
+                    decisions=decisions, all_points_retained=True,
+                    observation_completed=False, motion_authorized=False)
         trace_routes = []
         trace_stack_before = list(self._repair_stack)
         active_ids: List[int] = []
         new_ids: List[int] = []
         all_regions_handled = True
         for region in regions:
+            # A partially materialized inbox can outlive its first obligation.
+            # That obligation may already have been observed and removed. A
+            # fresh map query prevents recreating it on every pass and starving
+            # later regions in the SAME packet. Never infer completion from
+            # absence in the obligation list, a generated view, or LOS alone.
+            if os.environ.get('CARE_REPAIR_UNKNOWN_SOFT','false') == 'true':
+                seen_result = self._query_region_seen(region)
+                seen_diag = seen_result[-1]
+                point_seen = seen_diag.get('point_seen', [])
+                if (seen_diag.get('status') == 'ok' and
+                        len(point_seen) == len(region['points']) and point_seen and
+                        all(point_seen)):
+                    trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None,
+                        route='already_observed_current_map', actual_observation_completed=True))
+                    continue
+            if (self._external_occlusion is not None and
+                    self._external_occlusion.suppress_region(region, bundle_source, trace_identity)):
+                trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None,
+                    route='deferred_external_occlusion', actual_observation_completed=False))
+                continue
             routed = self._absorb_refined_partition_region(
                 region, trajectory, float(sweep),
                 trajectory_received, trajectory_source)
@@ -3308,6 +3482,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 if matched is not None:
                     self._update_matched_geometry_diagnostics(
                         matched, region, "candidate_vbc_active_set")
+                    matched['obligation_candidate_stamp_ns'] = max(
+                        matched.get('obligation_candidate_stamp_ns',0),
+                        int((trace_identity or {}).get('trajectory_stamp_ns',0)))
+                    if bundle_source == 'execution':
+                        matched['obligation_bundle_source'] = 'execution'
                     oid = int(matched["id"])
                     trace_routes.append(dict(points=region['points'].tolist(), obligation_id=oid, route='matched_existing'))
                     active_ids.append(oid)
@@ -3320,10 +3499,27 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                         1.0, "[vbc_blocker_stack] max_obligations=%d reached",
                         self.max_obligations)
                     continue
+            broker=self._external_occlusion
+            generation_revision=broker.goal_revision if broker is not None else None
             try:
-                new_ob = self._generate_new_obligation(
-                    region, trajectory, float(sweep), trajectory_received,
-                    trajectory_source)
+                new_ob=(broker.restore_result(region,bundle_source,trace_identity,
+                    float(sweep),trajectory_source) if broker is not None else None)
+                restored=new_ob is not None
+                if new_ob is None:
+                    new_ob = self._generate_new_obligation(
+                        region, trajectory, float(sweep), trajectory_received,
+                        trajectory_source)
+                if region.get('near_prefix_partition'):
+                    new_ob['near_prefix_partition'] = True
+                if broker is not None:
+                    broker.save_result(new_ob,'reused' if restored else 'generation_completed',generation_revision)
+                    if broker.reuse_enabled and generation_revision!=broker.goal_revision:
+                        self._last_process_reason='task_changed_during_generation'
+                        return
+                    if broker.superseded(bundle_source,trace_identity):
+                        trace_routes.append(dict(points=region['points'].tolist(),
+                            obligation_id=int(new_ob['id']),route='saved_superseded_result'))
+                        continue
             except Exception as exc:
                 self._schedule_generation_failures += 1
                 all_regions_handled = False
@@ -3331,21 +3527,46 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 rospy.logerr(
                     "[vbc_blocker_stack] obligation generation failed; retrying: %s", exc)
                 continue
-            with self._obligation_lock:
-                matched = self._match_existing(region)
-                if matched is None and len(self._obligations) < self.max_obligations:
-                    self._obligations.append(new_ob)
-                    self._schedule_new_obligations += 1
-                    oid = int(new_ob["id"])
-                    trace_routes.append(dict(points=region['points'].tolist(), obligation_id=oid, route='generated'))
-                    active_ids.append(oid)
-                    new_ids.append(oid)
-                elif matched is not None:
-                    active_ids.append(int(matched["id"]))
-                    trace_routes.append(dict(points=region['points'].tolist(), obligation_id=int(matched['id']), route='matched_after_generation'))
-                else:
-                    all_regions_handled = False
-                    trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None, route='capacity_after_generation'))
+            with self._coherent_bundle_lock:
+                if self._coherent_bundle_enabled and self._retire_irrelevant_pending_locked(work, 'after_generation'):
+                    self._last_process_reason = 'obsolete_candidate_result'
+                    return
+                with self._obligation_lock:
+                    matched = self._match_existing(region)
+                    if matched is None and len(self._obligations) < self.max_obligations:
+                        new_ob['obligation_bundle_source'] = bundle_source
+                        new_ob['obligation_candidate_stamp_ns'] = int((trace_identity or {}).get('trajectory_stamp_ns',0))
+                        self._obligations.append(new_ob)
+                        self._schedule_new_obligations += 1
+                        oid = int(new_ob["id"])
+                        if new_ob.get('near_prefix_partition'):
+                            self._trace_observation('near_prefix_materialized',
+                                vbc_identity=trace_identity, obligation_id=oid,
+                                generation_event_id=new_ob['generation_event_id'],
+                                observation_token=observation_token(new_ob),
+                                points=np.asarray(new_ob['points']).tolist(),
+                                group_reason=region.get('near_prefix_group_reason'),
+                                observation_completed=False, motion_authorized=False)
+                        trace_routes.append(dict(points=region['points'].tolist(), obligation_id=oid, route='reused_result' if restored else 'generated'))
+                        active_ids.append(oid)
+                        new_ids.append(oid)
+                    elif matched is not None:
+                        active_ids.append(int(matched["id"]))
+                        trace_routes.append(dict(points=region['points'].tolist(), obligation_id=int(matched['id']), route='matched_after_generation'))
+                    else:
+                        all_regions_handled = False
+                        trace_routes.append(dict(points=region['points'].tolist(), obligation_id=None, route='capacity_after_generation'))
+
+            # In the online rerouting variant, publish the first materialized
+            # view before solving the rest of a multi-region batch. The inbox
+            # is NOT acknowledged until every region is handled. The next
+            # pass matches this obligation and continues with pending regions,
+            # or retires obsolete candidate work after actual route progress.
+            if (self._external_occlusion is not None and new_ids and
+                    len(trace_routes) < len(regions)):
+                all_regions_handled = False
+                trace_routes.append(dict(route='remaining_regions_pending'))
+                break
 
         if all_regions_handled:
             with self._obligation_lock:
@@ -3360,7 +3581,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._process_success_count += 1
             self._last_process_reason = "handled"
         else:
-            self._last_process_reason = "generation_failed"
+            self._last_process_reason = ("first_view_published_remaining_pending"
+                if self._external_occlusion is not None and new_ids else "generation_failed")
         self._prune_or_initialize_stack()
         self._consider_active_layer(
             active_ids, new_ids, float(sweep),
@@ -3404,23 +3626,29 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # not be misread as "everything has been seen".
         # Continue querying/removing actually seen obligations even when the
         # inbox is full. _set_acquisition_completion keeps pending work false.
+        if self._external_occlusion is not None:
+            self._external_occlusion.process_obligations()
         super()._update_actual_visibility_completion()
         self._prune_or_initialize_stack()
         self._publish_schedule()
         self._publish_blocker_stack_summary()
 
+    def _activation_ros_now(self):
+        return rospy.Time.now().to_sec()
+
+    def _activation_union_min(self, points, q):
+        x = torch.as_tensor(np.asarray(points).reshape(-1, 3), device=self.device, dtype=torch.float32)
+        goal = torch.as_tensor(np.asarray(q).reshape(1, 7), device=self.device, dtype=torch.float32)
+        return float(np.min(self._per_point_values(x, goal)))
+
     def _publish_schedule(self) -> None:
-        with self._schedule_publish_lock:
-            super()._publish_schedule()
-            if getattr(self, "_c49_ready", False):
-                if getattr(self, '_require_task_binding', False):
-                    selection = self._task_selected_obligations
-                    frontier = self._compute_visibility_frontier(selected_obligations=selection)
-                    self._publish_visibility_frontier(frontier, computed=True)
-                    self._publish_task_recovery_snapshot(obligations=selection, frontier=frontier)
-                else:
-                    self._publish_visibility_frontier()
-                self._publish_blocker_stack_summary()
+        refresh = getattr(self, '_activation_refresh', None)
+        if getattr(self, '_c49_ready', False) and refresh is not None:
+            refresh.before_publish()
+        super()._publish_schedule()
+        if getattr(self, "_c49_ready", False):
+            self._publish_visibility_frontier()
+            self._publish_blocker_stack_summary()
 
     def _publish_blocker_stack_summary(self) -> None:
         if not getattr(self, "_c49_ready", False) or not hasattr(
@@ -3510,6 +3738,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             f" pending_blocker_enqueued={self._pending_vbc_blockers.enqueued}"
             f" pending_blocker_coalesced={self._pending_vbc_blockers.coalesced}"
             f" pending_blocker_materialized={self._pending_vbc_blockers.materialized}"
+            f" pending_blocker_obsolete={self._pending_vbc_blockers.obsolete}"
             f" pending_blocker_capacity_fault={int(self._pending_vbc_blockers.overflow)}"
             f" switch_reason={self._last_switch_reason}"
             f" obligation_match_qvis_min_f={self._obligation_match_qvis_min_f:.6f}"

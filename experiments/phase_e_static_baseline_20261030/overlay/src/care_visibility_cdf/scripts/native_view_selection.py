@@ -8,7 +8,10 @@ import numpy as np
 
 
 class NativeViewClient:
-    def __init__(self, timeout_s=.45):
+    def __init__(self, timeout_s=.45, mode="legacy"):
+        self.mode=mode
+        self.transaction_lock=threading.Lock()
+        if mode not in ("legacy", "aligned_shadow", "aligned_select"):raise ValueError("native preview mode")
         import rospy
         from std_msgs.msg import String
         self.String=String;self.timeout_s=timeout_s
@@ -23,18 +26,47 @@ class NativeViewClient:
             item=self.pending.get(result.get('id'))
             if item is not None:item[1].append(result);item[0].set()
 
-    def __call__(self,candidates,points):
+    def request(self, payload, deadline):
         if self.pub.get_num_connections()==0:return dict(status='unavailable',reason='no_native_receiver')
-        request=dict(id=uuid.uuid4().hex,candidates=candidates,points=np.asarray(points).tolist())
+        remaining=deadline-time.monotonic()
+        if remaining<=0:return dict(status='unavailable',reason='total_preview_budget')
+        request=dict(payload,id=uuid.uuid4().hex)
         event=threading.Event();result=[]
         with self.lock:
             if self.pending:return dict(status='unavailable',reason='native_busy')
             self.pending[request['id']]=(event,result)
         try:
             self.pub.publish(self.String(data=json.dumps(request)))
-            return result[0] if event.wait(self.timeout_s) and result else dict(status='unavailable',reason='native_timeout')
+            remaining=max(0.,deadline-time.monotonic())
+            return result[0] if event.wait(remaining) and result else dict(status='unavailable',reason='native_timeout')
         finally:
             with self.lock:self.pending.pop(request['id'],None)
+
+    def __call__(self,candidates,points):
+        return self.request(dict(candidates=candidates,points=np.asarray(points).tolist()),
+                            time.monotonic()+self.timeout_s)
+
+    def aligned(self,runtime,candidates,points,guidance,deadline):
+        from rolling_visibility_guidance import rolling_visibility_target
+        if not self.transaction_lock.acquire(blocking=False):
+            return dict(status='unavailable',reason='native_busy')
+        try:
+            captured=self.request(dict(phase='capture'),deadline)
+            if captured.get('status')!='captured':return captured
+            evaluated=[]
+            for candidate in candidates:
+                if time.monotonic()>=deadline:return dict(status='unavailable',reason='total_preview_budget')
+                value=rolling_visibility_target(runtime,points,captured['q_start'],candidate['q'],
+                    candidate['mask'],candidate['sensor_id'],guidance['step_limit'],guidance['drive_enabled'])
+                if value is None:return dict(status='unavailable',reason='rolling_field_unavailable')
+                evaluated.append(dict(candidate,target=value['target'].tolist(),gradient=value['gradient'].tolist(),
+                    rolling_value=value['value'],backoff=value['backoff']))
+            response=self.request(dict(phase='evaluate',context_id=captured['context_id'],
+                candidates=evaluated,points=np.asarray(points).tolist()),deadline)
+            response.update(capture=captured,rolling_candidates=evaluated)
+            return response
+        finally:
+            self.transaction_lock.release()
 
 
 def candidates_from_hybrid(runtime,hybrid):
@@ -92,14 +124,28 @@ def prefix_metrics(runtime,points,candidate,result,response,context):
 
 def select_native(runtime,points,hybrid,context,client):
     if not hybrid.get('accepted') or context is None:return hybrid
-    selected=hybrid;tic=time.monotonic();diagnostic=dict(selected_by='original_fallback',motion_authorized=False)
+    selected=hybrid;tic=time.monotonic();mode=getattr(client,'mode','legacy')
+    deadline=tic+getattr(client,'timeout_s',.45)
+    diagnostic=dict(selected_by='original_fallback',motion_authorized=False,mode=mode)
     try:
         candidates=candidates_from_hybrid(runtime,hybrid)
         if len(candidates)<2:
             diagnostic.update(status='no_second_accepted_candidate',candidate_count=len(candidates));return selected
-        response=client(candidates,points);diagnostic.update(response=response,candidates=candidates)
+        if mode=='legacy':response=client(candidates,points)
+        else:
+            guidance=context.get('preview_guidance')
+            if guidance is None:
+                diagnostic.update(status='missing_live_guidance_settings');return selected
+            response=client.aligned(runtime,candidates,points,guidance,deadline)
+        diagnostic.update(response=response,candidates=candidates)
         if response.get('status')!='valid':return selected
-        metrics=[prefix_metrics(runtime,points,c,r,response,context) for c,r in zip(candidates,response['candidate_results'])]
+        if [r.get('sensor_id') for r in response.get('candidate_results',[])] != [c['sensor_id'] for c in candidates]:
+            diagnostic['status']='candidate_identity_mismatch';return selected
+        metrics=[]
+        for c,r in zip(candidates,response['candidate_results']):
+            if mode!='legacy' and time.monotonic()>=deadline:
+                diagnostic['status']='total_preview_budget';return selected
+            metrics.append(prefix_metrics(runtime,points,c,r,response,context))
         if len(metrics)!=len(candidates):return selected
         evaluator=context.get('prefix_corridor_evaluator')
         corridors=evaluator(response) if evaluator is not None else None
@@ -110,11 +156,16 @@ def select_native(runtime,points,hybrid,context,client):
                     metric['score']-=.5*corridor['approach']['risk_fraction']
                     metric['new_unknown_risk_fraction']=corridor['approach']['risk_fraction']
         diagnostic['metrics']=metrics
+        if mode!='legacy' and time.monotonic()>=deadline:
+            diagnostic['status']='total_preview_budget';return selected
         viable=[i for i,m in enumerate(metrics) if m['valid']]
         if not viable:return selected
         index=max(viable,key=lambda i:metrics[i]['score'])
         if index!=0 and (not metrics[0]['valid'] or metrics[index]['score']>metrics[0]['score']+1e-6):
             from evaluate_direct_vs_projection_ascent import DEFAULT_SENSOR_FRAMES
+            diagnostic['would_select_sensor_id']=candidates[index]['sensor_id']
+            if mode=='aligned_shadow':
+                diagnostic['selected_by']='aligned_shadow_original';return selected
             row=candidates[index];selected=copy.copy(hybrid)
             selected.update(selected_sensor_id=row['sensor_id'],selected_q_vis=row['q'],selected_joint_mask=row['mask'],
                 selected_sensor_frame=DEFAULT_SENSOR_FRAMES[row['sensor_id']],

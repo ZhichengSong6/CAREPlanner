@@ -1574,6 +1574,16 @@ class OptimizedTrajectoryContinuityNode:
             normal_velocity_reference=False, motion_start=None):
         def fail(reason):
             self._last_prefix_build_reason=reason
+            if normal_velocity_reference and reason=='continuous_joint_limit' and getattr(self,'_normal_context_count',0)<6:
+                self._normal_context_count=getattr(self,'_normal_context_count',0)+1
+                names=list(candidate.joint_names)
+                rospy.logwarn('[NORMAL_LIMIT_CONTEXT] %s',json.dumps(dict(raw_stamp_ns=candidate.header.stamp.to_nsec(),
+                    now_ns=rospy.Time.now().to_nsec(),source_stamp_ns=self._latest_measured_stamp_ns,
+                    measured_q=[self._latest_measured_q_by_name[n] for n in names],
+                    measured_v=[self._latest_measured_velocity_by_name[n] for n in names],
+                    applied_v=[self._latest_actuator_velocity[n] for n in names],
+                    applied_stamp_ns=self._latest_actuator_stamp_ns,normal_velocity_reference=True,
+                    prefix_s=requested_prefix_s,forecast=motion_start is not None),separators=(',',':')))
             return None
         self._last_prefix_build_reason="none"
         if candidate is None or not candidate.points:
@@ -2322,6 +2332,9 @@ class OptimizedTrajectoryContinuityNode:
             # cannot stop a moving actuator; certify the complete ramp and tail.
             task_duration = self._duration(candidate)
             task_prefix = min(task_duration, (entry or {}).get('continuation_prefix_s', task_duration))
+            if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+                task_prefix = min(task_prefix, .25)
+                diag['rolling_task_prefix_s'] = task_prefix
             diag['task_reference_duration_s'] = task_duration
             diag['task_execution_prefix_s'] = task_prefix
             candidate = self._repair_prefix_with_braking_tail(

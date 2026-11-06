@@ -10,7 +10,7 @@ class PreflightWaitTests(AdmissionTests):
                           name=self.raw.joint_names,position=[] if actuator else self.data['measured_q'],velocity=[0.]*7)
     def waiting(self, offset=-.051):
         self.n.repair_motion_consistency_enabled=True
-        self.g.sender.replan_used=True  # Original one transport recovery is already spent.
+        self.g.sender.replan_count=1  # Original one transport recovery is already spent.
         self.n._joint_state_cb(self.state(self.now+offset))
         self.n._actuator_state_cb(self.state(actuator=True))
         self.start()
@@ -49,7 +49,7 @@ class PreflightWaitTests(AdmissionTests):
         self.assertEqual(self.n._admission_entries[self.key]['deadline'],self.deadline)
         self.n._joint_state_cb(self.state());self.n._actuator_state_cb(self.state(actuator=True));self.n._admission_tick()
         self.assertEqual(len(self.n.final_gcdf_query_pub.messages),1)
-        self.assertTrue(self.g.sender.replan_used)
+        self.assertTrue(self.g.sender.replan_count)
         self.assertEqual(self.n.committed_pub.messages,[])
     def test_future_timestamp_waits_until_clock_catches_up(self):
         self.waiting(offset=.001);self.advance(.002);self.n._admission_tick();self.pump()

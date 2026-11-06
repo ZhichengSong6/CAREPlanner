@@ -1,3 +1,7 @@
+#include <boost/property_tree/json_parser.hpp>
+#include <openssl/sha.h>
+#include <sstream>
+#include <iomanip>
 #include <ros/ros.h>
 
 #include <sensor_msgs/PointCloud2.h>
@@ -84,6 +88,8 @@ struct SensorState
       new pcl::PointCloud<pcl::PointXYZ>()};
 
   ros::Time cloud_stamp;
+  std::string source_frame;
+  tf2::Quaternion sensor_rotation_base{0.,0.,0.,1.};
   ros::Time received;
   ros::Time next_processing_stamp;
 
@@ -335,6 +341,7 @@ public:
         output_topic_, 1, false);
     ray_observation_pub_ = nh_.advertise<sensor_msgs::PointCloud2>(
         ray_observation_topic_, 1, false);
+    ray_provenance_pub_=nh_.advertise<std_msgs::String>(ray_observation_topic_+"/source_provenance",1,false);
     summary_pub_ = nh_.advertise<std_msgs::String>(
         summary_topic_, 1, true);
 
@@ -1028,6 +1035,7 @@ private:
       SensorState& state = sensor_states_[sensor_index];
       state.filtered_base = kept;
       state.cloud_stamp = msg->header.stamp;
+      state.source_frame=source_frame;state.sensor_rotation_base=T_base_sensor.getRotation();
       state.received = ros::Time::now();
       state.raw_points = raw->points.size();
       state.voxel_points = voxel->points.size();
@@ -1216,7 +1224,7 @@ private:
 
     sensor_msgs::PointCloud2Modifier ray_modifier(ray_msg);
     ray_modifier.setPointCloud2Fields(
-        8,
+        10,
         "x", 1, sensor_msgs::PointField::FLOAT32,
         "y", 1, sensor_msgs::PointField::FLOAT32,
         "z", 1, sensor_msgs::PointField::FLOAT32,
@@ -1224,7 +1232,9 @@ private:
         "origin_x", 1, sensor_msgs::PointField::FLOAT32,
         "origin_y", 1, sensor_msgs::PointField::FLOAT32,
         "origin_z", 1, sensor_msgs::PointField::FLOAT32,
-        "hit", 1, sensor_msgs::PointField::UINT8);
+        "hit", 1, sensor_msgs::PointField::UINT8,
+        "source_stamp_sec", 1, sensor_msgs::PointField::UINT32,
+        "source_stamp_nsec", 1, sensor_msgs::PointField::UINT32);
 
     ray_modifier.resize(ray_observation_count);
 
@@ -1242,6 +1252,8 @@ private:
     sensor_msgs::PointCloud2Iterator<uint8_t> ray_hit(
         ray_msg, "hit");
 
+    sensor_msgs::PointCloud2Iterator<uint32_t> source_sec(ray_msg,"source_stamp_sec");
+    sensor_msgs::PointCloud2Iterator<uint32_t> source_nsec(ray_msg,"source_stamp_nsec");
     for (std::size_t sensor_id = 0;
          sensor_id < states.size();
          ++sensor_id)
@@ -1273,6 +1285,10 @@ private:
         *ray_hit =
             ray.hit ? static_cast<uint8_t>(1)
                     : static_cast<uint8_t>(0);
+        // Exact integer source time survives heterogeneous fused packets.
+        // This is the time used for TF; it is not a registration-error bound.
+        *source_sec=state.cloud_stamp.sec;*source_nsec=state.cloud_stamp.nsec;
+        ++source_sec;++source_nsec;
 
         ++ray_x;
         ++ray_y;
@@ -1285,6 +1301,32 @@ private:
       }
     }
 
+    // Provenance has no mapping/authorization role. The payload digest binds
+    // exact ray coordinates, flags, sensors and per-ray integer source times.
+    // ROS may rewrite Header.seq; the digest deliberately excludes that field.
+    boost::property_tree::ptree document,sources;
+    document.put("schema",1);document.put("base_frame",base_frame_);
+    document.put("fused_stamp_sec",ray_msg.header.stamp.sec);document.put("fused_stamp_nsec",ray_msg.header.stamp.nsec);
+    document.put("ray_count",ray_observation_count);document.put("point_step",ray_msg.point_step);
+    document.put("registration_error_status","UNESTABLISHED");
+    unsigned char digest[SHA256_DIGEST_LENGTH];SHA256(ray_msg.data.data(),ray_msg.data.size(),digest);
+    std::ostringstream hex;hex<<std::hex<<std::setfill('0');for(const auto byte:digest)hex<<std::setw(2)<<static_cast<unsigned>(byte);
+    document.put("ray_data_sha256",hex.str());
+    for(std::size_t sensor_id=0;sensor_id<states.size();++sensor_id) {
+      const auto& state=states[sensor_id];const double age=(now-state.received).toSec();
+      if(!state.valid || !std::isfinite(age) || age>sensor_timeout_)continue;
+      boost::property_tree::ptree source,position,rotation;
+      source.put("sensor_id",sensor_id);source.put("source_frame",state.source_frame);
+      source.put("source_stamp_sec",state.cloud_stamp.sec);source.put("source_stamp_nsec",state.cloud_stamp.nsec);
+      source.put("tf_request_stamp_sec",state.cloud_stamp.sec);source.put("tf_request_stamp_nsec",state.cloud_stamp.nsec);
+      source.put("ray_count",state.ray_samples.size());
+      for(int axis=0;axis<3;++axis){boost::property_tree::ptree value;value.put("",state.sensor_origin_base[axis]);position.push_back(std::make_pair("",value));}
+      for(int axis=0;axis<4;++axis){boost::property_tree::ptree value;value.put("",state.sensor_rotation_base[axis]);rotation.push_back(std::make_pair("",value));}
+      source.add_child("tf_translation_base",position);source.add_child("tf_quaternion_base_xyzw",rotation);
+      sources.push_back(std::make_pair("",source));
+    }
+    document.add_child("sources",sources);std::ostringstream encoded;boost::property_tree::write_json(encoded,document,false);
+    std_msgs::String provenance;provenance.data=encoded.str();ray_provenance_pub_.publish(provenance);
     ray_observation_pub_.publish(ray_msg);
 
     sensor_msgs::PointCloud2 output_msg;
@@ -1418,7 +1460,7 @@ private:
 
   std::vector<ros::Subscriber> subscribers_;
   ros::Publisher output_pub_;
-  ros::Publisher ray_observation_pub_;
+  ros::Publisher ray_observation_pub_,ray_provenance_pub_;
   ros::Publisher summary_pub_;
   ros::Timer publish_timer_;
 

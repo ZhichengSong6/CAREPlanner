@@ -9,7 +9,3 @@ float64 remaining_budget_s
 trajectory_msgs/JointTrajectory trajectory
 # Immutable planning view, included in payload_sha256 when nonempty.
 string planned_prefix_context
-# Immutable task identity captured with the planning input, included in SHA.
-string task_context
-# Captured automatic regime session/revision/mode; included in payload SHA.
-string task_regime

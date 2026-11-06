@@ -176,7 +176,7 @@ def collision_hit_t(local_p0, local_p1, primitive, ignore_start_inside):
 
 
 def raycast_self_occlusion(robot, collision_chains, primitives, sensor_transform, point_base,
-                           q_map, args):
+                           q_map, args, _inverse_cache=None):
     sensor_origin = sensor_transform[:3, 3]
     vec = point_base - sensor_origin
     length = float(np.linalg.norm(vec))
@@ -195,9 +195,17 @@ def raycast_self_occlusion(robot, collision_chains, primitives, sensor_transform
         if primitive["link"] in args.ignore_links:
             continue
 
-        link_transform = fk_transform(chain, q_map)
-        collision_transform = link_transform @ primitive["origin"]
-        inv_collision_transform = np.linalg.inv(collision_transform)
+        # The optional cache is created by the batch wrapper and cannot
+        # outlive its fixed-pose call. Keep primitive order and arithmetic.
+        key = id(primitive)
+        if _inverse_cache is not None and key in _inverse_cache:
+            inv_collision_transform = _inverse_cache[key]
+        else:
+            link_transform = fk_transform(chain, q_map)
+            collision_transform = link_transform @ primitive["origin"]
+            inv_collision_transform = np.linalg.inv(collision_transform)
+            if _inverse_cache is not None:
+                _inverse_cache[key] = inv_collision_transform
         local_start = transform_point(inv_collision_transform, start)
         local_end = transform_point(inv_collision_transform, end)
 
@@ -219,6 +227,15 @@ def raycast_self_occlusion(robot, collision_chains, primitives, sensor_transform
             }
 
     return best is not None, best
+
+
+def raycast_self_occlusion_many(robot, collision_chains, primitives, sensor_transform,
+                                points_base, q_map, args):
+    """Check multiple rays at one pose; no cache crosses a call or q change."""
+    inverse_cache = {}
+    return [raycast_self_occlusion(robot, collision_chains, primitives,
+                sensor_transform, point, q_map, args, _inverse_cache=inverse_cache)
+            for point in points_base]
 
 
 def load_q0_entries(q0_data, num_samples, seed):

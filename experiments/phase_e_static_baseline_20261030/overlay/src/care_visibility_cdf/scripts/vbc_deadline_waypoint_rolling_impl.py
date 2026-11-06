@@ -84,7 +84,7 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         self._native_view_client=None
         if os.environ.get('CARE_NATIVE_VIEW_SELECTION')=='true':
             from native_view_selection import NativeViewClient
-            self._native_view_client=NativeViewClient()
+            self._native_view_client=NativeViewClient(mode=os.environ.get('CARE_NATIVE_VIEW_MODE','legacy'))
 
         self.selection_active_topic = str(rospy.get_param(
             "~selection_active_topic",
@@ -271,7 +271,22 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 self._task_rejoin_clock=pair
                 context['ros_per_wall_s']=self._task_rejoin_clock_rate
                 context['corridor_evaluator']=self._task_corridor_preview
+                context['paired_corridor_evaluator']=self._task_legacy_corridor_pair
+                context['corridor_pair_kind']='legacy_common_snapshot'
                 if self._native_view_client is not None:context['prefix_corridor_evaluator']=self._native_prefix_corridors
+            if os.environ.get('CARE_TASK_CORRIDOR','legacy')=='reference_pair' and context is not None:
+                from observation_task_corridor import bounded_task_reference
+                try:
+                    context['upcoming_task_reference']=bounded_task_reference(
+                        [[point.positions[j] for j in mapping] for point in trajectory.points],
+                        [point.time_from_start.to_sec() for point in trajectory.points],
+                        branch_seed,context['source'])
+                except (ValueError,TypeError,IndexError) as exc:
+                    context['upcoming_task_reference_error']=str(exc)
+                # Missing optional reference drops this feature symmetrically;
+                # keep the original travel/pose context and candidate budget.
+                context['paired_corridor_evaluator']=self._task_reference_corridor_pair
+                context['corridor_pair_kind']='reference_pair'
             return context
         except (KeyError, ValueError, TypeError, IndexError):
             return None
@@ -292,6 +307,43 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         req.points=[Point(*p) for p in points];reply=self._corridor_query(req)
         costs=[snapshot_cost(reply,points,leg,[],rospy.Time.now().to_nsec(),req.minimum_confidence) for leg in legs]
         return costs if all(c.get('status')=='valid' for c in costs) else None
+
+    def _task_reference_corridor_pair(self, candidates, context):
+        from observation_task_corridor import paired_corridor_costs
+        threshold=float(getattr(self,'seen_threshold',.6))
+        started=time.monotonic()
+        deadline=started+max(0.,float(context.get('paired_remaining_s',0.)))
+        def query(points):
+            if time.monotonic()>=deadline or getattr(self,'_corridor_query',None) is None:
+                return None
+            request=QueryConfidenceSnapshotRequest();request.horizon_s=0.
+            request.minimum_confidence=threshold;request.points=[Point(*p) for p in points]
+            return self._corridor_query(request)
+        if time.monotonic()>=deadline:
+            return [dict(status='unavailable',reason='existing_comparison_budget') for _ in candidates]
+        result=paired_corridor_costs(self._per_sensor_runtime,candidates,context,query,
+            lambda:rospy.Time.now().to_nsec(),threshold)
+        if time.monotonic()>deadline:
+            result=[dict(status='unavailable',reason='existing_comparison_budget') for _ in candidates]
+        for row in result:row['wall_ms']=1000.*(time.monotonic()-started)
+        return result
+
+    def _task_legacy_corridor_pair(self, candidates, context):
+        from observation_corridor_cost import paired_legacy_corridor_costs
+        started=time.monotonic()
+        deadline=started+max(0.,float(context.get('paired_remaining_s',0.)))
+        def query(points):
+            if time.monotonic()>=deadline:return None
+            req=QueryConfidenceSnapshotRequest();req.horizon_s=0.
+            req.minimum_confidence=float(getattr(self,'seen_threshold',.6))
+            req.points=[Point(*p) for p in points]
+            return self._corridor_query(req)
+        costs=paired_legacy_corridor_costs(self._per_sensor_runtime,candidates,context,
+            query,lambda:rospy.Time.now().to_nsec(),float(getattr(self,'seen_threshold',.6)))
+        if time.monotonic()>deadline:
+            costs=[dict(status='unavailable',reason='existing_comparison_budget') for _ in candidates]
+        for cost in costs:cost['wall_ms']=1000.*(time.monotonic()-started)
+        return costs
 
     def _task_corridor_preview(self,q,context):
         tic=time.monotonic();runtime=self._per_sensor_runtime
@@ -383,8 +435,16 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
         if self._native_view_client is not None:
             from native_view_selection import select_native
+            native_context=self._task_rejoin_context(branch_seed)
+            if native_context is not None:
+                with self._frontier_lock:
+                    escalated=bool(self.frontier_vbc_escalation_enabled and
+                        self._frontier_feedback_failures>=self.frontier_vbc_escalation_after)
+                native_context['preview_guidance']=dict(
+                    step_limit=self.frontier_escalated_step_inf if escalated else self.frontier_step_inf,
+                    drive_enabled=self.rolling_guidance_mode=='drive')
             hybrid=select_native(self._per_sensor_runtime,points_np,hybrid,
-                self._task_rejoin_context(branch_seed),self._native_view_client)
+                native_context,self._native_view_client)
         result["per_sensor_hybrid"] = hybrid
         result["per_sensor_hybrid_used"] = bool(hybrid["accepted"])
         result["per_sensor_scalar_q_vis_before_branch"] = (

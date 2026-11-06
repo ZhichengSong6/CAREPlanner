@@ -116,6 +116,7 @@ class PublishChainTests(unittest.TestCase):
         n._coherent_bundle_pending_nonempty = False
         from pending_vbc_blockers import PendingVbcBlockers
         n._pending_vbc_blockers = PendingVbcBlockers()
+        n._external_occlusion = None
         n._last_visibility_check_s = -math.inf
         n.visibility_check_rate = 20.
         n.seen_threshold = .8

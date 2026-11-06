@@ -1,3 +1,6 @@
+#include "egocentric_arm_planner/normal_executable_limits.hpp"
+#include "egocentric_arm_planner/normal_executable_curve.hpp"
+#include "egocentric_arm_planner/observation_local_decision.hpp"
 #include "egocentric_arm_planner/executable_task_objective.hpp"
 #include "egocentric_arm_planner/local_sparse_scp_planner.hpp"
 #include "egocentric_arm_planner/geometric_restore_proposal.hpp"
@@ -13,6 +16,7 @@
 #include "egocentric_arm_planner/candidate_audit_context.hpp"
 #include <iomanip>
 
+#include <arm_trajectory/joint_trajectory.hpp>
 #include <care_collision_cdf/QueryCollisionCDFPairs.h>
 #include <piqp/piqp.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -378,8 +382,19 @@ bool LocalSparseSCPPlanner::initialize(
     }
   }
 
+  const char* probe_task_policy=std::getenv("CARE_PROBE_EXECUTABLE_TASK");
+  probe_task_objective_enabled_=probe_task_policy && std::string(probe_task_policy)=="true";
+  probe_task_settings_.acceleration=repair_executable_settings_.acceleration;
+  nh_.param("/optimized_trajectory_continuity/probe_execution_prefix_s",probe_task_settings_.prefix,.25);
+  nh_.param("/optimized_trajectory_continuity/probe_velocity_cap",probe_task_settings_.velocity_cap,.5);
+  nh_.param("/optimized_trajectory_continuity/probe_time_scale_max",probe_task_settings_.time_scale_max,5.);
+  nh_.param("/optimized_trajectory_continuity/repair_brake_dt_s",probe_task_settings_.brake_dt,.05);
+  nh_.param("/optimized_trajectory_continuity/repair_brake_max_steps",probe_task_settings_.brake_steps,20);
+  nh_.param("/optimized_trajectory_continuity/repair_hold_s",probe_task_settings_.hold,.1);
   latest_executed_command_ = Eigen::VectorXd::Zero(dof_);
   pnh_.param("local_planner/terminal_retention/enabled",terminal_retention_enabled_,false);
+  const char* repair_goal_policy=std::getenv("CARE_REPAIR_GOAL_STOPPING");
+  repair_goal_stopping_enabled_=repair_goal_policy && std::string(repair_goal_policy)=="true";
   pnh_.param<std::string>("base_frame",terminal_base_frame_,"base_link");
   pnh_.param<std::string>("ee_frame",terminal_ee_frame_,"EE_link");
   if(terminal_retention_enabled_ && !primitive_observation_guard_enabled_) {
@@ -431,6 +446,8 @@ bool LocalSparseSCPPlanner::initialize(
       &LocalSparseSCPPlanner::singleWaypointActiveCallback, this);
   if (std::getenv("CARE_NATIVE_VIEW_SELECTION") &&
       std::string(std::getenv("CARE_NATIVE_VIEW_SELECTION")) == "true") {
+    const char* preview_mode=std::getenv("CARE_NATIVE_VIEW_MODE");
+    view_preview_aligned_enabled_=preview_mode && std::string(preview_mode)!="legacy";
     view_preview_pub_=nh_.advertise<std_msgs::String>("/care_planner/view_preview/response",2,false);
     view_preview_sub_=nh_.subscribe("/care_planner/view_preview/request",1,
         &LocalSparseSCPPlanner::viewPreviewCallback,this);
@@ -1356,8 +1373,16 @@ void LocalSparseSCPPlanner::recoveryCallback(
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (repair_mode_ != msg->data) {
+      const bool goal_handoff=repair_goal_stopping_enabled_ && repair_mode_ && !msg->data &&
+          terminal_retention_.armed && retainTerminalLocked();
       repair_mode_ = msg->data;
       ++mode_epoch_;
+      if(goal_handoff) {
+        // Same audited motion and goal; only its scheduling owner changes.
+        // This does not retire any observation obligation.
+        terminal_retention_.armed_context=terminalContextLocked();
+        repair_goal_handoff_execution_=terminal_retention_.armed;
+      }
       vbc_failure_direction_memory_.reset();
       normal_active_no_progress_.reset();
       normal_unknown_no_progress_.reset();
@@ -1376,7 +1401,7 @@ void LocalSparseSCPPlanner::recoveryCallback(
         // pending wait for a fresh NORMAL task reference is cancelled.
         normal_reference_refresh_pending_ = false;
       }
-      requestPlanLocked(
+      if(!goal_handoff)requestPlanLocked(
           repair_mode_ ? "enter_repair" : "leave_repair");
       clear_bootstrap = !repair_mode_;
     }
@@ -1496,10 +1521,12 @@ void LocalSparseSCPPlanner::smoothReplanRequestCallback(
 }
 
 std::string LocalSparseSCPPlanner::terminalContextLocked() const {
-  if(!terminal_retention_enabled_ || !terminal_goal_valid_ || repair_mode_ || probe_mode_ ||
-      !has_reference_ || normal_reference_refresh_pending_)return {};
+  if(!terminal_retention_enabled_ || !terminal_goal_valid_ || probe_mode_ ||
+      (repair_mode_ && !repair_goal_stopping_enabled_) ||
+      !has_reference_ || (!repair_mode_ && normal_reference_refresh_pending_))return {};
   return std::to_string(terminal_goal_revision_)+":"+std::to_string(mode_epoch_)+":"+
-      std::to_string(latest_reference_.header.stamp.toNSec());
+      (repair_mode_ ? "repair_goal_stop" :
+       std::to_string(latest_reference_.header.stamp.toNSec()));
 }
 
 bool LocalSparseSCPPlanner::terminalPoseInsideLocked(const Eigen::VectorXd& q) const {
@@ -1532,6 +1559,12 @@ void LocalSparseSCPPlanner::terminalGoalCallback(const geometry_msgs::PoseStampe
 }
 
 void LocalSparseSCPPlanner::armTerminalLocked() {
+  // A REPAIR goal-stop lease begins only after its tracker owns the actual
+  // committed motion. Earlier audit/outcome callbacks may precede that sample.
+  if(repair_goal_stopping_enabled_ && repair_mode_ &&
+      (!terminal_retention_.newest_commit || terminal_tracker_token_!=terminal_retention_.newest_commit ||
+       terminal_tracker_aborted_ || (terminal_tracker_source_!="active_trajectory" &&
+                                     terminal_tracker_source_!="trajectory_complete_hold")))return;
   const auto before=terminal_retention_.armed;
   terminal_retention_.tryArm(terminalContextLocked(),[&](const trajectory_msgs::JointTrajectory& t) {
     std::vector<int> mapping;Eigen::VectorXd q;
@@ -1540,6 +1573,12 @@ void LocalSparseSCPPlanner::armTerminalLocked() {
   });
   if(terminal_retention_.armed && terminal_retention_.armed!=before) {
     terminal_tracker_completed_=false;
+    if(repair_mode_ && repair_goal_stopping_enabled_) {
+      // A newer in-flight proposal must not replace this certified goal stop.
+      // Observation obligations and recovery budgets are retained.
+      ++plan_sequence_;plan_running_=false;waiting_for_cdf_=false;
+      pending_batch_.reset();plan_requested_=false;
+    }
     ROS_INFO_STREAM("[NORMAL_TERMINAL] armed execution_stamp_ns="<<terminal_retention_.armed
         <<" context="<<terminal_retention_.armed_context);
   }
@@ -1712,6 +1751,7 @@ void LocalSparseSCPPlanner::executionSummaryCallback(
       if(terminal_tracker_source_!="last_reference_hold" || terminal_tracker_aborted_)
         terminal_retention_.invalidate("tracker_hold_changed");
     }
+    if(repair_goal_stopping_enabled_ && repair_mode_)armTerminalLocked();
     if (has_execution_stamp) {
       latest_execution_stamp_ns_ = execution_stamp_ns;
     }
@@ -2387,6 +2427,7 @@ void LocalSparseSCPPlanner::checkKnownGroundHoldLocked() {
 }
 
 void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
+  bool goal_stop_heartbeat=false;
   bool should_start = false;
   bool should_abort = false;
   std::string replacement_event;
@@ -2396,6 +2437,15 @@ void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
     checkKnownGroundHoldLocked();
     if(terminal_retention_.armed && (terminal_tracker_token_==terminal_retention_.armed || terminal_tracker_completed_) &&
         !retainTerminalLocked())requestPlanLocked("terminal_retention_released");
+    goal_stop_heartbeat=repair_goal_stopping_enabled_ && repair_goal_handoff_execution_;
+    if(repair_goal_stopping_enabled_ && terminal_retention_.armed &&
+        (terminal_tracker_token_==terminal_retention_.armed || terminal_tracker_completed_) &&
+        retainTerminalLocked()) {
+      // Keep the receiver's certified stop while it is executing or holding.
+      // Replacement reservations remain recorded; their ordinary timer work
+      // must not schedule a competing motion or suppress this heartbeat.
+      lock.unlock();publishSummary("goal_stop_heartbeat");return;
+    }
     if(!state_evidence_retry_pending_.empty() && ros::WallTime::now()>=state_evidence_retry_deadline_) {
       const bool residual=state_residual_retry_raw_ && state_residual_retry_epoch_==mode_epoch_ &&
           state_residual_retry_token_==latest_observation_token_ && repair_mode_ && !probe_mode_ &&
@@ -2466,6 +2516,7 @@ void LocalSparseSCPPlanner::timerCallback(const ros::TimerEvent&) {
     }
   }
 
+  if(goal_stop_heartbeat)publishSummary("goal_stop_heartbeat");
   if(!replacement_event.empty())publishSummary(replacement_event);
   if (should_abort) {
     abortPlan("cdf_wait_timeout");
@@ -3181,7 +3232,9 @@ void LocalSparseSCPPlanner::finalVerificationCallback(const std_msgs::StringCons
     if (!parseUnsignedToken(msg->data, "raw_candidate_stamp_ns", &raw_safe) ||
         !parseUnsignedToken(msg->data, "execution_stamp_ns", &execution)) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if(fields["verification_view"]=="full_horizon" &&
+    if((fields["verification_view"]=="full_horizon" ||
+        (repair_goal_stopping_enabled_ && repair_mode_ && !probe_mode_ &&
+         fields["verification_view"]=="repair_prefix_brake_hold")) &&
         parseUnsignedToken(msg->data,"audited_trajectory_stamp_ns",&audited)) {
       terminal_retention_.certify(raw_safe,audited,execution,terminalContextLocked());armTerminalLocked();
     }
@@ -3921,14 +3974,22 @@ void LocalSparseSCPPlanner::requestPlanLocked(
   if(fixed_start_clearance_hold_.armed) {
     plan_requested_=false;plan_request_reason_="fixed_start_unknown_clearance_hold";return;
   }
-  const bool optional=reason=="smooth_handoff_normal" || reason=="normal_trajectory_complete";
+  const bool goal_observation_wakeup=repair_goal_stopping_enabled_ &&
+      (repair_mode_ || repair_goal_handoff_execution_==terminal_retention_.armed) &&
+      (reason.find("visibility")!=std::string::npos ||
+       reason=="vbc_obligation_points_changed" || reason=="repair_prefix_selection_changed" ||
+       reason.find("candidate_replacement")!=std::string::npos);
+  const bool optional=reason=="smooth_handoff_normal" || reason=="normal_trajectory_complete" ||
+      goal_observation_wakeup ||
+      (repair_goal_stopping_enabled_ && repair_mode_ &&
+       (reason=="smooth_handoff_repair" || reason=="repair_trajectory_complete"));
   if(optional && retainTerminalLocked()) {
     ++terminal_retention_.suppressed_count;
     ROS_INFO_STREAM("[NORMAL_TERMINAL] suppressed reason="<<reason<<" execution_stamp_ns="<<terminal_retention_.armed
         <<" count="<<terminal_retention_.suppressed_count);
     return;
   }
-  terminal_retention_.invalidate(reason);
+  terminal_retention_.replan(reason);
   // A different plan request supersedes any failed-QP retry ticket, including
   // reference/mode/progress changes. Its delayed delivery cannot preempt work.
   qp_retry_token_.clear();
@@ -4184,7 +4245,9 @@ bool LocalSparseSCPPlanner::startPlan() {
     return false;
   }
 
-  if (repair_executable_view_enabled_ && !probe) {
+  const bool rolling_task = std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION")) == "true";
+  if (repair_executable_view_enabled_ && (!probe || rolling_task)) {
     // NORMAL optimizes the same acceleration ramp that will be certified.
     // Its boundary is the measured velocity, not an instantaneous setpoint.
     previous_command.resize(dof_);
@@ -4200,6 +4263,33 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
   }
 
+  if (rolling_task && !repair && !reference.points.empty()) {
+    std::vector<int> goal_mapping;
+    if (!buildTrajectoryMapping(reference, goal_mapping)) {
+      abortPlan("rolling_task_goal_mapping_failed"); return false;
+    }
+    Eigen::VectorXd goal(dof_);
+    for (int j=0;j<dof_;++j) goal[j]=reference.points.back().positions[goal_mapping[j]];
+    double duration=2.;
+    for (int j=0;j<dof_;++j) {
+      const double delta=std::abs(goal[j]-q_current[j]);
+      duration=std::max(duration,1.9*delta/velocity_limits_[j]);
+      duration=std::max(duration,std::sqrt(6.*delta/repair_executable_settings_.acceleration[j]));
+    }
+    const auto refreshed=arm_trajectory::JointTrajectory::makeQuinticBoundaryVelocityAcceleration(
+        q_current,previous_command,Eigen::VectorXd::Zero(dof_),goal,
+        Eigen::VectorXd::Zero(dof_),Eigen::VectorXd::Zero(dof_),duration,.02);
+    reference.header.stamp=ros::Time::now(); reference.joint_names=joint_names_;reference.points.clear();
+    for (std::size_t k=0;k<refreshed.size();++k) {
+      trajectory_msgs::JointTrajectoryPoint p;
+      const auto a=refreshed.positions()[k],b=refreshed.velocities()[k],c=refreshed.accelerations()[k];
+      p.positions.assign(a.data(),a.data()+dof_);p.velocities.assign(b.data(),b.data()+dof_);
+      p.accelerations.assign(c.data(),c.data()+dof_);p.time_from_start=ros::Duration(refreshed.times()[k]);
+      reference.points.push_back(p);
+    }
+    ROS_INFO_STREAM("[ROLLING_TASK_REFERENCE] goal_revision="<<terminal_goal_revision_
+        <<" probe="<<probe<<" duration_s="<<duration<<" measured_stamp_ns="<<joint_state.header.stamp.toNSec());
+  }
   Eigen::MatrixXd q_ref, u_ref, q_init, u_init;
   if (!buildReferenceHorizon(
           q_current, reference, ros::Time::now(), probe,
@@ -4258,6 +4348,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     plan_qp_backtrack_policy_.reset();
     plan_normal_reseed_used_ = false;
     plan_repair_conflict_reseed_ = RepairConflictReseed{};
+    plan_normal_retained_q_.resize(0,0);plan_normal_retained_u_.resize(0,0);
     plan_executable_iterates_ = RepairExecutableIterates{};
     plan_u_bar_ = u_init;
     plan_schedule_ = schedule;
@@ -4520,6 +4611,30 @@ void LocalSparseSCPPlanner::workerLoop() {
       slack_linear_weight = plan_cdf_slack_linear_weight_;
       iteration = scp_iteration_;
       expected_stamp = current_query_stamp_;
+      if(view_preview_aligned_enabled_ && batch->header.stamp==expected_stamp &&
+          witnesses_fresh && (!repair || observation_phase) && !probe &&
+          frontier.recovery_attempt==0 && !executable_recheck_only) {
+        auto context=std::make_shared<ViewLocalContext>();
+        context->batch=*batch;context->q_bar=q_bar;context->u_bar=u_bar;
+        context->q_ref=q_ref;context->u_ref=u_ref;context->previous=previous_command;
+        context->obligation_points=obligation_points;
+        context->prefix=solve_prefix_selection;
+        if(!prefixSelectionCompatible(context->prefix))context->prefix=latest_prefix_selection_;
+        context->trust=trust;context->slack=slack_linear_weight;
+        context->step_scale=executable_step_scale;context->iteration=iteration;
+        context->repair=repair;context->epoch=solve_mode_epoch;
+        context->plan_sequence=solve_plan_sequence;context->goal_revision=terminal_goal_revision_;
+        context->owner=latest_observation_token_;context->region=latest_observation_region_;
+        context->wall=ros::WallTime::now();context->measured_stamp=latest_joint_state_.header.stamp;
+        extractMeasuredQ(latest_joint_state_,context->measured);
+        context->snapshot.witnesses=repair_unknown_witnesses_;
+        context->snapshot.points=latest_vbc_obligation_points_;
+        if(restore_path_guard_scope_==std::to_string(mode_epoch_)+":"+latest_observation_token_)
+          context->snapshot.path_guards=restore_path_guard_points_;
+        context->snapshot.shell=initial_shell_recovery_;
+        context->snapshot.goal=terminal_goal_;context->snapshot.goal_valid=terminal_goal_valid_;
+        view_local_context_=context;
+      }
     }
 
     if (batch->header.stamp != expected_stamp) {
@@ -4528,50 +4643,91 @@ void LocalSparseSCPPlanner::workerLoop() {
 
     publishSummary("sparse_qp_started");
 
-    SparseSolveResult result;
-    if (repair && !witnesses_fresh) {
-      result.status = "repair_witness_missing_or_invalid";
-    } else if (repair && !observation_phase && cdf_slack_enabled_) {
-      result.status = "repair_retreat_requires_hard_gcdf";
-    } else {
-      result = solveSparseSubproblem(
-            *batch,
-            q_bar,
-            u_bar,
-            q_ref,
-            u_ref,
-            previous_command,
-            schedule,
-            frontier,
-            obligation_points,
-            repair,
-            probe,
-            trust,
-            slack_linear_weight, false, false,
-            executable_step_scale, executable_recheck_only,
-            repair_prefix_binding_enabled_ && repair && !probe ? &solve_prefix_selection : nullptr);
-    }
-    bool free_joint_trial_ran = false, free_joint_trial_used = false;
-    if (result.solved && result.primitive_executable_valid &&
-        !result.primitive_live_rebase_required && repair && !probe && observation_phase &&
-        iteration+2 <= max_scp_iterations_ && !executable_recheck_only &&
-        repair_free_joint_task_tracking_scale_ > 0. && frontier.active &&
-        frontier.recovery_attempt == 0 && schedule.size() == 1 &&
-        schedule[0].joint_mask.size() == dof_ &&
-        (schedule[0].joint_mask.array() == 0.).any()) {
-      free_joint_trial_ran = true;
-      const auto trial = solveSparseSubproblem(*batch, q_bar, u_bar, q_ref, u_ref,
-          previous_command, schedule, frontier, obligation_points, repair, probe,
-          trust, slack_linear_weight, false, false, executable_step_scale,
-          executable_recheck_only,
-          repair_prefix_binding_enabled_ ? &solve_prefix_selection : nullptr, true);
-      const double combined_ms = result.setup_and_solve_ms+trial.setup_and_solve_ms;
-      if (freeJointTaskImproves(result, trial, schedule, frontier, q_ref)) {
-        result = trial;
-        free_joint_trial_used = true;
+    ObservationDecisionPolicy decision_policy;
+    decision_policy.repair=repair;decision_policy.probe=probe;
+    decision_policy.observation_phase=observation_phase;
+    decision_policy.iteration=iteration;decision_policy.max_iterations=max_scp_iterations_;
+    decision_policy.recheck_only=executable_recheck_only;
+    decision_policy.free_joint_task_enabled=repair_free_joint_task_tracking_scale_>0.;
+    decision_policy.frontier_active=frontier.active;
+    decision_policy.recovery_attempt=frontier.recovery_attempt;
+    decision_policy.schedule_size=schedule.size();
+    decision_policy.mask_has_free_joint=schedule.size()==1 &&
+        schedule[0].joint_mask.size()==dof_ && (schedule[0].joint_mask.array()==0.).any();
+    if(repair && observation_phase)native_snapshot_observation_seen_=true;
+    auto decision=observationLocalDecision(decision_policy, [&](bool free_joint_task) {
+      SparseSolveResult value;
+      if (repair && !witnesses_fresh) value.status="repair_witness_missing_or_invalid";
+      else if (repair && !observation_phase && cdf_slack_enabled_)
+        value.status="repair_retreat_requires_hard_gcdf";
+      else {
+        const char* requested=std::getenv("CARE_NATIVE_TASK_SNAPSHOT");
+        auto& selected_seq=probe ? native_snapshot_probe_seq_ : native_snapshot_normal_seq_;
+        const bool capture_task=requested && std::string(requested)=="true" && !repair &&
+          !free_joint_task && native_snapshot_observation_seen_ && native_snapshot_count_<16 &&
+          (selected_seq==0 || selected_seq==solve_plan_sequence);
+        if(capture_task && selected_seq==0)selected_seq=solve_plan_sequence;
+        ViewPreviewSnapshot frozen;
+        value=solveSparseSubproblem(*batch,q_bar,u_bar,q_ref,u_ref,previous_command,
+          schedule,frontier,obligation_points,repair,probe,trust,slack_linear_weight,
+          false,false,executable_step_scale,executable_recheck_only,
+          repair_prefix_binding_enabled_ && repair && !probe ? &solve_prefix_selection : nullptr,
+          free_joint_task,nullptr,capture_task?&frozen:nullptr);
+        if(capture_task) {
+          ++native_snapshot_count_;ViewPreviewSnapshot echo_input;
+          const auto tic=ros::WallTime::now();
+          const auto echo=solveSparseSubproblem(*batch,q_bar,u_bar,q_ref,u_ref,previous_command,
+            schedule,frontier,obligation_points,repair,probe,trust,slack_linear_weight,
+            false,false,executable_step_scale,executable_recheck_only,nullptr,
+            free_joint_task,&frozen,&echo_input);
+          const char* root=std::getenv("ROOT_OUT");
+          if(root && *root) {
+            std::ofstream file(std::string(root)+"/native_task_"+std::to_string(native_snapshot_count_)+".json");
+            file<<"{\"schema\":1,\"plan_sequence\":"<<solve_plan_sequence<<",\"mode_epoch\":"<<solve_mode_epoch
+              <<",\"iteration\":"<<iteration<<",\"probe\":"<<(probe?"true":"false")<<",\"repair\":false,\"owner\":";
+            jsonString(file,solve_observation_token);file<<",\"query_ns\":\""<<batch->header.stamp.toNSec()<<"\",\"dt\":";jsonNumber(file,dt_);
+            file<<",\"probe_velocity_cap\":";jsonNumber(file,probe_velocity_cap_);
+            file<<",\"trust\":";jsonNumber(file,trust);file<<",\"q_bar\":";jsonTrajectory(file,q_bar);
+            file<<",\"u_bar\":";jsonTrajectory(file,u_bar);file<<",\"q_ref\":";jsonTrajectory(file,q_ref);
+            file<<",\"u_ref\":";jsonTrajectory(file,u_ref);file<<",\"previous_command\":";jsonVector(file,previous_command);
+            file<<",\"batch\":";auditBatch(file,*batch);
+            file<<",\"matrix_identical\":"<<(frozen.native_matrix_json==echo_input.native_matrix_json?"true":"false");
+            file<<",\"matrix\":"<<(frozen.native_matrix_json.empty()?"null":frozen.native_matrix_json);
+            file<<",\"normal_live_fresh\":"<<(frozen.normal_live_fresh?"true":"false")<<",\"normal_live_q\":";jsonVector(file,frozen.normal_live_q);
+            file<<",\"normal_live_v\":";jsonVector(file,frozen.normal_live_v);
+            file<<",\"primitive_live_fresh\":"<<(frozen.primitive_live_fresh?"true":"false")<<",\"primitive_live_q\":";jsonVector(file,frozen.primitive_live_q);
+            file<<",\"primitive_live_v\":";jsonVector(file,frozen.primitive_live_v);
+            file<<",\"active_observation_points\":[";int pi=0;
+            for(const auto& point:frozen.points){if(pi++)file<<',';jsonVector(file,point);}file<<']';
+            file<<",\"obligation_points\":[";pi=0;
+            for(const auto& point:obligation_points){if(pi++)file<<',';jsonVector(file,point);}file<<']';
+            file<<",\"q_min\":";jsonVector(file,q_min_);file<<",\"q_max\":";jsonVector(file,q_max_);
+            file<<",\"velocity_limits\":";jsonVector(file,velocity_limits_);file<<",\"acceleration_limits\":";jsonVector(file,acceleration_limits_);
+            file<<",\"goal_valid\":"<<(frozen.goal_valid?"true":"false")<<",\"goal_position\":";jsonVector(file,frozen.goal.translation());
+            file<<",\"schedule_size\":"<<schedule.size()<<",\"frontier_active\":"<<(frontier.active?"true":"false");
+            file<<",\"frontier_q\":";jsonVector(file,frontier.q);
+            file<<",\"witness_count\":"<<frozen.witnesses.size()<<",\"path_guard_count\":"<<frozen.path_guards.size();
+
+            auto write=[&](const SparseSolveResult& result) {
+              file<<"{\"status\":";jsonString(file,result.status);file<<",\"solved\":"<<(result.solved?"true":"false");
+              file<<",\"normal_curve_checked\":"<<(result.normal_curve_checked?"true":"false")<<",\"normal_curve_valid\":"<<(result.normal_curve_valid?"true":"false");
+              file<<",\"normal_live_checked\":"<<(result.normal_live_checked?"true":"false")<<",\"normal_live_valid\":"<<(result.normal_live_valid?"true":"false");
+              file<<",\"primitive_valid\":"<<(result.primitive_executable_valid?"true":"false");
+              file<<",\"q\":";jsonTrajectory(file,result.q);file<<",\"u\":";jsonTrajectory(file,result.u);file<<'}';
+            };
+            file<<",\"original\":";write(value);file<<",\"echo\":";write(echo);
+            file<<",\"diagnostic_extra_ms\":";jsonNumber(file,(ros::WallTime::now()-tic).toSec()*1000.);
+            file<<",\"motion_authorized\":false,\"scope\":\"Original native subproblem including nonlinear/live checks; not an end-to-end task certificate\"}\n";
+          }
+        }
       }
-      result.setup_and_solve_ms = combined_ms;
-    }
+      return value;
+    }, [&](const SparseSolveResult& primary,const SparseSolveResult& trial) {
+      return freeJointTaskImproves(primary,trial,schedule,frontier,q_ref);
+    });
+    SparseSolveResult result=std::move(decision.result);
+    const bool free_joint_trial_ran=decision.free_joint_trial_ran;
+    const bool free_joint_trial_used=decision.free_joint_trial_used;
     bool margin_cause_proven = false;
     if (!result.solved && repair && !probe && witnesses_fresh &&
         (result.status == "primal infeasible" || result.status == "max iterations reached") &&
@@ -5026,6 +5182,10 @@ void LocalSparseSCPPlanner::workerLoop() {
         const bool exhausted =
             scp_iteration_ >= max_scp_iterations_;
 
+        if (!repair && !probe && result.normal_curve_checked && result.normal_curve_valid &&
+            (!result.normal_live_checked || result.normal_live_valid)) {
+          plan_normal_retained_q_=result.q;plan_normal_retained_u_=result.u;
+        }
         const bool executable_policy = !executable_context.empty() &&
             result.primitive_executable_samples > 0;
         if (executable_policy) {
@@ -5056,7 +5216,34 @@ void LocalSparseSCPPlanner::workerLoop() {
                       cdf_slack_penalty_multiplier_);
         }
 
-        if (result.primitive_live_rebase_required && !exhausted) {
+        if (!repair && !probe && result.normal_curve_checked &&
+            (!result.normal_curve_valid || (result.normal_live_checked && !result.normal_live_valid))) {
+          if (!exhausted) {
+            if (result.normal_curve_valid && result.normal_live_checked && !result.normal_live_valid) {
+              // Rebuild from one measured q/v snapshot. A different origin
+              // invalidates every old linearization; the next query is fresh.
+              Eigen::MatrixXd seed_q,seed_u;
+              if(buildNormalMotionSeed(result.normal_live_q,result.normal_live_v,result.q,seed_q,seed_u)) {
+                plan_q_current_=result.normal_live_q;plan_previous_command_=result.normal_live_v;
+                plan_q_bar_=seed_q;plan_u_bar_=seed_u;plan_q_ref_.col(0)=result.normal_live_q;
+                plan_normal_retained_q_.resize(0,0);plan_normal_retained_u_.resize(0,0);
+              }
+            } else if (scp_iteration_+1==max_scp_iterations_ && plan_normal_retained_q_.size()) {
+              // Reserve the final original iteration for an earlier feasible
+              // shape. It is a new query/solve, never reuse of a certificate.
+              plan_q_bar_=plan_normal_retained_q_;plan_u_bar_=plan_normal_retained_u_;
+            }
+            plan_has_hard_solution_=false;
+            previous_query_min_distance_=std::numeric_limits<double>::quiet_NaN();
+            plan_initialization_mode_="normal_curve_relinearization";
+            result.repair_feedback="normal_curve_relinearization";
+            publish_next_query=true;q_next=plan_q_bar_;u_next=plan_u_bar_;frame=current_frame_id_;
+          } else {
+            plan_running_=false;waiting_for_cdf_=false;last_plan_finish_time_=ros::Time::now();
+            result.repair_feedback="normal_curve_iteration_budget";
+            requestPlanLocked(result.repair_feedback);
+          }
+        } else if (result.primitive_live_rebase_required && !exhausted) {
           // The receiver rebases the newly proposed path to measured q before
           // certification. If that already destroys a known geometric row,
           // spend the next ORIGINAL SCP iteration at that measured origin.
@@ -5428,7 +5615,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     double executable_step_scale,
     bool executable_recheck_only,
     const RepairPrefixSelection* prefix_selection,
-    bool free_joint_task, const ViewPreviewSnapshot* preview) const {
+    bool free_joint_task, const ViewPreviewSnapshot* preview, ViewPreviewSnapshot* capture) const {
   const auto& geometry_guard=preview ? *preview->guard : primitive_observation_guard_;
   SparseSolveResult out;
   const char* recovery_policy = std::getenv("CARE_REPAIR_UNKNOWN_SOFT");
@@ -5446,13 +5633,25 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     return out;
   }
   const char* prefix_objective_policy=std::getenv("CARE_PREFIX_TASK_OBJECTIVE");
-  const bool prefix_task_objective=normal_motion && !force_diagnostic_slack &&
+  const bool normal_prefix_task_objective=normal_motion && !force_diagnostic_slack &&
       prefix_objective_policy && std::string(prefix_objective_policy)=="true";
   Eigen::Isometry3d prefix_task_goal=Eigen::Isometry3d::Identity();
   bool prefix_task_goal_valid=false;
   if(preview) {prefix_task_goal=preview->goal;prefix_task_goal_valid=preview->goal_valid;}
   else {std::lock_guard<std::mutex> lock(mutex_);
     prefix_task_goal=terminal_goal_;prefix_task_goal_valid=terminal_goal_valid_;}
+  if(capture) {
+    capture->native_task_replay=true;capture->goal=prefix_task_goal;
+    capture->goal_valid=prefix_task_goal_valid;capture->guard=geometry_guard.cloneForPreview();
+  }
+  Eigen::Matrix<double,6,1> current_task_error;
+  // Five task tolerances define a soft objective activation zone. No motion
+  // is rejected by this condition, and far observation motions keep their cost.
+  const bool repair_prefix_task_objective=repair_goal_stopping_enabled_ &&
+      repair_motion && !force_diagnostic_slack && prefix_task_goal_valid &&
+      taskPoseResidual(geometry_guard,q_bar.col(0),terminal_ee_frame_,prefix_task_goal,&current_task_error) &&
+      current_task_error.head<3>().norm()<=1. && current_task_error.tail<3>().norm()<=1.;
+  const bool prefix_task_objective=normal_prefix_task_objective || repair_prefix_task_objective;
   auto executable_settings=repair_executable_settings_;
   if(repair_motion)executable_settings.initial_velocity=previous_command;
   if (repair_prefix_binding_enabled_ && repair_mode && !probe_mode) {
@@ -5486,6 +5685,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     active_observation_points = latest_vbc_obligation_points_;
     if(restore_path_guard_scope_==std::to_string(mode_epoch_)+":"+latest_observation_token_)
       path_guards=restore_path_guard_points_;
+  }
+  if(capture) {
+    capture->witnesses=witnesses;capture->path_guards=path_guards;
+    capture->points=active_observation_points;
+    std::lock_guard<std::mutex> lock(mutex_);capture->shell=initial_shell_recovery_;
   }
   const bool slack_enabled =
       cdf_slack_enabled_ || force_diagnostic_slack || unknown_cdf_soft;
@@ -5990,13 +6194,24 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       shell_penalty_rows.push_back(r);
   }
   out.primitive_shell_penalty_rows=shell_penalty_rows.size();
+  std::vector<NormalExecutableLimitRow> normal_limit_samples;
+  if(normal_motion && std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true") {
+    std::string error;
+    if(!normalExecutableLimitRows(q_bar,u_bar,dt_,repair_executable_settings_,
+        previous_command,&normal_limit_samples,&error)) {
+      out.status="normal_executable_limit_model_error";return out;
+    }
+  }
   const int n=n_q+n_u+n_s+shell_penalty_rows.size();
   std::set<int> executable_velocity_knots;
   for (const auto& sample : executable_samples) for (const auto& term : sample.u_weights)
     if (term.second.cwiseAbs().maxCoeff() > 1e-12) executable_velocity_knots.insert(term.first);
   for (const auto& sample : cdf_executable_samples) for (const auto& term : sample.u_weights)
     if (term.second.cwiseAbs().maxCoeff() > 1e-12) executable_velocity_knots.insert(term.first);
-  const int n_ineq = n_acc + n_cdf_rows + out.primitive_observation_rows + shell_penalty_rows.size();
+  // NORMAL joint-limit envelopes need no brake-derivative velocity trust box.
+  const int normal_limit_row_offset=n_acc+n_cdf_rows+out.primitive_observation_rows+shell_penalty_rows.size();
+  const int n_ineq = normal_limit_row_offset+normal_limit_samples.size()*dof_;
 
   using Triplet = Eigen::Triplet<double>;
   std::vector<Triplet> p_triplets;
@@ -6085,11 +6300,17 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   if(prefix_task_objective && prefix_task_goal_valid) {
     auto settings=repair_executable_settings_;
     settings.initial_velocity=previous_command;settings.prefixes={.1,.15,.25,.5};
+    if(repair_prefix_task_objective) {
+      settings.prefixes=executable_settings.prefixes;
+    }
     std::vector<ExecutableTaskTarget> targets;std::string error;
     if(executableTaskTargets(primitive_observation_guard_,q_bar,u_bar,dt_,settings,
         terminal_ee_frame_,prefix_task_goal,&targets,&error)) {
       const double mass=(q_tracking_weight_+terminal_q_tracking_weight_)*num_intervals_;
-      const double weight=mass/targets.size();
+      // NORMAL uses 10cm/1rad objective units. Near-goal REPAIR uses
+      // the actual 2cm/.2rad task units (5^2), so observation/reference
+      // attraction does not dominate the feasible terminal stop.
+      const double weight=mass/targets.size()*(repair_prefix_task_objective ? 25. : 1.);
       for(const auto& target:targets) {
         std::map<int,Eigen::Matrix<double,6,1>> columns;
         auto add=[&](int index,const Eigen::Matrix<double,6,1>& column) {
@@ -6121,6 +6342,27 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  if(probe_task_objective_enabled_ && probe_mode && !repair_mode &&
+      !force_diagnostic_slack && prefix_task_goal_valid) {
+    Eigen::Matrix<double,6,1> residual;Eigen::MatrixXd jacobian;
+    if(probeTaskResidualJacobian(geometry_guard,q_bar,u_bar,dt_,previous_command,
+        probe_task_settings_,terminal_ee_frame_,prefix_task_goal,&residual,&jacobian)) {
+      const double weight=(q_tracking_weight_+terminal_q_tracking_weight_)*num_intervals_;
+      std::vector<int> active;Eigen::Matrix<double,6,1> offset=residual;
+      for(int col=0;col<jacobian.cols();++col)if(jacobian.col(col).cwiseAbs().maxCoeff()>1e-10) {
+        active.push_back(col);
+        const double nominal=col<n_q ? q_bar(col%dof_,col/dof_+1) : u_bar((col-n_q)%dof_,(col-n_q)/dof_);
+        offset-=jacobian.col(col)*nominal;
+      }
+      for(int a:active) {
+        c[a]+=2.*weight*jacobian.col(a).dot(offset);
+        for(int b:active)p_triplets.emplace_back(a,b,2.*weight*jacobian.col(a).dot(jacobian.col(b)));
+      }
+      ROS_INFO_STREAM("[PROBE_EXECUTABLE_TASK] active_columns="<<active.size()
+          <<" weight="<<weight<<" stopped_task_cost="<<residual.squaredNorm());
+    } else ROS_WARN("[PROBE_EXECUTABLE_TASK] optional objective unavailable");
+  }
+
   // Visibility obligations are long-range trajectory objectives. A learned
   // frontier target may simultaneously lower their weight and add a short
   // local visibility-improvement objective; neither changes hard safety.
@@ -6144,6 +6386,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  int stopped_observation_targets = 0;
   if (repair_mode &&
       frontier.active &&
       frontier.q.size() == dof_ &&
@@ -6267,7 +6510,48 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       }
       out.recovery_frontier = objective_target;
     }
+    // Ordinary sensing must improve the pose the receiver actually reaches
+    // after its selected prefix and brake. A target at k_frontier alone can
+    // improve briefly, then reverse before the prefix stops. Use the same
+    // differentiated executable view already used by the geometric guards.
+    // This changes a soft objective only; detour objectives remain unchanged.
+    if (repair_motion && frontier.recovery_attempt == 0) {
+      std::vector<RepairExecutableSample> samples;
+      std::string error;
+      if (repairExecutableSamples(q_bar,u_bar,dt_,executable_settings,&samples,&error)) {
+        const double weight = frontier_weight / executable_settings.prefixes.size();
+        for (double prefix : executable_settings.prefixes) {
+          const auto stop = std::find_if(samples.rbegin(),samples.rend(),
+              [&](const RepairExecutableSample& sample) {
+                return std::abs(sample.prefix_s-std::min(prefix,num_intervals_*dt_))<1e-9;
+              });
+          if (stop == samples.rend()) continue;
+          for (int j=0;j<dof_;++j) {
+            if (objective_mask[j] <= 0.) continue;
+            std::map<int,double> columns;
+            for (const auto& term : stop->q_weights)
+              if (term.first > 0) columns[qIndex(term.first,j)] += term.second;
+            for (const auto& term : stop->u_weights)
+              columns[uIndex(term.first,j)] += term.second[j];
+            double offset = stop->q[j] - objective_target[j];
+            for (const auto& term : columns) {
+              const double nominal = term.first < n_q
+                  ? q_bar(j,term.first/dof_+1) : u_bar(j,(term.first-n_q)/dof_);
+              offset -= term.second * nominal;
+            }
+            const double w = weight * objective_mask[j];
+            for (const auto& a : columns) {
+              c[a.first] += 2.*w*a.second*offset;
+              for (const auto& b : columns)
+                p_triplets.emplace_back(a.first,b.first,2.*w*a.second*b.second);
+            }
+          }
+          ++stopped_observation_targets;
+        }
+      }
+    }
     for (int j = 0; j < dof_; ++j) {
+      if (!stopped_observation_targets)
       addQuadraticTarget(
           qIndex(k_frontier, j),
           frontier_weight * objective_mask[j],
@@ -6532,6 +6816,34 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
+  // Joint position bounds on the actual .25 s task prefix and its complete
+  // discrete stop, rather than only the unexecuted one-second nodal reference.
+  int normal_padding_reduced_rows=0;
+  const Eigen::VectorXd normal_lower=q_min_.array()+joint_position_margin_;
+  const Eigen::VectorXd normal_upper=q_max_.array()-joint_position_margin_;
+  for(std::size_t i=0;i<normal_limit_samples.size();++i) {
+    const auto& limit=normal_limit_samples[i];
+    const auto& sample=limit.sample;
+    for(int j=0;j<dof_;++j) {
+      const int row=normal_limit_row_offset+i*dof_+j;
+      double offset=sample.q[j];
+      for(const auto& term:sample.q_weights)if(term.first>0 && term.second!=0.) {
+        g_triplets.emplace_back(row,qIndex(term.first,j),term.second);
+        offset-=term.second*q_bar(j,term.first);
+      }
+      for(const auto& term:sample.u_weights)if(term.second[j]!=0.) {
+        g_triplets.emplace_back(row,uIndex(term.first,j),term.second[j]);
+        offset-=term.second[j]*u_bar(j,term.first);
+      }
+      const auto padding=normalExecutableLimitPadding(limit,j,q_bar.col(0),
+          previous_command,velocity_limits_,acceleration_limits_,normal_lower,
+          normal_upper,dt_,2.*piqp_eps_abs_);
+      if((limit.lower && padding.lower<2.*piqp_eps_abs_) ||
+          (limit.upper && padding.upper<2.*piqp_eps_abs_))++normal_padding_reduced_rows;
+      if(limit.lower)h_l[row]=normal_lower[j]+padding.lower-offset;
+      if(limit.upper)h_u[row]=normal_upper[j]-padding.upper-offset;
+    }
+  }
   Eigen::SparseMatrix<double> P(n, n);
   Eigen::SparseMatrix<double> A(n_eq, n);
   Eigen::SparseMatrix<double> G(n_ineq, n);
@@ -6592,8 +6904,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       << " accel_constraints="
       << (acceleration_constraints ? 1 : 0)
       << " prefix_task_targets=" << prefix_task_targets
+      << " stopped_observation_targets=" << stopped_observation_targets
       << " normal_acceleration_motion=" << (normal_motion ? 1 : 0)
       << " repair_acceleration_motion=" << (repair_motion ? 1 : 0)
+      << " normal_executable_joint_limit_rows=" << normal_limit_samples.size()*dof_
+      << " normal_padding_reduced_rows=" << normal_padding_reduced_rows
       << " executable_cdf_samples=" << cdf_executable_samples.size()
       << " eq=" << n_eq
       << " ineq=" << n_ineq
@@ -6632,6 +6947,15 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   out.primal_residual = result.info.primal_res;
   out.dual_residual = result.info.dual_res;
   out.status = piqp::status_to_string(status);
+  if(capture) {
+    std::ostringstream m;m<<"{\"P\":";jsonSparse(m,P);
+    m<<",\"c\":";jsonVector(m,c);m<<",\"A\":";jsonSparse(m,A);
+    m<<",\"b\":";jsonVector(m,b);m<<",\"G\":";jsonSparse(m,G);
+    m<<",\"h_l\":";jsonVector(m,h_l);m<<",\"h_u\":";jsonVector(m,h_u);
+    m<<",\"x_l\":";jsonVector(m,x_l);m<<",\"x_u\":";jsonVector(m,x_u);m<<'}';
+    capture->native_matrix_json=m.str();
+  }
+
 
   if (!force_diagnostic_slack && status != piqp::PIQP_SOLVED) {
     out.box_conflicting_cdf_rows = lowerBoxConflicts(G, h_l, x_l, x_u, n_acc);
@@ -6914,6 +7238,32 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       out.solved=false;out.status="known_ground_nonlinear_recheck_failed";return out;
     }
   }
+  if (normal_motion && !normal_limit_samples.empty() && !force_diagnostic_slack) {
+    out.normal_curve_checked=true;
+    const Eigen::VectorXd lo=q_min_.array()+joint_position_margin_,hi=q_max_.array()-joint_position_margin_;
+    std::vector<NormalCurveKnot> curve;std::string error;
+    out.normal_curve_valid=normalExecutableCurve(out.q,out.u,dt_,repair_executable_settings_,previous_command,
+        out.q.col(0),previous_command,&curve,&error);
+    if(out.normal_curve_valid){const auto range=normalCurveRange(curve,lo,hi,velocity_limits_);
+      out.normal_curve_valid=range.valid;out.normal_curve_violation=range.violation;}
+    if(!preview || preview->native_task_replay) {
+      Eigen::VectorXd measured,velocity(dof_);bool fresh=false;
+      if(preview){fresh=preview->normal_live_fresh;measured=preview->normal_live_q;velocity=preview->normal_live_v;}
+      else
+      {std::lock_guard<std::mutex> lock(mutex_);
+        const double age=(ros::Time::now()-latest_joint_state_.header.stamp).toSec();
+        fresh=has_joint_state_ && !latest_joint_state_.header.stamp.isZero() && age>=0. && age<=.05 && extractMeasuredQ(latest_joint_state_,measured);
+        for(int j=0;fresh && j<dof_;++j){const auto it=std::find(latest_joint_state_.name.begin(),latest_joint_state_.name.end(),joint_names_[j]);
+          const auto k=std::distance(latest_joint_state_.name.begin(),it);
+          fresh=it!=latest_joint_state_.name.end() && k<static_cast<long>(latest_joint_state_.velocity.size()) && std::isfinite(latest_joint_state_.velocity[k]);
+          if(fresh)velocity[j]=latest_joint_state_.velocity[k];}}
+      if(capture){capture->normal_live_fresh=fresh;capture->normal_live_q=measured;capture->normal_live_v=velocity;}
+      if(fresh){out.normal_live_checked=true;out.normal_live_q=measured;out.normal_live_v=velocity;
+        out.normal_live_valid=normalExecutableCurve(out.q,out.u,dt_,repair_executable_settings_,previous_command,measured,velocity,&curve,&error);
+        if(out.normal_live_valid){const auto range=normalCurveRange(curve,lo,hi,velocity_limits_);
+          out.normal_live_valid=range.valid;out.normal_live_violation=range.violation;}}
+    }
+  }
   std::set<care_confidence_map::InitialShellRecovery::Key> consumed_margin_points;
   if (repair_executable_view_enabled_ && !primitive_points.empty()) {
     std::vector<RepairExecutableSample> samples;
@@ -6937,10 +7287,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         out.primitive_executable_valid=std::all_of(rows.begin(),rows.end(),[&](const PrimitiveObservationGuard::Row& row) {
           return row.distance_m>=primitive_floors.at(care_confidence_map::InitialShellRecovery::key(row.point));
         });
-        if (out.primitive_executable_valid && !force_diagnostic_slack && !previous_vbc_margins && !preview) {
+        if (out.primitive_executable_valid && !force_diagnostic_slack && !previous_vbc_margins && (!preview || preview->native_task_replay)) {
           Eigen::VectorXd measured,velocity(dof_);
           bool fresh = false;
-          {
+          if(preview){fresh=preview->primitive_live_fresh;measured=preview->primitive_live_q;velocity=preview->primitive_live_v;}
+          else {
             std::lock_guard<std::mutex> lock(mutex_);
             const double age=(ros::Time::now()-latest_joint_state_.header.stamp).toSec();
             fresh=has_joint_state_ && !latest_joint_state_.header.stamp.isZero() &&
@@ -6953,6 +7304,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
               if(fresh)velocity[j]=latest_joint_state_.velocity[index];
             }
           }
+          if(capture){capture->primitive_live_fresh=fresh;capture->primitive_live_q=measured;capture->primitive_live_v=velocity;}
           if (fresh) {
             const Eigen::VectorXd shift=measured-out.q.col(0);
             out.primitive_live_rebase_shift_inf=shift.lpNorm<Eigen::Infinity>();
@@ -7313,7 +7665,8 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
   const auto* normal_initial_velocity =
       repair_executable_view_enabled_ && !plan_probe_mode_ && (geometric_restore_points.empty() || margin_recovery) ? &plan_previous_command_ : nullptr;
   const auto msg = makeTrajectoryMessage(q, u, frame_id, ros::Time::now(), normal_initial_velocity);
-  if(!plan_repair_mode_ && !plan_probe_mode_ && plan_terminal_context_==terminalContextLocked())
+  if((!plan_repair_mode_ || repair_goal_stopping_enabled_) && !plan_probe_mode_ &&
+      plan_terminal_context_==terminalContextLocked())
     terminal_retention_.candidate(msg.header.stamp.toNSec(),plan_terminal_context_);
   if (!plan_repair_mode_ && !plan_probe_mode_) {
     const double age = (ros::Time::now()-last_query_ros_time_).toSec();
@@ -7361,7 +7714,8 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
         FinalVbcNoProgress::Candidate{plan_repair_ticket_,mode_epoch_,plan_sequence_},observation_token,
         msg.header.stamp,ros::WallTime::now()+ros::WallDuration(cdf_wait_timeout_s_)});
   }
-  if (rejection_snapshots_enabled_) {
+  if (rejection_snapshots_enabled_ || (std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+      std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true")) {
     std::ostringstream out;
     out << "{\"schema\":1,\"raw_candidate_stamp_ns\":\"" << msg.header.stamp.toNSec()
         << "\",\"plan_seq\":" << plan_sequence_ << ",\"mode_epoch\":" << mode_epoch_
@@ -7369,6 +7723,13 @@ void LocalSparseSCPPlanner::publishCandidateTrajectory(
         << ",\"progress_epoch\":" << final_vbc_no_progress_.progress.active.progress
         << ",\"observation_token\":";
     auditString(out,observation_token);
+    if (std::getenv("CARE_ROLLING_TASK_OBSERVATION") &&
+        std::string(std::getenv("CARE_ROLLING_TASK_OBSERVATION"))=="true") {
+      out << ",\"rolling_task\":true,\"goal_revision\":"<<terminal_goal_revision_
+          <<",\"repair\":"<<(plan_repair_mode_?"true":"false")
+          <<",\"probe\":"<<(plan_probe_mode_?"true":"false")
+          <<",\"candidate_trajectory\":"; auditTrajectory(out,msg);
+    }
     out << ",\"query_trajectory\":";
     auto query_message=makeTrajectoryMessage(query_q,query_u,frame_id,batch.header.stamp,
         repair_executable_view_enabled_ && !plan_probe_mode_ ? &plan_previous_command_ : nullptr);
@@ -7567,6 +7928,7 @@ void LocalSparseSCPPlanner::publishSummary(
   bool running = false;
   bool repair = false;
   bool probe = false;
+  unsigned long long goal_stop_execution=0,goal_stop_sample=0;
   int probe_restore_attempts = 0;
   bool observation_phase = true;
   int witness_count = 0;
@@ -7669,6 +8031,12 @@ void LocalSparseSCPPlanner::publishSummary(
     safe_stall_active = safe_frontier_recovery_enabled_ && safe_frontier_recovery_.active;
     safe_stall_reselect = safe_stall_active && (safe_frontier_recovery_.blocked() ||
         final_vbc_no_progress_.progress.blocked() || repair_no_progress_.blocked());
+    if(repair_goal_stopping_enabled_ && terminal_retention_.armed) {
+      if(retainTerminalLocked()) {
+        goal_stop_execution=terminal_retention_.armed;
+        goal_stop_sample=latest_joint_state_.header.stamp.toNSec();
+      } else requestPlanLocked("terminal_retention_released");
+    }
     observation_token = plan_observation_token_;
     batches = cdf_batch_received_;
     query_stamp_ns = current_query_stamp_.toNSec();
@@ -7931,6 +8299,12 @@ void LocalSparseSCPPlanner::publishSummary(
         << " executable_recheck_only=" << (result->executable_recheck_only ? 1 : 0)
         << " executable_trial_restored=" << (result->executable_trial_restored ? 1 : 0)
         << " executable_retained_available=" << (result->executable_retained_available ? 1 : 0)
+        << " normal_curve_checked=" << result->normal_curve_checked
+        << " normal_curve_valid=" << result->normal_curve_valid
+        << " normal_curve_violation=" << result->normal_curve_violation
+        << " normal_live_checked=" << result->normal_live_checked
+        << " normal_live_valid=" << result->normal_live_valid
+        << " normal_live_violation=" << result->normal_live_violation
         << " primitive_live_rebase_checked=" << result->primitive_live_rebase_checked
         << " primitive_live_rebase_required=" << result->primitive_live_rebase_required
         << " primitive_live_rebase_shift_inf=" << result->primitive_live_rebase_shift_inf
@@ -7975,10 +8349,13 @@ void LocalSparseSCPPlanner::publishSummary(
   }
   std_msgs::String msg;
   msg.data = oss.str();
+  msg.data+=" goal_stop_execution_stamp_ns="+std::to_string(goal_stop_execution)+
+      " goal_stop_sample_ros_ns="+std::to_string(goal_stop_sample);
   summary_pub_.publish(msg);
   ROS_INFO_STREAM_THROTTLE(
       0.25, "[LocalSparseSCPPlanner] " << msg.data);
 }
 
 #include "native_view_preview.inc"
+#include "aligned_view_preview.inc"
 }  // namespace egocentric_arm_planner

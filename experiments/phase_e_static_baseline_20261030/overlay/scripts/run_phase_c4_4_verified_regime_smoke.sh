@@ -4,7 +4,7 @@ SUMMARY_STATE_CLOCK_COHERENT="${SUMMARY_STATE_CLOCK_COHERENT:-false}"
 FIXED_START_RECOVERY_ENABLED="${FIXED_START_RECOVERY_ENABLED:-false}"
 FIXED_START_REBASE_REAUDIT_ENABLED="${FIXED_START_REBASE_REAUDIT_ENABLED:-false}"
 
-REPO="${REPO:-/home/zhicheng/Project/CAREPlanner}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 CASE_FILE="${CASE_FILE:-${REPO}/src/egocentric_arm_planner/config/phase_c2_vbc_cases.json}"
 CONFIG_FILE="${CONFIG_FILE:-${REPO}/src/egocentric_arm_planner/config/planner_phase1_c4_3_planner.yaml}"
 CASE_ID="${CASE_ID:-case_003}"
@@ -60,6 +60,7 @@ fi
 INITIAL_GATE_MAX_TRIES="${INITIAL_GATE_MAX_TRIES:-400}"
 INITIAL_GATE_ECHO_TIMEOUT="${INITIAL_GATE_ECHO_TIMEOUT:-1.0}"
 NCDF_ENV="${NCDF_ENV:-ncdf_l4c}"
+VISIBILITY_ENV="${VISIBILITY_ENV:-ncdf_l4c}"
 NCDF_DEVICE="${NCDF_DEVICE:-cpu}"
 CARE_WEIGHT="${CARE_WEIGHT:-3000.0}"
 SAFETY_MARGIN="${SAFETY_MARGIN:-0.30}"
@@ -233,7 +234,7 @@ ACTUATOR_TOPIC="/care_arm/arm_group_velocity_controller/command"
 ACTUATOR_COMMAND_WATCHDOG="${ACTUATOR_COMMAND_WATCHDOG:-false}"
 STOP_SHADOW_ENABLED="${STOP_SHADOW_ENABLED:-false}"
 STOP_SHADOW_RATE="${STOP_SHADOW_RATE:-5}"
-STOP_SHADOW_PYTHON="${STOP_SHADOW_PYTHON:-/home/zhicheng/miniconda3/envs/viscdf/bin/python}"
+STOP_SHADOW_PYTHON="${STOP_SHADOW_PYTHON:-python3}"
 case "${STOP_SHADOW_ENABLED}" in
   true)
     if [[ "${ACTUATOR_COMMAND_WATCHDOG}" != "true" || ! -x "${STOP_SHADOW_PYTHON}" ]]; then
@@ -290,7 +291,9 @@ if timeout 2 rosnode list >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
+if [[ -n "${CONDA_SH:-}" && -f "${CONDA_SH}" ]]; then
+  :
+elif [ -f "${HOME}/anaconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/anaconda3/etc/profile.d/conda.sh"
 elif [ -f "${HOME}/miniconda3/etc/profile.d/conda.sh" ]; then
   CONDA_SH="${HOME}/miniconda3/etc/profile.d/conda.sh"
@@ -584,7 +587,7 @@ TRACKER_PID=$!
 
 echo "[PER-SENSOR HYBRID] enabled=${PER_SENSOR_HYBRID_ENABLED} checkpoint=${PER_SENSOR_CHECKPOINT} branch_steps=${PER_SENSOR_BRANCH_ASCENT_STEPS} attempts=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} LOS=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} high_witness_priority=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} high_witness_z_min=${PER_SENSOR_HIGH_WITNESS_Z_MIN}"
 
-setsid bash -lc "source '${CONDA_SH}'; conda activate '${NCDF_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _frontier_step_inf:=${FRONTIER_STEP_INF} _frontier_vbc_escalation_enabled:=${FRONTIER_VBC_ESCALATION_ENABLED} _frontier_vbc_escalation_after:=${FRONTIER_VBC_ESCALATION_AFTER} _frontier_escalated_step_inf:=${FRONTIER_ESCALATED_STEP_INF} _blocker_push_max_sweep_s:=${BLOCKER_PUSH_MAX_SWEEP_S:-0.30} _blocker_confirmations:=${BLOCKER_CONFIRMATIONS:-2} _final_vbc_recovery_enabled:=${FINAL_VBC_RECOVERY_ENABLED} _final_vbc_recovery_feedback_topic:='${LOCAL_SCP_SUMMARY_TOPIC}' _execution_active_set_bundle_topic:='${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}' _candidate_replacement_enabled:=${CANDIDATE_REPLACEMENT_ENABLED:-false} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _per_sensor_allow_nominal_proposals:=${PER_SENSOR_ALLOW_NOMINAL_PROPOSALS} _per_sensor_high_witness_priority_enabled:=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} _per_sensor_high_witness_z_min:=${PER_SENSOR_HIGH_WITNESS_Z_MIN} _output_root:='${OUT}/projector_traces'" \
+setsid bash -lc "source '${CONDA_SH}'; conda activate '${VISIBILITY_ENV}'; cd '${REPO}'; source devel/setup.bash; exec python -u src/care_visibility_cdf/scripts/vbc_deadline_waypoint_online_node.py _device:=${NCDF_DEVICE} _rate:=50.0 _enable_oracle_diagnostics:=${ENABLE_ORACLE_DIAGNOSTICS} _region_schedule_mode:='${REGION_SCHEDULE_MODE}' _predicted_trajectory_topic:='${VERIFY_TOPIC}' _safety_margin_s:=${SAFETY_MARGIN} _predicted_trajectory_timeout:=${PREDICTION_TIMEOUT} _target_cell_resolution:=0.05 _projection_iters:=10 _projection_damping:=0.5 _projection_epsilon_f:=0.03 _projection_max_step_norm:=0.25 _root_refine_iters:=12 _root_tolerance_f:=0.002 _ascent_steps:=1 _ascent_step_size:=0.05 _ascent_max_step_norm:=0.25 _adaptive_refinement_enabled:=${ADAPTIVE_REFINEMENT_ENABLED} _frontier_steering_enabled:=${FRONTIER_STEERING_ENABLED} _vbc_gated_frontier_step_enabled:=${VBC_GATED_FRONTIER_STEP_ENABLED} _frontier_step_inf:=${FRONTIER_STEP_INF} _frontier_vbc_escalation_enabled:=${FRONTIER_VBC_ESCALATION_ENABLED} _frontier_vbc_escalation_after:=${FRONTIER_VBC_ESCALATION_AFTER} _frontier_escalated_step_inf:=${FRONTIER_ESCALATED_STEP_INF} _blocker_push_max_sweep_s:=${BLOCKER_PUSH_MAX_SWEEP_S:-0.30} _blocker_confirmations:=${BLOCKER_CONFIRMATIONS:-2} _final_vbc_recovery_enabled:=${FINAL_VBC_RECOVERY_ENABLED} _final_vbc_recovery_feedback_topic:='${LOCAL_SCP_SUMMARY_TOPIC}' _execution_active_set_bundle_topic:='${EXECUTION_VBC_ACTIVE_SET_BUNDLE_TOPIC}' _candidate_replacement_enabled:=${CANDIDATE_REPLACEMENT_ENABLED:-false} _per_sensor_hybrid_enabled:=${PER_SENSOR_HYBRID_ENABLED} _per_sensor_checkpoint:='${PER_SENSOR_CHECKPOINT}' _per_sensor_self_filter_urdf:='${PER_SENSOR_SELF_FILTER_URDF}' _per_sensor_branch_ascent_steps:=${PER_SENSOR_BRANCH_ASCENT_STEPS} _per_sensor_branch_step_size:=${PER_SENSOR_BRANCH_STEP_SIZE} _per_sensor_branch_max_step_norm:=${PER_SENSOR_BRANCH_MAX_STEP_NORM} _per_sensor_max_branch_attempts:=${PER_SENSOR_MAX_BRANCH_ATTEMPTS} _per_sensor_min_conservative_g:=${PER_SENSOR_MIN_CONSERVATIVE_G} _per_sensor_require_primitive_los:=${PER_SENSOR_REQUIRE_PRIMITIVE_LOS} _per_sensor_allow_nominal_proposals:=${PER_SENSOR_ALLOW_NOMINAL_PROPOSALS} _per_sensor_high_witness_priority_enabled:=${PER_SENSOR_HIGH_WITNESS_PRIORITY_ENABLED} _per_sensor_high_witness_z_min:=${PER_SENSOR_HIGH_WITNESS_Z_MIN} _output_root:='${OUT}/projector_traces'" \
   > "${LOG}/waypoint_generator.log" 2>&1 &
 GEN_PID=$!
 

@@ -90,20 +90,54 @@ def route_candidates(start, goal, lower, upper, generation=0):
     return sorted(candidates,key=lambda p:float(np.sum(np.linalg.norm(np.diff(p,axis=0),axis=1))))
 
 
+def load_route_cdf(device):
+    """Use the collision model selected for this run, including its epoch."""
+    import json
+    from pathlib import Path
+    from collision_cdf_model import CollisionCDF
+    path=os.environ.get('CARE_CDF_MODEL_BINDING')
+    if not path:
+        raise ValueError('Route proposals require CARE_CDF_MODEL_BINDING from the run launcher')
+    binding=json.loads(Path(path).read_text())
+    cdf=CollisionCDF(binding['checkpoint'],device=str(device),
+        checkpoint_key=binding['checkpoint_key'],activation=binding['activation'])
+    identity=dict(binding_path=str(Path(path).resolve()),checkpoint=binding['checkpoint'],
+        checkpoint_sha256=binding['checkpoint_sha256'],
+        checkpoint_key=str(binding['checkpoint_key']),selected_checkpoint=str(cdf.selected_checkpoint),
+        activation=cdf.architecture['activation'])
+    return cdf,identity
+
+
+def primitive_distances(primitive, points_link):
+    """Vectorized metric point distances, with the URDF collision transform."""
+    xyz=(np.asarray(points_link)-np.asarray(primitive.center))@np.asarray(primitive.rotation)
+    if primitive.kind=='sphere':
+        return np.linalg.norm(xyz,axis=1)-primitive.dimensions[0]
+    if primitive.kind=='cylinder':
+        gaps=np.column_stack((np.linalg.norm(xyz[:,:2],axis=1)-primitive.dimensions[0],
+                              np.abs(xyz[:,2])-primitive.dimensions[1]/2))
+    elif primitive.kind=='box':
+        gaps=np.abs(xyz)-np.asarray(primitive.dimensions)/2
+    else:
+        raise ValueError('Unsupported route primitive: '+primitive.kind)
+    return np.linalg.norm(np.maximum(gaps,0),axis=1)+np.minimum(np.max(gaps,axis=1),0)
+
+
 class RouteProposer:
-    """Sampled CDF/ground filtering only; original downstream gates stay active."""
-    def __init__(self, runtime, urdf, device):
-        import sys,json
+    """Sampled CDF/occupied/ground filtering; downstream gates stay active."""
+    def __init__(self, runtime, urdf, device, occupied_resolution=.05, occupied_margin=0.):
+        import sys
         from pathlib import Path
         runtime=Path(runtime)
         for rel in ('src/care_collision_cdf/scripts','src/egocentric_arm_planner/scripts',
                     'src/care_visibility_cdf/scripts','src/care_confidence_map/scripts'):
             path=str(runtime/rel)
             if path not in sys.path:sys.path.append(path)
-        from collision_cdf_model import CollisionCDF
         from known_ground import KnownGround
-        binding=json.loads((runtime.parent/'old_model_binding.json').read_text())
-        self.cdf=CollisionCDF(binding['checkpoint'],device=str(device),activation=binding['activation'])
+        self.cdf,self.cdf_identity=load_route_cdf(device)
+        if not np.isfinite(occupied_resolution) or occupied_resolution<=0 or not np.isfinite(occupied_margin):
+            raise ValueError('Invalid route occupied geometry parameters')
+        self.occupied_resolution=float(occupied_resolution);self.occupied_margin=float(occupied_margin)
         self.ground=KnownGround(str(urdf),str(runtime/'src/egocentric_arm_planner/config/known_ground_geometry.json'),backend='native')
         self.ee_chain=[];name='EE_link'
         while name!='base_link':
@@ -124,6 +158,33 @@ class RouteProposer:
                     if kind in ('revolute','continuous'):weights[index]=radius
                     radius+=float(np.linalg.norm(origin[:3,3]));name=parent
                 self.point_weights[(link,primitive.collision_index)]=weights
+
+    def sampled_occupied_clearance(self,qs,points):
+        """Screen sampled proposals against the final occupied-volume rule.
+
+        This is not a continuous-curve certificate. The local planner and final
+        gate still evaluate the executable trajectory against their live map.
+        Return early on a violating sample; no additional reserve is added.
+        """
+        points=np.asarray(points,dtype=float).reshape(-1,3)
+        if not len(points):return float('inf')
+        minimum=float('inf');radius=np.sqrt(3.)*self.occupied_resolution/2
+        for q in np.asarray(qs,dtype=float).reshape(-1,7):
+            cache={'base_link':np.eye(4)}
+            def pose(name):
+                if name not in cache:
+                    parent,origin,kind,axis,index=self.ground.frames[name];tf=pose(parent)@origin
+                    if kind in ('revolute','continuous'):
+                        outer,skew=self.ground.rotations[name];c=np.cos(q[index]);s=np.sin(q[index])
+                        tf[:3,:3]=tf[:3,:3]@(c*np.eye(3)+(1-c)*outer+s*skew)
+                    cache[name]=tf
+                return cache[name]
+            for link,primitives in self.point_primitives.items():
+                tf=pose(link);local=(points-tf[:3,3])@tf[:3,:3]
+                for primitive in primitives:
+                    minimum=min(minimum,float(primitive_distances(primitive,local).min())-radius)
+                    if minimum<self.occupied_margin:return minimum
+        return minimum
 
     def point_clearance_bound(self,knots,points):
         """Lower bound for this joint-linear proposal, not an executable curve.
@@ -222,13 +283,17 @@ class RouteProposer:
         candidates=[]
         for option in goals[:8]:candidates.extend(route_candidates(start,option,lower,upper,generation))
         candidates.sort(key=lambda p:float(np.sum(np.linalg.norm(np.diff(p,axis=0),axis=1))))
-        checked=0;best=-float('inf');minimum_ground=float('inf');unknown_rejected=0;budget_exhausted=False
+        checked=0;best=-float('inf');minimum_ground=float('inf');unknown_rejected=0;occupied_rejected=0;budget_exhausted=False
         for knots in candidates:
             if time.monotonic()-begin>wall_budget:
                 budget_exhausted=True;break
             q=sample_polyline(knots);checked+=1
             d=self.distances(q,points);minimum=float(np.min(d));best=max(best,minimum)
             if minimum<.010:continue
+            occupied_min=self.sampled_occupied_clearance(q,occupied)
+            if occupied_min<self.occupied_margin:
+                occupied_rejected+=1
+                continue
             ground=min(self.ground.clearance(row)[0] for row in q)
             minimum_ground=ground
             if ground+1e-10<.020:continue
@@ -236,17 +301,18 @@ class RouteProposer:
                 unknown_rejected+=1
                 if research and observation_route is None:
                     observation_route=knots
-                    observation_diag=dict(cdf_min=minimum,ground_min=ground,**endpoint,
+                    observation_diag=dict(cdf_min=minimum,ground_min=ground,occupied_volume_min_m=occupied_min,**endpoint,
                         sampled_poses=len(q),requires_observation=True)
                 continue
-            return knots,dict(checked=checked,cdf_min=minimum,ground_min=ground,**endpoint,
+            return knots,dict(checked=checked,cdf_min=minimum,ground_min=ground,occupied_volume_min_m=occupied_min,**endpoint,
                 sampled_poses=len(q),elapsed_s=time.monotonic()-begin,points=len(points),
-                unknown_avoid_count=len(unknown_avoid),unknown_rejected=unknown_rejected)
+                unknown_avoid_count=len(unknown_avoid),unknown_rejected=unknown_rejected,occupied_rejected=occupied_rejected)
         if observation_route is not None:
             return observation_route,dict(observation_diag,checked=checked,elapsed_s=time.monotonic()-begin,
                 points=len(points),unknown_avoid_count=len(unknown_avoid),unknown_rejected=unknown_rejected,
+                occupied_rejected=occupied_rejected,
                 reason='bounded_route_with_observation',proposal_only=True)
         return None,dict(checked=checked,best_cdf_min=best,last_ground_min=minimum_ground,**endpoint,
             elapsed_s=time.monotonic()-begin,points=len(points),unknown_avoid_count=len(unknown_avoid),
-            unknown_rejected=unknown_rejected,
+            unknown_rejected=unknown_rejected,occupied_rejected=occupied_rejected,
             reason='proposal_time_budget_exhausted' if budget_exhausted else 'finite_candidate_pool_exhausted')

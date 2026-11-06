@@ -360,13 +360,18 @@ class OcclusionReroute:
         try:
             if self.proposer is None:
                 runtime=Path(__file__).resolve().parents[3]
-                self.proposer=RouteProposer(runtime,self.node.urdf_path,self.node.device)
+                self.proposer=RouteProposer(runtime,self.node.urdf_path,self.node.device,
+                    occupied_resolution=float(rospy.get_param('/optimized_trajectory_continuity/final_occupied_resolution_m',.05)),
+                    occupied_margin=float(rospy.get_param('/optimized_trajectory_continuity/final_occupied_hard_margin_m',0.)))
+                self.trace('route_model_ready',**self.proposer.cdf_identity)
             lower=self.node.q_min.detach().cpu().numpy().reshape(7)
             upper=self.node.q_max.detach().cpu().numpy().reshape(7)
             if reason=='nominal_occupied_screen':
-                distance=float(self.proposer.distances(sample_polyline([start,goal]),occupied).min())
-                self.trace('nominal_occupied_screen',cdf_min=distance,generation=generation)
-                if distance>=.010:return
+                samples=sample_polyline([start,goal])
+                distance=float(self.proposer.distances(samples,occupied).min())
+                occupied_min=self.proposer.sampled_occupied_clearance(samples,occupied)
+                self.trace('nominal_occupied_screen',cdf_min=distance,occupied_volume_min_m=occupied_min,generation=generation)
+                if distance>=.010 and occupied_min>=self.proposer.occupied_margin:return
             unknown_avoid=([p for o in current_obligations if o.get('obligation_bundle_source')=='candidate'
                             for p in o['points']] if reason=='sensing_route_dependency' else [])
             route,diag=self.proposer.propose(start,goal,lower,upper,occupied,avoid,generation,

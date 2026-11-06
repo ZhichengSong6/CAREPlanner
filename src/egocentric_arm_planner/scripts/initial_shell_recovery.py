@@ -1,6 +1,7 @@
 """Bind recovery to the exact audited executable and fresh measured state."""
 import json
 import math
+import os
 from recovery_motion import residual_motion_bound
 
 
@@ -38,7 +39,7 @@ def unique_object(pairs):
 
 def commit_check(raw, stamp_ns, now_ns, measured_stamp_ns, names, measured, velocity,
                  acceleration, brake_dt, brake_steps, execution_margin, diagnostics=None,
-                 feedback_gain=1., actuator_velocity=None):
+                 feedback_gain=1., actuator_velocity=None, certificate_max_age_ns=50000000):
     """Bound FK snapshot changes plus braking, without claiming future tracking."""
     def reject(reason, failure_kind=None):
         if diagnostics is not None:
@@ -47,6 +48,8 @@ def commit_check(raw, stamp_ns, now_ns, measured_stamp_ns, names, measured, velo
         return False
 
     try:
+        if not 50000000 <= certificate_max_age_ns <= 250000000:
+            return reject('invalid_certificate_age_policy')
         if len(raw) > 256*1024:
             return reject('oversized_evidence')
         e = json.loads(raw, object_pairs_hook=unique_object)
@@ -63,7 +66,12 @@ def commit_check(raw, stamp_ns, now_ns, measured_stamp_ns, names, measured, velo
             return reject('measured_snapshot_stale', 'state_order_invalid')
         if not 0 <= now_ns-measured_stamp_ns <= 50000000:
             return reject('measured_snapshot_stale', 'live_state_stale')
-        if not 0 <= now_ns-previous_stamp <= 50000000:
+        # Static-scene research may spend up to 250 ms computing the proof.
+        # A fresh live sample and the full displacement/braking/residual bounds
+        # below still determine whether its geometry applies to the live robot.
+        if diagnostics is not None:
+            diagnostics['certificate_max_age_ms'] = certificate_max_age_ns/1e6
+        if not 0 <= now_ns-previous_stamp <= certificate_max_age_ns:
             return reject('measured_snapshot_stale', 'certificate_state_stale')
         reference, radii = list(e['measured_q']), list(e['joint_motion_radii'])
         if any(len(x) != 7 for x in [reference, radii, acceleration]):
@@ -135,19 +143,21 @@ def commit_check(raw, stamp_ns, now_ns, measured_stamp_ns, names, measured, velo
                     [measured[name] for name in names],[actuator_velocity[name] for name in names],
                     radii,acceleration,measured_horizon,feedback_gain)
                 total=max(total,measured_actuator_bound)
+            numerical_tolerance = 1e-5 if os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true' else 0.
             if diagnostics is not None:
                 diagnostics.update(motion_bound_m=total,certified_residual_m=reserve,
+                    research_numerical_tolerance_m=numerical_tolerance,
                     measured_motion_bound_m=measured_bound,initial_motion_bound_m=initial_bound,
                     actuator_motion_bound_m=actuator_bound,onset_clearance_budget_m=float(e['onset_clearance_budget_m']),
                     requires_reconstruction=max(initial_bound,actuator_bound)>=float(e['onset_clearance_budget_m']),
-                    initial_state_changed=max(initial_bound,actuator_bound)>=reserve-1e-12,
+                    initial_state_changed=max(initial_bound,actuator_bound)>=reserve+numerical_tolerance-1e-12,
                     measured_motion_horizon_s=measured_horizon,
                     measured_actuator_motion_bound_m=measured_actuator_bound,
                     live_stamp_ns=str(measured_stamp_ns),decision_ros_ns=str(now_ns),
                     live_q=[measured[name] for name in names],live_velocity=[velocity[name] for name in names],
                     actuator_velocity=[actuator_velocity[name] for name in names],
                     certification_method='continuous_geometry_residual')
-            if total>=reserve-1e-12:return reject('geometric_certificate_state_changed')
+            if total>=reserve+numerical_tolerance-1e-12:return reject('geometric_certificate_state_changed')
         elif actual_min-total <= execution_margin+1e-12:
             return reject('actual_clearance_consumed')
         budget = float(e['onset_clearance_budget_m'])

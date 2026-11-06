@@ -1,6 +1,4 @@
 #pragma once
-#include "egocentric_arm_planner/task_observation_context.hpp"
-#include <egocentric_arm_planner/CandidateTransfer.h>
 
 #include "arm_model/robot_model.hpp"
 #include "arm_trajectory/joint_trajectory.hpp"
@@ -18,7 +16,6 @@
 #include <geometry_msgs/PoseStamped.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <std_msgs/String.h>
-#include <std_msgs/Bool.h>
 #include <trajectory_msgs/JointTrajectory.h>
 #include <trajectory_msgs/JointTrajectoryPoint.h>
 
@@ -38,18 +35,6 @@ public:
 
 private:
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
-  void taskContextCallback(const std_msgs::StringConstPtr& msg);
-  void acceptTargetLocked(const geometry_msgs::PoseStamped& msg);
-  bool task_context_enabled_=false;
-  TaskObservationContext task_context_;
-  bool require_bound_regime_=false;
-  TaskPlanningEventReceiver task_control_receiver_;
-  std::uint64_t task_reference_refresh_sequence_=0;
-  ros::Subscriber task_control_sub_;
-  void taskControlCallback(const std_msgs::StringConstPtr& msg);
-  ros::Subscriber task_context_sub_,task_refresh_sub_;
-  void taskReferenceRefreshCallback(const std_msgs::BoolConstPtr& msg);
-  ros::Publisher bound_reference_pub_;
   void targetPoseCallback(const geometry_msgs::PoseStampedConstPtr& msg);
   void mpcCommandCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
 

@@ -1,4 +1,8 @@
+#include <cstring>
+#include <cstdlib>
+#include <array>
 #include <care_confidence_map/vbc_primitive_model.hpp>
+#include <care_confidence_map/analytic_ground_support.hpp>
 #include <care_confidence_map/gcdf_primitive_anchors.hpp>
 #include <ros/ros.h>
 #include <ros/callback_queue.h>
@@ -32,11 +36,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
-#include <fstream>
-#include <iomanip>
 #include <limits>
 #include <map>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -68,8 +69,23 @@ struct GridPoint
   // Phase E3 semantic state. 0 = not occupied / unknown-or-free,
   // 1 = most recently observed as occupied. Confidence distinguishes
   // UNKNOWN (low confidence) from observed FREE (high confidence).
-  float occupancy = 0.0f;
+  float occupancy = 0.0f; // Raw legacy evidence, retained for diagnostics.
+  uint32_t plane_candidate_hits=0,plane_compatible_hits=0,plane_generic_hits=0;
+  float residual_confidence=0.,residual_visibility=0.,residual_occupancy=0.;
+  double residual_last_seen=-1.;
+  std::array<double,8> residual_child_seen{{-1.,-1.,-1.,-1.,-1.,-1.,-1.,-1.}};
+  uint8_t residual_seen_mask=0,residual_required_mask=255;
   double last_seen_time = -1.0;
+  // Passive provenance for the current occupied lifetime. Near-plane means
+  // compatible endpoints only; it never certifies ground-only geometry.
+  uint32_t hit_count = 0, near_ground_hit_count = 0, other_hit_count = 0;
+  uint32_t hit_sensor_mask = 0;
+  float hit_z_min = 0, hit_z_max = 0;
+  float last_hit_x = 0, last_hit_y = 0, last_hit_z = 0;
+  double last_hit_stamp_s = -1.;
+  uint32_t source_time_valid_count=0,source_time_invalid_count=0;
+  uint32_t last_source_stamp_sec=0,last_source_stamp_nsec=0;
+  double source_stamp_min_s=-1.,source_stamp_max_s=-1.,max_fusion_skew_s=0.;
 };
 
 struct LocalVisiblePoint
@@ -125,7 +141,26 @@ public:
       return false;
     }
 
+    const char* plane_file=std::getenv("CARE_ANALYTIC_GROUND_FILE");
+    if(plane_file && *plane_file) {
+      try {ground_support_=care_confidence_map::AnalyticGroundSupport::load(plane_file);ground_support_loaded_=true;}
+      catch(const std::exception& e){ROS_ERROR_STREAM("[confidence_map_node] "<<e.what());return false;}
+      const char* apply=std::getenv("CARE_ANALYTIC_GROUND_APPLY");
+      ground_partition_applied_=apply && std::string(apply)=="true";
+      if(ground_partition_applied_ && !ground_support_.association_enabled) {
+        ROS_ERROR("Analytic ground application requires an established source-bound contract");return false;
+      }
+    }
     generateGlobalGrid();
+    if(ground_partition_applied_)for(auto& point:grid_points_) {
+      point.residual_required_mask=0;
+      for(int child=0;child<8;++child) {
+        Eigen::Vector3d center(point.x,point.y,point.z);
+        for(int axis=0;axis<3;++axis)center[axis]+=((child&(1<<axis))?.25:-.25)*resolution_;
+        if(!ground_support_.residual(center,resolution_/2.,ground_support_.supportUpper()).empty)
+          point.residual_required_mask|=uint8_t(1<<child);
+      }
+    }
     applyConfiguredTestKnownFreePoints();
     if (observation_mode_ == "ideal_fov")
     {
@@ -204,7 +239,6 @@ public:
 
     snapshot_instance_ = std::to_string(ros::WallTime::now().toNSec()) + ":" + std::to_string(getpid());
     snapshot_update_stamp_ = snapshot_clock_stamp_ = ros::Time::now();
-    if (!initializeObservationTrace()) return false;
     // All initialization (including optional prior refresh) precedes readers.
     if (dedicated_queries) {
       query_spinner_.reset(new ros::AsyncSpinner(1, &query_queue_));
@@ -700,11 +734,6 @@ private:
     nh.param("sensor_model/horizontal_fov_deg", horizontal_fov_deg_, 55.0);
     nh.param("sensor_model/vertical_fov_deg", vertical_fov_deg_, 72.0);
     nh.param("sensor_model/local_resolution", local_resolution_, resolution_);
-    nh.param("sensor_model/max_tf_age_s", sensor_max_tf_age_s_, 0.05);
-    if (!std::isfinite(sensor_max_tf_age_s_) || sensor_max_tf_age_s_ <= 0.) {
-      ROS_ERROR("sensor_model/max_tf_age_s must be finite and positive");
-      return false;
-    }
 
     if (local_resolution_ <= 0.0)
     {
@@ -850,12 +879,21 @@ private:
     return ix * ny_ * nz_ + iy * nz_ + iz;
   }
 
+  float residualConfidence(const GridPoint& p) const {
+    if(!ground_partition_applied_)return p.confidence;
+    const double age=ros::Time::now().toSec()-p.residual_last_seen;
+    if(p.residual_last_seen<0. || !std::isfinite(age) || age<0.)return 0.f;
+    return static_cast<float>(p.residual_confidence*std::exp(-age/temporal_decay_time_));
+  }
+  float effectiveOccupancy(const GridPoint& p) const {return ground_partition_applied_?p.residual_occupancy:p.occupancy;}
+  float effectiveVisibility(const GridPoint& p) const {return ground_partition_applied_?p.residual_visibility:p.current_visibility;}
+  double effectiveLastSeen(const GridPoint& p) const {return ground_partition_applied_?p.residual_last_seen:p.last_seen_time;}
   float effectiveConfidence(const GridPoint& p) const
   {
     const float bootstrap = current_body_prior_active_
         ? p.bootstrap_confidence
         : 0.0f;
-    return std::max(std::max(p.confidence, bootstrap),
+    return std::max(std::max(residualConfidence(p), bootstrap),
                     p.test_known_free_confidence);
   }
 
@@ -1313,21 +1351,12 @@ private:
 
   void updateConfidenceMapSensorCentric(
       const std::vector<tf2::Transform>& T_map_sensors,
-      const std::vector<geometry_msgs::TransformStamped>& sources,
-      const ros::Time& now,
-      std::vector<std::set<int>>* watched_hits = nullptr)
+      const ros::Time& now)
   {
     resetCurrentVisibility();
 
-    for (size_t sensor_index = 0; sensor_index < T_map_sensors.size(); ++sensor_index)
+    for (const auto& T_map_sensor : T_map_sensors)
     {
-      const auto& stamp = sources[sensor_index].header.stamp;
-      if (!sensorTransformUsable(stamp, now)) continue;
-      // A repeated cached transform is the SAME pose observation. Advancing
-      // the timer must never renew its evidence. Timeless static chains have
-      // no moving joint pose and remain current in this ideal-FOV model.
-      const double observed_s = stamp.isZero() ? now.toSec() : stamp.toSec();
-      const auto& T_map_sensor = T_map_sensors[sensor_index];
       for (const auto& local_point : local_visible_points_)
       {
         const tf2::Vector3 p_map =
@@ -1340,10 +1369,6 @@ private:
         }
 
         grid_points_[index].current_visibility = 1.0f;
-        grid_points_[index].last_seen_time =
-            std::max(grid_points_[index].last_seen_time, observed_s);
-        if (watched_hits && observation_trace_watch_indices_.count(index))
-          (*watched_hits)[sensor_index].insert(index);
       }
     }
 
@@ -1351,12 +1376,24 @@ private:
 
     for (auto& p : grid_points_)
     {
-      if (p.last_seen_time >= 0.0)
+      if (p.current_visibility > 0.5f)
       {
-        const double dt = std::max(0.0, now_sec - p.last_seen_time);
-        p.confidence = static_cast<float>(std::exp(-dt / temporal_decay_time_));
+        p.confidence = 1.0f;
+        p.last_seen_time = now_sec;
       }
-      else p.confidence = 0.0f;
+      else
+      {
+        if (p.last_seen_time >= 0.0)
+        {
+          const double dt = std::max(0.0, now_sec - p.last_seen_time);
+          p.confidence =
+              static_cast<float>(std::exp(-dt / temporal_decay_time_));
+        }
+        else
+        {
+          p.confidence = 0.0f;
+        }
+      }
     }
 
     printConfidenceStatsThrottled();
@@ -1408,7 +1445,24 @@ private:
     }
 
     std::vector<uint8_t> free_mask(grid_points_.size(), 0);
+    std::array<double,8> unseen;unseen.fill(-1.);
+    std::vector<std::array<double,8>> residual_free_source(grid_points_.size(),unseen);
+    const auto mark_residual_free=[&](int index,const tf2::Vector3& position,double source) {
+      if(!ground_partition_applied_)return;
+      const auto& cell=grid_points_[index];
+      const int child=(position.x()>=cell.x?1:0)|(position.y()>=cell.y?2:0)|(position.z()>=cell.z?4:0);
+      residual_free_source[index][child]=std::max(residual_free_source[index][child],source);
+    };
     std::vector<uint8_t> occupied_mask(grid_points_.size(), 0);
+    struct PacketHit {
+      uint32_t count=0,near=0,other=0,sensors=0,candidate=0,compatible=0;
+      uint32_t generic_source_valid=0;
+      double generic_source_max=-1.;
+      float z_min=0,z_max=0; tf2::Vector3 endpoint;
+      uint32_t source_valid=0,source_invalid=0,source_sec=0,source_nsec=0;
+      double source_min=-1.,source_max=-1.,fusion_skew=0.;
+    };
+    std::map<int,PacketHit> packet_hits;
 
     int watched_index = -1;
     if (debug_occupancy_watch_enabled_)
@@ -1473,9 +1527,21 @@ private:
       sensor_msgs::PointCloud2ConstIterator<uint8_t> hit_it(
           *msg, "hit");
 
+      // Optional additive fields. Missing/malformed source time is recorded
+      // as invalid; it never changes preexisting occupancy/free semantics.
+      const sensor_msgs::PointField *sec_field=nullptr,*nsec_field=nullptr;
+      int sec_fields=0,nsec_fields=0;
+      for(const auto& f:msg->fields) {
+        if(f.name=="source_stamp_sec"){sec_field=&f;++sec_fields;}
+        if(f.name=="source_stamp_nsec"){nsec_field=&f;++nsec_fields;}
+      }
+      const bool source_layout=sec_fields==1 && nsec_fields==1 && !msg->is_bigendian &&
+          sec_field->datatype==sensor_msgs::PointField::UINT32 && nsec_field->datatype==sensor_msgs::PointField::UINT32 &&
+          sec_field->count==1 && nsec_field->count==1 && static_cast<std::size_t>(sec_field->offset)+4<=msg->point_step && static_cast<std::size_t>(nsec_field->offset)+4<=msg->point_step;
+      std::size_t ray_index=0;
       for (; x_it != x_it.end();
            ++x_it, ++y_it, ++z_it,
-           ++ox_it, ++oy_it, ++oz_it, ++sensor_it, ++hit_it)
+           ++ox_it, ++oy_it, ++oz_it, ++sensor_it, ++hit_it,++ray_index)
       {
         const int sensor_id = static_cast<int>(*sensor_it);
         const bool hit = (*hit_it != 0);
@@ -1521,13 +1587,35 @@ private:
         }
         const tf2::Vector3 direction = delta / range;
 
-        const double free_end =
+        uint32_t source_sec_value=0,source_nsec_value=0;
+        const auto source_offset=msg->width ? (ray_index/msg->width)*msg->row_step+(ray_index%msg->width)*msg->point_step : 0;
+        bool plane_source_valid=source_layout && msg->width && source_offset+msg->point_step<=msg->data.size();
+        if(plane_source_valid) {
+          std::memcpy(&source_sec_value,msg->data.data()+source_offset+sec_field->offset,4);
+          std::memcpy(&source_nsec_value,msg->data.data()+source_offset+nsec_field->offset,4);
+          ros::Time source;source.sec=source_sec_value;source.nsec=source_nsec_value;
+          plane_source_valid=source_nsec_value<1000000000u && !source.isZero() && !msg->header.stamp.isZero() &&
+              source<=msg->header.stamp && source<=ros::Time::now() && msg->header.stamp<=ros::Time::now() &&
+              (last_ray_observation_stamp_.isZero() || msg->header.stamp>=last_ray_observation_stamp_) && msg->header.frame_id==map_frame_;
+        }
+        const Eigen::Vector3d endpoint_eigen(endpoint.x(),endpoint.y(),endpoint.z());
+        const bool plane_candidate=ground_support_loaded_ && std::abs(ground_support_.height(endpoint_eigen))<=ground_support_.association_band;
+        const bool plane_compatible=ground_support_loaded_ && ground_support_.compatibleEndpoint(endpoint_eigen,plane_source_valid);
+        double free_end =
             hit
                 ? std::max(
                       ray_free_start_range_,
                       range - ray_endpoint_guard_distance_)
                 : range;
 
+        if(hit && plane_compatible && ground_partition_applied_) {
+          const Eigen::Vector3d o(origin.x(),origin.y(),origin.z()),v(direction.x(),direction.y(),direction.z());
+          const double derivative=ground_support_.normal.dot(v),height=ground_support_.height(o);
+          if(derivative<0. && height>ground_support_.supportUpper()) {
+            const double support_entry=(height-ground_support_.supportUpper())/(-derivative);
+            free_end=std::min(range,std::max(free_end,support_entry-1e-6));
+          }
+        }
         if (free_end >= ray_free_start_range_)
         {
           for (double d = ray_free_start_range_;
@@ -1539,6 +1627,7 @@ private:
             if (positionToGridIndex(p, index))
             {
               free_mask[static_cast<std::size_t>(index)] = 1;
+              if(plane_source_valid)mark_residual_free(index,p,double(source_sec_value)+1e-9*double(source_nsec_value));
               if (index == watched_index)
               {
                 watched_free_counts[sensor_id] += 1;
@@ -1551,12 +1640,53 @@ private:
           }
         }
 
+        // The fixed step lattice can stop just outside the last free cell.
+        // Include the conservative, plane-clipped free-segment endpoint itself;
+        // it remains above the support envelope and carries the original time.
+        if(hit && plane_compatible && ground_partition_applied_ && free_end>ray_free_start_range_) {
+          int index=-1;
+          if(positionToGridIndex(origin+direction*free_end,index)) {
+            free_mask[index]=1;
+            mark_residual_free(index,origin+direction*free_end,double(source_sec_value)+1e-9*double(source_nsec_value));
+          }
+        }
         int endpoint_index = -1;
         if (positionToGridIndex(endpoint, endpoint_index))
         {
           if (hit)
           {
             occupied_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            auto& evidence=packet_hits[endpoint_index];
+            const float z=static_cast<float>(endpoint.z());
+            if (!evidence.count) evidence.z_min=evidence.z_max=z;
+            evidence.z_min=std::min(evidence.z_min,z);
+            evidence.z_max=std::max(evidence.z_max,z);
+            ++evidence.count;
+            if(plane_candidate)++evidence.candidate;
+            if(plane_compatible)++evidence.compatible;
+            if (std::abs(endpoint.z())<=0.0001) ++evidence.near;
+            else ++evidence.other;
+            if (sensor_id>=0 && sensor_id<32) evidence.sensors|=(uint32_t(1)<<sensor_id);
+            evidence.endpoint=endpoint;
+            uint32_t sec=0,nsec=0;
+            const auto offset=msg->width ? (ray_index/msg->width)*msg->row_step+(ray_index%msg->width)*msg->point_step : 0;
+            bool source_valid=source_layout && msg->width && offset+msg->point_step<=msg->data.size();
+            if(source_valid) {
+              std::memcpy(&sec,msg->data.data()+offset+sec_field->offset,4);
+              std::memcpy(&nsec,msg->data.data()+offset+nsec_field->offset,4);
+              ros::Time source;source.sec=sec;source.nsec=nsec;
+              source_valid=nsec<1000000000u && !source.isZero() && !msg->header.stamp.isZero() &&
+                  source<=msg->header.stamp && source<=ros::Time::now();
+              if(source_valid) {
+                const double value=source.toSec();
+                if(!evidence.source_valid)evidence.source_min=evidence.source_max=value;
+                evidence.source_min=std::min(evidence.source_min,value);evidence.source_max=std::max(evidence.source_max,value);
+                evidence.fusion_skew=std::max(evidence.fusion_skew,(msg->header.stamp-source).toSec());
+                evidence.source_sec=sec;evidence.source_nsec=nsec;++evidence.source_valid;
+                if(!plane_compatible){++evidence.generic_source_valid;evidence.generic_source_max=std::max(evidence.generic_source_max,value);}
+              }
+            }
+            if(!source_valid)++evidence.source_invalid;
             if (endpoint_index == watched_index)
             {
               watched_hit_counts[sensor_id] += 1;
@@ -1573,6 +1703,7 @@ private:
           else
           {
             free_mask[static_cast<std::size_t>(endpoint_index)] = 1;
+            if(plane_source_valid)mark_residual_free(endpoint_index,endpoint,double(source_sec_value)+1e-9*double(source_nsec_value));
             if (endpoint_index == watched_index)
             {
               watched_free_counts[sensor_id] += 1;
@@ -1640,11 +1771,75 @@ private:
     for (std::size_t i = 0; i < grid_points_.size(); ++i)
     {
       GridPoint& gp = grid_points_[i];
+      gp.residual_visibility=0.f;
+      const auto packet=packet_hits.find(static_cast<int>(i));
+      if(packet!=packet_hits.end()) {
+        const auto& evidence=packet->second;
+        const auto saturate=[](uint32_t a,uint32_t b){return static_cast<uint32_t>(std::min<uint64_t>(uint64_t(a)+b,std::numeric_limits<uint32_t>::max()));};
+        gp.plane_candidate_hits=saturate(gp.plane_candidate_hits,evidence.candidate);
+        gp.plane_compatible_hits=saturate(gp.plane_compatible_hits,evidence.compatible);
+        gp.plane_generic_hits=saturate(gp.plane_generic_hits,evidence.count-evidence.compatible);
+      }
+      // A compatible endpoint contributes no residual FREE update. Only an
+      // actually traversed ray segment does. Generic/mixed hits persist.
+      if(gp.plane_generic_hits) {
+        gp.residual_occupancy=1.f;
+        if(packet!=packet_hits.end() && packet->second.generic_source_valid) {
+          gp.residual_confidence=1.f;gp.residual_visibility=1.f;
+          gp.residual_last_seen=std::max(gp.residual_last_seen,packet->second.generic_source_max);
+        }
+      } else if(ground_partition_applied_) {
+        uint8_t current_mask=0;gp.residual_seen_mask=0;
+        double oldest=std::numeric_limits<double>::infinity();
+        for(int child=0;child<8;++child) {
+          if(residual_free_source[i][child]>=0.)current_mask|=uint8_t(1<<child);
+          gp.residual_child_seen[child]=std::max(gp.residual_child_seen[child],residual_free_source[i][child]);
+          if(gp.residual_child_seen[child]>=0.)gp.residual_seen_mask|=uint8_t(1<<child);
+          if(gp.residual_required_mask&(1<<child))oldest=std::min(oldest,gp.residual_child_seen[child]);
+        }
+        // Keep unseen subcells UNKNOWN. A whole coarse cell becomes observed
+        // free only after each residual25mm subcell has actual ray evidence.
+        // This is a declared discrete observation model, not a continuum
+        // guarantee about subpixel or subcell objects.
+        const char* profile=std::getenv("CARE_RESEARCH_PROFILE");
+        const bool research=profile && std::string(profile)=="nominal_plane_point_v1";
+        bool complete=gp.residual_required_mask && (gp.residual_seen_mask&gp.residual_required_mask)==gp.residual_required_mask;
+        if(research) {
+          // Explicit original discrete ray-grid observation model. This does
+          // not claim that every physical point in a coarse voxel was observed.
+          complete=gp.residual_seen_mask!=0;
+          oldest=*std::max_element(gp.residual_child_seen.begin(),gp.residual_child_seen.end());
+        }
+        gp.residual_occupancy=0.f;gp.residual_confidence=complete?1.f:0.f;
+        gp.residual_last_seen=complete?oldest:-1.;
+        gp.residual_visibility=(research ? current_mask!=0 : gp.residual_required_mask && (current_mask&gp.residual_required_mask)==gp.residual_required_mask) ? 1.f:0.f;
+      }
 
       // Occupied endpoint wins over free traversal if multiple sensors touch
       // the same coarse voxel during one fused observation packet.
       if (occupied_mask[i] != 0)
       {
+        const auto& evidence=packet_hits.at(static_cast<int>(i));
+        if (!gp.hit_count) {gp.hit_z_min=evidence.z_min;gp.hit_z_max=evidence.z_max;}
+        gp.hit_z_min=std::min(gp.hit_z_min,evidence.z_min);
+        gp.hit_z_max=std::max(gp.hit_z_max,evidence.z_max);
+        auto add=[](uint32_t a,uint32_t b) {return static_cast<uint32_t>(
+            std::min<uint64_t>(uint64_t(a)+b,std::numeric_limits<uint32_t>::max()));};
+        gp.hit_count=add(gp.hit_count,evidence.count);
+        gp.near_ground_hit_count=add(gp.near_ground_hit_count,evidence.near);
+        gp.other_hit_count=add(gp.other_hit_count,evidence.other);
+        gp.hit_sensor_mask|=evidence.sensors;
+        gp.last_hit_x=evidence.endpoint.x();gp.last_hit_y=evidence.endpoint.y();gp.last_hit_z=evidence.endpoint.z();
+        gp.last_hit_stamp_s=stamp_sec;
+        if(evidence.source_valid) {
+          if(!gp.source_time_valid_count)gp.source_stamp_min_s=evidence.source_min;
+          gp.source_stamp_min_s=std::min(gp.source_stamp_min_s,evidence.source_min);
+          gp.source_stamp_max_s=std::max(gp.source_stamp_max_s,evidence.source_max);
+          gp.max_fusion_skew_s=std::max(gp.max_fusion_skew_s,evidence.fusion_skew);
+          gp.last_source_stamp_sec=evidence.source_sec;gp.last_source_stamp_nsec=evidence.source_nsec;
+        }
+        gp.source_time_valid_count=add(gp.source_time_valid_count,evidence.source_valid);
+        gp.source_time_invalid_count=add(gp.source_time_invalid_count,evidence.source_invalid);
         gp.occupancy = 1.0f;
         gp.current_visibility = 1.0f;
         gp.confidence = 1.0f;
@@ -1663,6 +1858,11 @@ private:
         else
         {
           gp.occupancy = 0.0f;
+          gp.hit_count=gp.near_ground_hit_count=gp.other_hit_count=gp.hit_sensor_mask=0;
+          gp.hit_z_min=gp.hit_z_max=gp.last_hit_x=gp.last_hit_y=gp.last_hit_z=0;
+          gp.last_hit_stamp_s=-1.;
+          gp.source_time_valid_count=gp.source_time_invalid_count=gp.last_source_stamp_sec=gp.last_source_stamp_nsec=0;
+          gp.source_stamp_min_s=gp.source_stamp_max_s=-1.;gp.max_fusion_skew_s=0.;
         }
         gp.current_visibility = 1.0f;
         gp.confidence = 1.0f;
@@ -1970,12 +2170,6 @@ private:
     observeSnapshotClock(now);
     ++snapshot_revision_;
     snapshot_update_stamp_ = now;
-    if (observation_trace_.is_open()) {
-      observation_trace_ << "{\"event\":\"map_write\",\"instance\":"
-          << traceString(snapshot_instance_) << ",\"epoch\":" << snapshot_epoch_
-          << ",\"revision\":" << snapshot_revision_ << ",\"map_update_ns\":"
-          << snapshot_update_stamp_.toNSec() << "}" << std::endl;
-    }
   }
 
   bool handleQuerySnapshot(
@@ -2024,11 +2218,12 @@ private:
       int index = -1;
       if (!positionToGridIndex(tf2::Vector3(p.x,p.y,p.z), index)) continue;
       const auto& v = grid_points_[index];
-      res.inside_map[i] = 1; res.occupancy[i] = v.occupancy;
-      res.last_seen_s[i] = v.last_seen_time;
+      res.inside_map[i] = 1; res.occupancy[i] = effectiveOccupancy(v);
+      const double last_seen=effectiveLastSeen(v);
+      res.last_seen_s[i] = last_seen;
       // Recompute decay at the query time, even if cached visibility is stale.
-      const bool sensor = v.last_seen_time >= 0. && v.last_seen_time <= now.toSec();
-      const double age = sensor ? now.toSec()-v.last_seen_time : 0.;
+      const bool sensor = last_seen >= 0. && last_seen <= now.toSec();
+      const double age = sensor ? now.toSec()-last_seen : 0.;
       const double sensor_now = sensor ? std::exp(-age/temporal_decay_time_) : 0.;
       const double sensor_end = sensor ? std::exp(-(age+req.horizon_s)/temporal_decay_time_) : 0.;
       const double bootstrap = current_body_prior_active_ ? v.bootstrap_confidence : 0.;
@@ -2037,7 +2232,7 @@ private:
                           (v.test_known_free_confidence > 0. ? 4 : 0);
       res.confidence_now[i] = std::max(sensor_now, prior);
       res.confidence_at_horizon[i] = std::max(sensor_end, prior);
-      res.model_free_at_horizon[i] = v.occupancy <= .5f &&
+      res.model_free_at_horizon[i] = effectiveOccupancy(v) <= .5f &&
           std::max(sensor_end, prior) >= req.minimum_confidence;
     }
     res.valid = true;
@@ -2058,6 +2253,16 @@ private:
     res.confidence.reserve(req.points.size());
     res.current_visibility.reserve(req.points.size());
     res.inside_map.reserve(req.points.size());
+    const char* diagnostic_env = std::getenv("CARE_QUERY_DIAGNOSTICS");
+    const bool diagnostic = !diagnostic_env || std::string(diagnostic_env) != "false";
+    if (diagnostic) {
+    res.evidence_instance=snapshot_instance_;
+    res.evidence_revision=snapshot_revision_;
+    res.evidence_stamp=ros::Time::now();
+    res.evidence_occupancy.reserve(req.points.size());
+    res.evidence_last_seen_s.reserve(req.points.size());
+    res.evidence_prior.reserve(req.points.size());
+    }
 
     for (const auto& point : req.points)
     {
@@ -2069,14 +2274,24 @@ private:
         res.confidence.push_back(0.0f);
         res.current_visibility.push_back(0.0f);
         res.inside_map.push_back(0);
+      if (diagnostic) {
+        res.evidence_occupancy.push_back(0.);
+        res.evidence_last_seen_s.push_back(-1.);
+        res.evidence_prior.push_back(0.);
+      }
         continue;
       }
 
       const GridPoint& voxel = grid_points_[index];
 
       res.confidence.push_back(effectiveConfidence(voxel));
-      res.current_visibility.push_back(voxel.current_visibility);
+      res.current_visibility.push_back(effectiveVisibility(voxel));
       res.inside_map.push_back(1);
+      if (diagnostic) {
+      res.evidence_occupancy.push_back(effectiveOccupancy(voxel));
+      res.evidence_last_seen_s.push_back(effectiveLastSeen(voxel));
+      res.evidence_prior.push_back(std::max(current_body_prior_active_?voxel.bootstrap_confidence:0.f,voxel.test_known_free_confidence));
+      }
     }
 
     maybeLogDebugNeighborhood(req);
@@ -2356,14 +2571,41 @@ private:
 
     sensor_msgs::PointCloud2Modifier modifier(cloud);
     modifier.setPointCloud2Fields(
-        7,
+        34,
         "x", 1, sensor_msgs::PointField::FLOAT32,
         "y", 1, sensor_msgs::PointField::FLOAT32,
         "z", 1, sensor_msgs::PointField::FLOAT32,
         "confidence", 1, sensor_msgs::PointField::FLOAT32,
         "current_visibility", 1, sensor_msgs::PointField::FLOAT32,
         "occupancy", 1, sensor_msgs::PointField::FLOAT32,
-        "intensity", 1, sensor_msgs::PointField::FLOAT32);
+        "intensity", 1, sensor_msgs::PointField::FLOAT32,
+        "hit_count", 1, sensor_msgs::PointField::UINT32,
+        "near_ground_hit_count", 1, sensor_msgs::PointField::UINT32,
+        "other_hit_count", 1, sensor_msgs::PointField::UINT32,
+        "hit_sensor_mask", 1, sensor_msgs::PointField::UINT32,
+        "hit_z_min", 1, sensor_msgs::PointField::FLOAT32,
+        "hit_z_max", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_x", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_y", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_z", 1, sensor_msgs::PointField::FLOAT32,
+        "last_hit_stamp_s", 1, sensor_msgs::PointField::FLOAT64,
+        "source_time_valid_count",1,sensor_msgs::PointField::UINT32,
+        "source_time_invalid_count",1,sensor_msgs::PointField::UINT32,
+        "last_source_stamp_sec",1,sensor_msgs::PointField::UINT32,
+        "last_source_stamp_nsec",1,sensor_msgs::PointField::UINT32,
+        "source_stamp_min_s",1,sensor_msgs::PointField::FLOAT64,
+        "source_stamp_max_s",1,sensor_msgs::PointField::FLOAT64,
+        "max_fusion_skew_s",1,sensor_msgs::PointField::FLOAT64,
+        "plane_candidate_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_compatible_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_generic_hits",1,sensor_msgs::PointField::UINT32,
+        "plane_partition_applied",1,sensor_msgs::PointField::UINT8,
+        "raw_occupancy",1,sensor_msgs::PointField::FLOAT32,
+        "residual_confidence",1,sensor_msgs::PointField::FLOAT32,
+        "residual_current_visibility",1,sensor_msgs::PointField::FLOAT32,
+        "residual_occupancy",1,sensor_msgs::PointField::FLOAT32,
+        "residual_seen_mask",1,sensor_msgs::PointField::UINT8,
+        "residual_required_mask",1,sensor_msgs::PointField::UINT8);
 
     modifier.resize(grid_points_.size());
 
@@ -2375,19 +2617,43 @@ private:
     sensor_msgs::PointCloud2Iterator<float> iter_occ(cloud, "occupancy");
     sensor_msgs::PointCloud2Iterator<float> iter_intensity(cloud, "intensity");
 
+    sensor_msgs::PointCloud2Iterator<uint32_t> count(cloud,"hit_count"),near(cloud,"near_ground_hit_count"),
+        other(cloud,"other_hit_count"),sensors(cloud,"hit_sensor_mask");
+    sensor_msgs::PointCloud2Iterator<float> zmin(cloud,"hit_z_min"),zmax(cloud,"hit_z_max"),
+        hx(cloud,"last_hit_x"),hy(cloud,"last_hit_y"),hz(cloud,"last_hit_z");
+    sensor_msgs::PointCloud2Iterator<double> hit_stamp(cloud,"last_hit_stamp_s");
+    sensor_msgs::PointCloud2Iterator<uint32_t> source_valid(cloud,"source_time_valid_count"),source_invalid(cloud,"source_time_invalid_count"),
+        source_sec(cloud,"last_source_stamp_sec"),source_nsec(cloud,"last_source_stamp_nsec");
+    sensor_msgs::PointCloud2Iterator<double> source_min(cloud,"source_stamp_min_s"),source_max(cloud,"source_stamp_max_s"),fusion_skew(cloud,"max_fusion_skew_s");
+    sensor_msgs::PointCloud2Iterator<uint32_t> plane_candidate(cloud,"plane_candidate_hits"),plane_compatible(cloud,"plane_compatible_hits"),plane_generic(cloud,"plane_generic_hits");
+    sensor_msgs::PointCloud2Iterator<uint8_t> plane_applied(cloud,"plane_partition_applied");
+    sensor_msgs::PointCloud2Iterator<uint8_t> residual_seen(cloud,"residual_seen_mask"),residual_required(cloud,"residual_required_mask");
+    sensor_msgs::PointCloud2Iterator<float> raw_occupancy(cloud,"raw_occupancy"),residual_conf(cloud,"residual_confidence"),residual_vis(cloud,"residual_current_visibility"),residual_occ(cloud,"residual_occupancy");
     for (const auto& p : grid_points_)
     {
+      *plane_candidate=p.plane_candidate_hits;*plane_compatible=p.plane_compatible_hits;*plane_generic=p.plane_generic_hits;
+      *plane_applied=ground_partition_applied_?1:0;*raw_occupancy=p.occupancy;
+      *residual_seen=p.residual_seen_mask;*residual_required=p.residual_required_mask;++residual_seen;++residual_required;
+      *residual_conf=residualConfidence(p);*residual_vis=effectiveVisibility(p);*residual_occ=effectiveOccupancy(p);
+      ++plane_candidate;++plane_compatible;++plane_generic;++plane_applied;++raw_occupancy;++residual_conf;++residual_vis;++residual_occ;
+      *count=p.hit_count;*near=p.near_ground_hit_count;*other=p.other_hit_count;*sensors=p.hit_sensor_mask;
+      *source_valid=p.source_time_valid_count;*source_invalid=p.source_time_invalid_count;
+      *source_sec=p.last_source_stamp_sec;*source_nsec=p.last_source_stamp_nsec;
+      *source_min=p.source_stamp_min_s;*source_max=p.source_stamp_max_s;*fusion_skew=p.max_fusion_skew_s;
+      ++source_valid;++source_invalid;++source_sec;++source_nsec;++source_min;++source_max;++fusion_skew;
+      *zmin=p.hit_z_min;*zmax=p.hit_z_max;*hx=p.last_hit_x;*hy=p.last_hit_y;*hz=p.last_hit_z;*hit_stamp=p.last_hit_stamp_s;
+      ++count;++near;++other;++sensors;++zmin;++zmax;++hx;++hy;++hz;++hit_stamp;
       *iter_x = p.x;
       *iter_y = p.y;
       *iter_z = p.z;
       const float effective_confidence = effectiveConfidence(p);
       *iter_conf = effective_confidence;
-      *iter_vis = p.current_visibility;
-      *iter_occ = p.occupancy;
+      *iter_vis = effectiveVisibility(p);
+      *iter_occ = effectiveOccupancy(p);
       // RViz-compatible intensity: occupied known cells appear stronger than
       // free known cells while unknown remains near zero.
       *iter_intensity =
-          p.occupancy > 0.5f ? 2.0f : effective_confidence;
+          effectiveOccupancy(p) > 0.5f ? 2.0f : effective_confidence;
 
       ++iter_x;
       ++iter_y;
@@ -2748,8 +3014,7 @@ private:
 
   bool getSensorTransforms(
       std::vector<tf2::Transform>& T_map_sensors,
-      visualization_msgs::MarkerArray* marker_array,
-      std::vector<geometry_msgs::TransformStamped>* source_transforms = nullptr)
+      visualization_msgs::MarkerArray* marker_array)
   {
     T_map_sensors.clear();
 
@@ -2783,7 +3048,6 @@ private:
 
       const tf2::Transform T_map_sensor = transformMsgToTf2(tf_msg);
       T_map_sensors.push_back(T_map_sensor);
-      if (source_transforms) source_transforms->push_back(tf_msg);
 
       if (marker_array != nullptr)
       {
@@ -2806,146 +3070,19 @@ private:
     return ready_count > 0;
   }
 
-  static std::string traceString(const std::string& value)
-  {
-    std::ostringstream out;
-    out << '"';
-    for (unsigned char c : value) {
-      if (c == '"' || c == '\\') out << '\\' << c;
-      else if (c < 0x20) out << "\\u" << std::hex << std::setw(4)
-                            << std::setfill('0') << static_cast<unsigned>(c) << std::dec;
-      else out << c;
-    }
-    out << '"';
-    return out.str();
-  }
-
-  bool sensorTransformUsable(const ros::Time& stamp, const ros::Time& now) const
-  {
-    return stamp.isZero() ||
-        (stamp <= now && (now-stamp).toSec() <= sensor_max_tf_age_s_);
-  }
-
-  bool initializeObservationTrace()
-  {
-    std::string filename;
-    pnh_.param<std::string>("confidence_map/observation_trace_file", filename, "");
-    if (filename.empty()) return true;
-    std::vector<int> watched;
-    pnh_.getParam("confidence_map/observation_trace_watch_grid_indices", watched);
-    for (int index : watched) {
-      if (index < 0 || static_cast<size_t>(index) >= grid_points_.size()) {
-        ROS_ERROR("Invalid observation trace watch index"); return false;
-      }
-      observation_trace_watch_indices_.insert(index);
-    }
-    // A trace is a new experiment artifact; never append to an earlier run.
-    if (std::ifstream(filename).good()) {
-      ROS_ERROR("Observation trace already exists"); return false;
-    }
-    observation_trace_.open(filename);
-    if (!observation_trace_) {
-      ROS_ERROR("Cannot open observation trace"); return false;
-    }
-    observation_trace_ << std::setprecision(17)
-        << "{\"event\":\"model\",\"instance\":" << traceString(snapshot_instance_)
-        << ",\"observation_mode\":" << traceString(observation_mode_)
-        << ",\"runtime_admission\":false,\"frame\":" << traceString(map_frame_)
-        << ",\"map_min\":[" << x_min_ << ',' << y_min_ << ',' << z_min_
-        << "],\"map_max\":[" << x_max_ << ',' << y_max_ << ',' << z_max_
-        << "],\"grid_size\":[" << nx_ << ',' << ny_ << ',' << nz_
-        << "],\"resolution\":" << resolution_
-        << ",\"temporal_decay_time\":" << temporal_decay_time_
-        << ",\"forward_axis\":" << traceString(forward_axis_)
-        << ",\"min_range\":" << tof_min_range_ << ",\"max_range\":" << tof_max_range_
-        << ",\"horizontal_fov_deg\":" << horizontal_fov_deg_
-        << ",\"vertical_fov_deg\":" << vertical_fov_deg_
-        << ",\"local_resolution\":" << local_resolution_
-        << ",\"max_tf_age_s\":" << sensor_max_tf_age_s_
-        << ",\"observation_timestamp_policy\":\"tf_source_time\""
-        << ",\"local_sample_count\":" << local_visible_points_.size()
-        << ",\"expected_sensor_count\":" << sensors_.size() << ",\"watched\":[";
-    bool first = true;
-    for (int index : observation_trace_watch_indices_) {
-      const auto& p = grid_points_[index];
-      if (!first) observation_trace_ << ',';
-      first = false;
-      observation_trace_ << "{\"grid_index\":" << index << ",\"point\":["
-                         << p.x << ',' << p.y << ',' << p.z << "]}";
-    }
-    observation_trace_ << "]}" << std::endl;
-    return static_cast<bool>(observation_trace_);
-  }
-
-  void writeObservationTrace(const ros::Time& now,
-      const std::vector<geometry_msgs::TransformStamped>& transforms,
-      const std::vector<std::set<int>>& watched_hits)
-  {
-    if (!observation_trace_.is_open()) return;
-    observation_trace_ << "{\"event\":\"ideal_fov_update\",\"instance\":"
-        << traceString(snapshot_instance_) << ",\"epoch\":" << snapshot_epoch_
-        << ",\"revision\":" << snapshot_revision_ << ",\"observation_ns\":" << now.toNSec()
-        << ",\"map_update_ns\":" << snapshot_update_stamp_.toNSec() << ",\"sensors\":[";
-    for (size_t i = 0; i < transforms.size(); ++i) {
-      const auto& t = transforms[i];
-      if (i) observation_trace_ << ',';
-      observation_trace_ << "{\"frame\":" << traceString(t.child_frame_id)
-          << ",\"tf_stamp_ns\":" << t.header.stamp.toNSec()
-          << ",\"applied_to_map\":" << (sensorTransformUsable(t.header.stamp, now) ? "true" : "false")
-          << ",\"tf_time_reason\":" << traceString(t.header.stamp.isZero() ? "timeless_static_chain" :
-              t.header.stamp > now ? "future_tf" :
-              (now-t.header.stamp).toSec() > sensor_max_tf_age_s_ ? "stale_tf" : "valid_source_time")
-          << ",\"translation\":[" << t.transform.translation.x << ','
-          << t.transform.translation.y << ',' << t.transform.translation.z
-          << "],\"quaternion_xyzw\":[" << t.transform.rotation.x << ','
-          << t.transform.rotation.y << ',' << t.transform.rotation.z << ','
-          << t.transform.rotation.w << "],\"hit_watch_grid_indices\":[";
-      bool first = true;
-      for (int index : watched_hits[i]) {
-        if (!first) observation_trace_ << ',';
-        first = false; observation_trace_ << index;
-      }
-      observation_trace_ << "]}";
-    }
-    observation_trace_ << "],\"watched\":[";
-    bool first = true;
-    for (int index : observation_trace_watch_indices_) {
-      const auto& p = grid_points_[index];
-      if (!first) observation_trace_ << ',';
-      first = false;
-      observation_trace_ << "{\"grid_index\":" << index << ",\"last_seen_s\":"
-          << p.last_seen_time << ",\"sensor_confidence\":" << p.confidence
-          << ",\"bootstrap_confidence\":" << p.bootstrap_confidence
-          << ",\"occupancy\":" << p.occupancy << '}';
-    }
-    observation_trace_ << "]}" << std::endl;
-    if (!observation_trace_) ROS_ERROR_THROTTLE(1., "Observation trace write failed");
-  }
-
   void updateTimerCallback(const ros::TimerEvent&)
   {
     std::lock_guard<std::mutex> lock(map_query_mutex_);
+    markSnapshotWrite(ros::Time::now());
+    const ros::Time now = ros::Time::now();
 
     if (observation_mode_ == "ideal_fov")
     {
       std::vector<tf2::Transform> T_map_sensors;
-      std::vector<geometry_msgs::TransformStamped> sources;
-      getSensorTransforms(T_map_sensors, nullptr, &sources);
-      // TF lookups can wait. Timestamp the mutation after obtaining them,
-      // and reject poses from beyond this actual update time.
-      const ros::Time now = ros::Time::now();
-      markSnapshotWrite(now);
-      if (observation_trace_.is_open()) {
-        std::vector<std::set<int>> watched_hits(sources.size());
-        updateConfidenceMapSensorCentric(T_map_sensors, sources, now, &watched_hits);
-        writeObservationTrace(now, sources, watched_hits);
-      } else {
-        updateConfidenceMapSensorCentric(T_map_sensors, sources, now);
-      }
+      getSensorTransforms(T_map_sensors, nullptr);
+      updateConfidenceMapSensorCentric(T_map_sensors, now);
       return;
     }
-    const ros::Time now = ros::Time::now();
-    markSnapshotWrite(now);
 
     // In tof_ray mode the observation callback owns the current visible set.
     // Only clear it when the entire E2 observation stream has gone stale;
@@ -3110,6 +3247,8 @@ private:
       "/care_planner/confidence_map/e3_summary";
   double ray_observation_timeout_ = 0.25;
   double ray_free_start_range_ = 0.15;
+  care_confidence_map::AnalyticGroundSupport ground_support_;
+  bool ground_support_loaded_=false,ground_partition_applied_=false;
   double ray_endpoint_guard_distance_ = 0.025;
   double ray_step_ = 0.025;
   double ray_min_valid_range_ = 0.10;
@@ -3193,7 +3332,6 @@ private:
   double horizontal_fov_deg_ = 55.0;
   double vertical_fov_deg_ = 72.0;
   double local_resolution_ = 0.05;
-  double sensor_max_tf_age_s_ = 0.05;
 
   double half_h_fov_rad_ = 0.0;
   double half_v_fov_rad_ = 0.0;
@@ -3205,8 +3343,6 @@ private:
   std::vector<LocalVisiblePoint> local_visible_points_;
 
   int last_ready_count_ = -1;
-  std::ofstream observation_trace_;
-  std::set<int> observation_trace_watch_indices_;
 };
 
 int main(int argc, char** argv)

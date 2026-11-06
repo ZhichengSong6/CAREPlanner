@@ -351,7 +351,11 @@ class CandidateReplacement:
         if lineage not in self.families and len(self.families) >= 64:
             return False
         tried = self.families.setdefault(lineage, set())
-        sensor = int(ob.get('per_sensor_selected_sensor_id', -1))
+        # The trigger was matched to this published target, which may be a
+        # shared or pinned pose from a different head than the stored owner.
+        # Charge the same snapshot used for previous_q/mask below; a union
+        # target (-1) must not consume the owner's stale sensor branch.
+        sensor = int(published.get('per_sensor_selected_sensor_id', -1))
         if sensor >= 0:
             tried.add(sensor)
         if len(tried) >= 8:
@@ -376,6 +380,8 @@ class CandidateReplacement:
                 event['observation_token'], int(ob['id']), trigger_raw))
         self.log('requested', request_id=self.serial, reason=reason,
                  active_id=int(ob['id']), owners=sorted(owners),
+                 failed_sensor_id=sensor,
+                 stored_sensor_id=int(ob.get('per_sensor_selected_sensor_id', -1)),
                  query_stamp_ns=event['query_stamp_ns'],
                  trigger_raw_candidate_stamp_ns=trigger_raw)
         return True

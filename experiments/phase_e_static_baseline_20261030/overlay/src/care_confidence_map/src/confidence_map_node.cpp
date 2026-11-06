@@ -2253,6 +2253,16 @@ private:
     res.confidence.reserve(req.points.size());
     res.current_visibility.reserve(req.points.size());
     res.inside_map.reserve(req.points.size());
+    const char* diagnostic_env = std::getenv("CARE_QUERY_DIAGNOSTICS");
+    const bool diagnostic = !diagnostic_env || std::string(diagnostic_env) != "false";
+    if (diagnostic) {
+    res.evidence_instance=snapshot_instance_;
+    res.evidence_revision=snapshot_revision_;
+    res.evidence_stamp=ros::Time::now();
+    res.evidence_occupancy.reserve(req.points.size());
+    res.evidence_last_seen_s.reserve(req.points.size());
+    res.evidence_prior.reserve(req.points.size());
+    }
 
     for (const auto& point : req.points)
     {
@@ -2264,6 +2274,11 @@ private:
         res.confidence.push_back(0.0f);
         res.current_visibility.push_back(0.0f);
         res.inside_map.push_back(0);
+      if (diagnostic) {
+        res.evidence_occupancy.push_back(0.);
+        res.evidence_last_seen_s.push_back(-1.);
+        res.evidence_prior.push_back(0.);
+      }
         continue;
       }
 
@@ -2272,6 +2287,11 @@ private:
       res.confidence.push_back(effectiveConfidence(voxel));
       res.current_visibility.push_back(effectiveVisibility(voxel));
       res.inside_map.push_back(1);
+      if (diagnostic) {
+      res.evidence_occupancy.push_back(effectiveOccupancy(voxel));
+      res.evidence_last_seen_s.push_back(effectiveLastSeen(voxel));
+      res.evidence_prior.push_back(std::max(current_body_prior_active_?voxel.bootstrap_confidence:0.f,voxel.test_known_free_confidence));
+      }
     }
 
     maybeLogDebugNeighborhood(req);

@@ -1,5 +1,6 @@
 // Optional proposal ranking only. No publication to any motion/audit/owner topic.
 void LocalSparseSCPPlanner::viewPreviewCallback(const std_msgs::StringConstPtr& message) {
+  if(view_preview_aligned_enabled_) {alignedViewPreview(message);return;}
   std::ostringstream out;std::string id="invalid";
   const auto started=ros::WallTime::now();
   try {

@@ -24,7 +24,7 @@ def _rest_time(q0, q1, context):
 
 
 def task_pose_ranking_enabled():
-    return os.environ.get('CARE_TASK_POSE_RANKING') == 'true'
+    return os.environ.get('CARE_OBSERVATION_SELECTOR','task')=='task' and os.environ.get('CARE_TASK_POSE_RANKING') == 'true'
 
 
 def task_departure_penalty(cost):
@@ -42,7 +42,8 @@ def task_departure_penalty(cost):
 
 def ranking_total(cost, completion=False):
     total = (cost['completion']['estimate_wall_s'] if completion else cost['total_s'])
-    return total + (task_departure_penalty(cost) if task_pose_ranking_enabled() else 0.)
+    penalty = task_departure_penalty(cost) if task_pose_ranking_enabled() else 0.
+    return total + (penalty / cost.get('ros_per_wall_s', 1.) if completion else penalty)
 
 
 def candidate_cost(q, context, pose, task_pose):
@@ -53,11 +54,11 @@ def candidate_cost(q, context, pose, task_pose):
     rejoin = _rest_time(q, context['q_task'], context)
     rate=float(context.get('ros_per_wall_s',1.))
     if not math.isfinite(rate) or rate<=0.:raise ValueError('invalid task-return clock rate')
-    approach/=rate;rejoin/=rate
     position = float(np.linalg.norm(pose[:3, 3]-task_pose[:3, 3]))
     cosine = float((np.trace(task_pose[:3, :3].T @ pose[:3, :3])-1.)*.5)
     angle = math.acos(min(1., max(-1., cosine)))
     result=dict(approach_s=approach, rejoin_s=rejoin, total_s=approach+rejoin,
+                time_basis='physical_seconds', ros_per_wall_s=rate,
                 task_position_m=position, task_angle_rad=angle,
                 task_pose_error=max(position/.02, angle/.2))
     evaluator=context.get('corridor_evaluator')
@@ -73,9 +74,9 @@ def candidate_cost(q, context, pose, task_pose):
     completion = context.get('completion')
     if completion is not None:
         # This remains a calibrated ranking estimate, never a feasibility bound.
-        estimate = (approach * completion['approach_scale'] +
+        estimate = ((approach * completion['approach_scale'] +
                     rejoin * completion['rejoin_scale'] +
-                    result.get('new_observation_proxy_s', 0.) +
+                    result.get('new_observation_proxy_s', 0.)) / rate +
                     completion['acquisition_wall_s'] +
                     completion.get('return_overhead_wall_s', 0.) +
                     (completion['tail_ros_s'] + completion['hold_ros_s']) / rate)
@@ -104,6 +105,8 @@ def alternative_can_improve(baseline, context, extra_compute_s, now=None):
         context['_task_first_comparisons'] = calls + 1
         if calls >= 1 or extra_compute_s >= 1.5:
             return False
+    if os.environ.get('CARE_OBSERVATION_SELECTOR','task')=='observation':
+        return True
     if baseline.get('approach_requires_detour') is not False:
         return True
     try:
@@ -113,13 +116,13 @@ def alternative_can_improve(baseline, context, extra_compute_s, now=None):
         win_fraction = 1. if task_pose_ranking_enabled() else .95
         if not all(math.isfinite(x) for x in (rate, elapsed, total)) or rate <= 0. or min(elapsed, total) < 0.:
             return True
-        lower = _rest_time(context['q_start'], context['q_task'], context) / rate
+        lower = _rest_time(context['q_start'], context['q_task'], context)
         completion = context.get('completion')
         if completion is None:
-            return lower + elapsed < win_fraction * total
+            return lower + elapsed * rate < win_fraction * total
         if baseline.get('completion') is None:
             return True
-        lower = (lower * min(completion['approach_scale'], completion['rejoin_scale']) +
+        lower = (lower / rate * min(completion['approach_scale'], completion['rejoin_scale']) +
                  completion['acquisition_wall_s'] +
                  completion.get('return_overhead_wall_s', 0.) +
                  (completion['tail_ros_s'] + completion['hold_ros_s']) / rate)
@@ -156,7 +159,7 @@ def improves_candidate(candidate, baseline, extra_compute_s):
             return not candidate['approach_requires_detour']
         comparable = (candidate.get('corridor_used', False) == baseline.get('corridor_used', False) and
             (not candidate.get('corridor_used', False) or
-             candidate['corridor_preview']['map_identity'] == baseline['corridor_preview']['map_identity']))
+             same_corridor_snapshot(candidate['corridor_preview'], baseline['corridor_preview'])))
         if not comparable:
             # Use common information on BOTH sides, never missing=free for one.
             candidate, baseline = dict(candidate), dict(baseline)
@@ -165,11 +168,11 @@ def improves_candidate(candidate, baseline, extra_compute_s):
                 cost['corridor_used'] = False
                 if cost.get('completion') is not None:
                     cost['completion'] = dict(cost['completion'])
-                    cost['completion']['estimate_wall_s'] -= cost.get('new_observation_proxy_s', 0.)
+                    cost['completion']['estimate_wall_s'] -= cost.get('new_observation_proxy_s', 0.) / cost.get('ros_per_wall_s', 1.)
     # Missing information must not look cheaper than a queried corridor.
     if candidate.get('corridor_used',False)!=baseline.get('corridor_used',False):return False
     if candidate.get('corridor_used',False) and (
-            candidate['corridor_preview']['map_identity']!=baseline['corridor_preview']['map_identity']):return False
+            not same_corridor_snapshot(candidate['corridor_preview'], baseline['corridor_preview'])):return False
     # Within the original candidate pool, prefer an approach that can observe
     # the actual target points before crossing the execution floor. Keep the
     # first accepted proposal when no such alternative exists. Sampling only
@@ -177,6 +180,11 @@ def improves_candidate(candidate, baseline, extra_compute_s):
     if ('approach_requires_detour' in candidate and 'approach_requires_detour' in baseline and
             candidate['approach_requires_detour']!=baseline['approach_requires_detour']):
         return not candidate['approach_requires_detour']
+    if os.environ.get('CARE_OBSERVATION_SELECTOR','task')=='observation':
+        def observation_cost(cost):
+            risk=cost.get('corridor_preview',{}).get('approach',{}).get('risk_fraction',0.) if cost.get('corridor_used') else 0.
+            return cost['approach_s']*(1.+risk)
+        return observation_cost(candidate)+extra_compute_s*candidate.get('ros_per_wall_s',1.) < .95*observation_cost(baseline)
     c, b = candidate.get('completion'), baseline.get('completion')
     if c is not None or b is not None:
         if c is None or b is None:
@@ -201,5 +209,11 @@ def improves_candidate(candidate, baseline, extra_compute_s):
     # one longer leg may be outweighed by the other leg. Full execution audits
     # remain mandatory for every selected proposal.
     if task_pose_ranking_enabled():
-        return ranking_total(candidate)+extra_compute_s < ranking_total(baseline)-1e-6
-    return candidate['total_s']+extra_compute_s < .95*baseline['total_s']
+        return ranking_total(candidate)+extra_compute_s*candidate.get('ros_per_wall_s', 1.) < ranking_total(baseline)-1e-6
+    return candidate['total_s']+extra_compute_s*candidate.get('ros_per_wall_s', 1.) < .95*baseline['total_s']
+
+
+def same_corridor_snapshot(a, b):
+    """Identity, revision and query time are all needed for a fair comparison."""
+    keys = ('map_identity', 'map_revision', 'snapshot_stamp_ns')
+    return all(key in a and key in b and a[key] == b[key] for key in keys)

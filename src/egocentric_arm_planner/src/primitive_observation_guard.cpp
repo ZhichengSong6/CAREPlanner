@@ -7,6 +7,11 @@
 #include <pinocchio/parsers/urdf.hpp>
 #include <sstream>
 #include <set>
+#include <cstdlib>
+#include <urdf/model.h>
+#include <chrono>
+#include <hpp/fcl/distance.h>
+#include <hpp/fcl/shape/geometric_shapes.h>
 
 namespace egocentric_arm_planner {
 bool parseHandoffResidualFailure(const std::string& evidence,
@@ -155,14 +160,49 @@ bool parsePrimitiveObservationEvidence(const std::string& evidence,
 struct PrimitiveObservationGuard::Impl {
   pinocchio::Model model;
   mutable pinocchio::Data data;
-  care_confidence_map::VbcPrimitiveModel primitives;
+  care_confidence_map::VbcPrimitiveModel primitives,voxel_primitives;
+  std::vector<pinocchio::FrameIndex> voxel_frame_ids;
+  std::vector<std::shared_ptr<hpp::fcl::CollisionGeometry>> voxel_shapes;
+  std::vector<bool> voxel_moving;
   std::vector<int> q_indices, v_indices;
   std::vector<pinocchio::FrameIndex> frame_ids;
   pinocchio::FrameIndex base_id = 0;
   bool ready = false;
+  double point_support_radius=0.;
+  struct GroundBody { pinocchio::FrameIndex frame; std::string link; std::vector<Eigen::Vector3d> corners; double required_margin_m=0.; };
+  std::vector<GroundBody> ground_bodies;
+  bool ground_enabled=false;
+  double ground_z=0.,ground_margin=.02,ground_offset=0.,ground_uncertainty=0.,ground_observation_reserve=0.;
+  Eigen::Vector3d ground_normal=Eigen::Vector3d::UnitZ();
 };
 PrimitiveObservationGuard::PrimitiveObservationGuard() : impl_(new Impl) {}
 PrimitiveObservationGuard::~PrimitiveObservationGuard() = default;
+
+std::unique_ptr<PrimitiveObservationGuard> PrimitiveObservationGuard::cloneForPreview() const {
+  std::unique_ptr<PrimitiveObservationGuard> copy(new PrimitiveObservationGuard);
+  copy->impl_->model=impl_->model;
+  copy->impl_->primitives=impl_->primitives;
+  copy->impl_->voxel_primitives=impl_->voxel_primitives;
+  copy->impl_->voxel_frame_ids=impl_->voxel_frame_ids;
+  copy->impl_->voxel_shapes=impl_->voxel_shapes;
+  copy->impl_->voxel_moving=impl_->voxel_moving;
+  copy->impl_->q_indices=impl_->q_indices;
+  copy->impl_->v_indices=impl_->v_indices;
+  copy->impl_->frame_ids=impl_->frame_ids;
+  copy->impl_->base_id=impl_->base_id;
+  copy->impl_->ready=impl_->ready;
+  copy->impl_->point_support_radius=impl_->point_support_radius;
+  copy->impl_->ground_bodies=impl_->ground_bodies;
+  copy->impl_->ground_enabled=impl_->ground_enabled;
+  copy->impl_->ground_z=impl_->ground_z;
+  copy->impl_->ground_margin=impl_->ground_margin;
+  copy->impl_->ground_offset=impl_->ground_offset;
+  copy->impl_->ground_uncertainty=impl_->ground_uncertainty;
+  copy->impl_->ground_observation_reserve=impl_->ground_observation_reserve;
+  copy->impl_->ground_normal=impl_->ground_normal;
+  copy->impl_->data=pinocchio::Data(copy->impl_->model);
+  return copy;
+}
 
 bool PrimitiveObservationGuard::initialize(const std::string& fk_urdf,
     const std::string& primitive_urdf, const std::string& base_frame,
@@ -189,10 +229,96 @@ bool PrimitiveObservationGuard::initialize(const std::string& fk_urdf,
     }
     if (joints.empty() || joints.size() != static_cast<std::size_t>(p.model.nq))
       throw std::runtime_error("Incomplete primitive guard joint configuration");
-    if (!p.primitives.load(primitive_urdf, ignored, error)) return false;
+    const char* whole=std::getenv("CARE_VBC_WHOLE_VOXEL");
+    const bool whole_volume=whole && std::string(whole)=="true";
+    p.point_support_radius=whole_volume?.5*std::sqrt(3.)*.05:0.;
+    if (!p.primitives.load(primitive_urdf, whole_volume ? std::vector<std::string>{} : ignored, error)) return false;
     for (const auto& body : p.primitives.primitives()) {
       if (!p.model.existFrame(body.link_name)) throw std::runtime_error("Missing primitive guard link: " + body.link_name);
       p.frame_ids.push_back(p.model.getFrameId(body.link_name));
+    }
+    if(!p.voxel_primitives.load(primitive_urdf,{},error))return false;
+    for(const auto& body:p.voxel_primitives.primitives()) {
+      if(!p.model.existFrame(body.link_name))throw std::runtime_error("Missing occupied-volume body frame");
+      const auto frame=p.model.getFrameId(body.link_name);p.voxel_frame_ids.push_back(frame);
+      p.voxel_moving.push_back(p.model.frames[frame].parent!=0);
+      using care_confidence_map::PrimitiveKind;
+      if(body.kind==PrimitiveKind::Box)p.voxel_shapes.emplace_back(new hpp::fcl::Box(2*body.half_size.x(),2*body.half_size.y(),2*body.half_size.z()));
+      else if(body.kind==PrimitiveKind::Cylinder)p.voxel_shapes.emplace_back(new hpp::fcl::Cylinder(body.radius,2*body.half_length));
+      else p.voxel_shapes.emplace_back(new hpp::fcl::Sphere(body.radius));
+    }
+    const char* enabled=std::getenv("CARE_KNOWN_GROUND_ENABLED");
+    p.ground_enabled=enabled && std::string(enabled)=="true";
+    if(p.ground_enabled) {
+      const char* filename=std::getenv("CARE_KNOWN_GROUND_FILE");
+      if(!filename || !*filename)throw std::runtime_error("Missing known-ground geometry");
+      boost::property_tree::ptree tree;boost::property_tree::read_json(filename,tree);
+      p.ground_z=tree.get<double>("plane_z_m");p.ground_margin=tree.get<double>("margin_m");
+      const int schema=tree.get<int>("schema");
+      const char* research_env=std::getenv("CARE_RESEARCH_PROFILE");
+      const bool research=schema==4 && research_env && std::string(research_env)=="nominal_plane_point_v1" && tree.get<std::string>("research_profile","")==research_env;
+      const double tracking_budget=research?0.:.02;
+      if(!std::isfinite(p.ground_z) || (schema!=1 && schema!=2 && schema!=3 && schema!=4) || (schema==4 && !research) ||
+          (schema==1 && p.ground_margin!=.02) || (schema>=2 &&
+          (p.ground_margin!=.02+tracking_budget || tree.get<double>("physical_margin_m")!=.02 ||
+           tree.get<double>("assumed_tracking_tube_m")!=tracking_budget || (schema==2 && tree.get<double>("plane_uncertainty_m")!=0.) ||
+           tree.get<double>("contact_numerical_tolerance_m")!=1e-8)))
+        throw std::runtime_error("Invalid known-ground physical contract");
+      p.ground_offset=-p.ground_z;
+      if(schema==3 || schema==4) {
+        const auto& plane=tree.get_child("plane");int i=0;
+        for(const auto& x:plane.get_child("normal")){if(i>=3)throw std::runtime_error("Invalid plane normal count");p.ground_normal[i++]=x.second.get_value<double>();}
+        p.ground_offset=plane.get<double>("offset_m");p.ground_uncertainty=tree.get<double>("plane_uncertainty_m");
+        if(plane.get<bool>("association_enabled",false)) {
+          const double registration=plane.get<double>("registration_bound_m"),band=plane.get<double>("association_band_m",.002);
+          if(!std::isfinite(registration) || registration<0. || !std::isfinite(band) || band<0. || !std::isfinite(registration+band))
+            throw std::runtime_error("Invalid ground observation bound");
+          p.ground_observation_reserve=research?0.:registration+band;
+        }
+        if(i!=3 || !p.ground_normal.allFinite() || std::abs(p.ground_normal.squaredNorm()-1.)>1e-10 ||
+            !std::isfinite(p.ground_offset) || !std::isfinite(p.ground_uncertainty) || p.ground_uncertainty<0. ||
+            plane.get<std::string>("frame")!="base_link" || plane.get<std::string>("support_id")!="known_ground" ||
+            plane.get<std::string>("calibration_id").empty())throw std::runtime_error("Invalid calibrated plane");
+      }
+      std::set<std::pair<std::string,int>> expected_ground_bodies,actual_ground_bodies;
+      if(schema>=2) {
+        urdf::Model source;
+        if(!source.initFile(fk_urdf))throw std::runtime_error("Ground source URDF unavailable");
+        std::vector<urdf::LinkSharedPtr> links;source.getLinks(links);
+        for(const auto& link:links)for(std::size_t i=0;i<link->collision_array.size();++i)
+          expected_ground_bodies.emplace(link->name,static_cast<int>(i));
+      }
+      for(const auto& entry:tree.get_child("bodies")) {
+        Impl::GroundBody body;body.link=entry.second.get<std::string>("link");
+        if(!p.model.existFrame(body.link))throw std::runtime_error("Unknown ground body frame");
+        body.frame=p.model.getFrameId(body.link);body.required_margin_m=p.ground_margin;
+        if(schema>=2 && !actual_ground_bodies.emplace(body.link,entry.second.get<int>("collision_index")).second)
+          throw std::runtime_error("Duplicate ground collision geometry");
+        if(schema>=2) {
+          const bool fixed=p.model.frames[body.frame].parent==0;
+          const bool mounting=entry.second.get<std::string>("contact_policy")=="mounted_nonpenetration";
+          if(mounting && (body.link!="base_link" || !fixed))throw std::runtime_error("Invalid ground mount policy");
+          const double physical=mounting?0.:.02,tracking=fixed?0.:tracking_budget;
+          if(entry.second.get<std::string>("support_id")!="known_ground" ||
+              entry.second.get<bool>("structurally_fixed")!=fixed ||
+              entry.second.get<double>("physical_margin_m")!=physical ||
+              entry.second.get<double>("assumed_tracking_normal_reserve_m")!=tracking ||
+              (!std::isfinite(entry.second.get<double>("reference_margin_m")) || std::abs(entry.second.get<double>("reference_margin_m")-physical-tracking)>1e-12))
+            throw std::runtime_error("Invalid per-body ground clearance");
+          body.required_margin_m=physical+tracking+p.ground_uncertainty+(mounting?0.:p.ground_observation_reserve)-(mounting?1e-8:0.);
+        }
+        for(const auto& v:entry.second.get_child("vertices")) {
+          if(v.second.size()!=3)throw std::runtime_error("Malformed ground corner");
+          Eigen::Vector3d corner;int j=0;for(const auto& x:v.second)corner[j++]=x.second.get_value<double>();
+          if(!corner.allFinite())throw std::runtime_error("Nonfinite ground corner");
+          body.corners.push_back(corner);
+        }
+        if(body.corners.size()<4 || body.corners.size()>16384)throw std::runtime_error("Invalid ground mesh hull size");
+        p.ground_bodies.push_back(body);
+      }
+      if(p.ground_bodies.empty() || p.ground_bodies.size()>64)throw std::runtime_error("Invalid ground body count");
+      if(schema>=2 && expected_ground_bodies!=actual_ground_bodies)
+        throw std::runtime_error("Incomplete ground collision geometry");
     }
     p.ready = true;
     return true;
@@ -215,6 +341,52 @@ bool PrimitiveObservationGuard::framePose(const Eigen::VectorXd& q,
     const auto relative=scratch.oMf[p.base_id].inverse()*scratch.oMf[p.model.getFrameId(frame)];
     pose->matrix()=relative.toHomogeneousMatrix();return pose->matrix().allFinite();
   } catch(...) {return false;}
+}
+
+bool PrimitiveObservationGuard::knownGroundEnabled() const {return impl_->ground_enabled;}
+double PrimitiveObservationGuard::knownGroundMargin() const {return impl_->ground_margin;}
+bool PrimitiveObservationGuard::linearizeKnownGround(const Eigen::MatrixXd& q,
+    std::vector<Row>* rows,std::string* error) const {
+  if(!rows)return false;
+  rows->clear();const auto& p=*impl_;
+  if(!p.ground_enabled)return true;
+  try {
+    if(!p.ready || q.rows()!=static_cast<int>(p.q_indices.size()) || !q.allFinite())
+      throw std::runtime_error("Invalid ground linearization state");
+    pinocchio::Data data(p.model);
+    for(int k=0;k<q.cols();++k) {
+      Eigen::VectorXd full=pinocchio::neutral(p.model);
+      for(int j=0;j<q.rows();++j)full[p.q_indices[j]]=q(j,k);
+      pinocchio::computeJointJacobians(p.model,data,full);pinocchio::updateFramePlacements(p.model,data);
+      const auto base_inverse=data.oMf[p.base_id].inverse();
+      for(const auto& body:p.ground_bodies) {
+        // A body fixed to base_link has exactly the same plane clearance at
+        // every knot. Check it at the measured start; repeating its zero-J
+        // mounted-contact row makes the interior-point barrier degenerate.
+        if(k>0 && p.model.frames[body.frame].parent==0)continue;
+        const auto pose=base_inverse*data.oMf[body.frame];
+        Eigen::Vector3d point=pose.act(body.corners.front());
+        for(const auto& corner:body.corners) {
+          const Eigen::Vector3d candidate=pose.act(corner);
+          if(p.ground_normal.dot(candidate)<p.ground_normal.dot(point))point=candidate;
+        }
+        Eigen::Matrix<double,6,Eigen::Dynamic> J(6,p.model.nv);J.setZero();
+        pinocchio::getFrameJacobian(p.model,data,body.frame,pinocchio::LOCAL_WORLD_ALIGNED,J);
+        Row row;row.known_ground=true;row.required_margin_m=body.required_margin_m;row.point=Eigen::Vector3d::Zero();
+        row.timestep=k;row.q_linearization=q.col(k);row.distance_m=p.ground_normal.dot(point)+p.ground_offset;
+        row.link=body.link;row.collision_name="known_ground_mesh_hull";row.gradient.resize(q.rows());
+        const Eigen::Vector3d offset=point-pose.translation();
+        for(int j=0;j<q.rows();++j) {
+          const auto column=J.col(p.v_indices[j]);
+          row.gradient[j]=p.ground_normal.dot(base_inverse.rotation()*column.head<3>()+
+              (base_inverse.rotation()*column.tail<3>()).cross(offset));
+        }
+        if(!std::isfinite(row.distance_m) || !row.gradient.allFinite())throw std::runtime_error("Nonfinite ground row");
+        rows->push_back(row);
+      }
+    }
+    return true;
+  } catch(const std::exception& e) {if(error)*error=e.what();return false;}
 }
 
 bool PrimitiveObservationGuard::linearize(const Eigen::MatrixXd& q,
@@ -271,7 +443,7 @@ bool PrimitiveObservationGuard::linearize(const Eigen::MatrixXd& q,
           Row row;
           row.timestep = k; row.point = point.point;
           row.q_linearization = q.col(k);
-          row.distance_m = world[i].signedDistance(point.point);
+          row.distance_m = world[i].signedDistance(point.point)-p.point_support_radius;
           row.link = local[i].link_name; row.collision_name = local[i].collision_name;
           // Differentiate the primitive SDF in workspace, then apply the rigid
           // frame Jacobian. No perturbed joint FK or learned model is involved.
@@ -301,4 +473,5 @@ bool PrimitiveObservationGuard::linearize(const Eigen::MatrixXd& q,
     return false;
   }
 }
+#include "egocentric_arm_planner/occupied_voxel_guard_impl.hpp"
 }  // namespace egocentric_arm_planner

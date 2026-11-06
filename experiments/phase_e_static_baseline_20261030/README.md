@@ -1,31 +1,42 @@
-# 静态障碍物运行源码
+# 当前发布运行源码
 
-共享源码由 `source_manifest.json` 固定，差异文件位于 `overlay/`。`prepare.py` 建立独立 catkin 工作区；`build_support/` 补齐解析地面库和链接依赖，`runtime_portability.py` 处理启动脚本路径与 Conda 环境名。
+目录名保留 2026-10-30 的入口兼容性，当前内容已晋升为 **2026-11-06 near-prefix closed-loop candidate**。`source_manifest.json` 固定每个文件的来源与 SHA256；`overlay/` 保存对根工程的冻结覆盖。`prepare.py` 生成独立 catkin 工作区，不读取以前的实验结果。
 
-## 默认独立演示
+推荐从仓库根目录运行 `bash scripts/run_demo.sh`。该入口固定 R1、CPU/MKL 2 threads、GPU 碰撞、active observation、关节位置命令包络和 UNKNOWN enforce。`demo/runtime.json` 固定：
 
-在仓库根目录运行：
+| 参数 | 当前值 |
+|---|---|
+| policy | prefix_objective |
+| handoff-retry | disabled |
+| repair-goal-stopping | on |
+| normal-goal-prefix | off |
+| view-selection | current |
+| observation-release | matched |
+| observation-guidance | unseen |
+| run-seconds-wall | 60 |
+
+准备后 `run.py` 仍提供研究开关；直接调用时必须传入这些参数及相同环境。它的通用默认值不等于推荐发布配置。未晋升的历史策略没有被默认为开启。
+
+`demo/task.json` 提供目标 007、初始关节角和场景名。`demo_inputs.py` 根据配置、URDF、碰撞几何和世界文件重新生成任务与启动检查；无须本地历史输入。默认 `detour_box`，另可选择 `baseline`、`nonblocking_box`。
+
+初始已知区域采用 `src/care_confidence_map/config/confidence_map_static_box_ray.yaml` 的离散先验及实际机器人几何规则；它不是包围盒内全部空间的自由认证。物理地面保留，规划中同时使用解析平面。
+
+近端观察划分使用精确的 `(trajectory_stamp_ns, bundle_seq)` 对齐 VBC 证据。在同一个空间区域中分开最早原轨迹区间与后续点，保留每个点和已有所有者。证据不完整时使用原区域。实际完成仍依靠 ToF/confidence 更新，运动仍须原审核通过。
+
+终端修复保留同目标重规划时正在审核/接管的候选身份，避免清空尚未完成的停稳交接；目标变化、VBC/GCDF 停止、跟踪中止等仍撤销。关节命令包络是运动学限速机制，不是未测执行器动力学的严格误差界。
+
+`release_provenance.json` 记录冻结候选源清单及证据索引的哈希、开发验证分母和发布路径适配。封存实验未改写。当前发布不声称新的完整 30+18 成功率。
+
+模型仍为 `cdf_25mm_v2/model.pt` 与 `hierarchical9_r1_scratch50k/final.pt`，整体输出和八个 sensor head 共用一个 R1 实例。25 mm 是碰撞模型空间采样间距，输出仍是关节配置空间距离；VisCDF 的解析 FOV 距离不是环境感知的无碰撞代价，标签也不是连续边界的数学精确距离。
+
+## 维护与检查
 
 ```bash
-bash scripts/run_demo.sh
+python3 -B scripts/check_release.py
+bash scripts/run_demo.sh --build-only
+bash scripts/run_demo.sh --env viscdf --visibility-env ncdf_l4c --preflight-only
 ```
 
-`demo/task.json` 是任务输入配置，只含目标、初始关节角和场景名。世界模型保存在 `template/fixed/scenes/`。`demo_inputs.py` 从这些配置与 URDF 重新生成场景、任务输入和启动几何检查；不读取以前的实验输出。检查覆盖机器人碰撞体、初始地图膨胀、半体素对角线和起始关节偏差。
+每次使用新输出目录。准备阶段校验所有源码和模型；构建集成已包含在候选 CMake 中，`build_support/` 仅补齐缺失集成，避免重复声明库。
 
-场景可选 `baseline`、`nonblocking_box`、`detour_box`。默认使用新 CDF/ReLU、统一 R1 VisCDF、`current` 策略。R1 的整体输出负责投影与回退，八个传感器输出负责分支求解和引导，共享一次加载的网络。所有新日志与结果均写入本地输出目录。
-
-## 分步准备和构建
-
-```bash
-python3 experiments/phase_e_static_baseline_20261030/prepare.py --demo --output outputs/my_demo --assets-root .
-bash experiments/phase_e_static_baseline_20261030/build.sh outputs/my_demo
-python3 -B outputs/my_demo/run.py --model new --case 007 --configuration nonblocking_box --tag demo --handoff-retry disabled --view-selection current --preflight
-```
-
-完整运行建议使用顶层 `run_demo.sh`，它还会检查推理环境并处理无显示器场景。仅构建可用 `run_demo.sh --build-only`，或在准备命令中添加 `--without-models`。
-
-## 可选历史研究输入
-
-使用旧目标和旧校准输入时，可用 `--inputs-root` 替代 `--demo`。`input_assets.json` 只记录这些外置输入的路径和校验值；内容不在 Git 中。当前源码已统一使用 R1，因此这是在原输入上运行新实现，不是原混合模型的逐字复现。默认演示不依赖这些输入。
-
-`model_assets.json` 将新碰撞 CDF 和 VisCDF R1 标为两份必需资产。默认准备和运行不依赖旧碰撞 CDF，也不加载旧标量 VisCDF；做旧碰撞模型对照时，准备命令添加 `--include-legacy-models`，运行时选择 `--model old`，VisCDF 仍使用 R1。每次准备使用新的输出目录，每次运行使用唯一 tag；源码、选中的权重和运行配置在执行前后核对。原有封存研究不被修改。
+旧研究的 `--inputs-root` 入口与旧碰撞模型开关仍保留；其原始输入保持外置，仅在显式提供时使用。默认 `--demo` 只从版本化配置生成输入。发布不包含历史实验输出，也不需要它们。

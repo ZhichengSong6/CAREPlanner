@@ -22,8 +22,9 @@ remains the fail-safe while the next probe is planned/certified. ROS Header.seq
 is diagnostic only.
 """
 
-import json
 import math
+import json
+import os
 import re
 import threading
 import time
@@ -32,20 +33,7 @@ from collections import deque
 import rospy
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
-
-
-def _task_event_modules():
-    import sys
-    from pathlib import Path
-    source = Path(__file__).resolve().parents[2] / 'care_visibility_cdf/scripts'
-    if not source.is_dir():
-        import rospkg
-        source = Path(rospkg.RosPack().get_path('care_visibility_cdf')) / 'scripts'
-    if str(source) not in sys.path:
-        sys.path.insert(0, str(source))
-    import task_recovery_events
-    from task_observation_binding import TaskContextReceiver
-    return task_recovery_events, TaskContextReceiver
+from geometry_msgs.msg import PoseStamped
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -84,24 +72,6 @@ class C44VerifiedRegimeManager:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self.task_context_enabled = bool(rospy.get_param('~enable_observation_context', False))
-        if self.task_context_enabled:
-            events, receiver = _task_event_modules()
-            self.task_events = events
-            self.task_context = receiver()
-            self.task_event_receiver = events.TaskEventReceiver()
-            self.task_event_source = events.TaskEventSource()
-            self.task_binding = None
-            self.task_observation_episode = None
-            self.task_completed_episodes = deque(maxlen=64)
-            self.task_execution_bindings = {}
-            self.task_pending_events = {}
-            self.task_event_dispatch = threading.local()
-            self.task_event_rejected = 0
-            self.task_replan_sequence = 0
-            self.task_reference_refresh_sequence = 0
-            self.task_mode_revision = 1
-            self.task_control_last_pub_ns = 0
 
         self.rate = float(rospy.get_param("~rate", 20.0))
         self.candidate_unsafe_required = int(rospy.get_param(
@@ -112,14 +82,39 @@ class C44VerifiedRegimeManager:
             "~probe_safe_commits_required", 3))
         self.probe_completed_prefixes_required = int(rospy.get_param(
             "~probe_completed_prefixes_required", legacy_probe_required))
+        self.task_first_research = os.environ.get('CARE_TASK_FIRST_RESEARCH') == 'true'
+        self.repair_goal_stopping = os.environ.get('CARE_REPAIR_GOAL_STOPPING') == 'true'
+        self._goal_stop_execution = 0
+        self._goal_stop_feedback_time = None
+        self.task_first_seen_count = 0
+        self.task_first_seen_point_count = 0
+        self.task_first_observation_returns = 0
+        self._rolling_release = None
+        self._rolling_request_pub = rospy.Publisher('/care_planner/rolling_task/consumed_request', String, queue_size=8)
+        self.matched_observation_release = os.environ.get('CARE_MATCHED_OBSERVATION_RELEASE') == 'true'
+        if self.matched_observation_release:
+            # catkin devel relays execute in a private namespace, so importing
+            # a sibling relay does not export its classes. __file__ points at
+            # this real source (or installed script); load the sibling itself.
+            import importlib.util
+            release_spec = importlib.util.spec_from_file_location(
+                'care_observation_release_identity',
+                os.path.join(os.path.dirname(__file__), 'observation_release_identity.py'))
+            release_module = importlib.util.module_from_spec(release_spec)
+            release_spec.loader.exec_module(release_module)
+            self._observation_release_identity = release_module.ObservationReleaseIdentity(allow_completed_gain=os.environ.get('CARE_ROLLING_TASK_OBSERVATION')=='true')
+            self._observation_handoff = release_module.ObservationHandoffIdentity()
+            self._observation_waypoint_region = None
+        if self.task_first_research:
+            self.probe_completed_prefixes_required = 1
         self.input_timeout = float(rospy.get_param("~input_timeout", 0.25))
         self.clear_pulse_s = float(rospy.get_param("~clear_pulse_s", 0.12))
         self.probe_ignore_s = float(rospy.get_param("~probe_ignore_s", 0.16))
 
         self.repair_completion_gate_enabled = bool(rospy.get_param(
-            "~repair_completion_gate_enabled", self.task_context_enabled))
-        if self.task_context_enabled and not self.repair_completion_gate_enabled:
-            raise ValueError('task contexts require the actual-acquisition completion gate')
+            "~repair_completion_gate_enabled", False))
+        self.research_opportunistic_probe = os.environ.get(
+            'CARE_RESEARCH_OPPORTUNISTIC_PROBE','false').lower()=='true'
         self.repair_completion_topic = str(rospy.get_param(
             "~repair_completion_topic",
             "/care_planner/active_sensing/visibility_acquisition_complete"))
@@ -356,17 +351,6 @@ class C44VerifiedRegimeManager:
             self.force_vbc_bootstrap_topic, Bool, queue_size=1, latch=True)
         self.normal_task_replan_pub = rospy.Publisher(
             self.normal_task_replan_topic, Bool, queue_size=10, latch=False)
-        if self.task_context_enabled:
-            self.task_control_pub = rospy.Publisher(
-                events.CONTROL_TOPIC, String, queue_size=8, latch=True)
-            rospy.Subscriber('/care_planner/active_sensing/observation_context', String,
-                             self._task_context_cb, queue_size=32)
-            rospy.Subscriber(events.RECOVERY_TOPIC, String,
-                             lambda m: self._task_event_cb(m, 'recovery_snapshot'), queue_size=8)
-            rospy.Subscriber(events.VERIFICATION_TOPIC, String,
-                             self._task_verification_cb, queue_size=32)
-            rospy.Subscriber(events.PLANNER_TOPIC, String,
-                             lambda m: self._task_event_cb(m, 'planner_status'), queue_size=32)
 
         rospy.Subscriber(
             self.candidate_outcome_topic, String, self._candidate_outcome_cb,
@@ -419,7 +403,7 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.candidate_vbc_summary_topic, String,
             self._candidate_vbc_summary_cb, queue_size=20)
-        if self.repair_completion_gate_enabled:
+        if self.repair_completion_gate_enabled or self.research_opportunistic_probe:
             rospy.Subscriber(
                 self.repair_completion_topic, Bool,
                 self._repair_completion_cb, queue_size=1)
@@ -429,6 +413,14 @@ class C44VerifiedRegimeManager:
         self.clear_pub.publish(Bool(data=False))
         self.hold_pub.publish(Bool(data=False))
         self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+        self._occlusion_reference_stamps = deque(maxlen=32)
+        self._occlusion_pending = None
+        self._occlusion_goal = None
+        self._occlusion_consumed_routes = set()
+        if os.environ.get('CARE_OCCLUSION_REROUTE_ENABLED','false') == 'true':
+            rospy.Subscriber('/care_planner/task_trajectory',JointTrajectory,self._occlusion_reference_cb,queue_size=8)
+            rospy.Subscriber('/care_planner/ee_target_pose',PoseStamped,self._occlusion_goal_cb,queue_size=1)
+            rospy.Subscriber('/care_planner/active_sensing/occlusion_reroute',String,self._occlusion_route_cb,queue_size=8)
         self.timer = rospy.Timer(rospy.Duration(1.0 / self.rate), self._timer_cb)
         self._publish_summary()
 
@@ -440,253 +432,78 @@ class C44VerifiedRegimeManager:
             int(self.repair_completion_gate_enabled),
             self.repair_completion_topic)
 
-    def _task_reset_planning_locked(self, reason):
-        # Execution safety state and old execution/audit bindings survive task
-        # replacement until the physical tracker has stopped that execution.
-        self._retire_qp_retry_locked()
-        self.state = self.NORMAL
-        self.last_transition_reason = reason
-        self.last_candidate_seq = 0
-        self.candidate_outcome_time = None
-        self.candidate_outcome_pending_gate_replay = False
-        self.candidate_unsafe_streak = 0
-        self.probe_completed_prefix_streak = 0
-        self.pending_probe_candidate_seq = 0
-        self.pending_probe_execution_stamp_ns = 0
-        self.pending_probe_effective_prefix_s = math.nan
-        self.repair_completion = self.repair_completion_armed = False
-        self.repair_completion_time = None
-        self.visibility_waypoint_active = False
-        self._observation_waypoint = self._observation_demand = None
-        self.task_observation_episode = None
-        self.task_completed_episodes.clear()
-        self._observation_retired_tokens.clear()
-        self.task_infeasible_pending = self.task_uncertified_pending = False
-        self.task_obstacle_blocked_pending = False
-        self.repair_final_vbc_hold = False
-        self.blocker_rediscovery_pending = self.blocker_rediscovery_force_bootstrap = False
-        self.blocker_rediscovery_origin = 'none'
-        self.task_stall_stamp_ns = 0
-        self.task_stall_deadline = None
-        self.task_stall_confirmed = False
-        self.probe_single_flight_phase = 'IDLE'
-        self.probe_single_flight_execution_stamp_ns = 0
-        self.probe_single_flight_summary_time = None
-        self.clear_until = self.probe_ignore_until = self.physical_deadline_abs = None
-        self.task_replan_sequence = self.task_reference_refresh_sequence = 0
-        self.task_mode_revision += 1
-        self.task_control_last_pub_ns = 0
-        self.task_recovery_target_sha256 = ''
-        self.trigger_pub.publish(Bool(data=False))
-        self.probe_active_pub.publish(Bool(data=False))
-        self.clear_pub.publish(Bool(data=False))
-        self.force_vbc_bootstrap_pub.publish(Bool(data=False))
-
-    def _task_context_cb(self, msg):
-        try:
-            with self._lock:
-                now = rospy.Time.now().to_nsec()
-                context = self.task_context.update(json.loads(msg.data), now)
-                binding = context['candidate_binding'] if context else None
-                if binding != self.task_binding:
-                    self.task_binding = binding
-                    self._task_reset_planning_locked('task_context_changed')
-                self._drain_task_events_locked()
-                self._publish_task_control_locked()
-        except (ValueError, TypeError, KeyError, OverflowError):
-            self.task_event_rejected += 1
-
-    def _task_verification_cb(self, msg):
-        try:
-            kind = json.loads(msg.data).get('kind')
-            if kind in ('candidate_outcome', 'execution_binding'):
-                self._task_event_cb(msg, kind)
-        except (ValueError, TypeError, AttributeError):
-            self.task_event_rejected += 1
-
-    def _task_event_cb(self, msg, kind, buffering=True):
-        try:
-            with self._lock:
-                now = rospy.Time.now().to_nsec()
-                context = self.task_context.snapshot(now)
-                event = self.task_event_receiver.parse(msg.data, context, now, kind)
-                payload = event['payload']
-                if kind == 'recovery_snapshot':
-                    self.task_events.validate_recovery_snapshot(payload, event['task_context'])
-                elif kind == 'execution_binding':
-                    if (type(payload.get('execution_stamp_ns')) is not int or
-                            not 0 < payload['execution_stamp_ns'] < 2**64 or
-                            re.fullmatch(r'[0-9a-f]{64}', payload.get('trajectory_sha256', '')) is None):
-                        raise ValueError('invalid_task_execution_binding')
-                    old = self.task_execution_bindings.get(payload['execution_stamp_ns'])
-                    if old is not None and old != event['task_context']:
-                        raise ValueError('conflicting_task_execution_binding')
-                elif kind in ('candidate_outcome', 'planner_status'):
-                    expected_regime = (self.task_event_source.session+':'+
-                                       str(self.task_mode_revision)+':'+self.state)
-                    if payload.get('task_regime') != expected_regime:
-                        raise ValueError('task_event_regime_mismatch')
-                    text = payload.get('text')
-                    if not isinstance(text, str) or len(text) > 32768:
-                        raise ValueError('invalid_task_status_text')
-                    pairs = _TOKEN_RE.findall(text)
-                    if len(pairs) != len(dict(pairs)):
-                        raise ValueError('ambiguous_task_status_text')
-                    if kind == 'planner_status' and payload.get('name') not in {
-                            'infeasible', 'obstacle_blocked', 'uncertified', 'stall',
-                            'summary', 'single_flight', 'qp_retry_ack'}:
-                        raise ValueError('unknown_task_planner_status')
-                else:
-                    raise ValueError('unknown_task_event_kind')
-                self.task_event_receiver.remember(event)
-                self.task_event_dispatch.active = True
-                try:
-                    if kind == 'recovery_snapshot':
-                        self._task_recovery_snapshot_locked(payload)
-                    elif kind == 'execution_binding':
-                        token = payload['execution_stamp_ns']
-                        self.task_execution_bindings[token] = event['task_context']
-                        while len(self.task_execution_bindings) > 64:
-                            del self.task_execution_bindings[next(iter(self.task_execution_bindings))]
-                        self.last_committed_trajectory_time = rospy.Time.now()
-                        self._remember_execution_audit_identity_locked(token, token)
-                        self._drain_execution_audits_locked(rospy.Time.now())
-                    elif kind == 'candidate_outcome':
-                        self._candidate_outcome_cb(String(data=payload['text']))
-                    else:
-                        callbacks = dict(infeasible=self._task_infeasible_cb,
-                            obstacle_blocked=self._task_obstacle_blocked_cb,
-                            uncertified=self._task_uncertified_cb, stall=self._task_stall_cb,
-                            summary=self._repair_final_vbc_feedback_cb,
-                            single_flight=self._probe_single_flight_summary_cb,
-                            qp_retry_ack=self._qp_retry_ack_cb)
-                        name = payload['name']
-                        value = (Bool(data=payload['text'] == '1') if name in
-                                 ('infeasible', 'obstacle_blocked', 'uncertified')
-                                 else String(data=payload['text']))
-                        callbacks[name](value)
-                finally:
-                    self.task_event_dispatch.active = False
-                self._publish_task_control_locked()
-        except (ValueError, TypeError, KeyError, OverflowError):
-            self.task_event_rejected += 1
-            if buffering and len(msg.data) <= self.task_events.MAX_EVENT_BYTES:
-                try:
-                    value = json.loads(msg.data)
-                    now = rospy.Time.now().to_nsec()
-                    binding = json.loads(value['task_context'])
-                    if type(value['stamp_ns']) is not int or value['stamp_ns']-now > 50000000:
-                        return
-                    provisional = dict(binding, candidate_binding=value['task_context'], active=True,
-                        stamp_ns=binding['started_ns'], valid_until_ns=value['valid_until_ns'])
-                    # Validate shape, replay state and age before bounded early
-                    # storage. The provisional context never authorizes use;
-                    # the real owner's exact context must arrive to drain it.
-                    self.task_event_receiver.parse(msg.data, provisional,
-                                                   max(now, value['stamp_ns']), kind)
-                    current = self.task_context.context.current
-                    future_task = current is None or (
-                        binding['owner_session'] == current['owner_session'] and
-                        binding['generation'] > current['generation']) or (
-                        binding['owner_session'] not in self.task_context.context.sessions)
-                    clock_wait = (value['task_context'] == self.task_binding and
-                                  0 < value['stamp_ns']-now <= 50000000)
-                    if (future_task or clock_wait) and value['valid_until_ns'] >= now:
-                        key = (kind, value['payload'].get('name', ''))
-                        previous = self.task_pending_events.get(key)
-                        if (previous is not None or len(self.task_pending_events) < 16) and (
-                                previous is None or previous[0] != msg.data):
-                            self.task_pending_events[key] = (msg.data, now)
-                except (ValueError, KeyError, TypeError, AttributeError):
-                    pass
-
-    def _drain_task_events_locked(self):
-        now = rospy.Time.now().to_nsec()
-        for key, (raw, received) in list(self.task_pending_events.items()):
-            event = json.loads(raw)
-            if not 0 <= now-received <= self.task_events.MAX_EVENT_NS or event['valid_until_ns'] < now:
-                del self.task_pending_events[key]
-            elif event['task_context'] == self.task_binding and event['stamp_ns'] <= now:
-                del self.task_pending_events[key]
-                self._task_event_cb(String(data=raw), key[0], buffering=False)
-
-    def _task_recovery_snapshot_locked(self, snapshot):
-        now = rospy.Time.now()
-        episode = snapshot['episode_id']
-        if episode in self.task_completed_episodes:
-            return
-        target = snapshot['target']
-        version = snapshot.get('selection', {}).get('target_sha256', '') if target is not None else ''
-        if target is not None:
-            if (self.state == self.REPAIR and
-                    (getattr(self, 'task_recovery_target_sha256', '') != version or
-                     (self._observation_waypoint is not None and
-                      self._observation_waypoint[0] != target['observation_token']))):
-                self.task_mode_revision += 1
-            self.task_recovery_target_sha256 = version
-            self.task_observation_episode = episode
-            self.visibility_waypoint_active = True
-            token = target['observation_token']
-            self._observation_waypoint = self._observation_demand = (token, now)
-            self.physical_deadline_abs = target['deadline_ns']*1e-9
-            self._maybe_enter_observation_repair_locked(now, 'task_snapshot')
-        elif snapshot['complete'] and episode == self.task_observation_episode:
-            self.task_recovery_target_sha256 = ''
-            self.task_completed_episodes.append(episode)
-            self.visibility_waypoint_active = False
-            self._retire_observation_demand_locked()
-            if self.state == self.REPAIR and self.execution_ready:
-                self.repair_completion = self.repair_completion_armed = True
-                self.repair_completion_time = now
-                self.repair_completion_event_count += 1
-                self._transition_locked(self.PROBE_NORMAL,
-                                        'actual_task_visibility_acquisition_complete', now)
-        elif target is None:
-            self.task_recovery_target_sha256 = ''
-            self.visibility_waypoint_active = False
-            self._observation_waypoint = self._observation_demand = None
-
-    def _publish_task_control_locked(self):
-        if not getattr(self, 'task_context_enabled', False):
-            return
-        now = rospy.Time.now()
-        context = self.task_context.snapshot(now.to_nsec())
-        if context is None:
-            return
-        if self.task_control_last_pub_ns and not 0 <= now.to_nsec()-self.task_control_last_pub_ns <= self.task_events.MAX_EVENT_NS:
-            self.task_mode_revision += 1
-        self.task_control_last_pub_ns = now.to_nsec()
-        payload = dict(mode=self.state, mode_revision=self.task_mode_revision, ready=self.execution_ready,
-            clear=bool(self.state == self.PROBE_NORMAL and self.clear_until is not None and now <= self.clear_until),
-            replan_seq=self.task_replan_sequence,
-            reference_refresh_seq=self.task_reference_refresh_sequence,
-            qp_retry=self.qp_retry_token,
-            force_bootstrap=self.blocker_rediscovery_force_bootstrap,
-            recovery_target_sha256=getattr(self, 'task_recovery_target_sha256', ''))
-        event = self.task_event_source.event('regime_control', context, payload, now.to_nsec())
-        self.task_control_pub.publish(String(data=self.task_events.canonical(event)))
-
-    def _request_task_replan(self):
+    def _occlusion_goal_cb(self,msg):
+        p=msg.pose.position;q=msg.pose.orientation
         with self._lock:
-            self.replan_request_pub.publish(Bool(data=True))
-            if getattr(self, 'task_context_enabled', False):
-                self.task_replan_sequence += 1
-                self._publish_task_control_locked()
+            goal=[msg.header.frame_id,p.x,p.y,p.z,q.x,q.y,q.z,q.w]
+            if goal != self._occlusion_goal:
+                self._occlusion_consumed_routes.clear()
+            self._occlusion_goal=goal
+            self._occlusion_pending=None
 
-    def _request_normal_reference(self):
-        self.normal_task_replan_pub.publish(Bool(data=True))
-        if getattr(self, 'task_context_enabled', False):
-            self.task_reference_refresh_sequence += 1
-            self._publish_task_control_locked()
+    def _occlusion_reference_cb(self,msg):
+        with self._lock:
+            self._occlusion_reference_stamps.append(msg.header.stamp.to_nsec())
+            self._try_occlusion_route_locked()
+
+    def _occlusion_route_cb(self,msg):
+        try:
+            event=json.loads(msg.data)
+            if (event.get('schema')!=1 or event.get('action')!='try_alternative_reference' or
+                    event.get('actual_observation_completed') is not False or
+                    not isinstance(event.get('deferred_tokens'),list)):
+                return
+            stamp=int(event['reference_stamp_ns'])
+            if stamp<=0:return
+        except (ValueError,KeyError,TypeError):return
+        with self._lock:
+            self._occlusion_pending=(event,rospy.Time.now())
+            self._try_occlusion_route_locked()
+
+    def _try_occlusion_route_locked(self):
+        pending=self._occlusion_pending
+        if pending is None:return
+        event,received=pending;now=rospy.Time.now()
+        if (not 0 <= (now-received).to_sec() <= .5 or event.get('goal_key')!=self._occlusion_goal):
+            self._occlusion_pending=None;return
+        if int(event['reference_stamp_ns']) not in self._occlusion_reference_stamps:return
+        self._occlusion_pending=None
+        if self.task_first_research:
+            route=(event.get('goal_revision'),event.get('route_generation'),
+                   tuple(sorted(event['deferred_tokens'])))
+            if route in self._occlusion_consumed_routes:return
+            # A refreshed stamp alone is not new information. A newly retired
+            # observation, however, must release its now-empty recovery episode.
+            self._occlusion_consumed_routes.add(route)
+        if not self.execution_ready or self.state!=self.REPAIR:return
+        deferred=event['deferred_tokens'];demand=self._observation_demand
+        if demand is not None and demand[0] not in deferred:return
+        # Planning may try another reference while unresolved UNKNOWN remains
+        # in the map. This is not a completion edge or execution permission.
+        for token in deferred:
+            if token not in self._observation_retired_tokens:self._observation_retired_tokens.append(token)
+        self._observation_waypoint=None;self._observation_demand=None
+        self.visibility_waypoint_active=False
+        self._transition_locked(self.PROBE_NORMAL if self.task_first_research else self.NORMAL,
+            'external_occlusion_alternative_reference',now)
+        self.replan_request_pub.publish(Bool(data=True))
 
     def _transition_locked(self, new_state, reason, now):
+        if os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') == 'false' and new_state != self.NORMAL:
+            # Component ablation: preserve NORMAL task motion and every safety
+            # hold; do not admit a dedicated observation-motion episode.
+            self.passive_observation_suppressed = getattr(self, 'passive_observation_suppressed', 0) + 1
+            self.last_transition_reason = 'passive_observation_suppressed_' + reason
+            return
         if new_state == self.state:
             self.last_transition_reason = reason
             return
         old = self.state
-        if getattr(self, 'task_context_enabled', False):
-            self.task_mode_revision += 1
+        if new_state not in (self.PROBE_NORMAL, self.NORMAL):
+            self._rolling_release = None
         self._retire_qp_retry_locked()
+        if old == self.REPAIR and hasattr(self, '_observation_handoff'):
+            self._observation_handoff.clear()
         self.state = new_state
         self.last_transition_reason = reason
         # Blocker rediscovery is a fail-closed substate used by NORMAL and
@@ -709,6 +526,11 @@ class C44VerifiedRegimeManager:
 
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
+            if hasattr(self, '_observation_handoff'):
+                self._observation_handoff.clear()
+                if self._observation_waypoint is not None and self._observation_waypoint_region is not None:
+                    self._observation_handoff.bind(self._observation_waypoint[0],self._observation_waypoint_region,
+                        (self._occlusion_goal,self.repair_entry_count))
             self.probe_completed_prefix_streak = 0
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
@@ -756,12 +578,11 @@ class C44VerifiedRegimeManager:
             # legacy RECOVERY_HOLD / replan-ready controller handshake.
             if old == self.PROBE_NORMAL and self.execution_ready:
                 self.normal_task_replan_count += 1
-                self._request_normal_reference()
+                self.normal_task_replan_pub.publish(Bool(data=True))
 
         rospy.logwarn(
             "[c4_regime] %s -> %s reason=%s repair_entries=%d probe_entries=%d",
             old, new_state, reason, self.repair_entry_count, self.probe_entry_count)
-        self._publish_task_control_locked()
 
     def _execution_ready_cb(self, msg):
         if msg is None:
@@ -770,8 +591,6 @@ class C44VerifiedRegimeManager:
             was_ready = bool(self.execution_ready)
             new_ready = bool(msg.data)
             self.execution_ready = new_ready
-            if getattr(self, 'task_context_enabled', False) and was_ready != new_ready:
-                self.task_mode_revision += 1
             self.execution_ready_time = rospy.Time.now()
 
             if not new_ready:
@@ -817,7 +636,7 @@ class C44VerifiedRegimeManager:
                 self.task_obstacle_replan_count += 1
                 self.last_transition_reason = (
                     "task_obstacle_blocked_after_gate_release_replan")
-                self._request_task_replan()
+                self.replan_request_pub.publish(Bool(data=True))
             elif self.task_infeasible_pending and self.state == self.NORMAL:
                 self.task_infeasible_pending = False
                 self.task_uncertified_pending = False
@@ -844,7 +663,7 @@ class C44VerifiedRegimeManager:
                 # Only an actual GCDF/VBC/visibility fact may enter REPAIR.
                 self.last_transition_reason = (
                     "task_planner_uncertified_after_gate_release_replan")
-                self._request_task_replan()
+                self.replan_request_pub.publish(Bool(data=True))
             elif (self.candidate_outcome_pending_gate_replay and
                   self.state == self.NORMAL):
                 self.candidate_outcome_pending_gate_replay = False
@@ -856,13 +675,26 @@ class C44VerifiedRegimeManager:
                     replay=True)
 
     def _repair_final_vbc_feedback_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         fields = _tokens(msg.data)
         hold = _as_bool(fields.get("final_vbc_hold"))
         if hold is None:
             return
         with self._lock:
+            if getattr(self, 'repair_goal_stopping', False):
+                now = rospy.Time.now()
+                execution = _as_int(fields.get('goal_stop_execution_stamp_ns'), 0)
+                sample = _as_int(fields.get('goal_stop_sample_ros_ns'), 0)
+                tracker_fresh = (self.tracker_summary_time is not None and
+                    0 <= (now-self.tracker_summary_time).to_sec() <= self.input_timeout)
+                eligible = (execution > 0 and execution == self.tracker_execution_stamp_ns and
+                    execution != self.last_tracker_aborted_stamp_ns and
+                    execution != self.vbc_unsafe_execution_stamp_ns and tracker_fresh and
+                    self.tracker_source in ('active_trajectory', 'trajectory_complete_hold') and
+                    0 <= now.to_nsec()-sample <= 50000000)
+                self._goal_stop_execution = execution if eligible else 0
+                self._goal_stop_feedback_time = now
+                if eligible and self.execution_ready and self.state == self.REPAIR:
+                    self._transition_locked(self.NORMAL, 'certified_goal_stop_handoff', now)
             self.repair_final_vbc_hold = hold
             if hold and self.state == self.REPAIR:
                 self.last_transition_reason = "repair_final_vbc_no_progress_hold"
@@ -905,8 +737,6 @@ class C44VerifiedRegimeManager:
             self.qp_retry_pub.publish(String(data="ready_" + msg.data))
 
     def _qp_retry_ack_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -926,8 +756,6 @@ class C44VerifiedRegimeManager:
             self._retire_qp_retry_locked()
 
     def _task_stall_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -1001,8 +829,6 @@ class C44VerifiedRegimeManager:
         self._observation_demand = None
 
     def _observation_waypoint_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         """Read the same token and seven-value pose consumed by the planner."""
         now = rospy.Time.now()
         with self._lock:
@@ -1018,11 +844,14 @@ class C44VerifiedRegimeManager:
                     target[1] != regions[0][1] or labels[0] in self._observation_retired_tokens):
                 return
             self._observation_waypoint = (labels[0], now)
+            self._observation_waypoint_region = next(label for label in labels if label.startswith('care_region_v1_'))
             self._maybe_enter_observation_repair_locked(now, "waypoint")
+            if self.state == self.REPAIR and hasattr(self, '_observation_handoff'):
+                self._observation_handoff.bind(labels[0],self._observation_waypoint_region,
+                    (self._occlusion_goal,self.repair_entry_count))
+            self._maybe_release_matched_observation_locked(now)
 
     def _observation_acquisition_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         now = rospy.Time.now()
         with self._lock:
             pairs = _TOKEN_RE.findall(msg.data or "") if msg is not None else []
@@ -1030,6 +859,29 @@ class C44VerifiedRegimeManager:
             if len(pairs) != len(f) or f.get("policy") != "visibility_acquisition":
                 self._observation_demand = None
                 return
+            if getattr(self, 'matched_observation_release', False):
+                self._observation_release_identity.observe(f, now.to_sec())
+                if self._maybe_release_matched_observation_locked(now):
+                    return
+            if getattr(self, 'task_first_research', False):
+                count = _as_int(f.get('seen_obligation_count'), 0)
+                previous = self.task_first_seen_count
+                self.task_first_seen_count = max(previous, count)
+                points = _as_int(f.get('acquired_point_count'), 0)
+                previous_points = self.task_first_seen_point_count
+                self.task_first_seen_point_count = max(previous_points, points)
+                if (not getattr(self, 'matched_observation_release', False) and
+                        (count > previous or points > previous_points) and
+                        self.state == self.REPAIR and self.execution_ready):
+                    self.task_first_observation_returns += 1
+                    # Pending regions remain UNKNOWN and can be rediscovered by
+                    # the next task prefix. Completion does not require q_vis.
+                    self._observation_release_waypoint = self._observation_waypoint[0] if self._observation_waypoint else 'none'
+                    self._observation_release_gain_kind = 'point_gain' if points > previous_points else 'region_completion'
+                    self._observation_release_snapshot = f.get("acquisition_snapshot_id", "none")
+                    self._observation_release_stamp_ns = now.to_nsec()
+                    self._transition_locked(self.PROBE_NORMAL,
+                        'task_first_observation_acquired', now)
             if f.get("complete") == "1" and f.get("remaining_obligation_count") == "0":
                 demand = self._observation_demand
                 # A short observation may finish before a false Bool is
@@ -1050,6 +902,8 @@ class C44VerifiedRegimeManager:
                     self.repair_completion_time = now
                     self.repair_completion_armed = True
                     self.repair_completion_event_count += 1
+                    self._observation_release_snapshot = f.get("acquisition_snapshot_id", "none")
+                    self._observation_release_stamp_ns = now.to_nsec()
                     self._transition_locked(self.PROBE_NORMAL,
                         "actual_visibility_acquisition_complete", now)
                 return
@@ -1065,6 +919,31 @@ class C44VerifiedRegimeManager:
                 return
             self._observation_demand = (token, now)
             self._maybe_enter_observation_repair_locked(now, "acquisition")
+            self._maybe_release_matched_observation_locked(now)
+
+    def _maybe_release_matched_observation_locked(self, now):
+        if (not getattr(self, 'matched_observation_release', False) or
+                not self.task_first_research or self.state != self.REPAIR or not self.execution_ready):
+            return False
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true' and hasattr(self,'_observation_handoff'):
+            event=self._observation_handoff.take(self._observation_release_identity,
+                (self._occlusion_goal,self.repair_entry_count),self._observation_retired_tokens,now.to_sec())
+            token=event['token'] if event is not None else None
+        else:
+            if self._observation_waypoint is None:return False
+            token,_received=self._observation_waypoint
+            event=self._observation_release_identity.take(token,self._observation_retired_tokens,now.to_sec())
+        if event is None:
+            return
+        self.task_first_observation_returns += 1
+        self._observation_release_waypoint = token
+        self._observation_release_gain_kind = 'matched_point_gain'
+        self._observation_release_snapshot = event['acquisition_snapshot_id']
+        if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+            self._rolling_release = event.copy()
+        self._observation_release_stamp_ns = now.to_nsec()
+        self._transition_locked(self.PROBE_NORMAL, 'task_first_observation_acquired', now)
+        return True
 
     def _maybe_enter_observation_repair_locked(self, now, source, probe_boundary=False):
         """A live observation is a planning request in either arrival order.
@@ -1073,7 +952,19 @@ class C44VerifiedRegimeManager:
         callback may yield to sensing; all three prefixes are still required
         before returning to NORMAL without an observation.
         """
-        if (not getattr(self, "repair_completion_gate_enabled", False) or
+        if os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') == 'false':
+            return False
+        if (getattr(self, 'repair_goal_stopping', False) and self.state == self.NORMAL and
+                getattr(self, '_goal_stop_execution', 0) > 0 and
+                self._goal_stop_execution == self.tracker_execution_stamp_ns and
+                self._goal_stop_execution != self.last_tracker_aborted_stamp_ns and
+                self._goal_stop_feedback_time is not None and
+                0 <= (now-self._goal_stop_feedback_time).to_sec() <= self.input_timeout):
+            return False
+
+        if (getattr(self, "task_first_research", False) or
+                getattr(self, "research_opportunistic_probe", False) or
+                not getattr(self, "repair_completion_gate_enabled", False) or
                 not self.execution_ready or not self.visibility_waypoint_active or
                 self.state not in (self.NORMAL, self.PROBE_NORMAL)):
             return False
@@ -1097,8 +988,6 @@ class C44VerifiedRegimeManager:
         return True
 
     def _visibility_waypoint_active_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         value = bool(msg.data)
@@ -1150,8 +1039,6 @@ class C44VerifiedRegimeManager:
                 now)
 
     def _candidate_vbc_summary_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -1230,14 +1117,12 @@ class C44VerifiedRegimeManager:
         if clear_bootstrap:
             self.force_vbc_bootstrap_pub.publish(Bool(data=False))
         if request_replan:
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _probe_single_flight_busy_locked(self):
         return self.probe_single_flight_phase in ("VERIFYING", "EXECUTING")
 
     def _probe_single_flight_summary_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -1255,8 +1140,6 @@ class C44VerifiedRegimeManager:
                 self.probe_single_flight_summary_time, "probe_idle")
 
     def _task_infeasible_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None or not bool(msg.data):
             return
         now = rospy.Time.now()
@@ -1324,8 +1207,6 @@ class C44VerifiedRegimeManager:
                         force_bootstrap=False)
 
     def _task_obstacle_blocked_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         """Known OCCUPIED geometry is a planning problem, never a sensing one."""
         if msg is None or not bool(msg.data):
             return
@@ -1354,11 +1235,9 @@ class C44VerifiedRegimeManager:
             self.last_transition_reason = (
                 "task_obstacle_blocked_{}_replan".format(
                     self.state.lower()))
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _task_uncertified_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None or not bool(msg.data):
             return
         now = rospy.Time.now()
@@ -1409,11 +1288,9 @@ class C44VerifiedRegimeManager:
                 # task infeasibility still enters REPAIR through its own path.
                 self.last_transition_reason = (
                     "task_planner_uncertified_replan")
-                self._request_task_replan()
+                self.replan_request_pub.publish(Bool(data=True))
 
     def _deadline_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         value = float(msg.data)
@@ -1425,9 +1302,6 @@ class C44VerifiedRegimeManager:
 
     def _committed_trajectory_cb(self, msg):
         with self._lock:
-            if (getattr(self, 'task_context_enabled', False) and
-                    msg.header.stamp.to_nsec() not in self.task_execution_bindings):
-                return
             self.last_committed_trajectory_time = rospy.Time.now()
             # The direct committed-trajectory audit retains the commit stamp.
             stamp = int(msg.header.stamp.to_nsec())
@@ -1436,8 +1310,6 @@ class C44VerifiedRegimeManager:
                 self._drain_execution_audits_locked(rospy.Time.now())
 
     def _repair_completion_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None or not self.repair_completion_gate_enabled:
             return
         value = bool(msg.data)
@@ -1471,7 +1343,7 @@ class C44VerifiedRegimeManager:
             self.gcdf_occupied_replan_count += 1
             self.last_transition_reason = (
                 "final_gcdf_occupied_normal_replan_{}".format(source))
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
             return
 
         if (result == "unsafe" and
@@ -1502,7 +1374,7 @@ class C44VerifiedRegimeManager:
                     self.candidate_unsafe_streak,
                     self.candidate_unsafe_required,
                     source))
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
             return
 
         if result == "timeout":
@@ -1511,11 +1383,9 @@ class C44VerifiedRegimeManager:
             self.last_transition_reason = (
                 "{}_normal_timeout_replan_{}".format(
                     safety_gate, source))
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _candidate_outcome_cb(self, msg):
-        if getattr(self, 'task_context_enabled', False) and not getattr(self.task_event_dispatch, 'active', False):
-            return
         if msg is None:
             return
         f = _tokens(msg.data)
@@ -1546,6 +1416,13 @@ class C44VerifiedRegimeManager:
                 # and mode budgets. The uncertified candidate never executes.
                 self.candidate_protocol_invalid_count += 1
                 self.last_transition_reason = 'candidate_vbc_protocol_invalid_wait'
+                # This request has terminated without a commit or a future
+                # tracker completion. One fresh-plan request per new outcome
+                # restores progress without changing geometric failure memory,
+                # the current execution token, mode or task budget.
+                if self.execution_ready:
+                    self.last_transition_reason = 'candidate_vbc_protocol_invalid_replan'
+                    self.replan_request_pub.publish(Bool(data=True))
                 return
 
             if result == "unsafe":
@@ -1592,17 +1469,17 @@ class C44VerifiedRegimeManager:
                     # to drive another REPAIR plan. Stay in REPAIR and explicitly
                     # request a fresh local plan.
                     self.last_transition_reason = "repair_candidate_unsafe_replan"
-                    self._request_task_replan()
+                    self.replan_request_pub.publish(Bool(data=True))
                     return
                 if result == "timeout":
                     self.last_transition_reason = "repair_candidate_timeout_replan"
-                    self._request_task_replan()
+                    self.replan_request_pub.publish(Bool(data=True))
                     return
                 if result == "safe" and committed is True:
                     self.last_commit_count += 1
                     self.repair_safe_commit_count += 1
                     self.last_commit_event_time = now
-                    if self.repair_completion_gate_enabled:
+                    if self.repair_completion_gate_enabled and not self.research_opportunistic_probe:
                         # C4.7: executing a VBC-safe detour is progress toward
                         # seeing. Stay in REPAIR until real confidence confirms it.
                         self.last_transition_reason = (
@@ -1624,7 +1501,7 @@ class C44VerifiedRegimeManager:
                         self.pending_probe_effective_prefix_s = math.nan
                         self.last_transition_reason = (
                             "probe_commit_missing_execution_token_replan")
-                        self._request_task_replan()
+                        self.replan_request_pub.publish(Bool(data=True))
                         return
                     self.last_commit_count += 1
                     self.last_commit_event_time = now
@@ -1659,7 +1536,7 @@ class C44VerifiedRegimeManager:
                         self.gcdf_occupied_replan_count += 1
                         self.last_transition_reason = (
                             "final_gcdf_occupied_probe_replan")
-                        self._request_task_replan()
+                        self.replan_request_pub.publish(Bool(data=True))
                         return
 
                     # Only visibility/VBC failures count as active-sensing
@@ -1693,7 +1570,7 @@ class C44VerifiedRegimeManager:
                     self.pending_probe_execution_stamp_ns = 0
                     self.pending_probe_effective_prefix_s = math.nan
                     self.last_transition_reason = "probe_candidate_timeout_replan"
-                    self._request_task_replan()
+                    self.replan_request_pub.publish(Bool(data=True))
                     return
 
     def _tracker_summary_cb(self, msg):
@@ -1726,9 +1603,6 @@ class C44VerifiedRegimeManager:
                 self.vbc_unsafe_execution_stamp_ns = 0
                 self.execution_vbc_hold_tokenized = False
             self._drain_execution_audits_locked(now)
-            if (getattr(self, 'task_context_enabled', False) and
-                    self.task_execution_bindings.get(execution_stamp_ns) != self.task_binding):
-                return
 
             if (aborted is True and execution_stamp_ns > 0 and
                     execution_stamp_ns != self.last_tracker_aborted_stamp_ns):
@@ -1790,6 +1664,16 @@ class C44VerifiedRegimeManager:
                 # certified PROBE prefix (full completion remains separately logged
                 # through last_tracker_complete_*).
                 self.probe_completed_execution_count += 1
+                release = self._rolling_release
+                if release is not None and os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
+                    self._rolling_request_pub.publish(String(data=json.dumps(dict(
+                        observation_token=release['token'],
+                        region_token=release['point_gain_event']['region_token'],
+                        acquisition_snapshot_id=release['acquisition_snapshot_id'],
+                        point_gain_event=release['point_gain_event'],
+                        execution_stamp_ns=str(completed_stamp),
+                        consumed_after_actual_task_prefix=True),separators=(',',':'))))
+                    self._rolling_release = None
 
                 if self._maybe_enter_observation_repair_locked(
                         now, "probe_prefix_complete", probe_boundary=True):
@@ -1802,7 +1686,8 @@ class C44VerifiedRegimeManager:
                     # an ordinary UNKNOWN row and spend one cycle rediscovering
                     # what the acquisition layer already reported.
                     if (self.visibility_waypoint_active and
-                            not self.repair_completion_gate_enabled):
+                            not self.repair_completion_gate_enabled and
+                            not self.research_opportunistic_probe):
                         self._transition_locked(
                             self.REPAIR,
                             "probe_prefixes_complete_visibility_obligation",
@@ -1820,7 +1705,7 @@ class C44VerifiedRegimeManager:
                     request_next_probe = True
 
         if request_next_probe:
-            self._request_task_replan()
+            self.replan_request_pub.publish(Bool(data=True))
 
     def _remember_execution_audit_identity_locked(self, audit, execution):
         previous = self.execution_audit_identities.get(audit)
@@ -1882,8 +1767,6 @@ class C44VerifiedRegimeManager:
                 self.execution_unsafe_streak = 0
                 self.execution_event_latched = False
             if (self.execution_ready and unsafe and
-                    (not getattr(self, 'task_context_enabled', False) or
-                     self.task_execution_bindings.get(execution) == self.task_binding) and
                     self.execution_unsafe_streak >= self.execution_unsafe_required and
                     not self.execution_event_latched):
                 self.execution_event_latched = True
@@ -1923,12 +1806,6 @@ class C44VerifiedRegimeManager:
     def _timer_cb(self, _event):
         now = rospy.Time.now()
         with self._lock:
-            if getattr(self, 'task_context_enabled', False):
-                if self.task_context.snapshot(now.to_nsec()) is None and self.task_binding is not None:
-                    self.task_binding = None
-                    self._task_reset_planning_locked('task_context_expired')
-                self._drain_task_events_locked()
-                self._publish_task_control_locked()
             self._pump_qp_retry_locked()
             self._maybe_enter_observation_repair_locked(now, "timer")
             if (self.task_stall_deadline is not None and
@@ -1981,6 +1858,9 @@ class C44VerifiedRegimeManager:
             msg = String()
             msg.data = " ".join([
                 "state={}".format(self.state),
+                "active_observation={}".format(int(os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') != 'false')),
+                "passive_observation_suppressed={}".format(getattr(self, 'passive_observation_suppressed', 0)),
+                "goal_stop_execution_stamp_ns={}".format(getattr(self, '_goal_stop_execution', 0)),
                 "reason={}".format(self.last_transition_reason),
                 "execution_ready={}".format(int(self.execution_ready)),
                 "qp_retry_pending={}".format(int(bool(self.qp_retry_token))),
@@ -2096,6 +1976,16 @@ class C44VerifiedRegimeManager:
                 "repair_completion_gate_enabled={}".format(
                     int(self.repair_completion_gate_enabled)),
                 "repair_completion={}".format(int(self.repair_completion)),
+                "observation_return_policy={}".format('matched' if getattr(self, 'matched_observation_release', False) else 'legacy'),
+                "observation_release_waypoint={}".format(getattr(self, '_observation_release_waypoint', 'none')),
+                "observation_release_gain_kind={}".format(getattr(self, '_observation_release_gain_kind', 'none')),
+                "observation_return_observed_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'observed_gains', 0)),
+                "observation_return_unbound_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'unbound_gains', 0)),
+                "observation_return_expired_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'expired_gains', 0)),
+                "observation_return_retired_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'retired_gains', 0)),
+                "observation_return_released_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'released_gains', 0)),
+                "observation_release_snapshot={}".format(getattr(self, '_observation_release_snapshot', 'none')),
+                "observation_release_stamp_ns={}".format(getattr(self, '_observation_release_stamp_ns', 0)),
                 "repair_completion_armed={}".format(
                     int(self.repair_completion_armed)),
                 "repair_completion_event_count={}".format(

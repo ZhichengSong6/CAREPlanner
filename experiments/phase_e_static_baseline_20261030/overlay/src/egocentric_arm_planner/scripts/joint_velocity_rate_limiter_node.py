@@ -8,6 +8,11 @@ robot.  It contains no planning or VBC logic.
 """
 
 import math
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from joint_position_envelope import cap_velocity
 import threading
 
 import numpy as np
@@ -54,6 +59,19 @@ class JointVelocityRateLimiter:
             raise RuntimeError("velocity limits must be positive")
         if np.any(self.acceleration_limits <= 0.0):
             raise RuntimeError("acceleration limits must be positive")
+
+        self._position_envelope = os.environ.get('CARE_POSITION_LIMIT_ENVELOPE', 'false') == 'true'
+        limits = rospy.get_param('~mpc/joint_position_limits', {})
+        margin = float(rospy.get_param('~mpc/joint_position_margin', 0.01))
+        self._position_lower = np.asarray([float(limits[j]['lower'])+margin for j in self.joint_names])
+        self._position_upper = np.asarray([float(limits[j]['upper'])-margin for j in self.joint_names])
+        self._position = None
+        self._position_stamp = None
+        self._position_limited_cycles = 0
+        self._position_infeasible_cycles = 0
+        self._position_unavailable_cycles = 0
+        if self._position_envelope:
+            self._position_sub = rospy.Subscriber('/care_arm/joint_states', JointState, self._position_cb, queue_size=1, tcp_nodelay=True)
 
         self._desired = np.zeros(self.dof, dtype=np.float64)
         self._last_output = np.zeros(self.dof, dtype=np.float64)
@@ -105,6 +123,17 @@ class JointVelocityRateLimiter:
                 [float(cfg.get(j, fallback)) for j in self.joint_names],
                 dtype=np.float64)
         return np.full(self.dof, float(fallback), dtype=np.float64)
+
+    def _position_cb(self, msg):
+        index = {name:i for i,name in enumerate(msg.name)}
+        if any(j not in index or index[j] >= len(msg.position) for j in self.joint_names):
+            return
+        position = np.asarray([msg.position[index[j]] for j in self.joint_names], dtype=float)
+        if not np.all(np.isfinite(position)):
+            return
+        with self._lock:
+            self._position = position
+            self._position_stamp = msg.header.stamp if msg.header.stamp.to_sec() > 0 else rospy.Time.now()
 
     def _desired_cb(self, msg):
         if msg is None or len(msg.data) != self.dof:
@@ -188,6 +217,21 @@ class JointVelocityRateLimiter:
             raw_delta = desired - last
             limited_delta = np.clip(raw_delta, -max_delta, max_delta)
             output = np.clip(last + limited_delta, -self.velocity_limits, self.velocity_limits)
+            if self._position_envelope:
+                age = (now-self._position_stamp).to_sec() if self._position_stamp is not None else float('inf')
+                if self._position is not None and 0 <= age <= self.input_timeout:
+                    changed = infeasible = False
+                    for j in range(self.dof):
+                        output[j], detail = cap_velocity(float(output[j]), float(last[j]), float(self._position[j]),
+                            float(self._position_lower[j]), float(self._position_upper[j]),
+                            float(self.acceleration_limits[j]), float(self.velocity_limits[j]), dt, age+2.0/self.rate)
+                        changed |= detail['limited']
+                        infeasible |= detail['infeasible']
+                    self._position_limited_cycles += int(changed)
+                    self._position_infeasible_cycles += int(infeasible)
+                    if changed: status += '_position_envelope'
+                else:
+                    self._position_unavailable_cycles += 1
             limited = bool(np.any(np.abs(raw_delta - limited_delta) > 1e-10))
             accel = np.abs(output - last) / max(dt, 1e-9)
             ratio = float(np.max(accel / self.acceleration_limits)) if self.dof else 0.0
@@ -222,7 +266,7 @@ class JointVelocityRateLimiter:
             text = (
                 "status={} input_count={} output_count={} limited_cycle_count={} "
                 "dt_s={:.6f} max_accel_ratio={:.6f} "
-                "vbc_hold={} gcdf_hold={} held_input_count={}"
+                "vbc_hold={} gcdf_hold={} held_input_count={} position_envelope={} position_limited_cycles={} position_infeasible_cycles={} position_unavailable_cycles={}"
             ).format(
                 status,
                 self._input_count,
@@ -231,6 +275,7 @@ class JointVelocityRateLimiter:
                 float(dt),
                 float(max_accel_ratio),
                 int(self._vbc_hold), int(self._gcdf_hold), self._held_input_count,
+                int(self._position_envelope), self._position_limited_cycles, self._position_infeasible_cycles, self._position_unavailable_cycles,
             )
         if self._shutdown_requested():
             return

@@ -1,11 +1,7 @@
 #pragma once
 
 #include <care_confidence_map/vbc_primitive_model.hpp>
-#include <care_velocity_controller/ExecutionLease.h>
-#include <care_velocity_controller/LeasedVelocityCommand.h>
-#include <care_velocity_controller/CommandStatus.h>
 #include "egocentric_arm_planner/execution_stop_state.hpp"
-#include "egocentric_arm_planner/prepared_execution_state.hpp"
 #include <ros/ros.h>
 
 #include <sensor_msgs/JointState.h>
@@ -68,12 +64,6 @@ private:
   bool last_tracking_phase_alignment_used_ = false;
   void jointStateCallback(const sensor_msgs::JointStateConstPtr& msg);
   void limiterOutputCallback(const std_msgs::Float64MultiArrayConstPtr& msg);
-  void executionLeaseCallback(const care_velocity_controller::ExecutionLeaseConstPtr& msg);
-  void controllerStateCallback(const care_velocity_controller::CommandStatusConstPtr& msg);
-  void preparationCallback(const CandidateTransferConstPtr& msg);
-  void preparationContextCallback(const std_msgs::StringConstPtr& msg);
-  void preparationControlCallback(const std_msgs::StringConstPtr& msg);
-  void preparedExecutionTick();
   void trajectoryCallback(const trajectory_msgs::JointTrajectoryConstPtr& msg);
   void safetyHoldCallback(const std_msgs::BoolConstPtr& msg);
   void vbcSafetyHoldCallback(const std_msgs::BoolConstPtr& msg);
@@ -131,7 +121,7 @@ private:
 
   Eigen::VectorXd clampVelocityCommand(const Eigen::VectorXd& dq_cmd) const;
 
-  void publishVelocityCommand(const Eigen::VectorXd& dq_cmd, bool terminal_stop=false);
+  void publishVelocityCommand(const Eigen::VectorXd& dq_cmd);
 
   void publishReferenceState(const Eigen::VectorXd& q_ref,
                              const Eigen::VectorXd& dq_ref);
@@ -165,16 +155,12 @@ private:
 
   ros::Subscriber joint_state_sub_;
   ros::Subscriber limiter_output_sub_;
-  ros::Subscriber execution_lease_sub_,controller_state_sub_;
-  ros::Subscriber preparation_sub_,preparation_context_sub_,preparation_control_sub_;
-  ros::Publisher preparation_status_pub_;
   ros::Subscriber trajectory_sub_;
   ros::Subscriber safety_hold_sub_;
   ros::Subscriber vbc_safety_hold_sub_;
   ros::Subscriber execution_vbc_stop_sub_;
 
   ros::Publisher velocity_command_pub_;
-  ros::Publisher leased_velocity_command_pub_;
   ros::Publisher reference_state_pub_;
   ros::Publisher summary_pub_;
   ros::Publisher replan_request_pub_;
@@ -193,13 +179,6 @@ private:
   sensor_msgs::JointState latest_joint_state_;
   Eigen::VectorXd q_measured_;
   Eigen::VectorXd dq_measured_;
-  bool require_command_lease_=false;
-  bool require_prepared_execution_=false;
-  PreparedExecutionState prepared_execution_;
-  care_velocity_controller::ExecutionLease command_lease_;
-  care_velocity_controller::CommandStatus controller_state_;
-  uint64_t command_source_sequence_=0;
-  uint64_t last_lease_sequence_=0;
   ExecutionStopState stop_state_;
   Eigen::VectorXd latest_limiter_output_;
   ros::Time latest_limiter_output_received_;
