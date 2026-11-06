@@ -4367,14 +4367,6 @@
     },
     {
       "path": "src/care_collision_cdf/scripts/cdf_monotonic_clock.py",
-      "kind": "file",
-      "sha256": "9d78ad2ee58b86fedc2ecc995262524e9902b6947944cc0d91146a910f65dc1e",
-      "git_blob": "859139f7d51be7c76c9fff5476034af55f979323",
-      "mode": 436,
-      "source": "repository"
-    },
-    {
-      "path": "src/care_collision_cdf/scripts/cdf_monotonic_clock.py",
       "kind": "symlink",
       "target": "../../../scripts/cdf_monotonic_clock.py"
     },

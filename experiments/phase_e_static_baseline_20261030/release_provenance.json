@@ -3,7 +3,7 @@
   "candidate_source_manifest_sha256": "cb260ca121dd8e3f291dc99a72f2477d1c1f222afbbfae5f7a3d7d1c62f30956",
   "candidate_artifact_index_sha256": "60659e9bd15e8a84367d76a348250eea40db66836f0a473c733a9a7149c1cc52",
   "selected_source_files": 1073,
-  "published_source_files": 1065,
+  "published_source_files": 1064,
   "excluded": [
     "scripts/fixtures/gcdf_case011.txt",
     "scripts/fixtures/phase_e_case007_candidate.json",

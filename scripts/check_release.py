@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 
@@ -22,10 +23,18 @@ def main():
     tracked = set(subprocess.check_output(
         ['git', '-C', str(ROOT), 'ls-files', '-z']).decode().split('\0'))
     errors = []
+    names = [entry['path'] for entry in manifest['files']]
+    if len(names) != len(set(names)):
+        errors.append('Duplicate source manifest paths')
     for entry in manifest['files']:
         base = ROOT if entry.get('source') == 'repository' else PACKAGE / 'overlay'
         if entry['kind'] == 'symlink':
-            continue  # prepare.py creates the declared system ROS symlink.
+            link = ROOT / entry['path']
+            if not link.is_symlink() or os.readlink(link) != entry['target'] or not link.exists():
+                errors.append('Source symlink: ' + entry['path'])
+            if entry['path'] not in tracked:
+                errors.append('Not in Git: ' + entry['path'])
+            continue
         source = base / entry['path']
         if not source.is_file() or digest(source) != entry['sha256']:
             errors.append('Source hash: ' + str(source.relative_to(ROOT)))
