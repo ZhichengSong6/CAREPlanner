@@ -61,10 +61,10 @@ class SplitPreflightTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)/"bank.npz"
             np.savez_compressed(path,
-                x=np.zeros((2, 3), np.float32),
-                q=np.zeros((2, 1, 7, 8), np.float32),
-                k=np.arange(2),
-                valid_fov=np.ones((2, 1, 8), bool),
+                x=np.zeros((256, 3), np.float32),
+                q=np.zeros((256, 4, 7, 8), np.float32),
+                k=np.arange(256),
+                valid_fov=np.ones((256, 4, 8), bool),
                 sensor_chain_masks=np.ones((8, 7), np.float32),
                 q_min=np.full((7,), -1, np.float32),
                 q_max=np.full((7,), 1, np.float32))
