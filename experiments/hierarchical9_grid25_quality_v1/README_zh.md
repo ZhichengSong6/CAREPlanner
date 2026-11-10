@@ -39,3 +39,21 @@
 1. 依据新网格和预留 fresh holdout，定义可追溯 train/val/test 划分。
 2. 按所需原 V4 协议重建 Grid25 派生训练标签（global signs、V3 pairs、V4 tubes、相应缓存），而不是只替换旧脚本里的 NPZ 路径。
 3. 先做小规模 dry-run 和数值校验，再提交正式训练作业。
+
+
+## 第二步：fresh holdout 坐标检查（只读，不生成正式 split）
+
+Grid25 25mm 网格与旧网格不同。旧 starts.jsonl 每行包含老 x_index 和实际 x 坐标，**只能使用坐标**做新网格 holdout 排除方案，不能直接复用整数索引。
+
+    cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+    export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+    export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+    export R012_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_scratch50k_r012_v1"
+    FRESH="$R012_ROOT/evaluation_fresh_holdout_v1/starts.jsonl"
+
+    "$VIS_PYTHON" -m unittest discover -s experiments/hierarchical9_grid25_quality_v1 -p 'test_split_preflight.py' -v
+    "$VIS_PYTHON" experiments/hierarchical9_grid25_quality_v1/split_preflight.py --root "$GRID25_ROOT" --fresh-starts "$FRESH"
+
+脚本按实际 XYZ 距离，列出 25/50/75mm 排除邻域在 Grid25 上影响多少位置，并仅用 ZIP 文件目录读取压缩/未压缩大小预估。输入是旧 fresh holdout 的坐标，不是标签，输出只写 analysis/grid25_quality_v1/split_preflight.json。此步不需要 Slurm/GPU，不复制 36GB 数据，不生成正式划分、不导出 36GB q 张量，也不启动训练。
+
+**不可以直接运行旧 hierarchical9_full_dataset_v4_v1/prepare_full.sh 指向 Grid25 NPZ**：它的 prepare.py 读取的是旧 cache_io.open_job 来源格式，而且使用 starts.jsonl 的旧 x_index。需要后续专门的 Grid25 bank 缓存/坐标 split 适配器与小样本标签 pilot；本脚本仅为此前必要预检查。
