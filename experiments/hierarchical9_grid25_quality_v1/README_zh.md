@@ -57,3 +57,24 @@ Grid25 25mm 网格与旧网格不同。旧 starts.jsonl 每行包含老 x_index 
 脚本按实际 XYZ 距离，列出 25/50/75mm 排除邻域在 Grid25 上影响多少位置，并仅用 ZIP 文件目录读取压缩/未压缩大小预估。输入是旧 fresh holdout 的坐标，不是标签，输出只写 analysis/grid25_quality_v1/split_preflight.json。此步不需要 Slurm/GPU，不复制 36GB 数据，不生成正式划分、不导出 36GB q 张量，也不启动训练。
 
 **不可以直接运行旧 hierarchical9_full_dataset_v4_v1/prepare_full.sh 指向 Grid25 NPZ**：它的 prepare.py 读取的是旧 cache_io.open_job 来源格式，而且使用 starts.jsonl 的旧 x_index。需要后续专门的 Grid25 bank 缓存/坐标 split 适配器与小样本标签 pilot；本脚本仅为此前必要预检查。
+
+## 修复：old fresh x 不全部属于 Grid25 工作空间
+
+此前 split_preflight.py 在 old fresh holdout 任意 x 超出 Grid25 x/y=[-0.8,0.8]m、z=[0,1]m 时直接 STOP。
+旧 fresh JSONL 是从旧网格的真实空间坐标生成的（不是新的 25mm 网格），因此这一条件不合理。
+
+新版不会强制 old x 落在新网格内；仍使用全部独立 XYZ 坐标做 25/50/75mm 欧氏距离排除：
+- 范围外但在新网格边界附近的 old fresh，仍可排除邻近训练点；
+- 范围外很远的 old fresh，不会凭空映射成 Grid25 测试点，也不会排除无关样本；
+- 报告新增 fresh_unique_positions_inside_workspace / outside_workspace、按 xyz 方向的越界计数和实例、最大越界距离、各半径内能触及 Grid25 的 fresh 位置数量。
+
+这只是 **坐标邻域预检查**。old fresh 值必须与 Grid25 的 base_link 坐标使用相同坐标系；若来源不同，需要先转换并验证，而不能把错误映射“纠正”为有效分割。即使旧 holdout 位置全部越界，它们也不能直接作为 Grid25 域内的 validation set。正式 Grid25 新划分仍需单独实现、审阅，旧 x_index 永远不复用。
+
+重新执行：
+
+    git fetch origin mainline-b/h9-scratch50k-r012-v1
+    git merge --ff-only origin/mainline-b/h9-scratch50k-r012-v1
+    "$VIS_PYTHON" -m unittest discover -s experiments/hierarchical9_grid25_quality_v1 -p test_split_preflight.py -v
+    "$VIS_PYTHON" experiments/hierarchical9_grid25_quality_v1/split_preflight.py --root "$GRID25_ROOT" --fresh-starts "$FRESH"
+
+如果报告中的 max_distance_outside_workspace_mm 很大、越界比例异常或几乎没有 fresh 坐标靠近 Grid25，需要核实 old holdout 的空间覆盖与 frame，再决定新的独立 fresh cohort；**不能默默忽略越界报告**。
