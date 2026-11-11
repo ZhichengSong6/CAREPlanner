@@ -54,6 +54,46 @@ def load_fresh(path):
     return uniq, len(coords), len(old_indices), groups
 
 
+def workspace_coverage(fresh_xyz, origin, extent, tol=1e-6):
+    """Describe old holdout positions relative to Grid25; do not discard any."""
+    fresh = np.asarray(fresh_xyz, dtype=np.float64)
+    low = np.asarray(origin, dtype=np.float64)
+    high = np.asarray(extent, dtype=np.float64)
+    require(fresh.ndim == 2 and fresh.shape[1] == 3 and
+            len(fresh) > 0 and np.isfinite(fresh).all(),
+            "Invalid old fresh holdout coordinate array")
+    require(low.shape == (3,) and high.shape == (3,) and
+            np.isfinite(low).all() and np.isfinite(high).all() and (low <= high).all(),
+            "Invalid Grid25 workspace bounds")
+    below = fresh < (low - tol)
+    above = fresh > (high + tol)
+    outside = (below | above).any(axis=1)
+    # Exact distance to the closed workspace box, zero for inside points.
+    gap = np.maximum(np.maximum(low - fresh, fresh - high), 0.0)
+    box_dist_mm = np.linalg.norm(gap, axis=1) * 1000
+    positions = np.flatnonzero(outside)
+    return {
+        "grid25_workspace_min_xyz_m": low.tolist(),
+        "grid25_workspace_max_xyz_m": high.tolist(),
+        "fresh_xyz_min_m": fresh.min(axis=0).tolist(),
+        "fresh_xyz_max_m": fresh.max(axis=0).tolist(),
+        "fresh_unique_positions_inside_workspace": int((~outside).sum()),
+        "fresh_unique_positions_outside_workspace": int(outside.sum()),
+        "outside_low_xyz_counts": below.sum(axis=0).astype(int).tolist(),
+        "outside_high_xyz_counts": above.sum(axis=0).astype(int).tolist(),
+        "max_distance_outside_workspace_mm": (
+            float(box_dist_mm[outside].max()) if outside.any() else 0.0
+        ),
+        "outside_position_examples": [
+            {
+                "xyz_m": fresh[i].tolist(),
+                "outside_distance_to_box_mm": float(box_dist_mm[i]),
+            }
+            for i in positions[:8]
+        ],
+    }
+
+
 def spatial_coverage(x, grid_shape, origin, step, fresh_xyz, radii_mm):
     """Locate small neighborhoods on the canonical ij mesh; no NxM dense matrix."""
     x = np.asarray(x, dtype=np.float32)
@@ -74,7 +114,7 @@ def spatial_coverage(x, grid_shape, origin, step, fresh_xyz, radii_mm):
     require(all(r > 0 for r in masks), "Exclusion radii must be positive")
     for xyz in fresh_xyz:
         frac = (xyz - origin) / step
-        at = np.clip(np.rint(frac).astype(int), 0, np.asarray(shape) - 1)
+        at = np.rint(np.clip(frac, 0, np.asarray(shape) - 1)).astype(int)
         nearest_id = int(np.ravel_multi_index(tuple(at), shape))
         nearest_dist.append(float(np.linalg.norm(x[nearest_id].astype(float) - xyz)))
         for radius_mm, mask in masks.items():
@@ -94,6 +134,9 @@ def spatial_coverage(x, grid_shape, origin, step, fresh_xyz, radii_mm):
             "grid25_points_excluded": excluded,
             "fraction_of_grid": excluded / len(x),
             "remaining_candidates": int(len(x) - excluded),
+            "fresh_unique_positions_within_radius_of_grid": int(
+                np.count_nonzero(np.asarray(nearest_dist) <= radius_mm / 1000.0 + 1e-12)
+            ),
         }
     return {
         "old_fresh_nearest_grid25_median_distance_mm": float(np.median(nearest_dist) * 1000),
@@ -146,8 +189,10 @@ def main():
     x = np.load(root / "formal/x.npy", mmap_mode="r", allow_pickle=False)
     origin = np.asarray([b[0] for b in job["cfg"]["workspace_mm"]], dtype=float) / 1000.0
     extent = np.asarray([b[1] for b in job["cfg"]["workspace_mm"]], dtype=float) / 1000.0
-    require(np.all(fresh >= origin - 1e-6) and np.all(fresh <= extent + 1e-6),
-            "Fresh holdout x outside canonical Grid25 workspace")
+    workspace = workspace_coverage(fresh, origin, extent)
+    # Old fresh targets may lie outside the new Grid25 box. Keep every old
+    # coordinate for distance-based exclusions: border-adjacent outsiders can
+    # still overlap training neighborhoods, while distant ones exclude nothing.
     spatial = spatial_coverage(x, job["cfg"]["grid_shape"], origin, 0.025,
                                fresh, a.radii_mm)
     archive = archive_metadata(merged)
@@ -162,7 +207,17 @@ def main():
         "fresh_old_grid_unique_indices": old_nidx,
         "fresh_groups": groups,
         "old_x_indices_reused": False,
+        **workspace,
         **spatial,
+        "outside_workspace_policy": (
+            "Old fresh xyz are retained for Euclidean-radius exclusion near "
+            "Grid25 boundaries; out-of-domain points do not become Grid25 test "
+            "samples or new grid indices."
+        ),
+        "coordinate_frame_assumption": (
+            "Old fresh x and Grid25 positions refer to the same base_link "
+            "frame; confirm provenance before defining official splits."
+        ),
         **archive,
         "free_disk_bytes_at_grid25_root": int(usage.free),
         "memory_warning": "Do not np.load and materialize full compressed q; use mmap / streaming caches.",
@@ -182,6 +237,11 @@ def main():
     finally:
         tmp.unlink(missing_ok=True)
     print(json.dumps(result, indent=2))
+    if workspace["fresh_unique_positions_outside_workspace"]:
+        print("[NOTICE] Old fresh holdout contains "
+              f'{workspace["fresh_unique_positions_outside_workspace"]} '
+              "out-of-workspace unique positions. Kept all coordinates for "
+              "distance-based boundary exclusions; no old index reused.")
     print("[DONE] Read-only Grid25 fresh-holdout preflight; NO training/split generated")
     print("[report]", out)
 
