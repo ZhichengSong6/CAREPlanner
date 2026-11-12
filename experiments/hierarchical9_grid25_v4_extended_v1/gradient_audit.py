@@ -68,7 +68,7 @@ def atomic_json(path, data):
 
 
 def deterministic_strata(rows, *, sign_guard_m=0.0):
-    """Select one query per split × sensor × sign BEFORE reading V3 outcomes.
+    """Select one query per split × sensor × sign using only FOV pool identities.
 
     Each row: (shard, x_index, split, sensor, q_slot, pool_index, margin_m).
     Nothing about V3 success, gradients or V4 validity is an input.
