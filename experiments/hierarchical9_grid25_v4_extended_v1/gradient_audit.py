@@ -470,8 +470,8 @@ def main():
         audit_summary(a.out, require_complete=True)
     else:
         out, _, _, _, root, frozen = open_audit(a.out)
-        done = len(list((root / "fd_records").glob("*.json"))) if
-            (root / "fd_records").is_dir() else 0
+        done = (len(list((root / "fd_records").glob("*.json")))
+                if (root / "fd_records").is_dir() else 0)
         print(json.dumps({"status": "PREPARED", "selected": len(frozen["selected"]),
                           "completed": done, "audit_root": str(root)}, indent=2))
 
