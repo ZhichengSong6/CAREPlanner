@@ -338,6 +338,25 @@ def prepare(args):
 def verify(out):
     out = Path(out).resolve()
     r = json.loads((out/"report.json").read_text())
+    info, source_root, merged = verify_plan(Path(r["trainprep"]))
+    require(source_root == Path(r["grid25_root"]).resolve() and
+            str(merged) == r["source_npz"] and
+            info["grid_complete_sha256"] == r["provenance"]["complete_sha256"] and
+            info["splits_sha256"] == r["provenance"]["splits_sha256"] and
+            info["source_npz_expected_sha256"] == r["provenance"]["original_npz_sha256"],
+            "Production source/split provenance changed")
+    require(p.sha(Path(r["trainprep"])/"bank_cache/bank_manifest.json") ==
+            r["provenance"]["bank_manifest_sha256"],
+            "Frozen bank manifest changed")
+    extended = Path(r["extended_pilot"])
+    require(p.sha(extended/"manifest.json") ==
+            r["provenance"]["pilot_manifest_sha256"] and
+            p.prod.code_identity() ==
+            r["provenance"]["original_algorithm_sha256"],
+            "Frozen V4 algorithm or extended pilot identity changed")
+    for filename, digest in r["provenance"]["pilot_summary_sha256"].items():
+        require(p.sha(extended/filename) == digest,
+                "Extended Pilot empirical cost source changed: " + filename)
     require(r["format"] == FORMAT and r["status"] == "COST_PREFLIGHT_ONLY_NOT_SUBMITTED"
             and r["training_ready"] is False and
             r["production_policy"]["no_auto_submit"] is True,
@@ -360,6 +379,7 @@ def verify(out):
                 and int((split==1).sum()) == r["split_counts"]["val"]["x"],
                 "Plan split counts mismatch")
         require(int(support.sum()) == r["total_work"]["supported_sensor_pairs"]
+                and int(support.sum())*4 == r["total_work"]["v3_tasks"]
                 and int(np.minimum(counts,32).sum()) == r["total_work"]["v4_anchor_budget"],
                 "Plan counts changed")
     shards = json.loads((out/"shards.json").read_text())
