@@ -133,7 +133,7 @@ def prepare_one(grid_root, segment_id):
                 read(marker).get("status") == "SEGMENT_COMPLETE" and
                 read(marker).get("segment_id") == segment_id-1,
                 "Previous production segment must finish and verify before preparing the next")
-        open_segment(previous)  # Check previous run's frozen identity, not only marker.
+        verify_segment(previous, complete_required=True)  # Check previous stage hashes and metadata.
     require(not target.exists() and not target.is_symlink(),
             "Segment already prepared. Use status/submit; do not overwrite")
     local = segment_slice(plan, segment)
