@@ -59,7 +59,7 @@ PILOT_WORKERS=4 \
 bash experiments/hierarchical9_grid25_v4_pilot_v1/submit.sh
 ```
 
-提交器只申请 **1个GPU分区节点，8 CPU，32G内存，24小时**，并未请求 GPU；前提是集群允许 CPU-only GPU 分区作业（之前 g25_cache 的成功提交表明可行）。先执行 `sbatch --test-only`，再实际 `sbatch --parsable` 一次。若自己已有活跃队列作业、squeue 查询失败、或 --test-only 被拒绝，则 fail closed；不会偷偷提交依赖、自动重试或排多个作业。
+提交器默认申请 **1个 GPU 分区节点、4 CPU、24 小时时限，0 GPU**，不显式指定 `--mem`，使用 Slurm 分区默认内存配额。该配置与已成功运行的 Grid25 mmap 缓存作业（Job 19806）的核心资源请求一致。保持 `PILOT_WORKERS=4`，即每个 CPU worker 使用一个请求的 CPU；如果未来调整可设置 `PILOT_CPUS`（1–8，必须大于等于 PILOT_WORKERS），但不要绕过集群资源规则。此前 `--cpus-per-task=8 --mem=32G` 在本集群 `--test-only` 提示 Requested node configuration is not available；**这不是普通排队**，可能是显式内存/CPU请求的资源组合不被接受，无法仅凭报错确认是哪一项。现在去掉未证实可用的资源要求，再测试。前提是集群允许 CPU-only GPU 分区作业（之前 g25_cache 的成功提交表明可行）。先执行 `sbatch --test-only`，再实际 `sbatch --parsable` 一次。若自己已有活跃队列作业、squeue 查询失败、或 --test-only 被拒绝，则 fail closed；不会偷偷提交依赖、自动重试或排多个作业。
 
 作业先调用 `RepoOracle.verify` 做 CPU 几何 / Jacobian / old-target parity gate，然后依次：
 
