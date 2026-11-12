@@ -76,7 +76,7 @@ def build_shards(n, counts, *, shard_x=128):
 
 def build_segments(shards, *, max_shards=8):
     """Group whole atomic shards; segments never share x or shard IDs."""
-    require(max_shards >= 1, "Segment must contain at least one shard")
+    require(max_shards >= 1 and len(shards) > 0, "Segment size/available shard count invalid")
     segments = []
     for begin in range(0, len(shards), max_shards):
         group = shards[begin:begin + max_shards]
@@ -120,7 +120,8 @@ def pilot_rates(global_summary, v3_summary, v4_summary, pilot_manifest):
 
 
 def project_cost(unit, rates, workers=4, multiplier=2.0, overhead_minutes=10):
-    require(workers >= 1 and multiplier >= 1.0 and overhead_minutes >= 0,
+    require(workers >= 1 and math.isfinite(multiplier) and multiplier >= 1.0
+            and math.isfinite(overhead_minutes) and overhead_minutes >= 0,
             "Invalid resource-planning assumptions")
     cpu = dict(
         global_pool=float(unit["x_count"]) * rates["global_cpu_seconds_per_x"],
@@ -247,9 +248,7 @@ def prepare(args):
             complete_sha256=info["grid_complete_sha256"],
             splits_sha256=info["splits_sha256"],
             original_npz_sha256=info["source_npz_expected_sha256"],
-            bank_manifest_sha256=p.sha(extended.parent.parent /
-                "grid25_trainprep_v1/bank_cache/bank_manifest.json") if False
-                else p.sha(Path(trainprep)/"bank_cache/bank_manifest.json"),
+            bank_manifest_sha256=p.sha(Path(trainprep)/"bank_cache/bank_manifest.json"),
             pilot_manifest_sha256=p.sha(extended/"manifest.json"),
             pilot_summary_sha256={
                 filename: p.sha(extended/filename) for filename in (
