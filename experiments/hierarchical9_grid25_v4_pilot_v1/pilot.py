@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from dataclasses import asdict
 import hashlib
 import json
@@ -302,7 +303,7 @@ def run(args):
             verify_stage_data(out, stage)
             continue
         print(f"[STAGE] {stage}; selected x={len(plan['x_index'])}; workers={args.workers}", flush=True)
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        with ProcessPoolExecutor(max_workers=args.workers, mp_context=get_context('spawn')) as pool:
             tasks = [pool.submit(one_worker, stage, str(out), m["urdf"],
                                  rank, args.workers) for rank in range(args.workers)]
             for task in as_completed(tasks):
