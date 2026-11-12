@@ -19,7 +19,9 @@ case "$MODE" in
   status)
     exec bash "$BASE/run.sh" status --out "$EXT_OUT" ;;
   verify)
-    exec "$PY" "$HERE/gradient_audit.py" status --out "$EXT_OUT" ;;
+    bash "$BASE/run.sh" verify --out "$EXT_OUT"
+    [[ -f "$EXT_OUT/pilot_report.json" && -f "$EXT_OUT/v3_summary.json" && -f "$EXT_OUT/v4_summary.json" && -f "$EXT_OUT/global_pool_summary.json" ]] || { echo "[STOP] Extended Pilot incomplete" >&2; exit 2; }
+    echo "[EXTENDED PILOT COMPLETE] $EXT_OUT" ;;
   fd-plan|fd-work|fd-verify|fd-status)
     ACTION="${MODE#fd-}"
     [[ "$ACTION" != verify || -f "$EXT_OUT/extended_fd_audit_v1/audit_manifest.json" ]] || { echo "[STOP] FD audit not prepared" >&2; exit 2; }
