@@ -126,6 +126,14 @@ def prepare_one(grid_root, segment_id):
     segment = segments[segment_id]
     require(segment["segment_id"] == segment_id, "Segment ID/order mismatch")
     target = segment_out(grid_root, segment_id)
+    if segment_id:
+        previous = segment_out(grid_root, segment_id-1)
+        marker = previous / "segment_complete.json"
+        require(marker.is_file() and
+                read(marker).get("status") == "SEGMENT_COMPLETE" and
+                read(marker).get("segment_id") == segment_id-1,
+                "Previous production segment must finish and verify before preparing the next")
+        open_segment(previous)  # Check previous run's frozen identity, not only marker.
     require(not target.exists() and not target.is_symlink(),
             "Segment already prepared. Use status/submit; do not overwrite")
     local = segment_slice(plan, segment)
@@ -292,6 +300,25 @@ def verify_one_stage(out, stage):
                     require(np.array_equal(actual_split,
                             np.asarray([expected_split[int(i)] for i in indices])),
                             f"Split mismatch in {sub} shard {sh}")
+                if sub in ("v3_labels", "v4_anchors", "v4_tubes"):
+                    sensors = np.asarray(z["sensor"], dtype=np.int64)
+                    require(sensors.shape == indices.shape and
+                            np.all((sensors >= 0) & (sensors < 8)),
+                            f"Invalid sensor identity in {sub}/{sh}")
+                    pos = np.searchsorted(ix, indices)
+                    require(np.all(pos < len(ix)) and
+                            np.array_equal(ix[pos], indices),
+                            f"Row outside this atomic shard in {sub}/{sh}")
+                    observed = np.zeros((len(ix), 8), dtype=np.int64)
+                    np.add.at(observed, (pos, sensors), 1)
+                    expected = ((support * cfg.v3_q_per_x)
+                                if sub == "v3_labels" else np.minimum(counts, 32))
+                    if sub == "v4_tubes":
+                        require(np.all(observed <= 7 * expected),
+                                "Unexpected V4 tubes per x/sensor")
+                    else:
+                        require(np.array_equal(observed, expected),
+                                f"Missing/extra per-sensor rows in {sub}/{sh}")
                 if sub == "v3_labels":
                     require(len(indices) == int(np.count_nonzero(support)
                                                * cfg.v3_q_per_x),
@@ -325,6 +352,17 @@ def verify_one_stage(out, stage):
     require((out / name).is_file(), f"Stage summary missing: {name}")
     report = read(out / name)
     require(report.get("status") == "COMPLETE", "Upstream stage summary not complete")
+    if stage == "global_pool":
+        require(report.get("shards") == n, "Wrong global shard count")
+    elif stage == "v3_labels":
+        require(report.get("tasks") == m["counts"]["v3_tasks"],
+                "Aggregated V3 task count mismatch")
+    else:
+        require(report.get("anchors") == m["counts"]["v4_anchor_budget"]
+                and 0 <= report.get("regular", -1) <= report.get("refined", -1)
+                <= report["anchors"]
+                and 0 <= report.get("valid_tubes", -1) <= 7*report["regular"],
+                "Aggregated V4 anchor/tube counts mismatch")
     print("[STAGE VERIFIED]", stage, "shards=", n, flush=True)
     return report
 
