@@ -98,8 +98,10 @@ class ProductionRunnerTests(unittest.TestCase):
             np.savez_compressed(file, x_index=idx, split=split, support=support)
             (folder / "shard_0000.json").write_text(
                 json.dumps({"sha256": r.sha(file)}) + "\n")
-            (out / "global_pool_summary.json").write_text(
-                '{"status":"COMPLETE"}\n')
+            # Upstream global_pool.merge always records the number of shards.
+            # Verify both the fail-closed mismatch and the valid fixture.
+            summary = out / "global_pool_summary.json"
+            summary.write_text('{"status":"COMPLETE","shards":0}\n')
             m = dict(config=asdict(r.prod.Config(
                 128, 4, 32, 128, 260927)))
             plan = dict(x_index=idx, split=split,
@@ -107,6 +109,9 @@ class ProductionRunnerTests(unittest.TestCase):
                         valid_count=np.full((2, 8), 500, dtype=np.uint16))
             with mock.patch.object(r, "open_segment",
                                    return_value=(out, m, None, plan)):
+                with self.assertRaisesRegex(RuntimeError, "Wrong global shard count"):
+                    r.verify_one_stage(out, "global_pool")
+                summary.write_text('{"status":"COMPLETE","shards":1}\n')
                 result = r.verify_one_stage(out, "global_pool")
                 self.assertEqual(result["status"], "COMPLETE")
                 np.savez_compressed(file, x_index=idx, split=split,
