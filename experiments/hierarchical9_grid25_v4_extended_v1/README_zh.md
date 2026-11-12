@@ -4,7 +4,7 @@
 
 两个独立单作业阶段：
 1. **Extended Pilot 32+32**：使用原 `hierarchical9_grid25_v4_pilot_v1/pilot.py` 和已验证的 original `global_pool.py`、`v3_labels.py`、`v4_tubes.py`。仍然 128 uniform q/x、4 V3 q/x 和最多32 anchor/(x,s)、原有 SLSQP / screening / reference gate / 0±(.005,.01,.02)rad tubes。没有偷改 sampler 或 solver 预算。
-2. **独立 FD Gradient Audit**：固定 `split × sensor × 正/负 FOV` 共32个候选层，每层根据**预先保存的 global_pool 源查询**固定最多1条，整个选择不读 V3 成功/失败或梯度；缺的 strata 标记为 missing。无效原 V3 标签不换其他样本。有效原标签在 FD 前使用原V3求解器重新算中心并对账，再通过 `verified_core.verify_gradient` 原版两尺度、两侧和单侧斜率检查（各活动关节+混合方向、扰动后重新SLSQP、重用原 SLSQP/fail-close 设定）。保存 PASS/HOLD/SKIPPED、probe数和误差。绝不把未审计或候选梯度自动当成 FD-PASS 训练目标。
+2. **独立 FD Gradient Audit**：固定 `split × sensor × 正/负 FOV` 共32个候选层，每层根据**原始 global_pool 源查询**确定性固定最多1条；虽然是在 Pilot 完成后冻结名单，但选择算法不使用 V3 成功/失败、梯度或 V4 结果；缺的 strata 标记为 missing。无效原 V3 标签不换其他样本。有效原标签在 FD 前使用原V3求解器重新算中心并对账，再通过 `verified_core.verify_gradient` 原版两尺度、两侧和单侧斜率检查（各活动关节+混合方向、扰动后重新SLSQP、重用原 SLSQP/fail-close 设定）。保存 PASS/HOLD/SKIPPED、probe数和误差。绝不把未审计或候选梯度自动当成 FD-PASS 训练目标。
 
 ## 1. 从原 GitHub 分支拉代码并运行 CPU 测试
 
