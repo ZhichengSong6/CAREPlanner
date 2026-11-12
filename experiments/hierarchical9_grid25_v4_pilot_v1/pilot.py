@@ -357,9 +357,12 @@ def verify_stage_data(out, stage):
                 if sub == "v4_tubes":
                     require(np.isfinite(z["q"]).all() and np.isfinite(z["grad"]).all()
                             and np.isfinite(z["value"]).all(), "Invalid V4 tube data")
-                    require(np.all(np.isin(np.round(z["value"], 6),
-                                               [0., -.005, .005, -.01, .01, -.02, .02])),
-                            "Unexpected V4 normal offset")
+                    offsets = np.asarray([0., -.005, .005, -.01, .01, -.02, .02])
+                    actual = np.asarray(z["value"], dtype=float)
+                    if len(actual):
+                        require(np.all(np.min(np.abs(actual[:, None] - offsets[None, :]),
+                                              axis=1) <= 5e-7),
+                                "Unexpected V4 normal offset")
 
 
 def verify_pilot(out, require_complete=False):
