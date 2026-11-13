@@ -130,7 +130,9 @@ def collect_v3(seg,m,bank,plan):
     require(int(valid.sum())==
             int(json.loads((seg/"v3_summary.json").read_text())["valid_values"]),
             "Per-shard V3 valid count differs from stage summary")
-    require(np.all(valid.any(axis=1)),"V3 query has no supported valid sensor")
+    # A valid (x, q) may have all eight V3 labels HOLD at this query.
+    # Preserve the original frozen rows, mask out invalid supervision,
+    # and let batch-level masked MSE exclude them rather than inventing labels.
     return dict(x=x,q=q,target=target,valid=valid,
                 x_index=np.repeat(xids,nq),
                 split=split_rows,
