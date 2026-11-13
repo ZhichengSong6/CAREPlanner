@@ -37,7 +37,11 @@ DEFAULT_ROOT=base.DEFAULT_ROOT
 # Patch ONLY this Python process' copy of the old, frozen wrapper.  The
 # original upstream workers, scientific Config, V3 solver, and disk locations
 # for Segment 0/1 are never modified.
+ORIGINAL_SUMMARIES = dict(base.STAGE_SUMMARIES)
 base.STAGES=STAGES
+base.STAGE_SUMMARIES={
+    stage:ORIGINAL_SUMMARIES[stage] for stage in STAGES
+}
 base.FORMAT=FORMAT
 
 
@@ -81,7 +85,7 @@ def verify_original_predecessor(root):
     n=prod.shard_count(m["counts"]["x"],m["config"]["x_shard_size"])
     for stage in ("global_pool","v3_labels","v4_anchors","v4_tubes"):
         prod.verify_stage(old,stage,n)
-    for stage,summary_file in base.STAGE_SUMMARIES.items():
+    for stage,summary_file in ORIGINAL_SUMMARIES.items():
         require(sha(old/summary_file)==marker["per_stage_summaries"][summary_file],
                 "Original Segment1 summary changed: "+stage)
     print("[PREDECESSOR VERIFIED] original segment_001")
@@ -219,7 +223,24 @@ def verify(out,complete=False):
 
 
 def status(out):
-    return base.status(out)
+    out,m,bank,plan=open_segment(out)
+    n=prod.shard_count(len(plan["x_index"]),m["config"]["x_shard_size"])
+    progress={}
+    for stage in STAGES:
+        folder=out/stage
+        progress[stage]=dict(
+            published_shards=sum(int(
+                (folder/f"shard_{k:04d}.npz").is_file() and
+                (folder/f"shard_{k:04d}.json").is_file()
+            ) for k in range(n)),
+            expected_shards=n,
+        )
+    record=dict(segment=m["segment_id"],status="COMPLETE" if
+                (out/"segment_complete.json").is_file() else "IN_PROGRESS",
+                counts=m["counts"],progress=progress,
+                v4_production=False,training_ready=False)
+    print(json.dumps(record,indent=2),flush=True)
+    return record
 
 
 def work(out):
