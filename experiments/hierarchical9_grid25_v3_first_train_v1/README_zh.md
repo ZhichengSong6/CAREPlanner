@@ -25,7 +25,7 @@ export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/output
 # 1. 只读源 Segment 0，一次性把 V3 距离+mask 冻结成小训练快照。
 bash experiments/hierarchical9_grid25_v3_first_train_v1/run.sh prepare --root "$GRID25_ROOT"
 
-# 2. 提交真正的 GPU 训练：3090node1 1×3090 + 4 CPUs，1000 successful optimizer steps。
+# 2. 提交真正的 GPU 训练：3090node3 1×3090 + 4 CPUs，1000 successful optimizer steps。
 bash experiments/hierarchical9_grid25_v3_first_train_v1/submit.sh
 ```
 
