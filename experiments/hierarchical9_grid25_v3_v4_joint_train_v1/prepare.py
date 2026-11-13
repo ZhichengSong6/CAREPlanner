@@ -150,8 +150,8 @@ def prepare(args):
     for sh in range(count):
         ap,_ = r.prod.stage_paths(seg, "v4_anchors", sh)
         tp,_ = r.prod.stage_paths(seg, "v4_tubes", sh)
-        hashed[ap.name]=sha(ap)
-        hashed[tp.name]=sha(tp)
+        hashed["v4_anchors/"+ap.name]=sha(ap)
+        hashed["v4_tubes/"+tp.name]=sha(tp)
         arrays.append(convert_shard(bank,seg,sh,plan))
         print(f"[TUBE SHARD] {sh+1}/{count} rows={len(arrays[-1]['q'])}",flush=True)
     combined={k:np.concatenate([a[k] for a in arrays]) for k in arrays[0]}
