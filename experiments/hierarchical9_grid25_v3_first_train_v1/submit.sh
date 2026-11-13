@@ -15,12 +15,12 @@ MY_QUEUE="$(squeue -h -u "$USER")" || { echo "[STOP] Cannot query own Slurm jobs
 [[ -z "$MY_QUEUE" ]] || { echo "[STOP] Finish own existing Slurm job first"; printf "%s\n" "$MY_QUEUE"; exit 2; }
 mkdir -p "$GRID25_ROOT/derived/grid25_v3_first_train_v1/logs"
 LOGDIR="$GRID25_ROOT/derived/grid25_v3_first_train_v1/logs"
-ARGS=(--partition=GPU --nodelist=3090node1 --nodes=1 --ntasks=1
+ARGS=(--partition=GPU --nodelist=3090node3 --nodes=1 --ntasks=1
       --gres=gpu:3090:1 --cpus-per-task=4 --time=04:00:00
       --job-name=g25_h9v3
       "--output=$LOGDIR/slurm_%j.out" "--error=$LOGDIR/slurm_%j.err"
       "--export=ALL,TRAIN_DATA=$TRAIN_DATA,TRAIN_OUT=$TRAIN_OUT")
-echo "[GPU dry-run] 3090node1 one RTX 3090; 4 CPUs; 4h limit"
+echo "[GPU dry-run] 3090node3 one RTX 3090; 4 CPUs; 4h limit"
 sbatch --test-only "${ARGS[@]}" "$HERE/worker.sbatch"
 echo "[Submit] One 1000-step H9 R1 V3 signed-distance training run"
 JOB="$(sbatch --parsable "${ARGS[@]}" "$HERE/worker.sbatch")" || { echo "[STOP] Slurm submission failed" >&2; exit 2; }
