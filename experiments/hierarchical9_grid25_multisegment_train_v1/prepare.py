@@ -186,9 +186,6 @@ def prepare(root,out):
     sx=set(arrays3["x_index"])
     require(set(arrays4["x_index"]).issubset(sx),
             "V4 includes x absent from V3 snapshot")
-    require(np.array_equal(np.unique(arrays3["x_index"]),
-                           np.unique(arrays4["x_index"])) is False or True,
-            "No-op")
     ntrain_x=len(np.unique(arrays3["x_index"][arrays3["split"]==0]))
     nval_x=len(np.unique(arrays3["x_index"][arrays3["split"]==1]))
     require(ntrain_x==1701 and nval_x==347,"Frozen spatial x counts changed")
