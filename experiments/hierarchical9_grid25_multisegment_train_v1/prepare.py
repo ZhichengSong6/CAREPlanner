@@ -7,6 +7,7 @@ V3 solver labels, V4 regular tube local offsets, and all source files stay intac
 from __future__ import annotations
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -22,8 +23,20 @@ RUNNER = REPO / "experiments/hierarchical9_grid25_v4_production_runner_v1"
 SINGLE = REPO / "experiments/hierarchical9_grid25_v3_v4_joint_train_v1"
 sys.path.insert(0,str(RUNNER))
 import runner as runner
-sys.path.insert(0,str(SINGLE))
-import prepare as old_tubes
+# "prepare" is also the name of the Grid25 training-prep module loaded
+# by runner/preflight. A normal "import prepare" silently resolves that cached
+# module from sys.modules, which does NOT implement convert_shard.
+# Import the single-segment V4 adapter under its own unambiguous module name.
+_TUBE_ADAPTER = SINGLE / "prepare.py"
+_tube_spec = importlib.util.spec_from_file_location(
+    "grid25_single_segment_v4_tube_adapter_v1", _TUBE_ADAPTER)
+if _tube_spec is None or _tube_spec.loader is None:
+    raise ImportError(f"Cannot load V4 tube adapter: {_TUBE_ADAPTER}")
+old_tubes = importlib.util.module_from_spec(_tube_spec)
+sys.modules[_tube_spec.name] = old_tubes
+_tube_spec.loader.exec_module(old_tubes)
+if not callable(getattr(old_tubes, "convert_shard", None)):
+    raise ImportError(f"V4 tube converter missing in {_TUBE_ADAPTER}")
 
 FORMAT = "care_grid25_multisegment_01_v3_v4_labels_v1"
 DEFAULT_ROOT = Path(
