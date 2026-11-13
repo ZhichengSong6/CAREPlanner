@@ -201,12 +201,12 @@ def train(args):
     require(len(train_rows)==3380 and len(val_rows)==716 and
             len(tube_train)>0 and len(tube_val)>0,
             "Frozen segment_000 split counts changed")
-    require(set(txi[tsplit==0]) <= set(np.repeat(
-             np.unique(np.asarray(np.load(v3/"labels.npz")["x_index"])[split==0]),1)),
-            "V4 training includes position absent from frozen V3 training")
-    require(set(txi[tsplit==1]) <= set(
-             np.unique(np.asarray(np.load(v3/"labels.npz")["x_index"])[split==1])),
-            "V4 validation includes position absent from frozen V3 validation")
+    with np.load(v3/"labels.npz", allow_pickle=False) as source_labels:
+        v3_xids = np.asarray(source_labels["x_index"], dtype=np.int64)
+    require(set(txi[tsplit==0]).issubset(set(v3_xids[split==0])),
+            "V4 training includes a position absent from frozen V3 training")
+    require(set(txi[tsplit==1]).issubset(set(v3_xids[split==1])),
+            "V4 validation includes a position absent from frozen V3 validation")
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
