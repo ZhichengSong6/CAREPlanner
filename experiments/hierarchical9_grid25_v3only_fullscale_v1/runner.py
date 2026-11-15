@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import subprocess
+import importlib.util
 from pathlib import Path
 import shutil
 import sys
@@ -22,8 +23,16 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 LEGACY = REPO / "experiments/hierarchical9_grid25_v4_production_runner_v1"
-sys.path.insert(0,str(LEGACY))
-import runner as base
+# batch.py imports this file as module "runner". A plain import runner
+# would return this partially initialized module, not the old production
+# runner. Load the frozen original under a unique explicit name instead.
+_base_spec=importlib.util.spec_from_file_location(
+    "grid25_original_v4_runner_fullscale_adapter_v1",LEGACY/"runner.py")
+if _base_spec is None or _base_spec.loader is None:
+    raise ImportError("Missing original Grid25 production runner")
+base=importlib.util.module_from_spec(_base_spec)
+sys.modules[_base_spec.name]=base
+_base_spec.loader.exec_module(base)
 
 prod=base.prod
 FORMAT="care_grid25_v3only_segment_production_v1"
