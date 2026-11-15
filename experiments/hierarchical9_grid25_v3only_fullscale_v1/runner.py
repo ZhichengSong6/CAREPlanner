@@ -243,7 +243,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("mode",choices=("prepare","work","status","verify"))
     p.add_argument("--root",type=Path,default=DEFAULT_ROOT)
-    p.add_argument("--segment",type=int,default=2)
+    p.add_argument("--segment",type=int,default=8)
     args=p.parse_args()
     if args.mode=="prepare":
         prepare(args.root,args.segment)
