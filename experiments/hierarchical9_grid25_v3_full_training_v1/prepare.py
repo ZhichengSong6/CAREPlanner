@@ -95,7 +95,7 @@ def build(root):
     out=destination(root)
     require(not out.exists() and not out.is_symlink(),
             "Full V3 dataset already exists; refuse overwrite")
-    batch=fullv3_root=root/"derived/grid25_v3only_fullscale_v1"
+    batch=root/"derived/grid25_v3only_fullscale_v1"
     batch_marker=batch/"batch_complete.json"
     require(batch_marker.is_file() and
             base.read(batch_marker)["status"]=="COMPLETE" and
