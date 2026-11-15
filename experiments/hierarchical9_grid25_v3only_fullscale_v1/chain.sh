@@ -36,7 +36,8 @@ fi
 echo "[CHAIN SUBMIT DENIED] $(cat "$BASE/chain/submit_${PARENT}.err")" >&2
 echo "[FULLSCALE FALLBACK] trying one-job scontrol requeue for quota-limited clusters"
 if scontrol requeue "$PARENT"; then
-  printf 'parent=%s mode=scontrol_requeue\n' "$PARENT" > "$RECORD"
+  # Requeued jobs keep the same Slurm ID: NEVER write a once-only
+  # afterok-child sentinel here, or the second restart would stop early.
   echo "[FULLSCALE REQUEUED] job=$PARENT (same ID, new allocation)"
   exit 0
 fi
