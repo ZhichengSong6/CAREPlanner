@@ -12,7 +12,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
 import sys
 import tempfile
 import shutil
@@ -61,32 +60,67 @@ def destination(root):
 
 
 def verified_segment(root,i,full_plan,segplans):
+    """Use already issued strong completion proofs without a second full scan.
+
+    The production batch_complete.json only exists after exhaustive source
+    shard verification. Still verify every manifest, original code identity,
+    stage summary and frozen x plan. Imported V3 NPZ shard bytes are rehashed
+    once by collect_v3() and compared to their original immutable sidecars.
+    """
     if i<2:
         seg=base.segment_out(root,i)
-        base.verify_segment(seg,complete_required=True)
-        _,m,_,plan=base.open_segment(seg)
+        module=ORIGINAL
     else:
         module=OLDV3 if i<=7 else FULLV3
         seg=(Path(root).resolve()/"derived"/
              ("grid25_v3only_production_v1" if i<=7 else
               "grid25_v3only_fullscale_v1")/f"segment_{i:03d}")
-        cmd=["bash",str(module/"run.sh"),"verify",
-             "--root",str(root),"--segment",str(i)]
-        # Scientific runner modules patch the original preflight globals.
-        # Verify in separate interpreter, never import both into this process.
-        subprocess.run(cmd,check=True,stdout=subprocess.DEVNULL)
-        m=base.read(seg/"manifest.json")
-        with np.load(seg/"x_plan.npz",allow_pickle=False) as z:
-            plan={k:z[k] for k in z.files}
-    require(m["segment_id"]==i
-            and m["segment_plan"]==segplans[i],
-            "Source segment frozen plan differs: "+str(i))
+    m=base.read(seg/"manifest.json")
+    proof=base.read(seg/"segment_complete.json")
+    require(m.get("segment_id")==i and
+            m.get("segment_plan")==segplans[i] and
+            m.get("status")=="PREPARED" and
+            m.get("original_algorithms")==base.prod.code_identity(),
+            f"Source segment {i} is not the frozen original V3 algorithm")
+    require(proof.get("status")=="SEGMENT_COMPLETE" and
+            proof.get("segment_id")==i and
+            proof.get("format")==m.get("format") and
+            proof.get("manifest_sha256")==sha(seg/"manifest.json") and
+            proof.get("x_plan_sha256")==sha(seg/"x_plan.npz"),
+            f"Completed source segment {i} provenance changed")
+    expected_summaries=(
+        {"global_pool_summary.json","v3_summary.json","v4_summary.json"}
+        if i<2 else
+        {"global_pool_summary.json","v3_summary.json"}
+    )
+    summaries=proof.get("per_stage_summaries",{})
+    require(set(summaries)==expected_summaries and
+            all(sha(seg/name)==digest for name,digest in summaries.items()),
+            f"Source segment {i} frozen stage summary changed")
+    if i<2:
+        require(m.get("runner_source_hashes")==base.runner_code_hashes(),
+                f"Original V4 production source drift in segment {i}")
+    else:
+        recorded=m.get("v3only_code_identity")
+        require(isinstance(recorded,dict) and
+                "runner.py" in recorded and
+                "original_v4_production_runner.py" in recorded,
+                f"V3 production code identity absent in segment {i}")
+        for name,digest in recorded.items():
+            code_path=(ORIGINAL/"runner.py" if
+                       name=="original_v4_production_runner.py" else
+                       module/name)
+            require(code_path.is_file() and sha(code_path)==digest,
+                    f"Frozen production source changed: segment={i}, file={name}")
+    with np.load(seg/"x_plan.npz",allow_pickle=False) as z:
+        plan={k:z[k] for k in z.files}
     expected=base.segment_slice(full_plan,segplans[i])
     require(plan.keys()==expected.keys() and
             all(np.array_equal(plan[k],expected[k]) for k in expected),
-            "Source x plan/split differs from frozen Grid25: "+str(i))
-    require(0<len(plan["x_index"])<=1024,
-            "Invalid segment capacity")
+            f"Source segment {i} frozen x/split/support plan changed")
+    require(0<len(plan["x_index"])<=1024 and
+            int(plan["support"].sum())==m["counts"]["supported_x_sensor_pairs"],
+            f"Invalid source segment {i} support/count")
     return seg,m,plan
 
 
@@ -111,6 +145,15 @@ def build(root):
     for i in range(124):
         seg,m,plan=verified_segment(root,i,full,segplans)
         part,hashes=converter.collect_v3(seg,m,cache,plan)
+        # collect_v3() hashes each imported source shard once. Verify that
+        # digest against the sidecar originally published by install_shard().
+        for source_name,actual_digest in hashes.items():
+            source_file=seg/source_name
+            sidecar=source_file.with_suffix(".json")
+            recorded=base.read(sidecar)
+            require(recorded.get("sha256")==actual_digest,
+                    f"V3 imported shard checksum differs from production: "
+                    f"segment={i}, shard={source_name}")
         summ=base.read(seg/"v3_summary.json")
         valid=int(part["valid"].sum())
         require(summ["status"]=="COMPLETE" and
