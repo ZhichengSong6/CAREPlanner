@@ -137,7 +137,7 @@ def evaluate_boundary(model,inputs,targets,masks,split,batch,device):
             delta=pred-y
             sq+=float((delta.square()*band).sum().item())
             ab+=float((delta.abs()*band).sum().item())
-            correct+=float(((((pred>=0)==(y>=0))&band).sum()).item())
+            correct+=float(((((pred>=0)==(y>=0))&band).sum().item()))
             count+=float(band.sum().item())
     require(count>0, "No qualified near-boundary validation V3 labels")
     return dict(
@@ -273,6 +273,8 @@ def run(args):
                     model_source_sha256=log["model_source_sha256"],
                     trainer_sha256=log["trainer_sha256"],
                     val_sensor_rmse=ev["val_sensor_rmse"],
+                    val_boundary_sensor_rmse=ev["val_boundary_sensor_rmse"],
+                    val_boundary_sensor_sign_accuracy=ev["val_boundary_sensor_sign_accuracy"],
                     no_fd_gradient_supervision=True,union_proxy_not_exact=True,
                 )
                 atomic_save(out/"latest.pt",state)
