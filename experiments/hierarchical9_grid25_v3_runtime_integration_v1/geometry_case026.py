@@ -109,39 +109,11 @@ class GeometryOnlyCase026(PerSensorVisibilityRuntime):
         )
 
 
-def maybe_h9_seeds(root):
-    case = (
-        root / "derived/grid25_v3_runtime_integration_v1/case026/grid25_v3_h9.json"
-    )
-    if not case.is_file():
-        return []
-    payload = json.loads(case.read_text())
-    require(np.allclose(
-        np.asarray(payload["target_xyz"], dtype=float), TARGET, atol=1e-8
-    ), "Previous Case026 report does not use the frozen target")
-    require(np.allclose(
-        np.asarray(payload["measured_seed_q"], dtype=float), MEASURED_SEED,
-        atol=1e-8,
-    ), "Previous Case026 report does not use the frozen measured seed")
-    result = []
-    q_zero = payload.get("scalar", {}).get("q_zero")
-    if q_zero is not None:
-        result.append(("scalar_q_zero", np.asarray(q_zero, dtype=float)))
-    for attempt in payload.get("per_sensor", {}).get("attempts", []):
-        sid = int(attempt["sensor_id"])
-        require(0 <= sid < 8, "Invalid sensor ID in prior Case026 report")
-        for which in ("q_zero", "q_candidate"):
-            value = attempt.get(which)
-            if value is not None:
-                result.append((f"h9_S{sid}_{which}", np.asarray(value, dtype=float)))
-    return result
-
-
 def generate_candidates(root, *, seed, local_samples, global_samples):
     seeds = [
         ("measured", np.asarray(MEASURED_SEED, dtype=float)),
         ("known_blocked_old_scalar", np.asarray(KNOWN_BLOCKED_QVIS, dtype=float)),
-    ] + maybe_h9_seeds(root)
+    ]
     for label, q in seeds:
         require(q.shape == (7,) and np.isfinite(q).all(),
                 "Malformed fixed candidate "+label)
@@ -204,7 +176,7 @@ def run(args):
         accepted=0, optimized_seeds=0,
     )
     best = [(-math.inf, None, None) for _ in range(8)]
-    # Keep one best FOV candidate per distinct q for each sensor.
+    # Keep the strongest analytic-FOV seeds for optional local refinement.
     top = [[] for _ in range(8)]
     found = None
     start = time.monotonic()
