@@ -7,8 +7,8 @@ Same R1 architecture, frozen train/val split, random seed, Adam, cosine
 schedule, union-proxy coefficient, batch, and 20k updates.
 
 No LOS, self-occlusion, FD-gradient, Eikonal or V4 targets are introduced.
-Checkpoint selection uses qualified near-boundary validation RMSE; global
-RMSE/MAE/sign remain reported for honest baseline comparison.
+Checkpoint selection remains the baseline global validation RMSE to isolate
+the training-loss change; qualified near-boundary metrics are reported too.
 """
 from __future__ import annotations
 
@@ -195,7 +195,7 @@ def run(args):
                 boundary_band=BOUNDARY_BAND,
                 boundary_boost=BOUNDARY_BOOST,
                 sensor_loss="masked_distance_mse_boundary_weighted",
-                checkpoint_selector="val_boundary_sensor_rmse")
+                checkpoint_selector="val_sensor_rmse")
     qualified_boundary=(valid & (np.abs(targets)<=BOUNDARY_BAND))
     boundary_train=int(qualified_boundary[split==0].sum())
     boundary_val=int(qualified_boundary[split==1].sum())
@@ -226,7 +226,7 @@ def run(args):
     )
     (out/"run.json").write_text(json.dumps(log,indent=2,sort_keys=True)+"\n")
     best=float("inf")
-    best_global_rmse=float("inf")
+    best_boundary_rmse=float("inf")
     best_boundary_sign=float("nan")
     best_step=0
     begin=time.monotonic()
@@ -278,17 +278,17 @@ def run(args):
                     no_fd_gradient_supervision=True,union_proxy_not_exact=True,
                 )
                 atomic_save(out/"latest.pt",state)
-                if ev["val_boundary_sensor_rmse"]<best:
-                    best=ev["val_boundary_sensor_rmse"]
-                    best_global_rmse=ev["val_sensor_rmse"]
+                if ev["val_sensor_rmse"]<best:
+                    best=ev["val_sensor_rmse"]
+                    best_boundary_rmse=ev["val_boundary_sensor_rmse"]
                     best_boundary_sign=ev["val_boundary_sensor_sign_accuracy"]
                     best_step=step
                     atomic_save(out/"best.pt",state)
     os.replace(out/"latest.pt",out/"final.pt")
     log.update(
         status="COMPLETE",successful_updates=args.steps,
-        best_val_sensor_rmse=best_global_rmse,
-        best_val_boundary_sensor_rmse=best,
+        best_val_sensor_rmse=best,
+        best_val_boundary_sensor_rmse=best_boundary_rmse,
         best_val_boundary_sign_accuracy=best_boundary_sign,
         best_step=best_step,
         best_sha256=sha(out/"best.pt"),
@@ -299,8 +299,8 @@ def run(args):
     temp.write_text(json.dumps(log,indent=2,sort_keys=True)+"\n")
     os.replace(temp,out/"run.json")
     print("[H9 FULL V3 BOUNDARY TRAIN COMPLETE]",
-          "best_boundary_RMSE=",round(best,6),
-          "global_RMSE_at_best=",round(best_global_rmse,6),
+          "best_global_RMSE=",round(best,6),
+          "boundary_RMSE_at_best=",round(best_boundary_rmse,6),
           "best_step=",best_step,"out=",out,flush=True)
 
 
