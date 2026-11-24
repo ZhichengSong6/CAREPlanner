@@ -75,7 +75,7 @@ NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
 bash "$NEXT/run.sh" geometry026
 ```
 
-搜索保持原Case026 target、关节区间、保守FOV (50度/66度，z=.20/.70，delta=.01) 和原始self-filter URDF primitive LOS参数。第一步必须重现已知S4自遮挡作为几何回归检查。候选依次覆盖 measured seed、已知被遮挡旧q_vis、Case026中已有的H9候选（只用其q向量，绝不使用其网络输出打分）、2048个姿态邻域高斯采样、4096个覆盖全关节空间的确定性Sobol采样，以及每个传感器最多4个初始点的纯解析FOV局部优化（SciPy L-BFGS-B）。只有FOV margin非负的候选才会进一步执行完全相同的primitive LOS检查。找到合格候选会提前结束，完整JSON保留所有来源与算法预算：
+搜索保持原Case026 target、关节区间、保守FOV (50度/66度，z=.20/.70，delta=.01) 和原始self-filter URDF primitive LOS参数。第一步必须重现已知S4自遮挡作为几何回归检查。候选依次覆盖 measured seed、已知被遮挡的旧scalar q_vis、2048个姿态邻域高斯采样、4096个覆盖全关节空间的确定性Sobol采样，以及每个传感器最多4个初始点的纯解析FOV局部优化（SciPy L-BFGS-B）。**不会读取H9生成的候选，也不运行任何网络；检验与新旧网络预测完全独立。**只有FOV margin非负的候选才会进一步执行完全相同的primitive LOS检查。找到合格候选会提前结束，完整JSON保留所有来源与算法预算：
 
 ```
 $GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_geometry_only.json
