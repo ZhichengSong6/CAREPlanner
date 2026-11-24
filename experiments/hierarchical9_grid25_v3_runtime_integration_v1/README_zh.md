@@ -7,7 +7,7 @@
 - `src/care_visibility_cdf/scripts/grid25_v3_h9_runtime_loader.py`：识别正式 `care_grid25_h9_r1_full_124seg_v3_distance_training_v1`，核对同目录 `run.json`、冻结数据 `manifest.json`、checkpoint SHA、step、R1架构与训练权重。**先核对SHA再反序列化**，只接受 `best.pt`。
 - `src/care_visibility_cdf/scripts/per_sensor_visibility_runtime.py`：增加仅对上述新格式生效的加载分支。原8-head、旧H9 V1、旧50k R1保持原逻辑。保留九分支模型完整权重，只暴露 `S0..S7` 8个sensor分支，不把union当S0。
 - `verify.py`：读现有best.pt，严格对照原训练R1模型与 runtime 的 **9/8输出、S0/S7索引、8个传感器分别对7D q的自动微分梯度**，结果保存 JSON。
-- `case026.sh`：复用原始 `scripts/test_phase_e_case026_targeted_per_sensor_fallback.py`，使用相同旧scalar、相同measured seed、相同S4优先和同一FOV/primitive self-occlusion准则比较旧8-head与新H9候选。输出两个JSON和日志，**没有自动启用模型生产模式**。
+- `case026.sh`：复用原始 `scripts/test_phase_e_case026_targeted_per_sensor_fallback.py`，使用相同旧scalar、相同measured seed、相同S4优先和同一FOV/primitive self-occlusion准则执行候选搜索。有旧8-head时比较旧8-head与新H9；旧8-head缺失时只运行新H9并记录 **baseline_available=false、NO BASELINE COMPARISON**，不能声称优于基线。**不自动启用模型生产模式**。
 
 ## HPC直接运行
 
@@ -38,16 +38,17 @@ bash "$NEXT/run.sh" verify --device cpu
 bash "$NEXT/run.sh" case026
 ```
 
-该命令要求原标量 `src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt` 和旧8-head `src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt` 确实存在，否则报告缺失并停止，**不伪造基线**。两组诊断都使用 CPU，保留完全相同的旧 scalar 粗投影、原有 conservative FOV 与 primitive LOS 检查。
+该命令**必须**有原标量 `src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt`，才能保持原本的粗投影策略。旧8-head `src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt` 为**可选**：如果 HPC 没有它，就跳过旧8-head，只运行新V3 H9的Case026，并在 `comparison_status.json` 标记 `baseline_available=false`，不作性能优劣结论。如果旧基线文件存储在其他路径，执行前设置 `export OLD8_CHECKPOINT="/实际路径/final.pt"`，原scalar可通过 `SCALAR_CHECKPOINT` 指定。诊断使用 CPU，保留原始scalar粗投影、conservative FOV与primitive LOS。
 
 输出路径：
 
 ```
 $GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026/
-  old8.json
-  old8.log
   grid25_v3_h9.json
   grid25_v3_h9.log
+  comparison_status.json
+  old8.json   # 仅在找到旧8-head checkpoint时
+  old8.log    # 仅在找到旧8-head checkpoint时
 ```
 
 记录每支候选、失败原因、rank、耗时、几何认证与选中结果。哪怕两组均是 `NO_CLEAR_SENSOR_BRANCH`，也应如实记录，不代表代码失败或理论上无解。
