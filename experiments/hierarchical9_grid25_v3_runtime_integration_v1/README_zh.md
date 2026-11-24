@@ -60,3 +60,28 @@ $GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026/
 - Case026只是单个离线候选检验，检测不等于安全执行；真正的规划还依赖现有GCDF碰撞、VBC、tracker和传感器视线等条件。
 - 不改变 `PER_SENSOR_HYBRID_ENABLED` 全局默认false。需要后续明确配置受控实验后再进行小规模仿真对照。不要自动连接真实机器人。
 - 不重复运行 `verify` 覆盖已有证明；如果需要不同GPU设备可显式用 `--device cuda` 输出单独的报告。不能在缺GPU的节点上要求CUDA。
+
+## Case026 纯几何可行性搜索（新增，无需旧8-head checkpoint）
+
+目前的完整 Grid25 V3 H9 在Case026中8/8分支未找到候选，但**旧8-head模型本次没有运行**：集群上缺少旧checkpoint；旧scalar模型曾得到 conservative FOV margin +0.018168 的S4候选，但被link3遮挡。因此不能声称旧模型优于新模型。
+
+要区分“神经网络搜索策略失败”与“当前几何约束下没有可见配置”，使用严格**不加载任何神经网络**的独立候选采样：
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
+bash "$NEXT/run.sh" geometry026
+```
+
+搜索保持原Case026 target、关节区间、保守FOV (50度/66度，z=.20/.70，delta=.01) 和原始self-filter URDF primitive LOS参数。第一步必须重现已知S4自遮挡作为几何回归检查。候选依次覆盖 measured seed、已知被遮挡旧q_vis、Case026中已有的H9候选（只用其q向量，绝不使用其网络输出打分）、2048个姿态邻域高斯采样、4096个覆盖全关节空间的确定性Sobol采样，以及每个传感器最多4个初始点的纯解析FOV局部优化（SciPy L-BFGS-B）。只有FOV margin非负的候选才会进一步执行完全相同的primitive LOS检查。找到合格候选会提前结束，完整JSON保留所有来源与算法预算：
+
+```
+$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_geometry_only.json
+```
+
+输出中的 `FOUND_FOV_AND_PRIMITIVE_LOS_CANDIDATE` 只表明这两个静态几何谓词下存在一个符合条件的 `(q,sensor)`，**不是GCDF/VBC/轨迹执行安全或机器人碰撞认证**。`NOT_FOUND_WITHIN_FINITE_SEARCH_BUDGET` 只表示搜索预算内没有发现，不是数学意义无解。两种结果都不应直接归因于“旧网络更好”。
+
+可用参数控制资源，如 `bash "$NEXT/run.sh" geometry026 --local-samples 4096 --global-samples 8192 --refine-per-sensor 6`。如果上一轮已写出结果，脚本会拒绝覆盖；不要在没有查看原结果的情况下删除它。
+
