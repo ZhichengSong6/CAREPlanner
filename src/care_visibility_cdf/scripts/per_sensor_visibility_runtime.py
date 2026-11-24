@@ -24,8 +24,10 @@ Important runtime semantic:
 
 from __future__ import annotations
 
+import json
 import math
 import time
+from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -53,6 +55,10 @@ from hierarchical_visibility_cdf_model import (
     HierarchicalSensorView,
     build_from_checkpoint_args,
     build_private_tail_from_checkpoint_architecture,
+)
+from grid25_v3_h9_runtime_loader import (
+    CHECKPOINT_FORMAT as FULL_GRID25_V3_H9_FORMAT,
+    load_verified_grid25_v3_sensor_model,
 )
 
 
@@ -84,12 +90,19 @@ def _parse_skips(raw) -> Tuple[int, ...]:
 
 
 def build_per_sensor_model(checkpoint_path: str, device: torch.device):
-    """Load old8, hierarchical9 V1, or the frozen R1 private-tail champion.
+    """Load frozen old8/V1/R012 and opt-in full-Grid25 V3-distance H9 R1.
 
-    Runtime semantics remain eight sensor outputs. Hierarchical checkpoints are
-    loaded as complete 9-output networks and wrapped only at the interface so
-    union weights remain present and q gradients through sensor outputs are exact.
+    Only the V3-only 20k best.pt with a verified sibling run.json is
+    dispatched to the new loader *before* torch unpickling. All historical
+    checkpoint formats and default runtime behavior remain unchanged.
     """
+    sibling_run = Path(checkpoint_path).expanduser().resolve().parent / "run.json"
+    if sibling_run.is_file():
+        provenance = json.loads(sibling_run.read_text())
+        if provenance.get("format") == FULL_GRID25_V3_H9_FORMAT:
+            return load_verified_grid25_v3_sensor_model(
+                checkpoint_path, device, load_checkpoint=torch_load_checkpoint
+            )
     ckpt = torch_load_checkpoint(checkpoint_path, device)
     fmt = str(ckpt.get("format", ""))
 
