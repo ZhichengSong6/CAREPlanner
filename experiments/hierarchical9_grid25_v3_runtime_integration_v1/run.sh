@@ -16,8 +16,11 @@ case "$MODE" in
   case026)
     exec bash "$HERE/case026.sh" "$@"
     ;;
+  geometry026)
+    exec "$VIS_PYTHON" -u "$HERE/geometry_case026.py" --root "$GRID25_ROOT" "$@"
+    ;;
   *)
-    echo "Usage: bash $HERE/run.sh verify [--device cpu|cuda] OR case026 (CPU, baseline vs V3)" >&2
+    echo "Usage: bash $HERE/run.sh verify [--device cpu|cuda] | case026 | geometry026 [--local-samples N --global-samples N]" >&2
     exit 2
     ;;
 esac
