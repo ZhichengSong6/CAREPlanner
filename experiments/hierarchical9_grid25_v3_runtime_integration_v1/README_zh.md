@@ -1,0 +1,61 @@
+# Grid25 全量 V3 H9 → CAREPlanner 运行时接入（受控诊断，不替换默认规划）
+
+本阶段**不再训练**。输入是已完成全124段V3-only正式训练的 `best.pt`（step=19500，验证RMSE≈0.097157），不是原50k步R1 checkpoint。本模块只验证新模型可以通过原有的`per_sensor_visibility_runtime.py`调用并执行候选搜索；不会自动打开ROS/Gazebo、不修改默认per-sensor hybrid开关、不会发布运动命令。
+
+## 代码变化
+
+- `src/care_visibility_cdf/scripts/grid25_v3_h9_runtime_loader.py`：识别正式 `care_grid25_h9_r1_full_124seg_v3_distance_training_v1`，核对同目录 `run.json`、冻结数据 `manifest.json`、checkpoint SHA、step、R1架构与训练权重。**先核对SHA再反序列化**，只接受 `best.pt`。
+- `src/care_visibility_cdf/scripts/per_sensor_visibility_runtime.py`：增加仅对上述新格式生效的加载分支。原8-head、旧H9 V1、旧50k R1保持原逻辑。保留九分支模型完整权重，只暴露 `S0..S7` 8个sensor分支，不把union当S0。
+- `verify.py`：读现有best.pt，严格对照原训练R1模型与 runtime 的 **9/8输出、S0/S7索引、8个传感器分别对7D q的自动微分梯度**，结果保存 JSON。
+- `case026.sh`：复用原始 `scripts/test_phase_e_case026_targeted_per_sensor_fallback.py`，使用相同旧scalar、相同measured seed、相同S4优先和同一FOV/primitive self-occlusion准则比较旧8-head与新H9候选。输出两个JSON和日志，**没有自动启用模型生产模式**。
+
+## HPC直接运行
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+git -c http.version=HTTP/1.1 fetch origin mainline-b/h9-scratch50k-r012-v1
+git merge --ff-only origin/mainline-b/h9-scratch50k-r012-v1
+
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
+
+# 先运行：只检查加载、值和q梯度，不做规划动作
+bash "$NEXT/run.sh" verify --device cpu
+```
+
+成功时输出：
+```
+[GRID25 V3 H9 RUNTIME CHECK PASS]
+```
+以及 `$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/runtime_check_cpu.json`。八个sensor梯度是对原网络**自动微分的一致性检查**，不意味着它们已获独立离线FD标签认证。
+
+## Case026对照（离线、无ROS运动）
+
+第一步PASS后，在具有URDF parser等依赖、且能找到以下原始模型文件的环境执行：
+
+```bash
+bash "$NEXT/run.sh" case026
+```
+
+该命令要求原标量 `src/care_visibility_cdf/checkpoints/exp1_yiming_k500_fov_signed/final.pt` 和旧8-head `src/care_visibility_cdf/checkpoints/per_sensor_e2e_fullbatch_seed0/final.pt` 确实存在，否则报告缺失并停止，**不伪造基线**。两组诊断都使用 CPU，保留完全相同的旧 scalar 粗投影、原有 conservative FOV 与 primitive LOS 检查。
+
+输出路径：
+
+```
+$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026/
+  old8.json
+  old8.log
+  grid25_v3_h9.json
+  grid25_v3_h9.log
+```
+
+记录每支候选、失败原因、rank、耗时、几何认证与选中结果。哪怕两组均是 `NO_CLEAR_SENSOR_BRANCH`，也应如实记录，不代表代码失败或理论上无解。
+
+## 科学与安全边界
+
+- V3 only：只监督 signed distance **值**。没有FD验证的梯度监督；自动微分连续不代表真实FOV边界梯度准确。
+- Union 头训练的是 `max` 代理，不是精确全局SDF；该runtime只使用8个sensor头进行ranking/梯度搜索。
+- Case026只是单个离线候选检验，检测不等于安全执行；真正的规划还依赖现有GCDF碰撞、VBC、tracker和传感器视线等条件。
+- 不改变 `PER_SENSOR_HYBRID_ENABLED` 全局默认false。需要后续明确配置受控实验后再进行小规模仿真对照。不要自动连接真实机器人。
+- 不重复运行 `verify` 覆盖已有证明；如果需要不同GPU设备可显式用 `--device cuda` 输出单独的报告。不能在缺GPU的节点上要求CUDA。
