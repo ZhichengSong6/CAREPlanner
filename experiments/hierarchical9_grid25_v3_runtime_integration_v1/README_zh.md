@@ -85,3 +85,26 @@ $GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_geometry_only.json
 
 可用参数控制资源，如 `bash "$NEXT/run.sh" geometry026 --local-samples 4096 --global-samples 8192 --refine-per-sensor 6`。如果上一轮已写出结果，脚本会拒绝覆盖；不要在没有查看原结果的情况下删除它。
 
+
+## 下一步：针对 Case026 S4 的唯一修复实验（`repair026`）
+
+全量V3-only模型的 RMSE=0.097157，不能和旧网络不同数据集的 RMSE 严格比较。Case026 H9 在8个传感器上未找到通过保守 FOV+primitive LOS 的候选，但单独的几何 oracle 在第62个配置找到 S4 有效候选。这**不意味着**细化标注让网络预测变差：原训练只优化 V3 距离值的 masked MSE（没有独立FD梯度监督，没有LOS/self-occlusion目标），而运行时按传感器链掩码沿FOV梯度找边界。已知原S4候选被 `link3` 遮挡，FOV边界与无遮挡模式不一致。
+
+只做一个定位实验，避免重新训练或没有意义的批量测试：
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+git -c http.version=HTTP/1.1 fetch origin mainline-b/h9-scratch50k-r012-v1
+git merge --ff-only origin/mainline-b/h9-scratch50k-r012-v1
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
+
+bash "$NEXT/run.sh" repair026
+```
+
+该命令读取**已存在**的H9 Case026失败JSON、纯几何成功JSON、同SHA的正式`best.pt`；检查H9在原候选和纯几何可见解处的S4输出以及原FOV/LOS结果。几何成功解仅用于**诊断/后验对照**，不会作为搜索起点。修复搜索从原H9 S4 `q_candidate`/`q_zero`、已知被遮挡的旧scalar候选和measured seed开始，在S4运动学祖先关节（由URDF自动识别）上进行256个局部采样和1024个Sobol采样。剩余关节在全局采样中固定为measured q。判定仍然采用同一个原始解析FOV、相同的self-filter URDF、相同primitive LOS，**不改变安全阈值、模型参数或在线默认开关**。
+
+结果位于 `$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_s4_repair.json`。如果发现候选：仅说明多起点+几何筛选可补救本次候选生成，并非证明“新网络性能提升”或轨迹可执行。如果没有找到：只是该预算下没找到，不是无解证明。最有诊断价值的字段是 `observations.independent_geometry_witness.h9_s4_predicted_value`：对几何真实可见点，模型自己是否打正分。应结合训练FOV定义与本次保守FOV差异解释，不能将它直接当成同一真实标签。
+
+任何报告都不声称旧8-head成功，因为其checkpoint没有在本次HPC上运行。单个静态候选通过FOV/primitive LOS不等于GCDF/VBC/轨迹安全认证。
