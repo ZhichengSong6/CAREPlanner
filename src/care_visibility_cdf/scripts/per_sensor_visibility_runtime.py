@@ -57,7 +57,7 @@ from hierarchical_visibility_cdf_model import (
     build_private_tail_from_checkpoint_architecture,
 )
 from grid25_v3_h9_runtime_loader import (
-    CHECKPOINT_FORMAT as FULL_GRID25_V3_H9_FORMAT,
+    SUPPORTED_FORMATS as FULL_GRID25_V3_H9_FORMATS,
     load_verified_grid25_v3_sensor_model,
 )
 
@@ -99,7 +99,7 @@ def build_per_sensor_model(checkpoint_path: str, device: torch.device):
     sibling_run = Path(checkpoint_path).expanduser().resolve().parent / "run.json"
     if sibling_run.is_file():
         provenance = json.loads(sibling_run.read_text())
-        if provenance.get("format") == FULL_GRID25_V3_H9_FORMAT:
+        if provenance.get("format") in FULL_GRID25_V3_H9_FORMATS:
             return load_verified_grid25_v3_sensor_model(
                 checkpoint_path, device, load_checkpoint=torch_load_checkpoint
             )
