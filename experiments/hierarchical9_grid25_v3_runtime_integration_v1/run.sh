@@ -22,8 +22,11 @@ case "$MODE" in
   repair026)
     exec "$VIS_PYTHON" -u "$HERE/case026_s4_repair.py" --root "$GRID25_ROOT" "$@"
     ;;
+  fovpair026)
+    exec "$VIS_PYTHON" -u "$HERE/case026_fov_pair.py" --root "$GRID25_ROOT" "$@"
+    ;;
   *)
-    echo "Usage: bash $HERE/run.sh verify [--device cpu|cuda] | case026 | geometry026 | repair026 [--local-samples N --global-samples N]" >&2
+    echo "Usage: bash $HERE/run.sh verify | case026 | geometry026 | repair026 | fovpair026 (strict FOV-only comparison)" >&2
     exit 2
     ;;
 esac
