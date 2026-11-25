@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Verified runtime loader for full-Grid25 20k-step V3-distance H9 R1.
 
-Strictly opt-in: this loader is reached only when the checkpoint declares
-care_grid25_h9_r1_full_124seg_v3_distance_training_v1. It checks the frozen
+Strictly opt-in: this loader is reached only for either completed full-Grid25
+V3-distance 20k baseline or controlled zero-boundary-weighted run. It checks the frozen
 run.json, SHA256 and model dimensions before exposing sensors 0..7.
 
 The 9-output model's union is a *proxy* and is not used by the runtime
@@ -24,6 +24,8 @@ from hierarchical_visibility_cdf_model import (
 )
 
 CHECKPOINT_FORMAT = "care_grid25_h9_r1_full_124seg_v3_distance_training_v1"
+BOUNDARY_FORMAT = "care_grid25_h9_r1_full_124seg_v3_boundary_focus_training_v1"
+SUPPORTED_FORMATS = (CHECKPOINT_FORMAT, BOUNDARY_FORMAT)
 TRAINING_DATASET_FORMAT = "care_grid25_full_v3only_distance_snapshot_v1"
 
 
@@ -59,7 +61,7 @@ def load_verified_grid25_v3_sensor_model(
     run_path = checkpoint_path.parent / "run.json"
     require(run_path.is_file(), f"Training provenance missing: {run_path}")
     meta = json.loads(run_path.read_text())
-    require(meta.get("format") == CHECKPOINT_FORMAT
+    require(meta.get("format") in SUPPORTED_FORMATS
             and meta.get("status") == "COMPLETE"
             and meta.get("v3_distance_full_grid25_training") is True
             and meta.get("no_fd_gradient_supervision") is True
@@ -74,6 +76,13 @@ def load_verified_grid25_v3_sensor_model(
             and cfg.get("seed") == 0
             and math.isclose(float(cfg.get("union_weight", -1)), 0.2),
             "Unexpected full Grid25 training configuration")
+    if meta["format"] == BOUNDARY_FORMAT:
+        require(cfg.get("boundary_band") == 0.10
+                and cfg.get("boundary_boost") == 2.0
+                and cfg.get("sensor_loss") == "masked_distance_mse_boundary_weighted"
+                and cfg.get("checkpoint_selector") == "val_sensor_rmse"
+                and meta.get("boundary_only_change_from_baseline") is True,
+                "Not the frozen controlled boundary-focus training experiment")
     run_dataset = Path(meta.get("dataset", "")).expanduser().resolve()
     manifest = run_dataset / "manifest.json"
     require(manifest.is_file(), f"Dataset identity missing: {manifest}")
@@ -98,7 +107,7 @@ def load_verified_grid25_v3_sensor_model(
     # only locally trusted production files with independently checked SHA.
     ckpt = load_checkpoint(str(checkpoint_path), device)
     require(isinstance(ckpt, dict)
-            and ckpt.get("format") == CHECKPOINT_FORMAT
+            and ckpt.get("format") == meta["format"]
             and ckpt.get("step") == meta["best_step"]
             and ckpt.get("source_v3_sha256") == frozen["labels_sha256"]
             and ckpt.get("model_source_sha256") == meta.get("model_source_sha256")
@@ -113,6 +122,16 @@ def load_verified_grid25_v3_sensor_model(
                 rel_tol=1e-6, abs_tol=1e-8,
             ),
             "Checkpoint validation metric does not match run.json")
+    if meta["format"] == BOUNDARY_FORMAT:
+        require(math.isclose(
+                    float(ckpt.get("val_boundary_sensor_rmse", math.nan)),
+                    float(meta.get("best_val_boundary_sensor_rmse", math.nan)),
+                    rel_tol=1e-6, abs_tol=1e-8)
+                and math.isclose(
+                    float(ckpt.get("val_boundary_sensor_sign_accuracy", math.nan)),
+                    float(meta.get("best_val_boundary_sign_accuracy", math.nan)),
+                    rel_tol=1e-6, abs_tol=1e-8),
+                "Boundary-focus checkpoint metrics disagree with completed run")
     architecture = meta.get("model_architecture") or {}
     require(architecture.get("name") == "private_tail_h9"
             and architecture.get("total_parameters", 0) > 0
