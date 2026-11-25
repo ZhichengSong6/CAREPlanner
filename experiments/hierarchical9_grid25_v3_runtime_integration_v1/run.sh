@@ -25,8 +25,11 @@ case "$MODE" in
   fovpair026)
     exec "$VIS_PYTHON" -u "$HERE/case026_fov_pair.py" --root "$GRID25_ROOT" "$@"
     ;;
+  fovvalpair)
+    exec "$VIS_PYTHON" -u "$HERE/fov_val_pair.py" --root "$GRID25_ROOT" "$@"
+    ;;
   *)
-    echo "Usage: bash $HERE/run.sh verify | case026 | geometry026 | repair026 | fovpair026 (strict FOV-only comparison)" >&2
+    echo "Usage: bash $HERE/run.sh verify | case026 | geometry026 | repair026 | fovpair026 | fovvalpair (fixed held-out Val FOV search)" >&2
     exit 2
     ;;
 esac
