@@ -108,3 +108,24 @@ bash "$NEXT/run.sh" repair026
 结果位于 `$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_s4_repair.json`。如果发现候选：仅说明多起点+几何筛选可补救本次候选生成，并非证明“新网络性能提升”或轨迹可执行。如果没有找到：只是该预算下没找到，不是无解证明。最有诊断价值的字段是 `observations.independent_geometry_witness.h9_s4_predicted_value`：对几何真实可见点，模型自己是否打正分。应结合训练FOV定义与本次保守FOV差异解释，不能将它直接当成同一真实标签。
 
 任何报告都不声称旧8-head成功，因为其checkpoint没有在本次HPC上运行。单个静态候选通过FOV/primitive LOS不等于GCDF/VBC/轨迹安全认证。
+
+## FOV-only 严格对照：第一轮 vs 第二轮 H9（新增，下一步唯一实验）
+
+用户实测同一个冻结Val、同一|V3|≤0.10指标：
+- 第一轮 global RMSE 0.09715688490905942；near-boundary RMSE 0.058270900400498、sign 0.8119720260351752
+- 第二轮 global RMSE 0.09807170521342248；near-boundary RMSE 0.04795601933348324、sign 0.8433042514887135
+- 近边界 RMSE 相对降低17.7%，sign提升3.13个百分点，global RMSE相对升0.94%。
+
+这证明在该验证集上近边界监督效果改善，不证明Case026搜索已经改善，更不证明自遮挡由网络处理。本实验**完全不执行LOS、自遮挡判定**，严格沿用先前的Case026目标、旧scalar保存的q_zero、measured branch seed、8分支排序（S4强制首位）、projection/root/ascent参数以及保守FOV几何阈值；只替换两个已完成的最佳 H9 模型。两者都按原代码独立运行八分支，然后用 conservative FOV margin≥0 作为唯一通过条件。这里不增加新训练或多起点搜索。
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+git -c http.version=HTTP/1.1 fetch origin mainline-b/h9-scratch50k-r012-v1
+git merge --ff-only origin/mainline-b/h9-scratch50k-r012-v1
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
+bash "$NEXT/run.sh" fovpair026
+```
+
+输出 `$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_fov_only_pair_v1.json`；控制台两条 `[CASE026 FOV-ONLY]` 可直观查看各自八分支有多少通过解析FOV、S4 margin、各自首次通过的sensor。只按FOV判定，不做安全/LOS结论。任何一方失败只说明本Case、当前预算下的FOV候选生成结果。
