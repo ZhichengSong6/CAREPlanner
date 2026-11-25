@@ -129,3 +129,23 @@ bash "$NEXT/run.sh" fovpair026
 ```
 
 输出 `$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/case026_fov_only_pair_v1.json`；控制台两条 `[CASE026 FOV-ONLY]` 可直观查看各自八分支有多少通过解析FOV、S4 margin、各自首次通过的sensor。只按FOV判定，不做安全/LOS结论。任何一方失败只说明本Case、当前预算下的FOV候选生成结果。
+
+## 决定是否启动第三轮训练的唯一下一步：固定64个Val x的FOV-only配对搜索
+
+用户已经实测第一/第二轮 H9 近边界RMSE **0.0582709 → 0.0479560**（改善17.7%），近边界sign **81.20% → 84.33%**，整体RMSE **0.097157 → 0.098072**。Case026 FOV-only第一轮0/8、第二轮1/8（S7成功），但只是单个场景。
+
+下面的评估**不训练、不计算LOS/自遮挡/碰撞、不改变网络**，固定从旧的冻结val split中选64个不同x各一个q槽：seed=260930，且初始q的八个解析 conservative FOV margin 全为负，防止把已经可见的状态算作搜索成功。挑选依据**与两轮网络输出无关**；两模型共享完全相同的64个`(x,q)`、关节限位、每传感器10步projection/12步root/1步ascent/8步fallback、最多8分支。为了直接隔离H9搜索，ranking也在起始q上执行，**不额外运行旧scalar的粗投影**；因此这是H9独立搜索的验证对照，不等于整个CAREPlanner在线成功率。固定Val曾用于checkpoint选择，不是独立最终测试集。
+
+```bash
+cd /mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner-mainline-b
+git -c http.version=HTTP/1.1 fetch origin mainline-b/h9-scratch50k-r012-v1
+git merge --ff-only origin/mainline-b/h9-scratch50k-r012-v1
+export VIS_PYTHON="$HOME/miniforge3/envs/viscdf/bin/python"
+export GRID25_ROOT="/mnt/slurmfs-3090node3/user_data/zsong142/CAREPlanner/outputs/mainline_b/h9_grid25_data_v1"
+NEXT=experiments/hierarchical9_grid25_v3_runtime_integration_v1
+bash "$NEXT/run.sh" fovvalpair
+```
+
+结果文件：`$GRID25_ROOT/derived/grid25_v3_runtime_integration_v1/fov_val_baseline_vs_boundary_v1.json`。
+
+主要读取`[FOV VAL RESULT]`两行以及`[FOV VAL PAIRED]`，查看是否在更多未参与训练的Val空间位置上提高配置搜索成功率；后续再据此决定是否需要真正的零边界新采样/第三轮训练。没有旧8-head基线对照，本次只有原第一轮 vs 第二轮 H9。
