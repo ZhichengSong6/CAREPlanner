@@ -443,7 +443,18 @@ def merge(root):
                  & set(merged[1]["x_index"].tolist())),
             "Spatial train/val leakage in augmentation")
     for sp,name in ((0,"train_pairs.npz"),(1,"val_pairs.npz")):
-        write_npz(out/name,merged[sp])
+        path=out/name
+        if path.exists():
+            # Safe after an interrupted merge: never overwrite, only accept
+            # the exact previously constructed immutable data.
+            with np.load(path,allow_pickle=False) as z:
+                prior={k:np.asarray(z[k]) for k in z.files}
+            require(prior.keys()==merged[sp].keys() and
+                    all(np.array_equal(prior[k],merged[sp][k])
+                        for k in merged[sp]),
+                    "Interrupted merge created different data: "+str(path))
+        else:
+            write_npz(path,merged[sp])
     report=dict(
         format=FORMAT,status="FROZEN",
         plan_sha256=m["plan_npz_sha256"],
