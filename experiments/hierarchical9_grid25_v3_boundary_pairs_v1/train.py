@@ -168,7 +168,7 @@ def evaluate_pair_val(model,pair,batch,device):
                 n_s=int(mask[:,s].sum().item())
                 by[f"S{s}"]["count"]+=n_s
                 by[f"S{s}"]["sum_sq"]+=float((diff[:,s].square()*mask[:,s]).sum().item())
-                by[f"S{s}"]["sign_correct"]+=int(((((pred[:,s]>=0)==(y[:,s]>=0))&mask[:,s]).sum().item())
+                by[f"S{s}"]["sign_correct"]+=int((((pred[:,s]>=0)==(y[:,s]>=0))&mask[:,s]).sum().item())
     require(count==n,"Each qualified augmented Val row must have one label")
     return dict(
         val_new_boundary_count=count,
