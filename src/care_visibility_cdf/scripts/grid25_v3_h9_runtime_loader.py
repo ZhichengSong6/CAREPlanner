@@ -25,7 +25,8 @@ from hierarchical_visibility_cdf_model import (
 
 CHECKPOINT_FORMAT = "care_grid25_h9_r1_full_124seg_v3_distance_training_v1"
 BOUNDARY_FORMAT = "care_grid25_h9_r1_full_124seg_v3_boundary_focus_training_v1"
-SUPPORTED_FORMATS = (CHECKPOINT_FORMAT, BOUNDARY_FORMAT)
+PAIRS_FORMAT = "care_grid25_h9_r1_full_124seg_v3_boundary_pair_aug_training_v1"
+SUPPORTED_FORMATS = (CHECKPOINT_FORMAT, BOUNDARY_FORMAT, PAIRS_FORMAT)
 TRAINING_DATASET_FORMAT = "care_grid25_full_v3only_distance_snapshot_v1"
 
 
@@ -83,6 +84,26 @@ def load_verified_grid25_v3_sensor_model(
                 and cfg.get("checkpoint_selector") == "val_sensor_rmse"
                 and meta.get("boundary_only_change_from_baseline") is True,
                 "Not the frozen controlled boundary-focus training experiment")
+    if meta["format"] == PAIRS_FORMAT:
+        require(math.isclose(float(cfg.get("new_boundary_sample_fraction", -1)),
+                             0.25, rel_tol=0, abs_tol=1e-9)
+                and cfg.get("checkpoint_selector")=="original_frozen_val_sensor_rmse"
+                and cfg.get("no_new_loss_terms") is True
+                and meta.get("original_124_segment_dataset_unchanged") is True,
+                "Wrong third-round V3 pair-augmentation training protocol")
+        augmented_dir=checkpoint_path.parent.parent
+        augmented_manifest=augmented_dir/"augmentation_manifest.json"
+        require(augmented_manifest.is_file()
+                and sha256_file(augmented_manifest)==meta.get("augmentation_manifest_sha256"),
+                "Missing or altered qualified V3 boundary-pair augmentation")
+        augmented=json.loads(augmented_manifest.read_text())
+        require(augmented.get("format")=="care_grid25_v3_boundary_pairs_relabel_v1"
+                and augmented.get("status")=="FROZEN"
+                and augmented.get("no_los") is True
+                and augmented.get("no_fd_gradient_supervision") is True
+                and augmented.get("train_pairs_sha256")==meta.get("augmentation_train_sha256")
+                and augmented.get("val_pairs_sha256")==meta.get("augmentation_val_sha256"),
+                "Third-round augmentation identity/constraints changed")
     run_dataset = Path(meta.get("dataset", "")).expanduser().resolve()
     manifest = run_dataset / "manifest.json"
     require(manifest.is_file(), f"Dataset identity missing: {manifest}")
@@ -122,6 +143,13 @@ def load_verified_grid25_v3_sensor_model(
                 rel_tol=1e-6, abs_tol=1e-8,
             ),
             "Checkpoint validation metric does not match run.json")
+    if meta["format"] == PAIRS_FORMAT:
+        require(ckpt.get("augmented_train_sha256")==meta.get("augmentation_train_sha256")
+                and ckpt.get("augmented_val_sha256")==meta.get("augmentation_val_sha256")
+                and math.isclose(float(ckpt.get("val_new_boundary_rmse", math.nan)),
+                                 float(meta.get("best_val_new_boundary_rmse", math.nan)),
+                                 rel_tol=1e-6, abs_tol=1e-8),
+                "Third-round checkpoint does not match frozen augmented pairs")
     if meta["format"] == BOUNDARY_FORMAT:
         require(math.isclose(
                     float(ckpt.get("val_boundary_sensor_rmse", math.nan)),
