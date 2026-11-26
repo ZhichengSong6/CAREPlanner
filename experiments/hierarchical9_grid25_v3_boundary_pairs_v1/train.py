@@ -275,15 +275,22 @@ def run(args):
             optimizer.zero_grad(set_to_none=True)
             old_pred=model(x_d[idx]).float()
             new_pred=model(pair_x_d[pidx]).float()
-            old_total,sensor_mse,proxy_mse,nunion=prior.supervised_loss(
-                old_pred,y_d[idx],m_d[idx],args.union_weight)
+            old_sensor_loss,sensor_mse,_,_=prior.supervised_loss(
+                old_pred,y_d[idx],m_d[idx],0.0)
             pair_mse=((new_pred[:,1:]-pair_y_d[pidx]).square()
                       *pair_m_d[pidx]).sum()/pair_m_d[pidx].sum()
-            # Exactly the original supervised distance MSE, but sample the
-            # newly labeled two-sided boundary queries for 25% of updates.
-            # Original union proxy remains 0.2 on fully valid original rows.
-            loss=(1.0-PAIR_FRACTION)*sensor_mse+PAIR_FRACTION*pair_mse
-            loss+=args.union_weight*proxy_mse
+            # The baseline helper returns DETACHED sensor metrics; use
+            # old_sensor_loss itself in backward so original-distance
+            # supervision retains a live autograd graph.
+            both=m_d[idx].all(dim=1)
+            proxy_mse=(old_pred[:,0]*0.).sum()
+            nunion=int(both.sum().item())
+            if args.union_weight>0 and nunion:
+                pseudo=y_d[idx][both].max(dim=1).values
+                proxy_mse=(old_pred[both,0].float()-pseudo).square().mean()
+            loss=((1.0-PAIR_FRACTION)*old_sensor_loss
+                  +PAIR_FRACTION*pair_mse
+                  +args.union_weight*proxy_mse)
             require(torch.isfinite(loss).item(),
                     "Nonfinite H9 supervised loss at step "+str(step))
             loss.backward()
