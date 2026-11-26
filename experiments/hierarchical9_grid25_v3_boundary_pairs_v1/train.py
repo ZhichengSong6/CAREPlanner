@@ -203,6 +203,13 @@ def run(args):
     require(not out.exists(),"Training run already exists; do not overwrite")
     inputs,targets,valid,split,meta=load_data(root)
     pairs,pair_meta=load_pairs(root)
+    with np.load(snapshot_path(root)/"labels.npz",allow_pickle=False) as z:
+        original_xid=np.asarray(z["x_index"])
+    original_train=set(original_xid[split==0].tolist())
+    original_val=set(original_xid[split==1].tolist())
+    require(set(pairs[0]["x_index"].tolist()).issubset(original_train)
+            and set(pairs[1]["x_index"].tolist()).issubset(original_val),
+            "Augmented samples crossed original frozen spatial train/val split")
     train_ids=np.flatnonzero(split==0)
     val_ids=np.flatnonzero(split==1)
     require(len(train_ids)==meta["counts"]["train_queries"]
@@ -308,7 +315,7 @@ def run(args):
                     train_batch_total_mse=float(loss.detach().cpu()),
                     train_batch_sensor_mse=float(sensor_mse.cpu()),
                     train_batch_new_boundary_sensor_mse=float(pair_mse.detach().cpu()),
-                    train_batch_union_proxy_mse=float(proxy_mse.cpu()),
+                    train_batch_union_proxy_mse=float(proxy_mse.detach().cpu()),
                     train_batch_union_proxy_count=nunion,
                     lr=float(optimizer.param_groups[0]["lr"]),
                     elapsed_s=round(time.monotonic()-begin,2),
