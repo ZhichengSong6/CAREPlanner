@@ -21,8 +21,11 @@ case "$MODE" in
   train-status)
     exec "$VIS_PYTHON" -u "$HERE/train.py" status --root "$GRID25_ROOT" "$@"
     ;;
+  fov-compare)
+    exec "$VIS_PYTHON" -u "$HERE/fov_compare.py" --root "$GRID25_ROOT" "$@"
+    ;;
   *)
-    echo "Usage: bash $HERE/run.sh prepare | submit-labels | label-status | merge | submit-train | train-status" >&2
+    echo "Usage: bash $HERE/run.sh prepare | submit-labels | label-status | merge | submit-train | train-status | fov-compare" >&2
     exit 2
     ;;
 esac
