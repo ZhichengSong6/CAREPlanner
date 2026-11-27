@@ -713,6 +713,11 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                     label="care_visibility_obligation_points_v1",
                     size=len(msg.data), stride=len(msg.data))]
                 self.current_obligation_points_pub.publish(msg)
+            if getattr(self, 'local_observation_directions', False):
+                active = first is not None and obligation_id >= 0 and len(points) > 0
+                if active != getattr(self, '_last_local_schedule_active', None):
+                    self.active_pub.publish(Bool(data=active))
+                    self._last_local_schedule_active = active
 
     def _maybe_generate(self) -> None:
         if not self._c47_ready:
@@ -811,9 +816,16 @@ class VisibilityAcquisitionWaypointNode(AccumulatedMultiDeadlineWaypointNode):
                 label='care_sensor_v1_' + str(int(ob['per_sensor_selected_sensor_id'])),
                 size=7, stride=7))
         msg.layout.dim.append(MultiArrayDimension(label=region, size=7, stride=7))
+        route = getattr(self, '_task_route', None)
+        history = getattr(route, 'direction_history', None)
+        direction = history.identify(region, ob, q, joint_mask) if history is not None else None
+        if direction is not None:
+            msg.layout.dim.append(MultiArrayDimension(
+                label='care_r1_action_v1_' + str(direction), size=7, stride=7))
         if token != self._trace_last_target:
             self._trace_last_target = token
             self._trace_observation("scheduled", observation_token=token,
+                sensor=int(ob.get('per_sensor_selected_sensor_id', -1)), local_direction=direction,
                 generation_event_id=ob.get("generation_event_id", "legacy"),
                 obligation_id=int(ob["id"]), q_vis=q.tolist(),
                 q_vis_joint_mask=joint_mask.tolist(),

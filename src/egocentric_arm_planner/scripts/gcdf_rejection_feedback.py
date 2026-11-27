@@ -3,7 +3,7 @@ import math
 import struct
 
 
-def rejection_points(batch, candidate, margin):
+def rejection_points(batch, candidate, margin, occupied_rows=None):
     """Validate the association before returning identities, never old QP rows.
 
     Executable braking/time-scaled indices are deliberately NOT mapped to local
@@ -19,6 +19,11 @@ def rejection_points(batch, candidate, margin):
             not math.isfinite(margin)):
         raise ValueError('invalid executable batch identity/dimensions')
     points = {}
+    overflow = False
+    if occupied_rows is not None:
+        occupied_rows = set(occupied_rows)
+        if any(i < 0 or i >= n or batch.source_type[i] != 1 for i in occupied_rows):
+            raise ValueError('invalid occupied row identity')
     for i in range(n):
         k = batch.original_timestep[i]
         p = list(batch.point_flat[3*i:3*i+3])
@@ -33,10 +38,13 @@ def rejection_points(batch, candidate, margin):
                 # GPU transport uses float32. Compare in that exact domain.
                 struct.pack('!7f', *q) != struct.pack('!7f', *actual)):
             raise ValueError('executable q mismatch')
-        if d < margin:
+        if (d < margin if occupied_rows is None else i in occupied_rows):
             key = struct.pack('!3f', *p)
             if key not in points:
                 if len(points) == 32:
-                    return [], True
+                    if occupied_rows is None:
+                        return [], True
+                    overflow = True
+                    continue
                 points[key] = p
-    return [x for p in points.values() for x in p], False
+    return [x for p in points.values() for x in p], overflow

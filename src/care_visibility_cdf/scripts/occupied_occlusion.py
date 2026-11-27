@@ -133,15 +133,20 @@ class RouteProposer:
                     'src/care_visibility_cdf/scripts','src/care_confidence_map/scripts'):
             path=str(runtime/rel)
             if path not in sys.path:sys.path.append(path)
-        from known_ground import KnownGround
+        from known_ground import KnownGround, load_robot_frames
         self.cdf,self.cdf_identity=load_route_cdf(device)
         if not np.isfinite(occupied_resolution) or occupied_resolution<=0 or not np.isfinite(occupied_margin):
             raise ValueError('Invalid route occupied geometry parameters')
         self.occupied_resolution=float(occupied_resolution);self.occupied_margin=float(occupied_margin)
-        self.ground=KnownGround(str(urdf),str(runtime/'src/egocentric_arm_planner/config/known_ground_geometry.json'),backend='native')
+        self.ground = None
+        if os.environ.get('CARE_KNOWN_GROUND_ENABLED', 'true').lower() == 'true':
+            self.ground = KnownGround(str(urdf), str(runtime/'src/egocentric_arm_planner/config/known_ground_geometry.json'), backend='native')
+            self.frames, self.rotations = self.ground.frames, self.ground.rotations
+        else:
+            _, _, self.frames, self.rotations = load_robot_frames(str(urdf))
         self.ee_chain=[];name='EE_link'
         while name!='base_link':
-            data=self.ground.frames[name];self.ee_chain.append((name,data));name=data[0]
+            data=self.frames[name];self.ee_chain.append((name,data));name=data[0]
         self.ee_chain.reverse();self.ik_cache={}
         from primitive_point_geometry import load_primitives
         self.point_primitives=load_primitives(runtime/'src/arm_description/urdf/Arm_with_self_filter_collision.urdf')
@@ -154,7 +159,7 @@ class RouteProposer:
                     np.linalg.norm(np.asarray(dimensions)/2))
                 radius=float(np.linalg.norm(primitive.center)+extent);weights=np.zeros(7);name=link
                 while name!='base_link':
-                    parent,origin,kind,axis,index=self.ground.frames[name]
+                    parent,origin,kind,axis,index=self.frames[name]
                     if kind in ('revolute','continuous'):weights[index]=radius
                     radius+=float(np.linalg.norm(origin[:3,3]));name=parent
                 self.point_weights[(link,primitive.collision_index)]=weights
@@ -173,9 +178,9 @@ class RouteProposer:
             cache={'base_link':np.eye(4)}
             def pose(name):
                 if name not in cache:
-                    parent,origin,kind,axis,index=self.ground.frames[name];tf=pose(parent)@origin
+                    parent,origin,kind,axis,index=self.frames[name];tf=pose(parent)@origin
                     if kind in ('revolute','continuous'):
-                        outer,skew=self.ground.rotations[name];c=np.cos(q[index]);s=np.sin(q[index])
+                        outer,skew=self.rotations[name];c=np.cos(q[index]);s=np.sin(q[index])
                         tf[:3,:3]=tf[:3,:3]@(c*np.eye(3)+(1-c)*outer+s*skew)
                     cache[name]=tf
                 return cache[name]
@@ -197,9 +202,9 @@ class RouteProposer:
             mid=(a+b)/2;radius=np.abs(a-b)/2;cache={'base_link':np.eye(4)}
             def pose(name):
                 if name not in cache:
-                    parent,origin,kind,axis,index=self.ground.frames[name];tf=pose(parent)@origin
+                    parent,origin,kind,axis,index=self.frames[name];tf=pose(parent)@origin
                     if kind in ('revolute','continuous'):
-                        outer,skew=self.ground.rotations[name];c=np.cos(mid[index]);s=np.sin(mid[index])
+                        outer,skew=self.rotations[name];c=np.cos(mid[index]);s=np.sin(mid[index])
                         tf[:3,:3]=tf[:3,:3]@(c*np.eye(3)+(1-c)*outer+s*skew)
                     cache[name]=tf
                 return cache[name]
@@ -218,7 +223,7 @@ class RouteProposer:
             tf=tf@origin
             if kind in ('revolute','continuous'):
                 axes[index]=tf[:3,:3]@(axis/np.linalg.norm(axis));origins[index]=tf[:3,3].copy()
-                outer,skew=self.ground.rotations[name];c=np.cos(q[index]);s=np.sin(q[index])
+                outer,skew=self.rotations[name];c=np.cos(q[index]);s=np.sin(q[index])
                 tf[:3,:3]=tf[:3,:3]@(c*np.eye(3)+(1-c)*outer+s*skew)
             elif kind=='prismatic':raise ValueError('unsupported prismatic IK')
         jac=np.zeros((6,7))
@@ -247,7 +252,8 @@ class RouteProposer:
             self.ik_cache[key]=solutions
         solutions=self.ik_cache[key]
         distances=self.distances(solutions,points)
-        valid=[q for q,d in zip(solutions,distances) if d>=.010 and self.ground.clearance(q)[0]>=.020-1e-10]
+        valid=[q for q,d in zip(solutions,distances) if d>=.010 and
+               (self.ground is None or self.ground.clearance(q)[0]>=.020-1e-10)]
         return sorted(valid,key=lambda q:float(np.linalg.norm(q-start))),dict(
             ik_solutions=len(solutions),collision_filtered_goal_options=len(valid),goal_cdf_values=distances.tolist())
 
@@ -283,7 +289,7 @@ class RouteProposer:
         candidates=[]
         for option in goals[:8]:candidates.extend(route_candidates(start,option,lower,upper,generation))
         candidates.sort(key=lambda p:float(np.sum(np.linalg.norm(np.diff(p,axis=0),axis=1))))
-        checked=0;best=-float('inf');minimum_ground=float('inf');unknown_rejected=0;occupied_rejected=0;budget_exhausted=False
+        checked=0;best=-float('inf');minimum_ground=None;unknown_rejected=0;occupied_rejected=0;budget_exhausted=False
         for knots in candidates:
             if time.monotonic()-begin>wall_budget:
                 budget_exhausted=True;break
@@ -294,9 +300,9 @@ class RouteProposer:
             if occupied_min<self.occupied_margin:
                 occupied_rejected+=1
                 continue
-            ground=min(self.ground.clearance(row)[0] for row in q)
+            ground=min(self.ground.clearance(row)[0] for row in q) if self.ground is not None else None
             minimum_ground=ground
-            if ground+1e-10<.020:continue
+            if ground is not None and ground+1e-10<.020:continue
             if len(unknown_avoid) and self.point_clearance_bound(knots,unknown_avoid)<.020:
                 unknown_rejected+=1
                 if research and observation_route is None:

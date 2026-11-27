@@ -21,7 +21,8 @@ struct InitialShellRecovery {
   }
   bool floor(const Eigen::Vector3d& p, double start, double desired,
              double execution, double* required, bool* recovering,
-             bool owned_margin_recovery = false) {
+             bool owned_margin_recovery = false, bool* replaced_history = nullptr) {
+    if (replaced_history) *replaced_history = false;
     if (!required || !recovering || !p.allFinite() ||
         p.cwiseAbs().maxCoeff()>1e6 || !std::isfinite(start) ||
         !std::isfinite(desired) || !std::isfinite(execution) ||
@@ -35,7 +36,11 @@ struct InitialShellRecovery {
     const auto k=key(p);
     auto it=baselines.find(k);
     if (it==baselines.end()) {
-      if (baselines.size()>=32) return false;
+      if (baselines.size() >= 32) {
+        // These entries record past distances. The current distance was checked above.
+        baselines.erase(baselines.begin());
+        if (replaced_history) *replaced_history = true;
+      }
       it=baselines.emplace(k,start).first;
     }
     *required=execution;

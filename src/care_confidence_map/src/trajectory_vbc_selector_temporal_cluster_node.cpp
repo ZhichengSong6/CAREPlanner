@@ -9,6 +9,8 @@
 #include <care_confidence_map/initial_shell_recovery.hpp>
 #include <care_confidence_map/trajectory_motion.hpp>
 #include <boost/property_tree/json_parser.hpp>
+#include "brake_response_model.hpp"
+#include <cstdlib>
 
 #include <ros/ros.h>
 #include <ros/callback_queue.h>
@@ -75,7 +77,21 @@ public:
     if (initial_shell_recovery_enabled_ && (geometry_backend_!="primitive" ||
         !std::isfinite(shell_execution_margin_m_) || shell_execution_margin_m_<0. ||
         shell_execution_margin_m_>=swept_volume_margin_m_ || !std::isfinite(shell_occupied_margin_m_))) return false;
-    if (include_measured_body_ || initial_shell_recovery_enabled_) {
+    const char* response = std::getenv("CARE_BRAKE_RESPONSE_VBC");
+    brake_response_ = response && std::string(response) == "true" &&
+        predicted_trajectory_topic_ == "/care_planner/optimized_trajectory" &&
+        geometry_backend_ == "primitive" && !include_measured_body_;
+    if (brake_response_) {
+      auto options = ros::SubscribeOptions::create<sensor_msgs::JointState>(
+          "/care_arm/arm_group_velocity_controller/command_stamped", 1,
+          [this](const sensor_msgs::JointStateConstPtr& msg) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            latest_command_ = msg;
+          }, ros::VoidConstPtr(), &measured_queue_);
+      command_sub_ = nh_.subscribe(options);
+      ROS_INFO("Measured-state brake response sweep enabled for candidate VBC");
+    }
+    if (include_measured_body_ || initial_shell_recovery_enabled_ || brake_response_) {
       // Receive state while the serialized verifier performs FK and map RPCs.
       // Only this immutable pointer is updated here; geometry, evidence and the
       // per-audit FK ledger stay on the original single verification queue.
@@ -291,6 +307,7 @@ private:
     double initial_support_distance_m = std::numeric_limits<double>::quiet_NaN();
     bool initial_support_unknown = false;
     bool initial_shell_certified = false;
+    bool response_requires_free = false;
     bool full_path_excluded = false;
     Eigen::Vector3d sample_center_base = Eigen::Vector3d::Zero();
     double raw_sample_radius_m = 0.0;
@@ -1578,9 +1595,75 @@ private:
     return false;
   }
 
+  bool appendBrakeResponse(
+      const trajectory_msgs::JointTrajectory& trajectory, const std::vector<int>& mapping,
+      const std::vector<int>& indices, const std::vector<double>& times,
+      std::vector<SweepVoxel>& swept, std::set<CandidateKey>& response_points)
+  {
+    sensor_msgs::JointStateConstPtr measured, command;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      measured = latest_measured_;
+      command = latest_command_;
+    }
+    const auto now = ros::Time::now();
+    const auto fresh = [&now](const sensor_msgs::JointStateConstPtr& msg) {
+      return msg && !msg->header.stamp.isZero() && now >= msg->header.stamp &&
+          (now - msg->header.stamp).toSec() <= .05 && msg->velocity.size() == msg->name.size();
+    };
+    if (!fresh(measured) || !fresh(command) || measured->position.size() != measured->name.size())
+      return false;
+    Eigen::VectorXd q(mapping.size()), v(mapping.size()), u(mapping.size());
+    for (std::size_t j = 0; j < mapping.size(); ++j) {
+      const auto& name = evaluator_.activeJointNames()[j];
+      const auto m = std::find(measured->name.begin(), measured->name.end(), name);
+      const auto c = std::find(command->name.begin(), command->name.end(), name);
+      if (m == measured->name.end() || c == command->name.end()) return false;
+      const auto i = std::distance(measured->name.begin(), m);
+      q[j] = measured->position[i];
+      v[j] = measured->velocity[i];
+      u[j] = command->velocity[std::distance(command->name.begin(), c)];
+    }
+    if (!q.allFinite() || !v.allFinite() || !u.allFinite()) return false;
+    const double age = (now - measured->header.stamp).toSec();
+    const auto paths = care_confidence_map::predictBrakeResponse(trajectory, mapping, q, v, u, age);
+    const care_confidence_map::VbcGrid grid{
+        {map_x_min_, map_y_min_, map_z_min_}, {map_x_max_, map_y_max_, map_z_max_}, map_resolution_};
+    std::set<CandidateKey> covered;
+    for (const auto& voxel : swept) covered.insert(candidateKey(voxel.point_base));
+    for (const auto& path : paths) {
+      std::vector<double> response_times;
+      std::vector<int> response_indices;
+      for (std::size_t i = 0; i < path.size(); ++i) {
+        const double time = i == 0 ? 0. : std::max(age, .000001) + .01 * (i - 1);
+        response_times.push_back(time);
+        const auto match = std::upper_bound(times.begin(), times.end(), time);
+        const auto j = match == times.begin() ? 0 : std::distance(times.begin(), match) - 1;
+        response_indices.push_back(indices[j]);
+      }
+      std::vector<care_confidence_map::VbcPrimitiveFrame> frames;
+      std::vector<double> frame_times;
+      std::vector<int> frame_indices;
+      std::string error;
+      if (!primitive_model_.computeContinuousTrajectory(evaluator_, path, response_indices, response_times,
+              &frames, &frame_indices, &frame_times, &error, true)) return false;
+      auto extra = care_confidence_map::buildPrimitiveSweptVoxels<SweepVoxel>(
+          frames, frame_indices, frame_times, grid, swept_volume_margin_m_, voxelSupportRadius());
+      for (auto& voxel : extra) {
+        const auto key = candidateKey(voxel.point_base);
+        // Retain response points also found in the nominal broad phase. Its
+        // nominal-only exclusion proof may otherwise discard their sweep.
+        response_points.insert(key);
+        if (covered.insert(key).second) swept.push_back(std::move(voxel));
+      }
+    }
+    return true;
+  }
+
   bool isViolation(const Candidate& c) const
   {
-    return !c.initial_shell_certified && (!c.nominally_visible || c.margin_s < min_margin_s_);
+    return c.response_requires_free ||
+        (!c.initial_shell_certified && (!c.nominally_visible || c.margin_s < min_margin_s_));
   }
 
   bool betterViolation(const Candidate& a, const Candidate& b) const
@@ -1870,6 +1953,7 @@ private:
     oss << "vbc success=1 has_violation=0"
         << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
         << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
+        << " brake_response_checked=" << (brake_response_ && trajectory_source == "predicted")
         << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " sweep_refinement_checks=" << last_sweep_refinement_checks_
@@ -1983,6 +2067,7 @@ private:
     oss << "vbc success=1 has_violation=1"
         << " spatial_support=" << (geometry_backend_ == "primitive" ? "urdf_primitive_volume" : "body_sphere_volume")
         << " continuous_linear_sweep=" << (geometry_backend_ == "primitive")
+        << " brake_response_checked=" << (brake_response_ && trajectory_source == "predicted")
         << " include_measured_body=" << include_measured_body_
         << " swept_voxel_query_count=" << last_swept_voxel_query_count_
         << " sweep_refinement_checks=" << last_sweep_refinement_checks_
@@ -2236,6 +2321,13 @@ private:
       ROS_ERROR_STREAM_THROTTLE(2.0, "VBC geometry evaluation failed: " << e.what());
       return;
     }
+    std::set<CandidateKey> response_points;
+    if (brake_response_ && trajectory_source == "predicted" &&
+        !appendBrakeResponse(traj, curve_mapping, original_indices, eval_times_s,
+                             swept_voxels, response_points)) {
+      ROS_WARN_THROTTLE(1., "Candidate VBC waiting for a fresh brake-response state");
+      return;
+    }
     current_eval_timing_.swept_voxel_build_ms = wallMs(swept_begin);
     last_swept_voxel_query_count_ = swept_voxels.size();
     if (swept_voxels.empty())
@@ -2316,18 +2408,25 @@ private:
       const double current_visibility = static_cast<double>(
           confidence_srv.response.current_visibility[i]);
       if (!inside) continue;
-      if (confidence > frontier_confidence_threshold_ ||
-          current_visibility > 0.5) {
+      const SweepVoxel& voxel = swept_voxels[i];
+      const CandidateKey key = candidateKey(voxel.point_base);
+      const bool response = response_points.count(key) != 0;
+      if (response && confidence_srv.response.evidence_occupancy.size() != swept_voxels.size()) {
+        ROS_ERROR_THROTTLE(1., "Candidate VBC missing brake-response occupancy evidence");
+        return;
+      }
+      if (response ? confidence > frontier_confidence_threshold_ &&
+                         confidence_srv.response.evidence_occupancy[i] <= .5
+                   : confidence > frontier_confidence_threshold_ || current_visibility > .5) {
         shell_recovery_.observedFree(swept_voxels[i].point_base); continue;
       }
 
-      const SweepVoxel& voxel = swept_voxels[i];
       const int refinement_before = refinement_fk_remaining;
       std::string refinement_status = geometry_backend_ == "primitive"
           ? (voxel.primitive_signed_distance_m <= swept_volume_margin_m_ + 1e-12
               ? "representative_inside_margin" : "fk_budget_exhausted")
           : "not_applicable";
-      if (!(shell_eligible && current_geometric_restore_) && geometry_backend_ == "primitive" &&
+      if (!response && !(shell_eligible && current_geometric_restore_) && geometry_backend_ == "primitive" &&
           voxel.primitive_signed_distance_m > swept_volume_margin_m_ + 1e-12 &&
           refinement_fk_remaining > 0) {
         // The first enclosing frame can be outside the nominal margin while
@@ -2357,7 +2456,7 @@ private:
         refinement_status = "continuous_exclusion_budget_exhausted";
       if(shell_eligible && current_geometric_restore_)
         refinement_status="deferred_for_mandatory_certificate";
-      const CandidateKey key = candidateKey(voxel.point_base);
+      if (response) refinement_status = "brake_response_sweep";
       auto it = candidate_map.find(key);
       if (it == candidate_map.end())
       {
@@ -2370,6 +2469,7 @@ private:
         candidate.source_collision_name = voxel.source_collision_name;
         candidate.primitive_signed_distance_m = voxel.primitive_signed_distance_m;
         candidate.refinement_status = refinement_status;
+        candidate.response_requires_free = response;
         candidate.refinement_fk_before = refinement_before;
         candidate.refinement_fk_after = refinement_fk_remaining;
         candidate.candidate_margin_m = swept_volume_margin_m_;
@@ -2486,7 +2586,7 @@ private:
       if(certified) {
         const auto before=candidates.size();
         candidates.erase(std::remove_if(candidates.begin(),candidates.end(),
-            [](const Candidate& c){return c.full_path_excluded;}),candidates.end());
+            [](const Candidate& c){return c.full_path_excluded && !c.response_requires_free;}),candidates.end());
         last_sweep_refinement_excluded_+=before-candidates.size();
       }
     }
@@ -2889,6 +2989,9 @@ private:
   std::string primitive_urdf_file_;
   care_confidence_map::VbcPrimitiveModel primitive_model_;
   bool include_measured_body_ = false;
+  bool brake_response_ = false;
+  ros::Subscriber command_sub_;
+  sensor_msgs::JointStateConstPtr latest_command_;
   ros::CallbackQueue measured_queue_;
   ros::AsyncSpinner measured_spinner_;
   ros::Subscriber measured_sub_;

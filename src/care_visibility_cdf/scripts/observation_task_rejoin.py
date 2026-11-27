@@ -5,6 +5,110 @@ import time
 import numpy as np
 
 
+class OptionalSearchExpired(RuntimeError):
+    """Optional ranking work expired; retain the checked first proposal."""
+
+
+class OptionalSearchWork:
+    """Per-generation measured compute units; no extra model calls or I/O."""
+    def __init__(self):
+        self.max_s = {}
+        self.calls = {}
+
+    def estimate(self, kind):
+        return self.max_s.get(kind, max(self.max_s.values(), default=0.))
+
+    def call(self, guard, stage, kind, function, *args, **kwargs):
+        started = time.monotonic()
+        if guard is not None:
+            guard.admit(stage, kind, self.estimate(kind), started)
+        try:
+            result = function(*args, **kwargs)
+        except BaseException:
+            ended = time.monotonic()
+            self.observe(kind, ended-started)
+            if guard is not None:
+                guard.record(stage, kind, started, ended, returned=False)
+            raise
+        ended = time.monotonic()
+        self.observe(kind, ended-started)
+        if guard is not None:
+            guard.record(stage, kind, started, ended, returned=True)
+            guard.check(stage + '_end', now=ended)
+        return result
+
+    def observe(self, kind, elapsed):
+        self.max_s[kind] = max(self.max_s.get(kind, 0.), elapsed)
+        self.calls[kind] = self.calls.get(kind, 0) + 1
+
+
+class OptionalSearchBudget:
+    """One unchanged deadline, with measured admission and post-call checks.
+
+    Twice the largest observed unit of this kind plus 50ms is an empirical
+    reserve, not a hard realtime bound. A longer atomic call remains visible
+    in the original exit_overrun_s and must fail the original 150ms audit.
+    """
+    def __init__(self, context, limit_s=1.5, work=None):
+        if not math.isfinite(limit_s) or limit_s < 0.:
+            raise ValueError('invalid optional search limit')
+        self.limit_s = limit_s
+        self.work = OptionalSearchWork() if work is None else work
+        self.started = time.monotonic()
+        self.deadline = self.started + limit_s
+        for source in (context, context.get('completion') or {}):
+            value = source.get('deadline_monotonic_s')
+            if isinstance(value, (int, float)) and math.isfinite(value):
+                self.deadline = min(self.deadline, value)
+        self.last_stage = 'first_geometry_accepted'
+        self.expired_stage = None
+        self.stop_reason = None
+        self.stop_stage = None
+        self.exit_reserve_s = .05
+        self.cost_multiplier = 2.
+        self.last_units = []
+        self.estimated_next_unit_s = None
+
+    def remaining(self):
+        return max(0., self.deadline-time.monotonic())
+
+    def check(self, stage, now=None):
+        self.last_stage = stage
+        if (time.monotonic() if now is None else now) >= self.deadline:
+            if self.expired_stage is None:
+                self.expired_stage = stage
+            if self.stop_reason is None:
+                self.stop_reason, self.stop_stage = 'deadline', stage
+            raise OptionalSearchExpired(stage)
+
+    def admit(self, stage, kind, measured_cost_s, now):
+        self.check(stage + '_start', now=now)
+        required = self.cost_multiplier * measured_cost_s + self.exit_reserve_s
+        self.estimated_next_unit_s = required
+        if self.deadline-now <= required:
+            self.stop_reason, self.stop_stage = 'insufficient_remaining_time', stage
+            raise OptionalSearchExpired(stage)
+
+    def record(self, stage, kind, started, ended, returned):
+        self.last_units.append(dict(stage=stage, kind=kind,
+            start_s=started-self.started, end_s=ended-self.started,
+            wall_s=ended-started, returned=returned))
+        if len(self.last_units) > 8:
+            del self.last_units[0]
+
+    def diagnostic(self):
+        now = time.monotonic()
+        return dict(limit_s=self.limit_s, effective_budget_s=max(0., self.deadline-self.started),
+                    elapsed_s=now-self.started, expired=self.expired_stage is not None,
+                    expired_stage=self.expired_stage, last_stage=self.last_stage,
+                    exit_overrun_s=max(0., now-self.deadline),
+                    stop_reason=self.stop_reason, stop_stage=self.stop_stage,
+                    last_units=list(self.last_units), measured_unit_max_s=dict(self.work.max_s),
+                    unit_calls=dict(self.work.calls), estimated_next_unit_s=self.estimated_next_unit_s,
+                    cost_multiplier=self.cost_multiplier, exit_reserve_s=self.exit_reserve_s,
+                    clock='monotonic', enforcement='cooperative_before_and_after_compute_units')
+
+
 def task_rejoin_context(q_start, q_task, velocity, acceleration, source=None):
     arrays = [np.asarray(a, dtype=float).reshape(7)
               for a in (q_start, q_task, velocity, acceleration)]
@@ -46,7 +150,8 @@ def ranking_total(cost, completion=False):
     return total + (penalty / cost.get('ros_per_wall_s', 1.) if completion else penalty)
 
 
-def candidate_cost(q, context, pose, task_pose):
+def candidate_cost(q, context, pose, task_pose, budget=None):
+    if budget is not None:budget.check('candidate_cost_start')
     q = np.asarray(q, dtype=float).reshape(7)
     if not np.all(np.isfinite(q)):
         raise ValueError('nonfinite observation candidate')
@@ -63,8 +168,12 @@ def candidate_cost(q, context, pose, task_pose):
                 task_pose_error=max(position/.02, angle/.2))
     evaluator=context.get('corridor_evaluator')
     if evaluator is not None:
-        try:preview=evaluator(q,context)
+        if budget is not None:budget.check('corridor_query_start')
+        query_context = dict(context, _search_budget=budget) if budget is not None else context
+        try:preview=evaluator(q,query_context)
+        except OptionalSearchExpired:raise
         except Exception:preview=dict(status='unavailable')
+        if budget is not None:budget.check('corridor_query_end')
         result['corridor_preview']=preview
         result['corridor_used']=preview.get('status')=='valid'
         if result['corridor_used']:

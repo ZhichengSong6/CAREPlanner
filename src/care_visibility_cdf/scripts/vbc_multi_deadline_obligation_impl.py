@@ -363,9 +363,11 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
             source_trajectory_stamp_ns=int(trajectory.header.stamp.to_nsec()),
             trajectory_source=str(trajectory_source))
         try:
-            result = RollingVbcDeadlineWaypointNode._generate_active_set_waypoint(
-                self, region["points"], trajectory, sweep_time_s,
-                trajectory_received)
+            result = region.get('independent_view_waypoint')
+            if result is None:
+                result = RollingVbcDeadlineWaypointNode._generate_active_set_waypoint(
+                    self, region["points"], trajectory, sweep_time_s,
+                    trajectory_received)
         except Exception as exc:
             self._trace_observation("generation_failed", generation_event_id=generation_id,
                 error=str(exc), compute_ms=1000.0*(time.perf_counter()-t_generate_start))
@@ -520,6 +522,9 @@ class AccumulatedMultiDeadlineWaypointNode(RollingVbcDeadlineWaypointNode):
                     "compute_ms", math.nan)),
             "q_vis_generation_ms": float(q_vis_generation_ms),
         }
+        proposal = result.get('per_sensor_hybrid') or {}
+        if proposal.get('proposal_kind') == 'local_r1_direction' and not override_applied:
+            ob['per_sensor_hybrid'] = proposal
         if getattr(self, '_activation_refresh', None) is not None:
             from observation_activation_refresh import accepted_candidate_pool
             ob['activation_candidate_pool'] = accepted_candidate_pool(

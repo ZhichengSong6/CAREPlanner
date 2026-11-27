@@ -76,7 +76,7 @@ def main():
             delta=max(abs(values[n]-q) for n,q in zip(gate['joint_names'],gate['initial_q']))
             state['maximum_prearm_joint_deviation_rad']=max(delta,state['maximum_prearm_joint_deviation_rad'])
             joint_wall=time.monotonic()
-            if delta>gate['maximum_prearm_joint_deviation_rad']:trip('initial_bootstrap_joint_bound_exceeded',deviation_rad=delta)
+            if delta>gate['maximum_prearm_joint_deviation_rad']:trip('initial_task_joint_bound_exceeded',deviation_rad=delta)
     def armed(msg):
         with lock:
             if msg.data==os.environ.get('CARE_BENCHMARK_ARM_TOKEN') and msg.data:

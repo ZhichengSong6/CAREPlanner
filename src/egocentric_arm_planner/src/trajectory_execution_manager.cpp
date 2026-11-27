@@ -93,6 +93,8 @@ bool TrajectoryExecutionManager::initialize(const ros::NodeHandle& nh,
 
   summary_pub_ = nh_.advertise<std_msgs::String>(
       summary_topic_, 10);
+  rejection_pub_ = nh_.advertise<std_msgs::String>(
+      "/care_planner/execution/trajectory_rejection", 20);
 
   replan_request_pub_ = nh_.advertise<std_msgs::Bool>(
       replan_request_topic_, 10);
@@ -387,7 +389,12 @@ void TrajectoryExecutionManager::trajectoryCallback(
   if(enforce_motion_limits_) {
     const auto failure=executionMotionViolation(*msg,mapping,reference_velocity_limits_,reference_acceleration_limits_);
     if(!failure.empty()) {
-      ROS_ERROR_STREAM_THROTTLE(.5,"Reject committed execution motion: "<<failure);return;
+      std_msgs::String response;
+      response.data = "execution_stamp_ns=" + std::to_string(msg->header.stamp.toNSec()) +
+          " reason=" + failure;
+      rejection_pub_.publish(response);
+      ROS_ERROR_STREAM_THROTTLE(.5,"Reject committed execution motion: "<<failure);
+      return;
     }
   }
   if (!std::isfinite(duration) || duration < 0.0) {

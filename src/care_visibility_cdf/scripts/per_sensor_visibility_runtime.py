@@ -56,7 +56,8 @@ from check_visibility_self_occlusion import (
     raycast_self_occlusion_many,
 )
 from candidate_replacement_runtime import replacement_mount_group_pool
-from observation_task_rejoin import candidate_cost, improves_candidate, alternative_can_improve
+from observation_task_rejoin import (candidate_cost, improves_candidate, alternative_can_improve,
+                                     OptionalSearchBudget, OptionalSearchExpired, OptionalSearchWork)
 from observation_corridor_cost import approach_visibility_order
 
 
@@ -567,6 +568,29 @@ class PerSensorVisibilityRuntime:
             order.detach().cpu().numpy().astype(np.int64),
         )
 
+    def rank_local_branches(self, points, q):
+        """Rank the heads at one measured pose and reuse its graph for selected derivatives."""
+        points = points.detach().reshape(-1, 3)
+        q_var = q.detach().reshape(1, 7).clone().requires_grad_(True)
+        if not len(points) or not torch.isfinite(points).all() or not torch.isfinite(q_var).all():
+            raise ValueError("Local R1 ranking requires finite region points and joint positions")
+        with torch.enable_grad():
+            inputs = torch.cat((points, q_var.expand(len(points), -1)), dim=-1)
+            values = self.model(inputs)
+            _validate_sensor_output(values, len(points))
+        order = torch.argsort(values.detach().min(dim=0).values, descending=True).cpu().tolist()
+
+        def gradient(sensor, retain):
+            with torch.enable_grad():
+                score = values[:, sensor].min()
+                grad = torch.autograd.grad(score, q_var, retain_graph=retain)[0]
+            if not torch.isfinite(grad).all():
+                raise RuntimeError("Nonfinite local R1 derivative")
+            grad = grad * self.sensor_masks[sensor:sensor+1]
+            return float(score.detach()), grad.detach().cpu().numpy().reshape(7).astype(np.float64)
+
+        return order, gradient
+
     def branch_value_and_grad(
         self, points: torch.Tensor, q: torch.Tensor, sensor_id: int
     ) -> Tuple[float, torch.Tensor]:
@@ -724,7 +748,9 @@ class PerSensorVisibilityRuntime:
         fa: float,
         qb: torch.Tensor,
         fb: float,
+        budget=None, work=None,
     ) -> Tuple[torch.Tensor, float, List[Dict[str, object]]]:
+        work = OptionalSearchWork() if work is None else work
         lo = qa.detach().clone()
         hi = qb.detach().clone()
         flo = float(fa)
@@ -737,8 +763,9 @@ class PerSensorVisibilityRuntime:
             best_q, best_f = hi.clone(), fhi
 
         for iteration in range(1, self.root_refine_iters + 1):
+            if budget is not None:budget.check('branch_root_refinement')
             mid = 0.5 * (lo + hi)
-            fm = self.branch_score(points, mid, sensor_id)
+            fm = work.call(budget, 'branch_root_score', 'score', self.branch_score, points, mid, sensor_id)
             history.append({
                 "iter": int(iteration),
                 "score": float(fm),
@@ -758,23 +785,25 @@ class PerSensorVisibilityRuntime:
 
     def _optimize_branch(
         self, points: torch.Tensor, q_start: torch.Tensor, sensor_id: int,
-        geometry_guided: bool = False, geometry_threshold: float = 0.0,
+        geometry_guided: bool = False, geometry_threshold: float = 0.0, budget=None, work=None,
     ) -> Dict[str, object]:
         """Legacy-scalar-style per-head projection -> root -> ascent."""
+        work = OptionalSearchWork() if work is None else work
+        if budget is not None:budget.check('branch_start')
         if os.environ.get('CARE_VISIBILITY_BACKEND', 'r1') == 'geometry':
             from geometry_visibility_backend import optimize_branch
-            return optimize_branch(self,points,q_start,sensor_id)
+            return work.call(budget, 'geometry_backend', 'geometry', optimize_branch, self,points,q_start,sensor_id)
         sensor_id = int(sensor_id)
         q0, initial_clamped = self._clamp(
             q_start.detach().clone().reshape(1, 7)
         )
         q = q0.clone()
 
-        initial_score = self.branch_score(points, q, sensor_id)
+        initial_score = work.call(budget, 'branch_initial_score', 'score', self.branch_score, points, q, sensor_id)
         best_q = q.clone()
         best_score = float(initial_score)
         best_geometry_q = q.clone()
-        best_geometry = (self._proposal_fov_objective(points.detach().cpu().numpy(),
+        best_geometry = (work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),
             q[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf)
 
         projection_history: List[Dict[str, object]] = [{
@@ -806,6 +835,7 @@ class PerSensorVisibilityRuntime:
             root_found = True
 
         for iteration in range(1, self.projection_iters + 1):
+            if budget is not None:budget.check('branch_projection')
             if q_zero is not None:
                 break
 
@@ -814,25 +844,25 @@ class PerSensorVisibilityRuntime:
                 projection_history[-1]['geometry_quality'] -
                 projection_history[max(0, len(projection_history)-3)]['geometry_quality'] < .001)
             if geometry_stalled:
-                score, grad, objective = self._ascent_objective(
+                score, grad, objective = work.call(budget, 'ascent_objective', 'gradient', self._ascent_objective, 
                     points,q,sensor_id,True,geometry_threshold)
                 if objective == 'proposal_fov':
-                    score = self._proposal_fov_objective(points.detach().cpu().numpy(),
+                    score = work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),
                         q[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
                     projection_objective = objective
             else:
-                score, grad = self.branch_value_and_grad(points, q, sensor_id)
-            q_next, diag = self._projection_step(q, score, grad)
+                score, grad = work.call(budget, 'branch_value_and_grad', 'gradient', self.branch_value_and_grad, points, q, sensor_id)
+            q_next, diag = work.call(budget, 'projection_step', 'step', self._projection_step, q, score, grad)
             if bool(diag["degenerate"]):
                 root_source = "degenerate_projection_gradient"
                 break
 
-            f_next = self.branch_score(points, q_next, sensor_id)
+            f_next = work.call(budget, 'branch_projection_score', 'score', self.branch_score, points, q_next, sensor_id)
             if f_next > best_score:
                 best_score = float(f_next)
                 best_q = q_next.clone()
             if geometry_guided:
-                geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),
+                geometry = work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),
                     q_next[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
                 if geometry > best_geometry:
                     best_geometry,best_geometry_q = geometry,q_next.clone()
@@ -853,7 +883,7 @@ class PerSensorVisibilityRuntime:
 
             if f_current * f_next <= 0.0 and f_current != f_next:
                 q_zero, f_zero, root_history = self._refine_branch_root(
-                    points, sensor_id, q, f_current, q_next, f_next
+                    points, sensor_id, q, f_current, q_next, f_next, budget=budget, work=work
                 )
                 root_source = "branch_sign_crossing_bisection"
                 root_found = True
@@ -872,13 +902,14 @@ class PerSensorVisibilityRuntime:
         if q_zero is not None:
             q_vis = q_zero.clone()
             for step in range(1, self.branch_ascent_steps + 1):
-                score, grad, objective = self._ascent_objective(
+                if budget is not None:budget.check('branch_ascent')
+                score, grad, objective = work.call(budget, 'ascent_objective', 'gradient', self._ascent_objective, 
                     points,q_vis,sensor_id,geometry_guided and step>self.branch_ascent_steps-2,geometry_threshold)
-                q_next, diag = self._ascent_step(q_vis, grad)
+                q_next, diag = work.call(budget, 'ascent_step', 'step', self._ascent_step, q_vis, grad)
                 if bool(diag["degenerate"]):
                     break
                 q_vis = q_next.detach()
-                f_next = self.branch_score(points, q_vis, sensor_id)
+                f_next = work.call(budget, 'branch_ascent_score', 'score', self.branch_score, points, q_vis, sensor_id)
                 best_score = max(best_score, float(f_next))
                 ascent_history.append({
                     "step": int(step),
@@ -900,14 +931,15 @@ class PerSensorVisibilityRuntime:
             q_vis = best_geometry_q.clone() if geometry_guided else best_q.clone()
             best_shared_q = q_vis.clone()
             best_shared_score = float(best_score)
-            best_shared_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),best_shared_q[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
+            best_shared_geometry = work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),best_shared_q[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
             for step in range(1, self.branch_fallback_ascent_steps + 1):
-                score, grad, objective = self._ascent_objective(
+                if budget is not None:budget.check('branch_fallback_ascent')
+                score, grad, objective = work.call(budget, 'ascent_objective', 'gradient', self._ascent_objective, 
                     points,q_vis,sensor_id,geometry_guided,geometry_threshold)
-                q_next, diag = self._ascent_step(q_vis, grad)
+                q_next, diag = work.call(budget, 'ascent_step', 'step', self._ascent_step, q_vis, grad)
                 if bool(diag["degenerate"]):
                     break
-                f_next = self.branch_score(points, q_next, sensor_id)
+                f_next = work.call(budget, 'branch_fallback_score', 'score', self.branch_score, points, q_next, sensor_id)
                 ascent_history.append({
                     "step": int(step),
                     "score": float(f_next),
@@ -922,7 +954,7 @@ class PerSensorVisibilityRuntime:
                     .detach().cpu().numpy().astype(float).tolist(),
                 })
                 q_vis = q_next.detach()
-                current_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),q_vis[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
+                current_geometry = work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),q_vis[0].detach().cpu().numpy(),sensor_id,geometry_threshold) if geometry_guided else -math.inf
                 if ((geometry_guided and current_geometry>best_shared_geometry+1e-8) or
                         (not geometry_guided and f_next > best_shared_score)):
                     best_shared_score = float(f_next)
@@ -932,17 +964,18 @@ class PerSensorVisibilityRuntime:
             q_vis = best_shared_q
             best_score = max(best_score, best_shared_score)
             q_zero = best_q.clone()
-            f_zero = float(self.branch_score(points, q_zero, sensor_id))
+            f_zero = float(work.call(budget, 'fallback_root_score', 'score', self.branch_score, points, q_zero, sensor_id))
             if root_source == "none":
                 root_source = "branch_root_not_found"
             solution_mode = "branch_best_effort_ascent"
 
         if geometry_guided:
-            current_geometry = self._proposal_fov_objective(points.detach().cpu().numpy(),
+            current_geometry = work.call(budget, 'proposal_fov_objective', 'geometry', self._proposal_fov_objective, points.detach().cpu().numpy(),
                 q_vis[0].detach().cpu().numpy(),sensor_id,geometry_threshold)
             if best_geometry > current_geometry + 1e-8:
                 q_vis = best_geometry_q
-        final_score = self.branch_score(points, q_vis, sensor_id)
+        if budget is not None:budget.check('branch_final_score')
+        final_score = work.call(budget, 'branch_final_score', 'score', self.branch_score, points, q_vis, sensor_id)
 
         return {
             "sensor_id": sensor_id,
@@ -1188,6 +1221,8 @@ class PerSensorVisibilityRuntime:
         selected = None
         first_accepted = None
         rejoin_start = None
+        search_budget = None
+        search_work = OptionalSearchWork()
         task_pose = None
         rejoin_diagnostic = dict(enabled=task_rejoin is not None and replacement is None,
             selected_by='first_geometry_accepted', candidates=[])
@@ -1318,6 +1353,9 @@ class PerSensorVisibilityRuntime:
                                   'minimum_conservative_g', self.min_conservative_g)))
 
         for rank, sensor_id in selection:
+            if search_budget is not None:
+                try:search_budget.check('alternative_start')
+                except OptionalSearchExpired:break
             if first_accepted is not None and rejoin_diagnostic['enabled']:
                 elapsed = time.perf_counter() - rejoin_start
                 possible = alternative_can_improve(first_accepted['task_rejoin_cost'], task_rejoin, elapsed)
@@ -1333,14 +1371,19 @@ class PerSensorVisibilityRuntime:
             branch_tic = time.perf_counter()
             try:
                 if replacement is None:
-                    branch = self._optimize_branch(points, branch_seed, int(sensor_id))
+                    branch = self._optimize_branch(points, branch_seed, int(sensor_id),
+                        work=search_work, **({'budget':search_budget} if search_budget is not None else {}))
                 else:
                     branch = self._optimize_branch(points, branch_seed, int(sensor_id),
-                        geometry_guided=True,geometry_threshold=geometry_threshold)
-                geometry = self._candidate_geometry(
+                        geometry_guided=True,geometry_threshold=geometry_threshold,work=search_work)
+                if search_budget is not None:search_budget.check('branch_geometry_start')
+                geometry = search_work.call(search_budget, 'branch_geometry', 'geometry', self._candidate_geometry,
                     points_np, branch["q_candidate"], int(sensor_id),
                     minimum_conservative_g=geometry_threshold,
                 )
+                if search_budget is not None:search_budget.check('branch_geometry_end')
+            except OptionalSearchExpired:
+                break
             except Exception as exc:
                 if first_accepted is None or not rejoin_diagnostic['enabled']:
                     raise
@@ -1357,33 +1400,44 @@ class PerSensorVisibilityRuntime:
                 if first_accepted is None:
                     first_accepted = selected = attempt
                     rejoin_start = time.perf_counter()
+                    if rejoin_diagnostic['enabled']:
+                        search_budget = OptionalSearchBudget(task_rejoin, work=search_work)
                 if not rejoin_diagnostic['enabled']:
                     break
-                pose = fk_transform(self.task_ee_chain,
-                    q_row_to_map(DEFAULT_JOINT_NAMES, branch['q_candidate']))
-                cost_context=task_rejoin
-                paired=task_rejoin.get('paired_corridor_evaluator')
-                if paired is not None and attempt is not first_accepted:
-                    # First-candidate pruning retains its original information.
-                    # Replace the second legacy RPC with one common pair query.
-                    cost_context=dict(task_rejoin)
-                    cost_context.pop('corridor_evaluator',None)
-                cost = candidate_cost(branch['q_candidate'], cost_context, pose, task_pose)
-                approach_tic = time.perf_counter()
                 try:
-                    approach_order=approach_visibility_order(self,points_np,task_rejoin['q_start'],
-                        branch['q_candidate'],int(sensor_id))
-                except Exception as exc:
-                    approach_order=dict(status='unavailable',reason=str(exc))
+                    search_budget.check('candidate_ranking_start')
+                    pose = fk_transform(self.task_ee_chain,
+                    q_row_to_map(DEFAULT_JOINT_NAMES, branch['q_candidate']))
+                    cost_context=task_rejoin
+                    paired=task_rejoin.get('paired_corridor_evaluator')
+                    if paired is not None and attempt is not first_accepted:
+                        cost_context=dict(task_rejoin)
+                        cost_context.pop('corridor_evaluator',None)
+                    cost = search_work.call(search_budget, 'candidate_cost', 'ranking', candidate_cost, branch['q_candidate'], cost_context, pose, task_pose,
+                                          budget=search_budget)
+                    approach_tic = time.perf_counter()
+                    try:
+                        approach_order=search_work.call(search_budget, 'approach_order', 'geometry', approach_visibility_order, self,points_np,task_rejoin['q_start'],
+                            branch['q_candidate'],int(sensor_id),budget=search_budget)
+                    except OptionalSearchExpired:raise
+                    except Exception as exc:
+                        approach_order=dict(status='unavailable',reason=str(exc))
+                    search_budget.check('approach_ranking_end')
+                except OptionalSearchExpired:
+                    break
                 attempt['approach_visibility_order_ms'] = 1000.*(time.perf_counter()-approach_tic)
                 cost['approach_visibility_order']=approach_order
                 if approach_order['status']=='valid':cost['approach_requires_detour']=approach_order['requires_detour']
                 attempt['branch_latency_ms'] = 1000.*(time.perf_counter()-branch_tic)
                 if paired is not None and attempt is not first_accepted:
                     from observation_task_corridor import replace_corridor_costs
-                    pair_context=dict(task_rejoin,paired_remaining_s=max(0.,1.5-(time.perf_counter()-rejoin_start)))
+                    pair_context=dict(task_rejoin,paired_remaining_s=search_budget.remaining(),
+                                      _search_budget=search_budget)
                     try:
-                        previews=paired([first_accepted['q_candidate'],branch['q_candidate']],pair_context)
+                        search_budget.check('paired_corridor_start')
+                        previews=search_work.call(search_budget, 'paired_corridor', 'ranking', paired, [first_accepted['q_candidate'],branch['q_candidate']],pair_context)
+                        search_budget.check('paired_corridor_end')
+                    except OptionalSearchExpired:break
                     except Exception as exc:
                         previews=[dict(status='unavailable',reason=str(exc)) for _ in range(2)]
                     prior_first_cost=first_accepted['task_rejoin_cost']
@@ -1400,6 +1454,8 @@ class PerSensorVisibilityRuntime:
                         remaining_budget_s=pair_context['paired_remaining_s'])
                 attempt['task_rejoin_cost'] = cost
                 rejoin_diagnostic['candidates'].append(dict(sensor_id=int(sensor_id), **cost))
+                try:search_budget.check('alternative_comparison')
+                except OptionalSearchExpired:break
                 # Once both branches have been computed, their elapsed search
                 # time is shared. Charge it when deciding whether to search
                 # another branch, not asymmetrically to a completed alternative.
@@ -1417,6 +1473,8 @@ class PerSensorVisibilityRuntime:
             int(first_accepted['sensor_id']) if first_accepted is not None else -1)
         rejoin_diagnostic['extra_compute_ms'] = (
             1000.*(time.perf_counter()-rejoin_start) if rejoin_start is not None else 0.)
+        if search_budget is not None:
+            rejoin_diagnostic['search_budget'] = search_budget.diagnostic()
 
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)

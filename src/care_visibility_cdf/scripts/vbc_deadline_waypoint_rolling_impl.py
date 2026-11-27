@@ -347,13 +347,17 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
 
     def _task_corridor_preview(self,q,context):
         tic=time.monotonic();runtime=self._per_sensor_runtime
-        approach=body_path_probes(runtime,context['q_start'],q)
-        rejoin=body_path_probes(runtime,q,context['q_task'])
+        budget=context.get('_search_budget')
+        if budget is not None:budget.check('legacy_corridor_start')
+        approach=body_path_probes(runtime,context['q_start'],q,budget=budget)
+        rejoin=body_path_probes(runtime,q,context['q_task'],budget=budget)
         points=sorted(set(approach+rejoin))
         req=QueryConfidenceSnapshotRequest();req.horizon_s=0.
         req.minimum_confidence=float(getattr(self,'seen_threshold',.6))
         req.points=[Point(*p) for p in points]
+        if budget is not None:budget.check('legacy_corridor_rpc_start')
         response=self._corridor_query(req)
+        if budget is not None:budget.check('legacy_corridor_rpc_end')
         result=snapshot_cost(response,points,approach,rejoin,rospy.Time.now().to_nsec(),req.minimum_confidence)
         result['wall_ms']=1000.*(time.monotonic()-tic)
         return result
@@ -663,8 +667,65 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 float(np.mean(np.asarray(g_nom) >= 0.0)) if g_nom else None),
         }
 
+    @property
+    def local_observation_directions(self):
+        return getattr(getattr(self, '_task_route', None), 'local_observation_directions', False)
+
+    def _local_r1_view(self, points, q0, excluded=()):
+        runtime = self._per_sensor_runtime
+        xyz = points.detach().cpu().numpy()
+        measured = q0[0].detach().cpu().numpy().astype(np.float64)
+        began = time.perf_counter()
+        order, derivative = runtime.rank_local_branches(points, q0)
+        ranked = time.perf_counter()
+        eligible = [int(sid) for sid in order if int(sid) not in excluded]
+        if not eligible:
+            return None
+        margins = {sid: runtime._fov_objective(xyz, measured, sid) for sid in eligible}
+        heads = dict.fromkeys([max(eligible, key=lambda sid: (margins[sid], -sid)), *eligible[:2]])
+        initial_geometry = time.perf_counter()
+        gradient_ms = 0.
+        candidates = []
+        for i,sid in enumerate(heads):
+            grad_start = time.perf_counter()
+            score, gradient = derivative(sid, i+1 < len(heads))
+            gradient_ms += 1000.*(time.perf_counter()-grad_start)
+            scale = np.max(np.abs(gradient))
+            if not np.isfinite(scale) or scale <= 1e-6:
+                continue
+            target, _ = self._clamp(q0.new_tensor((measured + (.05/scale)*gradient).reshape(1, 7)))
+            target = target[0].detach().cpu().numpy().astype(np.float64)
+            if np.max(np.abs(target-measured)) <= 1e-6:
+                continue
+            margin = runtime._fov_objective(xyz, target, sid)
+            if np.isfinite(margin):
+                candidates.append(dict(sensor_id=sid, q=target.tolist(),
+                    start_margin_m=float(margins[sid]), target_margin_m=float(margin),
+                    r1_value=float(score)))
+        if not candidates:
+            return None
+        best = max(candidates, key=lambda row: 2.*row['target_margin_m']-row['start_margin_m'])
+        sid = best['sensor_id']
+        frame = runtime.sensor_chains[sid][-1].child
+        mask = runtime.sensor_masks[sid].detach().cpu().numpy().astype(float).tolist()
+        q_vis = q0.new_tensor([best['q']])
+        candidates_ready = time.perf_counter()
+        f_min = float(np.min(self._per_point_values(points, q_vis)))
+        stage_ms = dict(rank=1000.*(ranked-began), start_fov=1000.*(initial_geometry-ranked),
+            heads_gradient=gradient_ms, target_and_fov=1000.*(candidates_ready-initial_geometry)-gradient_ms,
+            union=1000.*(time.perf_counter()-candidates_ready))
+        return dict(q_vis=best['q'], q_zero=measured.tolist(), q_vis_joint_mask=mask,
+            final_f_min=f_min, shared_solution_mode='stopped_view_local_r1',
+            per_sensor_hybrid_used=True, per_sensor_selected_sensor_id=sid,
+            per_sensor_selected_sensor_frame=frame,
+            per_sensor_selected_rank=int(list(order).index(sid))+1,
+            per_sensor_hybrid=dict(enabled=True, proposal_kind='local_r1_direction',
+                selected_sensor_id=sid, candidates=candidates, stage_ms=stage_ms))
+
     def _generate_active_set_waypoint(
             self, points_xyz, trajectory, sweep_time_s, trajectory_received):
+        generation_wall_start = time.perf_counter()
+        generation_cpu_start = time.process_time()
         points_np = np.asarray(points_xyz, dtype=np.float64).reshape(-1, 3)
         if points_np.shape[0] < 1 or not _finite(points_np):
             raise ValueError("active set must contain finite xyz points")
@@ -690,6 +751,35 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
         q0 = torch.tensor(
             q_nom_np.reshape(1, 7), device=self.device, dtype=torch.float32)
         q0, initial_clamped = self._clamp(q0)
+        if self.local_observation_directions:
+            state = self._activation_measured_state
+            if state is None or not 0. <= rospy.Time.now().to_sec() - state[2] <= .15:
+                raise ValueError('local R1 direction requires a fresh joint state')
+            measured = np.asarray(state[0], dtype=np.float64)
+            if measured.shape != (7,) or not np.isfinite(measured).all():
+                raise ValueError('local R1 direction requires seven finite joint positions')
+            q0, _ = self._clamp(x.new_tensor(measured.reshape(1, 7)))
+            retry = getattr(self, '_candidate_replacement_override', None) or {}
+            local = self._local_r1_view(x, q0, retry.get('excluded', ()))
+            if local is None:
+                raise ValueError('no local R1 observation direction for this blocker')
+            elapsed_ms = 1000. * (time.perf_counter() - generation_wall_start)
+            local['deadline_absolute_ros_s'] = deadline_abs_s
+            local['per_sensor_hybrid']['compute_ms'] = elapsed_ms
+            self._trace_observation('local_r1_observation_direction', points=points_np.tolist(),
+                sensor=local['per_sensor_selected_sensor_id'], compute_ms=elapsed_ms,
+                stage_ms=local['per_sensor_hybrid'].get('stage_ms', {}))
+            return local
+        if (os.environ.get('CARE_STOPPED_VIEW_OBJECTIVE') == 'true' and
+                self._per_sensor_runtime is not None and
+                getattr(self, '_seed_override', None) is not None and
+                getattr(self, '_candidate_replacement_override', None) is None):
+            local = self._local_r1_view(x, q0)
+            if local is not None:
+                local['deadline_absolute_ros_s'] = deadline_abs_s
+                local['per_sensor_hybrid']['compute_ms'] = (
+                    1000.*(time.perf_counter()-generation_wall_start))
+                return local
         q = q0.clone()
 
         f_current, grad_current = self._learned(x, q)
@@ -865,7 +955,22 @@ class RollingVbcDeadlineWaypointNode(VbcDeadlineWaypointNode):
                 "shared_fallback_ascent_steps": self.shared_fallback_ascent_steps,
             },
         }
-        return self._maybe_apply_per_sensor_hybrid(points_np, result)
+        hybrid_wall_start = time.perf_counter()
+        hybrid_cpu_start = time.process_time()
+        result = self._maybe_apply_per_sensor_hybrid(points_np, result)
+        ended_wall, ended_cpu = time.perf_counter(), time.process_time()
+        timing = dict(
+            total_wall_ms=1000.*(ended_wall-generation_wall_start),
+            total_process_cpu_ms=1000.*(ended_cpu-generation_cpu_start),
+            union_and_diagnostics_wall_ms=1000.*(hybrid_wall_start-generation_wall_start),
+            union_and_diagnostics_process_cpu_ms=1000.*(hybrid_cpu_start-generation_cpu_start),
+            hybrid_pipeline_wall_ms=1000.*(ended_wall-hybrid_wall_start),
+            hybrid_pipeline_process_cpu_ms=1000.*(ended_cpu-hybrid_cpu_start),
+            qualification='Sequential full-generator phases. Process CPU includes all process threads; neither phase certifies motion.')
+        result['generation_timing'] = timing
+        if isinstance(result.get('per_sensor_hybrid'), dict):
+            result['per_sensor_hybrid']['pipeline_timing'] = timing
+        return result
 
     def _maybe_generate(self) -> None:
         with self._lock:

@@ -35,6 +35,42 @@
 
 namespace egocentric_arm_planner {
 
+namespace {
+double stoppedViewMargin(const PrimitiveObservationGuard& geometry,
+    const Eigen::VectorXd& q, int sensor, const std::vector<Eigen::Vector3d>& points) {
+  static const std::string frames[] = {
+    "link2_sensor1_tof_link", "link2_sensor2_tof_link",
+    "link3_sensor1_tof_link", "link3_sensor2_tof_link",
+    "link4_sensor1_tof_link", "link4_sensor2_tof_link",
+    "EE_sensor1_tof_link", "EE_sensor2_tof_link"
+  };
+  Eigen::Isometry3d pose;
+  if (sensor < 0 || sensor >= 8 || points.empty() || !geometry.framePose(q, frames[sensor], &pose))
+    return std::numeric_limits<double>::quiet_NaN();
+  static const double tx = std::tan(55. * std::acos(-1.) / 360.);
+  static const double ty = std::tan(72. * std::acos(-1.) / 360.);
+  static const double nx = std::hypot(1., tx), ny = std::hypot(1., ty);
+  double margin = std::numeric_limits<double>::infinity();
+  for (const auto& point : points) {
+    const Eigen::Vector3d p = pose.linear().transpose() * (point-pose.translation());
+    margin = std::min({margin, (tx*p.z()-std::abs(p.x()))/nx,
+                      (ty*p.z()-std::abs(p.y()))/ny, p.z()-.15, .75-p.z()});
+  }
+  return margin;
+}
+
+Eigen::VectorXd brakeFromStart(Eigen::VectorXd q, Eigen::VectorXd v,
+    const RepairExecutableSettings& settings) {
+  for (int step=0; step<settings.max_brake_steps && v.cwiseAbs().maxCoeff()>1e-6; ++step) {
+    const Eigen::VectorXd next = v.array().sign() *
+        (v.array().abs()-settings.brake_dt*settings.acceleration.array()).max(0.);
+    q += .5*settings.brake_dt*(v+next);
+    v = next;
+  }
+  return q;
+}
+}  // namespace
+
 // Opt-in diagnostics share the exact setup/solve entry with the running planner.
 // Input snapshots are serialized before setup; failed solves cannot alter them.
 static std::string sparseQpInputJson(
@@ -382,6 +418,8 @@ bool LocalSparseSCPPlanner::initialize(
     }
   }
 
+  const char* live_route = std::getenv("CARE_LIVE_TOF_ROUTE");
+  reference_route_joint_objective_ = live_route && std::string(live_route) == "true";
   const char* probe_task_policy=std::getenv("CARE_PROBE_EXECUTABLE_TASK");
   probe_task_objective_enabled_=probe_task_policy && std::string(probe_task_policy)=="true";
   probe_task_settings_.acceleration=repair_executable_settings_.acceleration;
@@ -399,6 +437,51 @@ bool LocalSparseSCPPlanner::initialize(
   pnh_.param<std::string>("ee_frame",terminal_ee_frame_,"EE_link");
   if(terminal_retention_enabled_ && !primitive_observation_guard_enabled_) {
     ROS_ERROR("Terminal retention requires the initialized objective FK model");return false;
+  }
+  if (std::getenv("CARE_TASK_ROUTE_COMPARISON")) {
+    observed_task_route_sub_ = nh_.subscribe<trajectory_msgs::JointTrajectory>(
+        "/care_planner/rolling_task/observed_route", 1,
+        [this](const trajectory_msgs::JointTrajectoryConstPtr& msg) {
+          if (!msg || (msg->points.size() != 2 && msg->points.size() != 3) ||
+              msg->points[0].positions.size() != msg->joint_names.size() ||
+              msg->points[1].positions.size() != msg->joint_names.size()) return;
+          std::vector<int> mapping;
+          if (!buildTrajectoryMapping(*msg, mapping)) return;
+          Eigen::VectorXd target(dof_), goal(dof_);
+          for (int j = 0; j < dof_; ++j) {
+            target[j] = msg->points[0].positions[mapping[j]];
+            goal[j] = msg->points[1].positions[mapping[j]];
+          }
+          if (!target.allFinite() || !goal.allFinite() ||
+              (target.array() < q_min_.array()).any() ||
+              (target.array() > q_max_.array()).any()) return;
+          const double age = (ros::Time::now() - msg->header.stamp).toSec();
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (!terminal_goal_valid_ || age < 0. || age > .5) return;
+          if (msg->points.size() == 3) {
+            if (msg->points[2].positions.size() != msg->joint_names.size()) return;
+            Eigen::VectorXd terminal(dof_);
+            for (int j = 0; j < dof_; ++j) terminal[j] = msg->points[2].positions[mapping[j]];
+            Eigen::Matrix<double, 6, 1> error;
+            if (!terminal.allFinite() ||
+                (terminal.array() < q_min_.array()).any() ||
+                (terminal.array() > q_max_.array()).any() ||
+                !taskPoseResidual(primitive_observation_guard_, terminal, terminal_ee_frame_,
+                                  terminal_goal_, &error) ||
+                error.head<3>().norm() > .2 || error.tail<3>().norm() > .2) return;
+            observed_task_terminal_ = terminal;
+            ROS_INFO("[TASK_ROUTE] accepted terminal within the original goal region");
+          } else if (observed_task_route_goal_revision_ != terminal_goal_revision_ ||
+                     observed_task_route_goal_.size() != dof_ ||
+                     (observed_task_route_goal_ - goal).lpNorm<Eigen::Infinity>() >= .20) {
+            observed_task_terminal_.resize(0);
+          }
+          observed_task_route_target_ = target;
+          observed_task_route_precision_view_ = msg->header.frame_id == "measured_free_task_route/precision_view";
+          observed_task_route_goal_ = goal;
+          observed_task_route_goal_revision_ = terminal_goal_revision_;
+          ROS_INFO_STREAM("[TASK_ROUTE] accepted observed route token=" << msg->header.frame_id);
+        });
   }
   if(terminal_retention_enabled_ || primitive_observation_guard_.knownGroundEnabled()) {
     terminal_goal_sub_=nh_.subscribe("/care_planner/ee_target_pose",1,&LocalSparseSCPPlanner::terminalGoalCallback,this);
@@ -541,6 +624,7 @@ bool LocalSparseSCPPlanner::initialize(
       candidate_trajectory_topic_ + "/audit_context", 4);
   summary_pub_ =
       nh_.advertise<std_msgs::String>(summary_topic_, 20, true);
+  local_r1_handoff_pub_ = nh_.advertise<std_msgs::String>(summary_topic_ + "/observation_handoff", 20);
   witness_diagnostic_pub_ = nh_.advertise<std_msgs::String>(summary_topic_ + "/witness", 100);
   task_infeasible_pub_ =
       nh_.advertise<std_msgs::Bool>(task_infeasible_topic_, 10, false);
@@ -1340,7 +1424,13 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
   latest_single_waypoint_q_ = q;
   latest_single_waypoint_joint_mask_ = joint_mask;
   latest_observation_region_.clear(); latest_observation_sensor_=-1;
+  latest_local_r1_direction_ = -1;
+  const std::string direction_prefix = "care_r1_action_v1_";
   for (const auto& dim : msg->layout.dim) {
+    if (dim.label.size() == direction_prefix.size() + 1 &&
+        dim.label.compare(0, direction_prefix.size(), direction_prefix) == 0 &&
+        dim.label.back() >= '0' && dim.label.back() <= '7')
+      latest_local_r1_direction_ = dim.label.back() - '0';
     if (dim.label.compare(0,15,"care_region_v1_")==0) latest_observation_region_=dim.label;
     if (dim.label.compare(0,15,"care_sensor_v1_")==0 && dim.label.size()==16 &&
         dim.label.back()>='0' && dim.label.back()<='7')
@@ -1364,6 +1454,28 @@ void LocalSparseSCPPlanner::singleWaypointQCallback(
       repair_mode_ && visibility_waypoint_weight_ > 0.0) {
     requestPlanLocked("single_visibility_waypoint_q_changed");
   }
+  if (changed || previous_token != latest_observation_token_)
+    publishLocalR1HandoffLocked(false);
+}
+
+void LocalSparseSCPPlanner::publishLocalR1HandoffLocked(bool refused) {
+  if (latest_local_r1_direction_ < 0 || latest_observation_sensor_ < 0 ||
+      latest_observation_token_ == "none") return;
+  if (refused) {
+    if (!repair_mode_ || !latest_single_waypoint_active_ || !latest_schedule_.empty() ||
+        last_refused_local_r1_token_ == latest_observation_token_) return;
+    last_refused_local_r1_token_ = latest_observation_token_;
+  }
+  std::ostringstream fields;
+  fields << "event=" << (refused ? "refused" : "received")
+         << " observation_token=" << latest_observation_token_
+         << " region=" << latest_observation_region_ << " sensor=" << latest_observation_sensor_
+         << " direction=" << latest_local_r1_direction_ << " reason=" << plan_request_reason_
+         << " mode_epoch=" << mode_epoch_;
+  std_msgs::String msg;
+  msg.data = fields.str();
+  local_r1_handoff_pub_.publish(msg);
+  ROS_INFO_STREAM("[LOCAL_R1_HANDOFF] " << msg.data);
 }
 
 void LocalSparseSCPPlanner::recoveryCallback(
@@ -1506,7 +1618,14 @@ void LocalSparseSCPPlanner::smoothReplanRequestCallback(
   if (!msg || !msg->data) return;
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (probe_mode_ || normal_reference_refresh_pending_) {
+  Eigen::VectorXd measured;
+  const double age = (ros::Time::now() - latest_joint_state_.header.stamp).toSec();
+  const bool measured_camera = probe_mode_ && observed_task_route_precision_view_ &&
+      observed_task_route_goal_revision_ == terminal_goal_revision_ &&
+      observed_task_route_target_.size() == dof_ && has_joint_state_ &&
+      age >= 0. && age <= .15 && extractMeasuredQ(latest_joint_state_, measured) &&
+      (measured - observed_task_route_target_).lpNorm<Eigen::Infinity>() > .20;
+  if ((probe_mode_ && !measured_camera) || normal_reference_refresh_pending_) {
     ++smooth_handoff_replan_suppressed_probe_count_;
     return;
   }
@@ -1516,8 +1635,13 @@ void LocalSparseSCPPlanner::smoothReplanRequestCallback(
   }
 
   ++smooth_handoff_replan_count_;
-  requestPlanLocked(
-      repair_mode_ ? "smooth_handoff_repair" : "smooth_handoff_normal");
+  if (measured_camera) {
+    ROS_INFO_STREAM("[MEASURED_CAMERA_NEXT_PREFIX] remaining_rad=" <<
+        (measured-observed_task_route_target_).lpNorm<Eigen::Infinity>());
+    requestPlanLocked("smooth_handoff_measured_camera");
+  } else {
+    requestPlanLocked(repair_mode_ ? "smooth_handoff_repair" : "smooth_handoff_normal");
+  }
 }
 
 std::string LocalSparseSCPPlanner::terminalContextLocked() const {
@@ -2898,11 +3022,18 @@ void LocalSparseSCPPlanner::selectRepairTargetLocked() {
   }
   repair_no_progress_.select(key);
   final_vbc_no_progress_.progress.select(key);
-  safe_frontier_recovery_.select(
-      candidate_replacement_enabled_ && latest_vbc_obligation_id_ >= 0 ?
-          "obligation:" + std::to_string(latest_vbc_obligation_id_) :
-          (safe_frontier_recovery_enabled_ && !geometry_points.empty() ? geometry.str() : key),
-      mode_epoch_);
+  std::string budget_key = candidate_replacement_enabled_ && latest_vbc_obligation_id_ >= 0 ?
+      "obligation:" + std::to_string(latest_vbc_obligation_id_) :
+      (safe_frontier_recovery_enabled_ && !geometry_points.empty() ? geometry.str() : key);
+  const std::string owner = "care_region_v1_" + std::to_string(latest_vbc_obligation_id_) + "_";
+  if (candidate_replacement_enabled_ && latest_single_waypoint_active_ && has_single_waypoint_q_ &&
+      latest_schedule_.empty() && latest_observation_token_ != "none" &&
+      latest_observation_sensor_ >= 0 && latest_local_r1_direction_ >= 0 &&
+      latest_observation_region_.compare(0, owner.size(), owner) == 0) {
+    budget_key += "/" + latest_observation_region_ + "/" + std::to_string(latest_observation_sensor_)
+        + "/" + std::to_string(latest_local_r1_direction_);
+  }
+  safe_frontier_recovery_.select(budget_key, mode_epoch_);
   // Use the stable published observation goal; rolling frontier updates must
   // not reset its progress window or credit visibility-free wrist motion.
   safe_frontier_recovery_.setObservationGoal(
@@ -4028,6 +4159,7 @@ void LocalSparseSCPPlanner::requestPlanLocked(
     plan_request_reason_ = candidate_replacement_enabled_ && latest_vbc_obligation_id_ >= 0
         ? "repair_candidate_replacement_exhausted_hold"
         : "repair_safe_stall_reselect_hold";
+    publishLocalR1HandoffLocked(true);
     return;
   }
   if (candidate_replacement_retry_pending_) {
@@ -4042,16 +4174,19 @@ void LocalSparseSCPPlanner::requestPlanLocked(
       geometric_restore_scope_!=std::to_string(mode_epoch_)+":"+safe_frontier_recovery_.key) {
     plan_requested_ = false;
     plan_request_reason_ = "repair_failed_candidate_hold";
+    publishLocalR1HandoffLocked(true);
     return;
   }
   if (repair_mode_ && final_vbc_no_progress_.progress.blocked()) {
     plan_requested_ = false;
     plan_request_reason_ = "repair_final_vbc_no_progress_hold";
+    publishLocalR1HandoffLocked(true);
     return;
   }
   if (repair_mode_ && repair_no_progress_.blocked()) {
     plan_requested_ = false;
     plan_request_reason_ = "repair_qp_no_progress_hold";
+    publishLocalR1HandoffLocked(true);
     return;
   }
   if (!repair_mode_ && task_no_progress_.blocked()) {
@@ -4136,6 +4271,12 @@ bool LocalSparseSCPPlanner::startPlan() {
       frontier.q=latest_visibility_guidance_.target;
       frontier.joint_mask=latest_visibility_guidance_.mask;
       frontier.visibility_gradient=latest_visibility_guidance_.gradient;
+      const char* stopped_view = std::getenv("CARE_STOPPED_VIEW_OBJECTIVE");
+      if (stopped_view && std::string(stopped_view) == "true" &&
+          !latest_vbc_obligation_points_.empty()) {
+        frontier.stopped_view_sensor = latest_visibility_guidance_.sensor;
+        frontier.stopped_view_points = latest_vbc_obligation_points_;
+      }
     }
     safe_frontier_recovery_.monitor_detour_observation=frontier.visibility_gradient.size()==7;
     if (safe_frontier_recovery_enabled_ && repair_mode_ && !probe_mode_ &&
@@ -4263,6 +4404,9 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
   }
 
+  Eigen::VectorXd observed_task_target;
+  bool observed_terminal_selected = false;
+  bool observed_precision_view = false;
   if (rolling_task && !repair && !reference.points.empty()) {
     std::vector<int> goal_mapping;
     if (!buildTrajectoryMapping(reference, goal_mapping)) {
@@ -4270,6 +4414,32 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
     Eigen::VectorXd goal(dof_);
     for (int j=0;j<dof_;++j) goal[j]=reference.points.back().positions[goal_mapping[j]];
+    bool observed_route = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (observed_task_route_goal_revision_ == terminal_goal_revision_ &&
+          observed_task_route_goal_.size() == dof_ &&
+          (goal - observed_task_route_goal_).lpNorm<Eigen::Infinity>() < .20) {
+        if (observed_task_terminal_.size() == dof_) goal = observed_task_terminal_;
+        if (observed_task_route_target_.size() == dof_) {
+          if (!observed_task_route_precision_view_ &&
+              (q_current - observed_task_route_target_).lpNorm<Eigen::Infinity>() <= .025) {
+            observed_task_route_target_.resize(0);
+            ROS_INFO("[TASK_ROUTE] short route reached, resuming terminal reference");
+          } else {
+            goal = observed_task_route_target_;
+            observed_route = true;
+          }
+        }
+        if (reference_route_joint_objective_ &&
+            (observed_route || observed_task_terminal_.size() == dof_)) {
+          observed_task_target = goal;
+          observed_precision_view = observed_route && observed_task_route_precision_view_;
+          observed_terminal_selected = observed_task_terminal_.size() == dof_ &&
+              (goal - observed_task_terminal_).lpNorm<Eigen::Infinity>() <= 1e-8;
+        }
+      }
+    }
     double duration=2.;
     for (int j=0;j<dof_;++j) {
       const double delta=std::abs(goal[j]-q_current[j]);
@@ -4287,7 +4457,7 @@ bool LocalSparseSCPPlanner::startPlan() {
       p.accelerations.assign(c.data(),c.data()+dof_);p.time_from_start=ros::Duration(refreshed.times()[k]);
       reference.points.push_back(p);
     }
-    ROS_INFO_STREAM("[ROLLING_TASK_REFERENCE] goal_revision="<<terminal_goal_revision_
+    ROS_INFO_STREAM("[ROLLING_TASK_REFERENCE] observed_route=" << observed_route << " goal_revision="<<terminal_goal_revision_
         <<" probe="<<probe<<" duration_s="<<duration<<" measured_stamp_ns="<<joint_state.header.stamp.toNSec());
   }
   Eigen::MatrixXd q_ref, u_ref, q_init, u_init;
@@ -4305,6 +4475,149 @@ bool LocalSparseSCPPlanner::startPlan() {
 
   std::string initialization_mode =
       probe ? "probe_short_horizon_hold_tail" : "task_reference";
+  const auto align_executable_prefix = [&](const Eigen::VectorXd& delta, double prefix_s,
+                                           Eigen::MatrixXd& target) {
+    const double excursion = delta.lpNorm<Eigen::Infinity>();
+    const double acceleration = acceleration_limits_.minCoeff();
+    const double distance = std::min(excursion, acceleration * prefix_s * prefix_s);
+    const double ramp_s = std::sqrt(distance / acceleration);
+    target.col(0) = q_current;
+    for (int k = 1; k <= num_intervals_; ++k) {
+      const double t = std::min(k*dt_, 2.*ramp_s);
+      const double travel = t <= ramp_s ? .5*acceleration*t*t
+          : distance - .5*acceleration*(2.*ramp_s-t)*(2.*ramp_s-t);
+      target.col(k) = q_current + (travel/std::max(excursion, 1e-12))*delta;
+    }
+  };
+  if (repair_executable_view_enabled_ && probe && !repair && observed_task_target.size() == dof_) {
+    // The observed map vetted a joint-space approach, while the receiver can
+    // execute only the probe prefix and its own braking tail. Center both the
+    // seed and its stopped objective on this short synchronized step.
+    Eigen::MatrixXd aligned = q_ref;
+    const Eigen::VectorXd route_delta = observed_task_target - q_current;
+    const double route_span = route_delta.lpNorm<Eigen::Infinity>();
+    // A short measured stop needs room for the certified brake. Shape the
+    // optimizer's existing reference with a smaller synchronized step.
+    const bool short_measured_step = observed_terminal_selected &&
+        route_span > 1e-6 && route_span <= .10;
+    const double reference_ramp = short_measured_step
+        ? std::min(probe_task_settings_.prefix, .18) : probe_task_settings_.prefix;
+    align_executable_prefix(route_delta, reference_ramp, aligned);
+    Eigen::VectorXd rolling_stop;
+    if (route_span > .24) {
+      // Continue an already aligned approach from the measured velocity.
+      // The optimizer proposes a new short probe with its bounded stop, and
+      // the existing collision queries and VBC judge the proposed motion.
+      const Eigen::VectorXd direction = route_delta / route_span;
+      const double projection = direction.dot(previous_command) / direction.squaredNorm();
+      const double initial = std::max(0., projection);
+      const double transverse = (previous_command - initial * direction).lpNorm<Eigen::Infinity>();
+      const double braking_acceleration = probe_task_settings_.acceleration.minCoeff();
+      const double acceleration = .9 * acceleration_limits_.minCoeff();
+      const double brake_time_limit = probe_task_settings_.brake_dt * (probe_task_settings_.brake_steps - 1);
+      const double maximum = std::min({.35, probe_task_settings_.velocity_cap,
+                                      braking_acceleration * brake_time_limit});
+      // A settled arm can initiate the same bounded prefix used for rolling
+      // handoffs. Preserve the direction check for a moving arm. The original
+      // optimizer, terminal braking view, CDF and VBC certify the candidate.
+      const bool settled_launch = projection >= -.006 &&
+          previous_command.lpNorm<Eigen::Infinity>() <= .030 && transverse <= .018;
+      if ((settled_launch || initial >= .025) && initial < maximum && transverse <= .035 &&
+          acceleration > 0. && braking_acceleration > 0.) {
+        const double prefix = probe_task_settings_.prefix;
+        const double ramp = std::min(prefix, (maximum - initial) / acceleration);
+        const double peak = initial + acceleration * ramp;
+        const auto advance = [&](double t) {
+          const double rising = std::min(t, ramp);
+          return initial * rising + .5 * acceleration * rising * rising + peak * (t - rising);
+        };
+        const double movement = advance(prefix);
+        const double braking_time = peak / braking_acceleration;
+        const double swept_span = movement + .5 * peak * braking_time;
+        if (swept_span + .025 < route_span) {
+          for (int k = 0; k <= num_intervals_; ++k) {
+            const double time = k * dt_;
+            const double braking = std::min(braking_time, std::max(0., time - prefix));
+            const double distance = advance(std::min(time, prefix))
+                + peak * braking - .5 * braking_acceleration * braking * braking;
+            aligned.col(k) = q_current + distance * direction;
+          }
+          rolling_stop = q_current + swept_span * direction;
+          ROS_INFO_STREAM("[MEASURED_ROUTE_ROLLING_SEED] settled_launch=" << settled_launch
+              << " prefix_s=" << prefix
+              << " initial_speed_rad_s=" << initial << " prefix_end_speed_rad_s=" << peak
+              << " prefix_progress_rad=" << movement << " stop_progress_rad=" << swept_span
+              << " route_span_rad=" << route_span << " transverse_rad_s=" << transverse
+              << " terminal_selected=" << observed_terminal_selected);
+        }
+      }
+    }
+    if (observed_precision_view && route_span > .24 && rolling_stop.size() == 0) {
+      // A wrist look can span several rad while the shoulder moves by only
+      // tenths. Keep aiming at a physically reachable local stop during the
+      // transition between aligned prefixes, including the current joint
+      // velocity. The regime manager retains the final camera posture.
+      const double prefix = probe_task_settings_.prefix;
+      const double brake_window = probe_task_settings_.brake_dt * (probe_task_settings_.brake_steps - 1);
+      const double speed = std::min({.35, probe_task_settings_.velocity_cap,
+                                    probe_task_settings_.acceleration.minCoeff() * brake_window});
+      if (prefix > 0. && speed > 0. && acceleration_limits_.minCoeff() > 0.) {
+        const Eigen::VectorXd direction = route_delta / route_span;
+        Eigen::VectorXd change(dof_), exit_velocity(dof_), arrival(dof_);
+        for (int j=0; j<dof_; ++j) {
+          const double bound = .90 * acceleration_limits_[j] * prefix;
+          change[j] = std::max(-bound,std::min(bound,speed*direction[j]-previous_command[j]));
+          exit_velocity[j] = previous_command[j] + change[j];
+          arrival[j] = q_current[j] + (previous_command[j]+.5*change[j])*prefix +
+              .5*exit_velocity[j]*std::abs(exit_velocity[j])/probe_task_settings_.acceleration[j];
+        }
+        if (route_delta.dot(arrival-q_current)>0. &&
+            (route_delta-(arrival-q_current)).lpNorm<Eigen::Infinity>()+.006<route_span &&
+            (exit_velocity.cwiseAbs().array() <=
+             (brake_window*probe_task_settings_.acceleration).array()+1.e-8).all()) {
+          for (int k=0; k<=num_intervals_; ++k) {
+            const double t=std::min(k*dt_,prefix);
+            for (int j=0; j<dof_; ++j) {
+              const double stopped=std::min(std::max(0.,k*dt_-prefix),
+                  std::abs(exit_velocity[j])/probe_task_settings_.acceleration[j]);
+              aligned(j,k)=q_current[j]+previous_command[j]*t+.5*change[j]*t*t/prefix+
+                  exit_velocity[j]*stopped-.5*std::copysign(probe_task_settings_.acceleration[j],
+                                                            exit_velocity[j])*stopped*stopped;
+            }
+          }
+          rolling_stop=arrival;
+          ROS_INFO_STREAM("[MEASURED_WRIST_APPROACH] remaining_rad=" << route_span
+              << " local_forward_rad=" << direction.dot(arrival-q_current)/direction.squaredNorm());
+        }
+      }
+    }
+    if (short_measured_step)
+      ROS_INFO_STREAM("[SHORT_MEASURED_STOP] route_span_rad=" << route_span
+          << " reference_ramp_s=" << reference_ramp
+          << " verification_prefix_s=" << probe_task_settings_.prefix);
+    Eigen::MatrixXd seed_q, seed_u;
+    if (buildNormalMotionSeed(q_current, previous_command, aligned, seed_q, seed_u)) {
+      q_init = seed_q;
+      u_init = seed_u;
+      q_ref = aligned;
+      u_ref = seed_u;
+      const double probe_span = acceleration_limits_.minCoeff()
+          * probe_task_settings_.prefix * probe_task_settings_.prefix;
+      const bool preserve_terminal_objective = short_measured_step && route_span <= probe_span;
+      if (rolling_stop.size() == dof_) {
+        observed_task_target = rolling_stop;
+      } else if (observed_precision_view || preserve_terminal_objective) {
+        // Keep the measured optical waypoint as the certified-stop objective.
+        // The short aligned reference still seeds the bounded PROBE motion.
+        ROS_INFO_STREAM("[SHORT_MEASURED_STOP_TARGET] precision_view=" << observed_precision_view
+            << " route_span_rad=" << route_span
+            << " prefix_span_rad=" << probe_span);
+      } else {
+        observed_task_target = aligned.col(num_intervals_);
+      }
+      initialization_mode = "probe_measured_route_aligned_prefix";
+    }
+  }
   if (repair && repair_hold_initialization_enabled_) {
     for (int k = 0; k <= num_intervals_; ++k) {
       q_init.col(k) = q_current;
@@ -4313,10 +4626,26 @@ bool LocalSparseSCPPlanner::startPlan() {
     initialization_mode = "repair_hold";
     if (!observation_phase) initialization_mode = "repair_safety_retreat_hold";
   }
-  if(repair_executable_view_enabled_ && repair && !probe) {
-    const Eigen::MatrixXd seed_target=q_init;
-    if(!buildNormalMotionSeed(q_current,previous_command,seed_target,q_init,u_init)) {
-      abortPlan("repair_motion_seed_failed");return false;
+  if (repair_executable_view_enabled_ && repair && !probe) {
+    Eigen::MatrixXd seed_target = q_init;
+    if (observation_phase && frontier.active && frontier.recovery_attempt == 0 &&
+        schedule.size() == 1 && schedule[0].q.size() == dof_ &&
+        schedule[0].joint_mask.size() == dof_) {
+      // Query the collision models around a dynamically bounded shape toward
+      // the selected view. The same SCP, exact VBC and final CDF still decide
+      // whether any portion of a candidate can execute.
+      const Eigen::VectorXd delta = schedule[0].joint_mask.cwiseProduct(schedule[0].q - q_current);
+      // Match the bounded stop-to-stop motion that the REPAIR receiver can
+      // actually run. A synchronized direction keeps link bodies on the
+      // checked approach when joints have very different remaining travel.
+      const double segment_s = repair_prefix_binding_enabled_ ? start_prefix_selection.prefix_s : .25;
+      align_executable_prefix(delta, segment_s, seed_target);
+      q_ref = seed_target;
+      initialization_mode = "repair_viscdf_aligned_prefix";
+    }
+    if (!buildNormalMotionSeed(q_current, previous_command, seed_target, q_init, u_init)) {
+      abortPlan("repair_motion_seed_failed");
+      return false;
     }
   }
 
@@ -4339,6 +4668,7 @@ bool LocalSparseSCPPlanner::startPlan() {
     }
     plan_q_current_ = q_current;
     plan_previous_command_ = previous_command;
+    plan_observed_task_target_ = observed_task_target;
     plan_q_ref_ = q_ref;
     plan_u_ref_ = u_ref;
     plan_q_bar_ = q_init;
@@ -6078,9 +6408,23 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         if (initial_shell_recovery_enabled_ && (!point.ordinary_path_guard || ordinary_execution_floor)) {
           std::lock_guard<std::mutex> lock(mutex_);
           auto& shell=preview ? preview_shell : initial_shell_recovery_;
-          if (!shell.floor(point.point,start,primitive_observation_margin_m_,
-                  initial_shell_execution_margin_m_,&required,&recovering,repair_prefix_binding_enabled_)) {
+          bool replaced_history = false;
+          if (!shell.floor(point.point, start, primitive_observation_margin_m_,
+                          initial_shell_execution_margin_m_, &required, &recovering,
+                          repair_prefix_binding_enabled_, &replaced_history)) {
+            if (!preview) {
+              ROS_WARN_STREAM("[observation_floor] rejected point_m=[" << point.point.transpose()
+                  << "] start_m=" << start << " execution_margin_m=" << initial_shell_execution_margin_m_
+                  << " planning_margin_m=" << primitive_observation_margin_m_
+                  << " history_size=" << shell.baselines.size());
+            }
             out.status="primitive_observation_start_blocked"; return out;
+          }
+          if (!preview && replaced_history) {
+            ROS_INFO_STREAM_ONCE("[observation_floor] replaced_history point_m=[" << point.point.transpose()
+                << "] start_m=" << start << " execution_margin_m=" << initial_shell_execution_margin_m_
+                << " planning_margin_m=" << primitive_observation_margin_m_
+                << " history_size=" << shell.baselines.size());
           }
           if (repair_prefix_binding_enabled_) out.primitive_margin_recovery_points.push_back(point.point);
         }
@@ -6239,6 +6583,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
 
   const double task_scale =
       repair_mode ? repair_task_tracking_scale_ : 1.0;
+  const bool selected_view_cost = repair_motion && frontier.active &&
+      frontier.recovery_attempt == 0 && schedule.size() == 1 &&
+      schedule[0].q.size() == dof_ && schedule[0].joint_mask.size() == dof_ &&
+      frontier.joint_mask.size() == dof_ &&
+      (schedule[0].joint_mask - frontier.joint_mask).cwiseAbs().maxCoeff() < 1e-12;
   Eigen::VectorXd task_free_mask = Eigen::VectorXd::Zero(dof_);
   if (free_joint_task && repair_mode && !probe_mode && frontier.active &&
       frontier.recovery_attempt == 0 && schedule.size() == 1 &&
@@ -6269,7 +6618,16 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
 
     for (int j = 0; j < dof_; ++j) {
       const int qi = qIndex(k, j);
-      addQuadraticTarget(qi, w, q_ref(j, k));
+      // The sensing joints follow the same selected view over the
+      // nominal horizon and at the executable stop. Other task coordinates
+      // remain free to follow the current reference.
+      if (selected_view_cost) {
+        const double view_weight = visibility_waypoint_weight_ /
+            static_cast<double>(num_intervals_);
+        addQuadraticTarget(qi, view_weight, q_ref(j,k));
+      } else {
+        addQuadraticTarget(qi, w, q_ref(j, k));
+      }
       if (task_free_mask[j] > 0.) {
         const double target = q_bar(j,0)+clampValue(q_ref(j,k)-q_bar(j,0),-.05,.05);
         const double weight = repair_free_joint_task_tracking_scale_ *
@@ -6342,13 +6700,36 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
     }
   }
 
-  if(probe_task_objective_enabled_ && probe_mode && !repair_mode &&
-      !force_diagnostic_slack && prefix_task_goal_valid) {
-    Eigen::Matrix<double,6,1> residual;Eigen::MatrixXd jacobian;
-    if(probeTaskResidualJacobian(geometry_guard,q_bar,u_bar,dt_,previous_command,
-        probe_task_settings_,terminal_ee_frame_,prefix_task_goal,&residual,&jacobian)) {
+  if (probe_task_objective_enabled_ && probe_mode && !repair_mode && !force_diagnostic_slack) {
+    Eigen::VectorXd route_target;
+    if (!preview && reference_route_joint_objective_) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      route_target = plan_observed_task_target_;
+    }
+    const bool track_route = route_target.size() == dof_;
+    Eigen::VectorXd residual;
+    Eigen::MatrixXd jacobian;
+    bool valid = false;
+    if (track_route) {
+      Eigen::VectorXd stop;
+      valid = probeStoppedPositionJacobian(q_bar, u_bar, dt_, previous_command,
+                                          probe_task_settings_, &stop, &jacobian);
+      if (valid) {
+        constexpr double joint_error_scale_rad = .20;
+        residual = (stop - route_target) / joint_error_scale_rad;
+        jacobian /= joint_error_scale_rad;
+      }
+    } else if (prefix_task_goal_valid) {
+      Eigen::Matrix<double, 6, 1> pose_error;
+      valid = probeTaskResidualJacobian(geometry_guard, q_bar, u_bar, dt_, previous_command,
+                                        probe_task_settings_, terminal_ee_frame_, prefix_task_goal,
+                                        &pose_error, &jacobian);
+      if (valid) residual = pose_error;
+    }
+    if (valid) {
       const double weight=(q_tracking_weight_+terminal_q_tracking_weight_)*num_intervals_;
-      std::vector<int> active;Eigen::Matrix<double,6,1> offset=residual;
+      std::vector<int> active;
+      Eigen::VectorXd offset = residual;
       for(int col=0;col<jacobian.cols();++col)if(jacobian.col(col).cwiseAbs().maxCoeff()>1e-10) {
         active.push_back(col);
         const double nominal=col<n_q ? q_bar(col%dof_,col/dof_+1) : u_bar((col-n_q)%dof_,(col-n_q)/dof_);
@@ -6358,8 +6739,23 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
         c[a]+=2.*weight*jacobian.col(a).dot(offset);
         for(int b:active)p_triplets.emplace_back(a,b,2.*weight*jacobian.col(a).dot(jacobian.col(b)));
       }
-      ROS_INFO_STREAM("[PROBE_EXECUTABLE_TASK] active_columns="<<active.size()
-          <<" weight="<<weight<<" stopped_task_cost="<<residual.squaredNorm());
+      const Eigen::MatrixXd brake_q = q_bar.col(0).replicate(1, q_bar.cols());
+      const Eigen::MatrixXd brake_u = Eigen::MatrixXd::Zero(u_bar.rows(), u_bar.cols());
+      Eigen::VectorXd brake_stop;
+      Eigen::Matrix<double,6,1> brake_error;
+      double braking_cost = std::numeric_limits<double>::quiet_NaN();
+      if (probeStoppedView(brake_q, brake_u, dt_, previous_command, probe_task_settings_, &brake_stop)) {
+        if (track_route) {
+          braking_cost = ((brake_stop - route_target) / .20).squaredNorm();
+        } else if (taskPoseResidual(geometry_guard, brake_stop, terminal_ee_frame_,
+                                   prefix_task_goal, &brake_error)) {
+          braking_cost = brake_error.squaredNorm();
+        }
+      }
+      ROS_INFO_STREAM("[PROBE_EXECUTABLE_TASK] route_joint_target=" << track_route
+          << " active_columns="<<active.size()
+          <<" weight="<<weight<<" stopped_task_cost="<<residual.squaredNorm()
+          <<" braking_task_cost="<<braking_cost);
     } else ROS_WARN("[PROBE_EXECUTABLE_TASK] optional objective unavailable");
   }
 
@@ -6387,6 +6783,8 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   int stopped_observation_targets = 0;
+  double direct_brake_margin = std::numeric_limits<double>::quiet_NaN();
+  bool stopped_view_objective_used = false;
   if (repair_mode &&
       frontier.active &&
       frontier.q.size() == dof_ &&
@@ -6510,6 +6908,71 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       }
       out.recovery_frontier = objective_target;
     }
+    bool alternate_approach = false;
+    const char* alternate = std::getenv("CARE_ALTERNATE_APPROACH");
+    if (alternate && std::string(alternate) == "true" && repair_motion &&
+        !preview && !force_diagnostic_slack && frontier.stopped_view_sensor >= 0 &&
+        previous_command.size() == dof_ && executable_settings.acceleration.size() == dof_) {
+      const Eigen::VectorXd start =
+          brakeFromStart(q_bar.col(0), previous_command, executable_settings);
+      const double start_view = stoppedViewMargin(geometry_guard, start,
+          frontier.stopped_view_sensor, frontier.stopped_view_points);
+      const double step = std::min(.03, trust_radius);
+      Eigen::VectorXd direct = frontier.q - start;
+      const double span = direct.lpNorm<Eigen::Infinity>();
+      if (std::isfinite(start_view) && start_view < 0. && span > 1e-6 && step > 0.) {
+        direct *= std::min(1., step / span);
+        // Compare the direct route and the existing tangent directions against
+        // the same local UNKNOWN rows from this solve. The result is a soft
+        // objective. The executable dynamics, CDF and exact VBC still gate it.
+        const auto firstUnknown = [&](const Eigen::VectorXd& direction) {
+          double first = 1.;
+          const PrimitiveObservationGuard::Row* blocker = nullptr;
+          for (const auto& row : primitive_rows) {
+            if (row.timestep != 1 || row.known_ground || row.occupied_volume ||
+                row.gradient.size() != dof_) continue;
+            const auto floor = primitive_floors.find(
+                care_confidence_map::InitialShellRecovery::key(row.point));
+            if (floor == primitive_floors.end()) continue;
+            const double change = row.gradient.dot(direction);
+            if (change >= -1e-9) continue;
+            const double gap = row.distance_m - floor->second +
+                row.gradient.dot(start - row.q_linearization);
+            const double fraction = std::max(0., gap / -change);
+            if (fraction < first) { first = fraction; blocker = &row; }
+          }
+          return std::make_pair(first, blocker);
+        };
+        const auto forward = firstUnknown(direct);
+        if (forward.second) {
+          const std::vector<Eigen::VectorXd> normal{forward.second->gradient};
+          double best_fraction = forward.first;
+          double best_view = -std::numeric_limits<double>::infinity();
+          for (int direction = 1; direction <= 4; ++direction) {
+            const Eigen::VectorXd side = boundedTangentTarget(
+                start, start + direct, normal, direction, step);
+            if (side.size() != dof_ || !side.allFinite()) continue;
+            const double fraction = firstUnknown(side - start).first;
+            if (fraction <= forward.first + .05) continue;
+            const double view = stoppedViewMargin(geometry_guard, side,
+                frontier.stopped_view_sensor, frontier.stopped_view_points);
+            if (fraction < best_fraction ||
+                (fraction == best_fraction && view <= best_view)) continue;
+            objective_target = side;
+            best_fraction = fraction;
+            best_view = view;
+            alternate_approach = true;
+          }
+          if (alternate_approach) {
+            objective_mask.setOnes();
+            ROS_INFO_STREAM_THROTTLE(.5, "[ALTERNATE_APPROACH] first_unknown_m=["
+                << forward.second->point.transpose() << "] direct_fraction=" << forward.first
+                << " selected_fraction=" << best_fraction << " start_view_m=" << start_view
+                << " selected_view_m=" << best_view << " target_q=[" << objective_target.transpose() << "]");
+          }
+        }
+      }
+    }
     // Ordinary sensing must improve the pose the receiver actually reaches
     // after its selected prefix and brake. A target at k_frontier alone can
     // improve briefly, then reverse before the prefix stops. Use the same
@@ -6520,12 +6983,78 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       std::string error;
       if (repairExecutableSamples(q_bar,u_bar,dt_,executable_settings,&samples,&error)) {
         const double weight = frontier_weight / executable_settings.prefixes.size();
+        // Track a selected VisCDF view at the pose that is executed, after the
+        // admitted prefix and brake. Keep the existing tangent target when the
+        // direct route has a local obstruction.
+        const bool track_selected_view = selected_view_cost && !alternate_approach;
+        if (track_selected_view) {
+          objective_target = q_ref.col(num_intervals_);
+          objective_mask.setOnes();
+        }
+        const auto marginAt = [&](const Eigen::VectorXd& pose) {
+          return stoppedViewMargin(geometry_guard, pose, frontier.stopped_view_sensor,
+                                   frontier.stopped_view_points);
+        };
+        // Follow an actual recovery detour at full weight even when its first
+        // step puts the old observation goal farther outside the frustum.
+        // Once recovery rejoins the frontier, restore the local view objective.
+        const bool following_detour = frontier.recovery_attempt > 0 && !out.recovery_rejoining;
+        if (!track_selected_view && frontier.stopped_view_sensor >= 0 &&
+            !following_detour && !alternate_approach && !force_diagnostic_slack &&
+            previous_command.size() == dof_ && executable_settings.acceleration.size() == dof_) {
+          direct_brake_margin = marginAt(brakeFromStart(q_bar.col(0), previous_command, executable_settings));
+        }
         for (double prefix : executable_settings.prefixes) {
           const auto stop = std::find_if(samples.rbegin(),samples.rend(),
               [&](const RepairExecutableSample& sample) {
                 return std::abs(sample.prefix_s-std::min(prefix,num_intervals_*dt_))<1e-9;
               });
           if (stop == samples.rend()) continue;
+          const double margin = std::isfinite(direct_brake_margin) ? marginAt(stop->q) : direct_brake_margin;
+          Eigen::VectorXd view_gradient = Eigen::VectorXd::Zero(dof_);
+          if (std::isfinite(margin)) {
+            constexpr double h = 1e-4;
+            for (int j=0; j<dof_; ++j) {
+              if (objective_mask[j] <= 0.) continue;
+              Eigen::VectorXd q = stop->q;
+              q[j] += h;
+              const double plus = marginAt(q);
+              q[j] -= 2.*h;
+              view_gradient[j] = (plus-marginAt(q))/(2.*h);
+            }
+          }
+          const double view_scale = view_gradient.norm();
+          const bool use_view = view_gradient.allFinite() && view_scale>1e-6;
+          if (use_view) {
+            // The local target is measured in equivalent radians. A positive
+            // target rewards useful partial views even when this prefix alone
+            // cannot yet bring the blocking region into the frustum.
+            const double goal_margin = std::max(direct_brake_margin, margin)+.05*view_scale;
+            double offset = (margin-goal_margin)/view_scale;
+            std::map<int,double> columns;
+            for (int j=0; j<dof_; ++j) {
+              const double slope = view_gradient[j]/view_scale;
+              if (slope == 0.) continue;
+              for (const auto& term : stop->q_weights)
+                if (term.first > 0) columns[qIndex(term.first,j)] += term.second*slope;
+              for (const auto& term : stop->u_weights)
+                columns[uIndex(term.first,j)] += term.second[j]*slope;
+            }
+            for (const auto& term : columns) {
+              const int index = term.first;
+              const double nominal = index<n_q ? q_bar(index%dof_,index/dof_+1) :
+                  u_bar((index-n_q)%dof_,(index-n_q)/dof_);
+              offset -= term.second*nominal;
+            }
+            for (const auto& a : columns) {
+              c[a.first] += 2.*weight*a.second*offset;
+              for (const auto& b : columns)
+                p_triplets.emplace_back(a.first,b.first,2.*weight*a.second*b.second);
+            }
+            stopped_view_objective_used = true;
+          }
+          // The VisCDF direction regularizes the view objective and serves
+          // as the existing fallback for a flat or unavailable frustum.
           for (int j=0;j<dof_;++j) {
             if (objective_mask[j] <= 0.) continue;
             std::map<int,double> columns;
@@ -6539,7 +7068,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
                   ? q_bar(j,term.first/dof_+1) : u_bar(j,(term.first-n_q)/dof_);
               offset -= term.second * nominal;
             }
-            const double w = weight * objective_mask[j];
+            const double w = weight * objective_mask[j] * (use_view ? .15 : 1.);
             for (const auto& a : columns) {
               c[a.first] += 2.*w*a.second*offset;
               for (const auto& b : columns)
@@ -6547,6 +7076,11 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
             }
           }
           ++stopped_observation_targets;
+        }
+        if (track_selected_view && !executable_recheck_only) {
+          ROS_INFO_STREAM_THROTTLE(.5, "[VISCDF_EXECUTABLE_VIEW] stopped_targets="
+              << stopped_observation_targets << " first_prefix_s="
+              << executable_settings.prefixes.front());
         }
       }
     }
@@ -6559,7 +7093,7 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
       // A short detour target also owns the tail objective. This suppresses
       // accelerating through the tiny target then being pulled back. It is
       // a soft tracking term, not a claimed hard displacement bound.
-      if (frontier.recovery_attempt > 0)
+      if (frontier.recovery_attempt > 0 || alternate_approach)
         for (int k = k_frontier+1; k <= num_intervals_; ++k)
           addQuadraticTarget(
               qIndex(k, j), frontier_weight * objective_mask[j],
@@ -7222,6 +7756,24 @@ LocalSparseSCPPlanner::solveSparseSubproblem(
   }
 
   out.solved = true;
+  if (stopped_view_objective_used && !executable_recheck_only) {
+    std::vector<RepairExecutableSample> view_samples;
+    if (repairExecutableSamples(out.q,out.u,dt_,executable_settings,&view_samples)) {
+      for (double prefix : executable_settings.prefixes) {
+        const auto stop = std::find_if(view_samples.rbegin(),view_samples.rend(),
+            [&](const RepairExecutableSample& sample) {
+              return std::abs(sample.prefix_s-std::min(prefix,num_intervals_*dt_))<1e-9;
+            });
+        if (stop == view_samples.rend()) continue;
+        const double candidate = stoppedViewMargin(geometry_guard, stop->q, frontier.stopped_view_sensor,
+                                                  frontier.stopped_view_points);
+        ROS_INFO_STREAM("[STOPPED_VIEW] stamp_ns="<<batch.header.stamp.toNSec()
+            <<" sensor="<<frontier.stopped_view_sensor<<" prefix="<<prefix
+            <<" points="<<frontier.stopped_view_points.size()<<" brake_m="<<direct_brake_margin
+            <<" candidate_m="<<candidate);
+      }
+    }
+  }
   if(occupied_volume_enabled && !occupied_volume_points.empty()) {
     std::vector<PrimitiveObservationGuard::Row> rows;std::string error;
     if(!geometry_guard.linearizeOccupiedVoxels(out.q,occupied_volume_points,.05,.02,.02,&rows,&error) ||

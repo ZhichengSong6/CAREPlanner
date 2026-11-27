@@ -8,6 +8,22 @@ from urdf_parser_py.urdf import URDF
 from compute_ee_workspace_bounds import find_chain_joints, get_joint_origin_transform as joint_origin_transform, axis_angle_to_rot
 
 
+def load_robot_frames(urdf):
+    robot = URDF.from_xml_file(urdf)
+    names = ['joint1', 'joint2', 'joint3', 'joint4', 'wrist_joint1', 'wrist_joint2', 'wrist_joint3']
+    frames = {}
+    rotations = {}
+    for joint in robot.joints:
+        axis = np.asarray(joint.axis, dtype=float) if joint.axis is not None else np.zeros(3)
+        index = names.index(joint.name) if joint.name in names else -1
+        frames[joint.child] = (joint.parent, joint_origin_transform(joint), joint.type, axis, index)
+        if joint.type in ('revolute', 'continuous'):
+            unit = axis / np.linalg.norm(axis)
+            x, y, z = unit
+            rotations[joint.child] = (np.outer(unit, unit), np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]]))
+    return robot, names, frames, rotations
+
+
 class KnownGround:
     def __init__(self, urdf, geometry, optimized=True, backend='python'):
         self.optimized=optimized
@@ -18,16 +34,7 @@ class KnownGround:
         plane=self.contract.get('plane',dict(normal=[0.,0.,1.],offset_m=-self.contract['plane_z_m']))
         self.plane_normal=np.asarray(plane['normal'],dtype=float)
         self.plane_offset=float(plane['offset_m'])
-        self.robot=URDF.from_xml_file(urdf)
-        self.names=['joint1','joint2','joint3','joint4','wrist_joint1','wrist_joint2','wrist_joint3']
-        self.frames={j.child:(j.parent,joint_origin_transform(j),j.type,
-            np.asarray(j.axis,dtype=float) if j.axis is not None else np.zeros(3),
-            self.names.index(j.name) if j.name in self.names else -1) for j in self.robot.joints}
-        self.rotations={}
-        for name,(_,_,kind,axis,_) in self.frames.items():
-            if kind in ('revolute','continuous'):
-                unit=axis/np.linalg.norm(axis);x,y,z=unit
-                self.rotations[name]=(np.outer(unit,unit),np.array([[0.,-z,y],[z,0.,-x],[-y,x,0.]]))
+        self.robot, self.names, self.frames, self.rotations = load_robot_frames(urdf)
         self.identity3=np.eye(3)
         self.bodies=[]
         for body in self.contract['bodies']:

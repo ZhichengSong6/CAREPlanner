@@ -34,6 +34,8 @@ import rospy
 from std_msgs.msg import Bool, Float64, Float64MultiArray, String
 from trajectory_msgs.msg import JointTrajectory
 from geometry_msgs.msg import PoseStamped
+from sensor_msgs.msg import JointState
+import tf2_ros
 
 
 _TOKEN_RE = re.compile(r"([A-Za-z0-9_]+)=([^\s]+)")
@@ -65,6 +67,36 @@ def _as_float(v, default=math.nan):
         return default
 
 
+def rejected_task_sweep(message):
+    header, marker, payload = message.partition(" vbc_evidence=")
+    if not marker:
+        return None
+    fields = dict(part.split("=", 1) for part in header.split() if "=" in part)
+    if (fields.get("result") != "unsafe" or fields.get("committed") != "0"
+            or fields.get("safety_gate") != "vbc"
+            or fields.get("verification_view") not in ("full_horizon", "probe_prefix_brake_hold")):
+        return None
+    try:
+        raw = int(fields["raw_candidate_stamp_ns"])
+        stamp = int(fields["audited_trajectory_stamp_ns"])
+        evidence, _ = json.JSONDecoder().raw_decode(payload)
+        if raw <= 0 or stamp < raw or int(evidence["trajectory_stamp_ns"]) != stamp:
+            return None
+        violations = [
+            (float(row["sweep_s"]), tuple(map(float, row["point"])))
+            for row in evidence["violations"]
+            if len(row["point"]) == 3 and row["sweeping_link"]
+        ]
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+    violations = sorted((t, p) for t, p in violations if t >= 0. and all(map(math.isfinite, p)))
+    if not violations:
+        return None
+    first = violations[0][0]
+    points = tuple(dict.fromkeys(p for t, p in violations if t <= first + .051))
+    return stamp, points
+
+
 class C44VerifiedRegimeManager:
     NORMAL = "NORMAL"
     REPAIR = "REPAIR"
@@ -89,6 +121,13 @@ class C44VerifiedRegimeManager:
         self.task_first_seen_count = 0
         self.task_first_seen_point_count = 0
         self.task_first_observation_returns = 0
+        self.task_sweep_handoff = os.environ.get('CARE_TASK_SWEEP_HANDOFF') == '1'
+        self.task_sweep_blocker = None
+        self.task_sweep_view = False
+        self.task_sweep_precision_view = False
+        self.task_sweep_terminal = False
+        self.view_ingress_veto = None
+        self.view_ingress_request_ns = 0
         self._rolling_release = None
         self._rolling_request_pub = rospy.Publisher('/care_planner/rolling_task/consumed_request', String, queue_size=8)
         self.matched_observation_release = os.environ.get('CARE_MATCHED_OBSERVATION_RELEASE') == 'true'
@@ -115,6 +154,26 @@ class C44VerifiedRegimeManager:
             "~repair_completion_gate_enabled", False))
         self.research_opportunistic_probe = os.environ.get(
             'CARE_RESEARCH_OPPORTUNISTIC_PROBE','false').lower()=='true'
+        self.rolling_executable_task = os.environ.get('CARE_ROLLING_EXECUTABLE_TASK') == 'true'
+        self.view_evidence_handoff = os.environ.get('CARE_VIEW_EVIDENCE_HANDOFF') == 'true'
+        self.task_route_comparison = os.environ.get('CARE_TASK_ROUTE_COMPARISON') == 'true'
+        self.task_route_proposal = None
+        self.task_route_target = None
+        self.task_route_velocity = None
+        self.task_route_reversal_available = False
+        self.task_route_reversal_stamp = 0
+        self.task_route_probe_distance = None
+        self.task_route_followup_request = None
+        if self.task_route_comparison:
+            self.task_route_pub = rospy.Publisher(
+                '/care_planner/rolling_task/observed_route', JointTrajectory, queue_size=1)
+            rospy.Subscriber('/care_planner/rolling_task/route_proposal', JointTrajectory,
+                             self._task_route_proposal_cb, queue_size=1)
+        self.view_progress = {}
+        self.view_corridor_trial = None
+        if self.view_evidence_handoff:
+            self.view_refresh_pub = rospy.Publisher(
+                "/care_planner/active_sensing/refresh_stalled_view", String, queue_size=1)
         self.repair_completion_topic = str(rospy.get_param(
             "~repair_completion_topic",
             "/care_planner/active_sensing/visibility_acquisition_complete"))
@@ -217,6 +276,9 @@ class C44VerifiedRegimeManager:
 
         self.tracker_summary_time = None
         self.tracker_active = False
+        self.occupied_stop = (0, 0)
+        self.occupied_stop_completed_tail = False
+        self.occupied_stop_handled = 0
         self.tracker_complete = False
         self.tracker_execution_stamp_ns = 0
         self.tracker_source = "none"
@@ -364,6 +426,8 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.tracker_summary_topic, String, self._tracker_summary_cb,
             queue_size=20)
+        rospy.Subscriber('/care_planner/rolling_task/occupied_stop_confirmed',
+                         String, self._occupied_stop_cb, queue_size=8)
         rospy.Subscriber(
             self.probe_single_flight_summary_topic, String,
             self._probe_single_flight_summary_cb, queue_size=20)
@@ -403,7 +467,20 @@ class C44VerifiedRegimeManager:
         rospy.Subscriber(
             self.candidate_vbc_summary_topic, String,
             self._candidate_vbc_summary_cb, queue_size=20)
-        if self.repair_completion_gate_enabled or self.research_opportunistic_probe:
+        if self.rolling_executable_task:
+            self.rolling_tf = tf2_ros.Buffer()
+            self.rolling_tf_listener = tf2_ros.TransformListener(self.rolling_tf)
+            self.rolling_goal = None
+            self.rolling_joints = None
+            self.rolling_observation_start = None
+            self.rolling_observation_execution = None
+            self.rolling_probe_start_cost = None
+            rospy.Subscriber("/care_planner/ee_target_pose", PoseStamped,
+                             self._rolling_goal_cb, queue_size=1)
+            rospy.Subscriber("/care_arm/joint_states", JointState,
+                             self._rolling_joints_cb, queue_size=1)
+        if (self.repair_completion_gate_enabled or self.research_opportunistic_probe
+                or self.rolling_executable_task):
             rospy.Subscriber(
                 self.repair_completion_topic, Bool,
                 self._repair_completion_cb, queue_size=1)
@@ -437,6 +514,7 @@ class C44VerifiedRegimeManager:
         with self._lock:
             goal=[msg.header.frame_id,p.x,p.y,p.z,q.x,q.y,q.z,q.w]
             if goal != self._occlusion_goal:
+                self.task_sweep_blocker = None
                 self._occlusion_consumed_routes.clear()
             self._occlusion_goal=goal
             self._occlusion_pending=None
@@ -476,6 +554,7 @@ class C44VerifiedRegimeManager:
             # observation, however, must release its now-empty recovery episode.
             self._occlusion_consumed_routes.add(route)
         if not self.execution_ready or self.state!=self.REPAIR:return
+        if self.task_sweep_handoff and self.task_sweep_blocker is not None:return
         deferred=event['deferred_tokens'];demand=self._observation_demand
         if demand is not None and demand[0] not in deferred:return
         # Planning may try another reference while unresolved UNKNOWN remains
@@ -489,6 +568,13 @@ class C44VerifiedRegimeManager:
         self.replan_request_pub.publish(Bool(data=True))
 
     def _transition_locked(self, new_state, reason, now):
+        if (self.task_sweep_handoff and self.task_sweep_blocker is not None
+                and self.state == self.REPAIR and new_state == self.PROBE_NORMAL
+                and reason in ("actual_visibility_acquisition_complete",
+                               "task_first_observation_acquired", "task_reference_sweep_clear",
+                               "external_occlusion_alternative_reference")):
+            self.last_transition_reason = "observing_until_task_sweep_supported"
+            return
         if os.environ.get('CARE_ACTIVE_OBSERVATION', 'true') == 'false' and new_state != self.NORMAL:
             # Component ablation: preserve NORMAL task motion and every safety
             # hold; do not admit a dedicated observation-motion episode.
@@ -499,6 +585,11 @@ class C44VerifiedRegimeManager:
             self.last_transition_reason = reason
             return
         old = self.state
+        if new_state == self.NORMAL or new_state == self.REPAIR:
+            self.task_sweep_view = False
+            self.task_sweep_terminal = False
+        if new_state == self.NORMAL:
+            self.task_sweep_blocker = None
         if new_state not in (self.PROBE_NORMAL, self.NORMAL):
             self._rolling_release = None
         self._retire_qp_retry_locked()
@@ -523,6 +614,12 @@ class C44VerifiedRegimeManager:
         if hasattr(self, "probe_active_pub"):
             self.probe_active_pub.publish(Bool(
                 data=bool(self.execution_ready and new_state == self.PROBE_NORMAL)))
+
+        if self.rolling_executable_task:
+            self.rolling_observation_execution = None
+            self.rolling_probe_start_cost = None
+            if new_state == self.REPAIR:
+                self.rolling_observation_start = self.rolling_joints
 
         if new_state == self.REPAIR:
             self.repair_entry_count += 1
@@ -560,7 +657,8 @@ class C44VerifiedRegimeManager:
             self.pending_probe_candidate_seq = 0
             self.pending_probe_execution_stamp_ns = 0
             self.pending_probe_effective_prefix_s = math.nan
-            self.clear_until = now + rospy.Duration(self.clear_pulse_s)
+            self.clear_until = (None if self.view_evidence_handoff else
+                                now + rospy.Duration(self.clear_pulse_s))
             self.probe_ignore_until = now + rospy.Duration(self.probe_ignore_s)
         elif new_state == self.NORMAL:
             self.normal_entry_count += 1
@@ -576,7 +674,8 @@ class C44VerifiedRegimeManager:
             # from the current measured state before NORMAL planning resumes.
             # This refreshes only the task reference; it does not restore the
             # legacy RECOVERY_HOLD / replan-ready controller handshake.
-            if old == self.PROBE_NORMAL and self.execution_ready:
+            if (old == self.PROBE_NORMAL and self.execution_ready
+                    and reason != 'rolling_task_stopped_at_goal'):
                 self.normal_task_replan_count += 1
                 self.normal_task_replan_pub.publish(Bool(data=True))
 
@@ -863,6 +962,8 @@ class C44VerifiedRegimeManager:
                 self._observation_release_identity.observe(f, now.to_sec())
                 if self._maybe_release_matched_observation_locked(now):
                     return
+            if self.view_evidence_handoff:
+                self._watch_view_progress_locked(f)
             if getattr(self, 'task_first_research', False):
                 count = _as_int(f.get('seen_obligation_count'), 0)
                 previous = self.task_first_seen_count
@@ -921,7 +1022,130 @@ class C44VerifiedRegimeManager:
             self._maybe_enter_observation_repair_locked(now, "acquisition")
             self._maybe_release_matched_observation_locked(now)
 
+    def _watch_view_progress_locked(self, fields):
+        if self.state != self.REPAIR or not self.execution_ready:
+            return
+        token = fields.get("active_q_vis_token")
+        gap = _as_float(fields.get("active_q_distance_inf"))
+        if (self._observation_waypoint is None or token != self._observation_waypoint[0] or
+                fields.get("active_q_distance_token") != token or
+                fields.get("active_query_status") != "ok" or
+                fields.get("active_seen") != "0" or not math.isfinite(gap)):
+            return
+        wall = time.monotonic()
+        previous = self.view_progress.get(token)
+        if previous is None or gap < previous[0] - .02:
+            if previous is None and len(self.view_progress) >= 32:
+                self.view_progress.pop(next(iter(self.view_progress)))
+            self.view_progress[token] = (gap, wall)
+            return
+        if wall - previous[1] >= 2.:
+            self.view_progress[token] = (min(gap, previous[0]), wall)
+            rospy.loginfo("[VIEW_EVIDENCE] refresh token=%s measured_gap_rad=%.4f", token, gap)
+            self.view_refresh_pub.publish(String(data=token))
+
+    def _task_route_proposal_cb(self, msg):
+        if (os.environ.get('CARE_MEASURED_TASK_ROUTE') == 'true' and
+                msg.header.frame_id == 'measured_free_task_route_yield'):
+            self._request_task_route_followup(msg)
+            return
+        if (os.environ.get('CARE_MEASURED_TASK_ROUTE') == 'true' and
+                msg.header.frame_id.split('/', 1)[0] == 'measured_free_task_route'):
+            self._request_measured_task_route(msg)
+            return
+        if (len(msg.points) != 2 or any(len(p.positions) != 7 for p in msg.points)
+                or not all(math.isfinite(q) for p in msg.points for q in p.positions)):
+            return
+        with self._lock:
+            self.task_route_proposal = msg
+
+    def _request_task_route_followup(self, proposal):
+        if len(proposal.points) != 1 or len(proposal.points[0].positions) != 7:
+            return
+        joints = proposal.points[0].positions
+        now = rospy.Time.now()
+        with self._lock:
+            if (not self.task_first_research or not self.rolling_executable_task
+                    or self.state != self.PROBE_NORMAL or not self.execution_ready
+                    or not self.tracker_active or self.execution_event_latched
+                    or self.task_route_target is None or self.rolling_joints is None
+                    or self.pending_probe_execution_stamp_ns <= 0
+                    or not 0. <= (now-proposal.header.stamp).to_sec() <= .15
+                    or not all(math.isfinite(q) for q in joints)
+                    or max(abs(a-b) for a,b in zip(joints,self.rolling_joints)) > .06):
+                return
+            self.task_route_followup_request = self.pending_probe_execution_stamp_ns, now
+
+    def _request_measured_task_route(self, proposal):
+        if (len(proposal.points) not in (3, 4) or any(len(p.positions) != 7 for p in proposal.points)
+                or not all(math.isfinite(q) for p in proposal.points for q in p.positions)):
+            return
+        now = rospy.Time.now()
+        target, _, initial = proposal.points[:3]
+        with self._lock:
+            idle_blocked_probe = (self.state == self.PROBE_NORMAL and self.blocker_rediscovery_pending
+                                  and not self.tracker_active and not self.execution_event_latched)
+            if (not self.task_first_research or not self.execution_ready
+                    or (self.state != self.REPAIR and not idle_blocked_probe)
+                    or self.rolling_joints is None or self._probe_single_flight_busy_locked()
+                    or not 0. <= (now - proposal.header.stamp).to_sec() <= .5
+                    or max(abs(a - b) for a, b in zip(initial.positions, self.rolling_joints)) > .06):
+                return
+            _, _, continuation = proposal.header.frame_id.partition('/')
+            if self.task_sweep_handoff and self.task_sweep_blocker is not None:
+                if continuation not in ('view','precision_view',str(self.task_sweep_blocker[0])):
+                    return
+            self.task_sweep_view = continuation in ('view','precision_view')
+            self.task_sweep_precision_view = continuation == 'precision_view'
+            self.task_sweep_terminal = (self.task_sweep_handoff and not self.task_sweep_view
+                and len(proposal.points) == 4
+                and max(abs(a-b) for a,b in zip(target.positions, proposal.points[3].positions)) <= 1e-8)
+            self.view_ingress_request_ns = now.to_nsec()
+            self.view_ingress_veto = None
+            proposal.header.frame_id = ('measured_free_task_route/precision_view' if self.task_sweep_precision_view
+                                        else 'measured_free_task_route')
+            self.task_route_followup_request = None
+            self.task_route_target = list(target.positions)
+            self.task_route_reversal_available = True
+            self.task_route_reversal_stamp = 0
+            proposal.points = proposal.points[:2] + proposal.points[3:]
+            self.task_route_pub.publish(proposal)
+            if idle_blocked_probe:
+                # This retires the failed route's rediscovery request. The
+                # replacement still needs a fresh PROBE verification and commit.
+                self.blocker_rediscovery_pending = False
+                self.blocker_rediscovery_origin = 'none'
+                if self.blocker_rediscovery_force_bootstrap:
+                    self.force_vbc_bootstrap_pub.publish(Bool(data=False))
+                self.blocker_rediscovery_force_bootstrap = False
+            reason = 'measured_free_probe_replacement' if idle_blocked_probe else 'measured_free_task_route'
+            self._transition_locked(self.PROBE_NORMAL, reason, now)
+            self.replan_request_pub.publish(Bool(data=True))
+            rospy.loginfo('[TASK_ROUTE] requested measured free short route target=%s', self.task_route_target)
+
+    def _task_route_velocity_locked(self, now):
+        sample = self.task_route_velocity
+        if sample is not None and 0. <= (now - sample[0]).to_sec() <= .12:
+            return sample[1]
+        return None
+
+    def _task_route_opposes_motion_locked(self, now):
+        velocity = self._task_route_velocity_locked(now)
+        if velocity is None or self.task_route_target is None or self.rolling_joints is None:
+            return False
+        error = [target-q for target, q in zip(self.task_route_target, self.rolling_joints)]
+        dominant = max(.09, max(abs(value) for value in error) - .035)
+        return any(abs(gap) >= dominant and abs(speed) >= .06 and gap * speed < 0.
+                   for gap, speed in zip(error, velocity))
+
+    def _task_route_distance_locked(self):
+        if self.task_route_target is None or self.rolling_joints is None:
+            return None
+        return max(abs(a - b) for a, b in zip(self.rolling_joints, self.task_route_target))
+
     def _maybe_release_matched_observation_locked(self, now):
+        if self.task_sweep_handoff and self.task_sweep_blocker is not None:
+            return False
         if (not getattr(self, 'matched_observation_release', False) or
                 not self.task_first_research or self.state != self.REPAIR or not self.execution_ready):
             return False
@@ -941,6 +1165,14 @@ class C44VerifiedRegimeManager:
         self._observation_release_snapshot = event['acquisition_snapshot_id']
         if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
             self._rolling_release = event.copy()
+        route = self.task_route_proposal
+        if route is not None and route.header.frame_id == token:
+            route.header.stamp = now
+            self.task_route_target = list(route.points[0].positions)
+            self.task_sweep_terminal = False
+            self.task_route_proposal = None
+            self.task_route_pub.publish(route)
+            rospy.loginfo('[TASK_ROUTE] released by ToF token=%s target=%s', token, self.task_route_target)
         self._observation_release_stamp_ns = now.to_nsec()
         self._transition_locked(self.PROBE_NORMAL, 'task_first_observation_acquired', now)
         return True
@@ -1042,6 +1274,17 @@ class C44VerifiedRegimeManager:
         if msg is None:
             return
         f = _tokens(msg.data)
+        if (self.view_evidence_handoff and f.get("trajectory_source") == "bootstrap"
+                and _as_bool(f.get("success")) and _as_bool(f.get("has_violation")) is False):
+            stamp = _as_int(f.get("trajectory_stamp_ns"), 0)
+            with self._lock:
+                if self.state == self.REPAIR and self.execution_ready and stamp > 0:
+                    token = self._observation_waypoint[0] if self._observation_waypoint else None
+                    key = (stamp, token)
+                    if key != self.view_corridor_trial:
+                        self.view_corridor_trial = key
+                        self._transition_locked(self.PROBE_NORMAL, "task_reference_sweep_clear", rospy.Time.now())
+            return
         # C5.30: solver-failure rediscovery is valid only on the latest
         # Sparse-SCP query trajectory: the same trajectory that generated the
         # local-GCDF batch. Task-bootstrap verdicts are not comparable here.
@@ -1309,8 +1552,69 @@ class C44VerifiedRegimeManager:
                 self._remember_execution_audit_identity_locked(stamp, stamp)
                 self._drain_execution_audits_locked(rospy.Time.now())
 
+    def _rolling_goal_cb(self, msg):
+        with self._lock:
+            if self.rolling_goal is None or self.rolling_goal.pose != msg.pose:
+                self.task_route_target = None
+                self.task_route_probe_distance = None
+            self.rolling_goal = msg
+
+    def _rolling_joints_cb(self, msg):
+        joints = dict(zip(msg.name, msg.position))
+        names = ("joint1", "joint2", "joint3", "joint4", "wrist_joint1",
+                 "wrist_joint2", "wrist_joint3")
+        if all(name in joints and math.isfinite(joints[name]) for name in names):
+            with self._lock:
+                self.rolling_joints = tuple(joints[name] for name in names)
+                if self.task_sweep_precision_view and self.task_route_target is not None:
+                    identity=tuple(self.task_route_target)
+                    current=rospy.Time.now().to_sec()
+                    history=getattr(self,'camera_tracking_history',None)
+                    if history is None or history[0]!=identity:
+                        history=identity,deque(maxlen=240)
+                        self.camera_tracking_history=history
+                    series=history[1]
+                    gap=max(abs(a-b) for a,b in zip(identity,self.rolling_joints))
+                    if not series or current-series[-1][0]>=.02:
+                        series.append((current,gap))
+                    while series and current-series[0][0]>1.45:series.popleft()
+
+                velocities = dict(zip(msg.name, msg.velocity))
+                if all(name in velocities and math.isfinite(velocities[name]) for name in names):
+                    self.task_route_velocity = msg.header.stamp, tuple(velocities[name] for name in names)
+                else:
+                    self.task_route_velocity = None
+                if self.state == self.REPAIR and self.rolling_observation_start is None:
+                    self.rolling_observation_start = self.rolling_joints
+
+    def _rolling_pose_error_locked(self, now):
+        goal = self.rolling_goal
+        if goal is None:
+            return None
+        try:
+            frame = goal.header.frame_id or "base_link"
+            actual = self.rolling_tf.lookup_transform(frame, "EE_link", rospy.Time(0))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+        if not 0 <= (now - actual.header.stamp).to_sec() <= self.input_timeout:
+            return None
+        p, goal_p = actual.transform.translation, goal.pose.position
+        a, b = actual.transform.rotation, goal.pose.orientation
+        q1, q2 = (a.x, a.y, a.z, a.w), (b.x, b.y, b.z, b.w)
+        norm = math.hypot(*q1) * math.hypot(*q2)
+        if not math.isfinite(norm) or norm <= 0:
+            return None
+        dot = abs(sum(x*y for x, y in zip(q1, q2))) / norm
+        return math.hypot(p.x-goal_p.x, p.y-goal_p.y, p.z-goal_p.z), 2*math.acos(min(1., dot))
+
+    @staticmethod
+    def _rolling_pose_cost(errors):
+        position, angle = errors
+        return (position / .10)**2 + angle**2
+
     def _repair_completion_cb(self, msg):
-        if msg is None or not self.repair_completion_gate_enabled:
+        if msg is None or not (self.repair_completion_gate_enabled or self.rolling_executable_task):
             return
         value = bool(msg.data)
         now = rospy.Time.now()
@@ -1410,6 +1714,18 @@ class C44VerifiedRegimeManager:
             self.last_candidate_verification_view = verification_view
             self.candidate_outcome_time = now
             self.candidate_event_count += 1
+            if (self.task_sweep_view and self.task_route_target is not None
+                    and self.state == self.PROBE_NORMAL and result == "unsafe"
+                    and verification_view == "probe_prefix_brake_hold"
+                    and _as_int(f.get("raw_candidate_stamp_ns"), 0) >= self.view_ingress_request_ns):
+                ingress = rejected_task_sweep(msg.data)
+                if ingress is not None:
+                    self.view_ingress_veto = (self.view_ingress_request_ns, self.task_route_target, ingress)
+            if (self.task_sweep_handoff and self.state in (self.NORMAL, self.PROBE_NORMAL)
+                    and not self.task_sweep_view and result == "unsafe"):
+                blocked = rejected_task_sweep(msg.data)
+                if blocked is not None:
+                    self.task_sweep_blocker = blocked
 
             if result == 'protocol_invalid':
                 # No geometry verdict: preserve unsafe/direction failure memory
@@ -1479,7 +1795,13 @@ class C44VerifiedRegimeManager:
                     self.last_commit_count += 1
                     self.repair_safe_commit_count += 1
                     self.last_commit_event_time = now
-                    if self.repair_completion_gate_enabled and not self.research_opportunistic_probe:
+                    if self.rolling_executable_task and execution_stamp_ns > 0:
+                        duration = _as_float(f.get("cycle_recovery_prefix_s"))
+                        if not math.isfinite(duration) or duration <= 0:
+                            duration = _as_float(f.get("committed_duration_s"))
+                        self.rolling_observation_execution = (execution_stamp_ns, duration)
+                        self.last_transition_reason = "observe_until_measured_motion_or_tof"
+                    elif self.repair_completion_gate_enabled and not self.research_opportunistic_probe:
                         # C4.7: executing a VBC-safe detour is progress toward
                         # seeing. Stay in REPAIR until real confidence confirms it.
                         self.last_transition_reason = (
@@ -1512,6 +1834,21 @@ class C44VerifiedRegimeManager:
                         if (math.isfinite(probe_effective_prefix_s) and
                             probe_effective_prefix_s > 0.0)
                         else math.nan)
+                    if self.rolling_executable_task:
+                        if self.view_evidence_handoff:
+                            # A tentative task solve leaves live observation
+                            # records intact until an audited executable commits.
+                            self.clear_until = now + rospy.Duration(self.clear_pulse_s)
+                        self.task_route_probe_distance = self._task_route_distance_locked()
+                        self.probe_view_joints = ((tuple(self.task_route_target),tuple(self.rolling_joints))
+                            if self.task_sweep_view and self.task_route_target is not None
+                            and self.rolling_joints is not None else None)
+                        reverses = (self.task_sweep_handoff and self.task_route_reversal_available
+                                    and self._task_route_opposes_motion_locked(now))
+                        self.task_route_reversal_stamp = execution_stamp_ns if reverses else 0
+                        errors = self._rolling_pose_error_locked(now)
+                        self.rolling_probe_start_cost = (
+                            self._rolling_pose_cost(errors) if errors is not None else None)
                     self.last_transition_reason = (
                         "safe_probe_commit_wait_prefix_stamp_{}".format(
                             execution_stamp_ns))
@@ -1525,11 +1862,41 @@ class C44VerifiedRegimeManager:
                             self.probe_ignore_until is not None and
                             now < self.probe_ignore_until):
                         return
+                    if (self.rolling_executable_task and committed is False
+                            and self.pending_probe_execution_stamp_ns > 0
+                            and self.tracker_active
+                            and self.tracker_execution_stamp_ns == self.pending_probe_execution_stamp_ns):
+                        errors = self._rolling_pose_error_locked(now)
+                        if errors is not None and errors[0] <= .02 and errors[1] <= .2:
+                            # A rejected replacement has no effect on the
+                            # identity of the certified tail already executing.
+                            # The tracker callback still verifies completion
+                            # and rechecks the measured goal before handoff.
+                            self.last_transition_reason = "probe_rejected_candidate_waiting_certified_goal_tail"
+                            return
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
                     self.pending_probe_effective_prefix_s = math.nan
 
                     if safety_gate == "gcdf_occupied":
+                        velocity = self._task_route_velocity_locked(now)
+                        idle_route = (
+                            self.task_sweep_handoff and self.rolling_executable_task
+                            and not self.task_sweep_view and self.task_route_target is not None
+                            and verification_view == 'probe_prefix_brake_hold'
+                            and 0 < self.view_ingress_request_ns <= self.last_tracker_complete_stamp_ns
+                            and _as_int(f.get('raw_candidate_stamp_ns'), 0) >= self.view_ingress_request_ns
+                            and not self.tracker_active and not self.execution_event_latched
+                            and self.tracker_source in ('trajectory_complete_hold', 'last_reference_hold')
+                            and self.tracker_execution_stamp_ns in (0, self.last_tracker_complete_stamp_ns)
+                            and self.tracker_summary_time is not None
+                            and 0. <= (now-self.tracker_summary_time).to_sec() <= self.input_timeout
+                            and velocity is not None and max(abs(v) for v in velocity) <= .05)
+                        if idle_route:
+                            self.gcdf_occupied_replan_count += 1
+                            self._transition_locked(self.REPAIR, 'occupied_task_tail_settled_replan', now)
+                            self._publish_summary()
+                            return
                         # The probe candidate hit a known physical obstacle.
                         # Stay in PROBE and ask for another collision-free task
                         # probe; never manufacture a visibility obligation.
@@ -1566,12 +1933,57 @@ class C44VerifiedRegimeManager:
                         verification_view == "probe_prefix_brake_hold"):
                     # Timeout is not evidence that active sensing is required;
                     # stay in PROBE, fail closed, and request a fresh candidate.
+                    retained_candidate_pending = self.pending_probe_execution_stamp_ns > 0
                     self.pending_probe_candidate_seq = 0
                     self.pending_probe_execution_stamp_ns = 0
                     self.pending_probe_effective_prefix_s = math.nan
+                    if (self.task_sweep_handoff and self.task_sweep_view
+                            and f.get('failure_kind') == 'retained_occupied_approach'
+                            and not retained_candidate_pending and not self.tracker_active
+                            and not self.execution_event_latched
+                            and self.tracker_summary_time is not None
+                            and 0. <= (now-self.tracker_summary_time).to_sec() <= self.input_timeout):
+                        self.task_sweep_view = False
+                        self.task_route_target = None
+                        self.task_route_followup_request = None
+                        self._begin_blocker_rediscovery_locked('retained_occupied_view', force_bootstrap=False)
+                        self._publish_summary()
+                        return
                     self.last_transition_reason = "probe_candidate_timeout_replan"
                     self.replan_request_pub.publish(Bool(data=True))
                     return
+
+    def _occupied_stop_cb(self, msg):
+        fields = _tokens(msg.data)
+        execution = _as_int(fields.get("execution_stamp_ns"), 0)
+        veto = _as_int(fields.get("veto_stamp_ns"), 0)
+        with self._lock:
+            if execution > 0 and veto > self.occupied_stop[1]:
+                self.occupied_stop = execution, veto
+                self.occupied_stop_completed_tail = fields.get('completed_tail') == '1'
+                self._consume_occupied_stop_locked(rospy.Time.now())
+
+    def _consume_occupied_stop_locked(self, now):
+        execution, veto = self.occupied_stop
+        if (not self.task_first_research or not self.execution_ready or self.tracker_active
+                or veto <= self.occupied_stop_handled or self._probe_single_flight_busy_locked()
+                or self.tracker_summary_time is None
+                or not 0. <= (now-self.tracker_summary_time).to_sec() <= self.input_timeout):
+            return
+        stopped = self.tracker_source == 'stopped_safety_hold' and self.tracker_execution_stamp_ns == execution
+        tail = False
+        if (self.occupied_stop_completed_tail and self.last_tracker_complete_stamp_ns == execution
+                and not self.execution_event_latched):
+            velocity = self._task_route_velocity_locked(now)
+            tail = (velocity is not None and max(abs(v) for v in velocity) <= .05
+                    and self.tracker_execution_stamp_ns in (0, execution)
+                    and self.tracker_source in ('trajectory_complete_hold', 'last_reference_hold',
+                                                'external_gcdf_hard_hold'))
+        if stopped or tail:
+            self.occupied_stop_handled = veto
+            reason = 'occupied_completed_tail_measured_retreat' if tail else 'occupied_stop_measured_retreat'
+            self._transition_locked(self.REPAIR, reason, now)
+            self._publish_summary()
 
     def _tracker_summary_cb(self, msg):
         if msg is None:
@@ -1618,6 +2030,23 @@ class C44VerifiedRegimeManager:
                 self.last_tracker_complete_seq = seq
                 if execution_stamp_ns != self.last_tracker_complete_stamp_ns:
                     self.last_tracker_complete_stamp_ns = execution_stamp_ns
+            self._consume_occupied_stop_locked(now)
+
+            if self.rolling_executable_task and self.state == self.REPAIR:
+                if self.view_evidence_handoff:
+                    return
+                observation = self.rolling_observation_execution
+                start = self.rolling_observation_start
+                measured = self.rolling_joints
+                if (observation is not None and execution_stamp_ns == observation[0] and not aborted
+                        and (full_complete or phase_s + 1e-6 >= observation[1])
+                        and start is not None and measured is not None):
+                    motion = max(abs(a-b) for a, b in zip(start, measured))
+                    if motion >= .08:
+                        rospy.loginfo("[ROLLING_OBSERVATION] stamp=%d measured_joint_change_rad=%.4f",
+                                      execution_stamp_ns, motion)
+                        self._transition_locked(self.PROBE_NORMAL, "executed_observation_changed_view", now)
+                return
 
             if self.state != self.PROBE_NORMAL:
                 return
@@ -1655,7 +2084,89 @@ class C44VerifiedRegimeManager:
                 if not prefix_complete and not full_complete:
                     return
 
+                if self.rolling_executable_task:
+                    errors = self._rolling_pose_error_locked(now)
+                    within_goal = errors is not None and errors[0] <= .02 and errors[1] <= .2
+                    before = self.rolling_probe_start_cost
+                    improvement = math.nan if errors is None or before is None else (
+                        before - self._rolling_pose_cost(errors))
+                    progressed = improvement > 1e-4
+                    if (os.environ.get('CARE_LIVE_TOF_ROUTE') == 'true' and
+                            self.task_route_probe_distance is not None):
+                        route_distance = self._task_route_distance_locked()
+                        if route_distance is not None:
+                            waypoint_tolerance = (.004 if self.task_sweep_terminal else
+                                .006 if self.task_sweep_view and self.task_sweep_precision_view else .025)
+                            progressed = (route_distance <= waypoint_tolerance or
+                                          route_distance < self.task_route_probe_distance - .001)
+                            origin=getattr(self,'probe_view_joints',None)
+                            if (self.task_sweep_view and not progressed and origin is not None
+                                    and tuple(self.task_route_target)==origin[0]
+                                    and route_distance<=self.task_route_probe_distance+.004):
+                                before_norm=math.sqrt(sum((a-b)**2 for a,b in zip(*origin)))
+                                now_norm=math.sqrt(sum((a-b)**2 for a,b in zip(origin[0],self.rolling_joints)))
+                                if now_norm<before_norm-.006:
+                                    progressed=True
+                                    rospy.loginfo("[VIEW_JOINT_PROGRESS] execution=%d max_gap=%.5f vector_reduction=%.5f",
+                                                  execution_stamp_ns,route_distance,before_norm-now_norm)
+                    followup = self.task_route_followup_request
+                    yield_after_tail = (followup is not None
+                                        and followup[0] == execution_stamp_ns
+                                        and 0. <= (now-followup[1]).to_sec() <= 2.
+                                        and self.execution_ready and not self.execution_event_latched)
+                    if self.task_sweep_view and not within_goal:
+                        distance = self._task_route_distance_locked()
+                        view_tolerance = .006 if self.task_sweep_precision_view else .025
+                        at_view = distance is not None and distance <= view_tolerance
+                        history=getattr(self,'camera_tracking_history',None)
+                        prior=None
+                        if (self.task_sweep_precision_view and not progressed and not at_view and
+                                not yield_after_tail and history is not None and self.task_route_target is not None
+                                and history[0]==tuple(self.task_route_target) and history[1] and distance is not None):
+                            latest=history[1][-1]
+                            if 0.<=now.to_sec()-latest[0]<.15:
+                                prior=next((gap for stamp,gap in history[1] if latest[0]-stamp>=.65),None)
+                                if prior is not None and prior-distance>.025:
+                                    progressed=True
+                                    rospy.loginfo_throttle(.5,"[MEASURED_VIEW_MOTION] previous=%.4f now=%.4f",
+                                                           prior,distance)
+                        if (at_view or not progressed or yield_after_tail) and full_complete and not self.tracker_active:
+                            rospy.loginfo("[MEASURED_VIEW_BOUNDARY] arrived=%s progressing=%s yielded=%s gap=%s prior=%s",
+                                          at_view,progressed,yield_after_tail,distance,prior)
+                        if at_view or not progressed or yield_after_tail:
+                            if full_complete and not self.tracker_active:
+                                self.task_route_target = None
+                                self.task_route_probe_distance = None
+                                self._transition_locked(self.REPAIR, "view_stopped_recompute_task_sweep", now)
+                                self._publish_summary()
+                            return
+                    route_distance = self._task_route_distance_locked()
+                    settled_tolerance = .004 if self.task_sweep_terminal else .025
+                    reached_task_waypoint = (
+                        self.task_sweep_handoff and not self.task_sweep_view
+                        and not within_goal and route_distance is not None and route_distance <= settled_tolerance)
+                    if reached_task_waypoint and (not full_complete or self.tracker_active):
+                        self.task_route_followup_request = execution_stamp_ns, now
+                        return
+                    if not full_complete and (within_goal or not progressed or yield_after_tail):
+                        # Observe the remaining certified braking motion before
+                        # replacing a near-goal or apparently stalled segment.
+                        return
+                    rospy.loginfo("[ROLLING_TASK] stamp=%d pose_cost_reduction=%.6f full=%s within_goal=%s",
+                                  execution_stamp_ns, improvement, full_complete, within_goal)
+
                 completed_stamp = self.pending_probe_execution_stamp_ns
+                if self.rolling_executable_task and self.task_route_probe_distance is not None:
+                    route_distance = self._task_route_distance_locked()
+                    if route_distance is not None:
+                        stop_tolerance = (.004 if self.task_sweep_terminal else
+                            .006 if self.task_sweep_view and self.task_sweep_precision_view else .025)
+                        progressed = progressed or (
+                            route_distance <= stop_tolerance or route_distance < self.task_route_probe_distance - .001)
+                        if route_distance <= stop_tolerance:
+                            self.task_route_target = None
+                    self.task_route_probe_distance = None
+
                 self.pending_probe_candidate_seq = 0
                 self.pending_probe_execution_stamp_ns = 0
                 self.pending_probe_effective_prefix_s = math.nan
@@ -1674,6 +2185,41 @@ class C44VerifiedRegimeManager:
                         execution_stamp_ns=str(completed_stamp),
                         consumed_after_actual_task_prefix=True),separators=(',',':'))))
                     self._rolling_release = None
+
+                if self.rolling_executable_task:
+                    self.task_route_followup_request = None
+                    if within_goal and full_complete and not self.tracker_active:
+                        # The matching committed trajectory has finished its
+                        # audited brake/hold tail. Finish the actual regime
+                        # handoff, leaving the tracker on that certified hold.
+                        self._transition_locked(self.NORMAL, "rolling_task_stopped_at_goal", now)
+                        self._publish_summary()
+                    elif within_goal:
+                        self.last_transition_reason = "rolling_task_stopped_at_goal"
+                    elif reached_task_waypoint or (yield_after_tail and full_complete and not self.tracker_active):
+                        reason = ("measured_task_waypoint_stopped" if reached_task_waypoint
+                                  else "task_route_followup_after_certified_tail")
+                        self._transition_locked(self.REPAIR, reason, now)
+                        self._publish_summary()
+                    elif progressed:
+                        self.last_transition_reason = "rolling_task_measured_progress"
+                        self.replan_request_pub.publish(Bool(data=True))
+                    else:
+                        velocity = self._task_route_velocity_locked(now)
+                        stopped_reversal = (self.task_route_reversal_stamp == completed_stamp
+                                            and self.task_route_reversal_available
+                                            and self.task_route_target is not None
+                                            and full_complete and not self.tracker_active
+                                            and self.execution_ready and not self.execution_event_latched
+                                            and velocity is not None and max(map(abs, velocity)) <= .05)
+                        if stopped_reversal:
+                            self.task_route_reversal_available = False
+                            self.last_transition_reason = "rolling_task_replan_after_measured_reversal"
+                            self.replan_request_pub.publish(Bool(data=True))
+                            self._publish_summary()
+                        else:
+                            self._transition_locked(self.REPAIR, "rolling_task_no_pose_progress", now)
+                    return
 
                 if self._maybe_enter_observation_repair_locked(
                         now, "probe_prefix_complete", probe_boundary=True):
@@ -1908,6 +2454,9 @@ class C44VerifiedRegimeManager:
                     self.tracker_execution_stamp_ns ==
                     self.vbc_unsafe_execution_stamp_ns)),
                 "tracker_source={}".format(self.tracker_source),
+                "occupied_stop_veto_stamp_ns={}".format(
+                    self.occupied_stop_handled if self.tracker_source == "stopped_safety_hold"
+                    and self.tracker_execution_stamp_ns == self.occupied_stop[0] else 0),
                 "tracker_abort_count={}".format(self.tracker_abort_count),
                 "last_tracker_aborted_stamp_ns={}".format(
                     self.last_tracker_aborted_stamp_ns),
@@ -1985,6 +2534,8 @@ class C44VerifiedRegimeManager:
                 "observation_return_retired_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'retired_gains', 0)),
                 "observation_return_released_gains={}".format(getattr(getattr(self, '_observation_release_identity', None), 'released_gains', 0)),
                 "observation_release_snapshot={}".format(getattr(self, '_observation_release_snapshot', 'none')),
+                "view_ingress_veto={}".format(json.dumps(self.view_ingress_veto, separators=(',', ':'))),
+                "task_sweep_blocker={}".format(json.dumps(self.task_sweep_blocker, separators=(',', ':'))),
                 "observation_release_stamp_ns={}".format(getattr(self, '_observation_release_stamp_ns', 0)),
                 "repair_completion_armed={}".format(
                     int(self.repair_completion_armed)),

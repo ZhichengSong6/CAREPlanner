@@ -161,6 +161,9 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         # confirmed blocker from the current earliest trajectory layer may join
         # the active target's shared solve and change q_vis.
         self._path_co_plan_ids: List[int] = []
+        # Co-plan membership is temporary (replacement pins it to one owner).
+        # Keep the reciprocal-pair memory independently, bound to live regions.
+        self._path_reciprocal_pairs = {}
         self._path_associated_ids: List[int] = []
         self._path_association_reason = "startup"
         self._path_associated_count = 0
@@ -553,6 +556,11 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self.final_recovery_sub = rospy.Subscriber(str(rospy.get_param(
                 '~final_vbc_recovery_feedback_topic', '/care_planner/local_planner/summary')),
                 String, self._final_recovery_feedback_cb, queue_size=8)
+        if os.environ.get('CARE_VIEW_EVIDENCE_HANDOFF') == 'true':
+            self._view_tried_heads = {}
+            self.view_refresh_sub = rospy.Subscriber(
+                '/care_planner/active_sensing/refresh_stalled_view', String,
+                self._stalled_view_cb, queue_size=1)
         if self._safe_stall_recovery_enabled:
             self.observation_dependency_sub = rospy.Subscriber(
                 '/care_planner/local_planner/observation_dependency', String,
@@ -570,6 +578,41 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if activation_mode != 'off':
             from observation_activation_refresh import ActivationRefresh
             self._activation_refresh = ActivationRefresh(self, mode=activation_mode)
+        self._task_route = None
+        if os.environ.get('CARE_TASK_ROUTE_COMPARISON') == 'true':
+            if os.environ.get('CARE_OCCUPIED_FEEDBACK') == 'true':
+                from measured_detour_route import TaskRouteComparison
+            elif os.environ.get('CARE_CHAINED_MEASURED_ENTRY') == 'true':
+                from chained_measured_entry import TaskRouteComparison
+            elif os.environ.get('CARE_TARGETED_MEASURED_ENTRY') == 'true':
+                from targeted_measured_entry import TaskRouteComparison
+            elif os.environ.get('CARE_ONLINE_MEASURED_ENTRY') == 'true':
+                from online_measured_entry import TaskRouteComparison
+            elif os.environ.get('CARE_MEASURED_BODY_ENTRY') == 'true':
+                from measured_body_entry import TaskRouteComparison
+            elif os.environ.get('CARE_RETAINED_FRONTIER_ENDPOINT') == 'true':
+                from retained_frontier_endpoint import TaskRouteComparison
+            elif os.environ.get('CARE_RETAINED_FRONTIER_ROUTE') == 'true':
+                from retained_frontier_route import TaskRouteComparison
+            elif os.environ.get('CARE_FRONTIER_TOF_ROUTE') == 'true':
+                from frontier_tof_route import TaskRouteComparison
+            elif os.environ.get('CARE_ROLLING_TOF_ROUTE') == 'true':
+                from rolling_tof_route import TaskRouteComparison
+            elif os.environ.get('CARE_LIVE_TOF_ROUTE') == 'true':
+                from live_tof_route import TaskRouteComparison
+            elif os.environ.get('CARE_MEASURED_TASK_ROUTE') == 'true':
+                from measured_task_route import TaskRouteComparison
+            elif os.environ.get('CARE_COUPLED_ENTRY') == 'true':
+                from coupled_entry import TaskRouteComparison
+            elif os.environ.get('CARE_PAIRED_VIEW') == 'true':
+                from paired_view import TaskRouteComparison
+            elif os.environ.get('CARE_OPTICAL_VIEW') == 'true':
+                from optical_view import TaskRouteComparison
+            elif os.environ.get('CARE_INDEPENDENT_VIEW') == 'true':
+                from independent_view import TaskRouteComparison
+            else:
+                from task_route_comparison import TaskRouteComparison
+            self._task_route = TaskRouteComparison(self)
         self._rolling_task = None
         if os.environ.get('CARE_ROLLING_TASK_OBSERVATION') == 'true':
             from rolling_task_observation import RollingTaskObservation
@@ -1766,8 +1809,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 f_min = float(
                     self._per_sensor_runtime.branch_score_numpy(
                         points, q_vis, sensor_id))
-                geometry = self._per_sensor_runtime._candidate_geometry(points, q_vis, sensor_id)
-                compatible = bool(geometry['accepted'])
+                compatible = self._view_covers_region(points, q_vis, sensor_id)
             else:
                 x = torch.tensor(
                     points, device=self.device, dtype=torch.float32)
@@ -1883,6 +1925,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         matched["last_geometry_match_source"] = str(source)
 
         matched["last_seen_ros_s"] = rospy.Time.now().to_sec()
+        if matched.get("paired_task_route"):
+            return
         matched["points"] = merged_points.copy()
         matched["keys"] = new_keys
         matched["centroid"] = new_centroid.copy()
@@ -1901,6 +1945,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
     def _prune_or_initialize_stack(self) -> None:
         with self._obligation_lock:
             existing = {int(ob["id"]) for ob in self._obligations}
+            live_regions = {int(ob['id']): observation_region_token(ob)
+                            for ob in self._obligations}
+            self._path_reciprocal_pairs = {
+                pair: regions for pair, regions in
+                getattr(self, '_path_reciprocal_pairs', {}).items()
+                if all(live_regions.get(oid) == token
+                       for oid, token in zip(pair, regions))}
             if not existing and hasattr(self, '_dependency_attempts'):
                 # A genuinely completed acquisition episode may start anew;
                 # movement, token changes and temporary preemption may not.
@@ -2382,6 +2433,12 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         )
         self.frontier_summary_pub.publish(summary)
 
+    def _view_covers_region(self, points, q_vis, sensor):
+        # This compares observation objectives. Only sensor evidence can complete one.
+        if self.local_observation_directions:
+            return self._per_sensor_runtime._fov_objective(points, q_vis, sensor) >= 0.
+        return bool(self._per_sensor_runtime._candidate_geometry(points, q_vis, sensor)['accepted'])
+
     def _region_learned_slack(self, ob, q_vis, proposal=None):
         points = np.asarray(ob.get("points", []), dtype=np.float64).reshape(-1, 3)
         if points.shape[0] == 0 or not np.all(np.isfinite(points)):
@@ -2396,10 +2453,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 getattr(self, '_per_sensor_runtime', None) is not None):
             sid = int(proposal.get('per_sensor_selected_sensor_id', -1))
             if sid >= 0:
-                geometry = self._per_sensor_runtime._candidate_geometry(points, q_vis, sid)
-                # Physical proposal geometry owns steering quality; learned
-                # values remain diagnostics. Actual confidence owns completion.
-                return (0. if geometry['accepted'] else math.inf), f_min
+                covers = self._view_covers_region(points, q_vis, sid)
+                return (0. if covers else math.inf), f_min
         slack = max(0.0, self.progressive_shared_accept_f_min - f_min)
         return float(slack), f_min
 
@@ -2616,7 +2671,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             len(by_id[active_id]['points']) and np.all(
                 np.asarray(by_id[active_id]['points'])[:, 2] >=
                 getattr(self, 'per_sensor_high_witness_z_min', .85)))
-        recovering = recovering or pinned or high_ee_target
+        recovering = (recovering or pinned or high_ee_target or
+            by_id[active_id].get('shared_solution_mode') == 'independent_task_view_r1')
         shared = None if recovering else self._compute_progressive_shared_target(
             by_id, active_id, shared_priority_order)
         if (shared is None and not recovering and
@@ -2648,7 +2704,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                         active_id, token, list(stored_mask), list(restored_mask),
                         stored_mask_explicit, 'q_vis_joint_mask' in first)
             first['shared_solution_mode'] = 'observation_dependency_target_locked'
-        if shared is not None:
+        if shared is not None and first.get('shared_solution_mode') != 'early_goal_region_r1':
             first["q_vis"] = np.asarray(
                 shared["q_vis"], dtype=np.float64).copy()
             first["q_zero"] = np.asarray(
@@ -2669,6 +2725,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             first["target_solver_points"] = list(shared["target_solver_points"])
 
         rest = [by_id[oid] for oid in priority_order if oid != active_id]
+        route = getattr(self, '_task_route', None)
+        screen = getattr(route, 'allow_observation', None)
+        if screen is not None and not screen(first):
+            return []
         return [first] + rest
 
     def _select_nearest_qvis_id(self, ids: List[int]):
@@ -2688,7 +2748,7 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
 
     def _consider_active_layer(
             self, active_ids: List[int], new_ids: List[int], sweep_s: float,
-            urgent_gcdf_recovery: bool = False) -> None:
+            urgent_gcdf_recovery: bool = False, candidate_identity=None) -> None:
         self._prune_or_initialize_stack()
         active_ids = sorted(set(int(v) for v in active_ids))
         new_ids = sorted(set(int(v) for v in new_ids))
@@ -2706,6 +2766,40 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._path_association_reason = "no_active_target_or_layer"
             return
 
+        # A superseded candidate can still describe a later task obstacle.
+        # Keep it queued while a newer audited REPAIR step toward the active
+        # view is being executed. Current candidate and execution vetoes go
+        # through the ordinary blocker path.
+        if candidate_identity and not urgent_gcdf_recovery and self._pending_relevance_enabled:
+            with self._obligation_lock:
+                owner = next((ob for ob in self._obligations if int(ob['id']) == current), None)
+                approach = getattr(self._task_route, 'early_terminal', None)
+                selected_view = (owner is not None and approach is not None
+                    and owner.get('shared_solution_mode') == 'independent_task_view_r1'
+                    and np.array_equal(np.asarray(owner['points']), approach[1][None]))
+            if selected_view:
+                state = self._pending_relevance
+                now = rospy.Time.now().to_sec()
+                case_stamp = int(candidate_identity.get('trajectory_stamp_ns', 0))
+                with self._coherent_bundle_lock:
+                    tracker = state.tracker or {}
+                    commit = str(state.newest_commit)
+                    progress = next((row for row in reversed(list(state.verdicts.values()))
+                                     if row.get('execution_stamp_ns') == commit
+                                     and row.get('result') == 'safe' and row.get('committed') == '1'
+                                     and row.get('verification_view') == 'repair_prefix_brake_hold'), None)
+                    superseded = (progress is not None and 0 < case_stamp < int(progress['audited_trajectory_stamp_ns'])
+                                  and not state.execution_blocked and tracker.get('execution_stamp_ns') == commit
+                                  and tracker.get('execution_state') == 'EXECUTING'
+                                  and 0. <= now - tracker.get('received', -1.) <= .15)
+                if superseded:
+                    self._pending_blocker_id = None
+                    self._pending_blocker_count = 0
+                    self._path_association_reason = "older_candidate_queued_during_audited_view"
+                    self._trace_observation('task_route_obsolete_candidate_queued',
+                        candidate_identity=candidate_identity, execution_stamp_ns=commit, owner=current)
+                    return
+
         # A QP-failed q_vis owns the sensor-replacement experiment until its
         # replacement target has received a hard-QP result. Keep newly found
         # path blockers live and queued, but do not let them change the stack
@@ -2714,6 +2808,17 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         locked_owner = (replacement.locked_qp_owner_id()
                         if replacement is not None else None)
         if locked_owner is not None:
+            with self._obligation_lock:
+                # Capture a confirmed pair before the temporary owner pin
+                # overwrites co-plan membership. Steering replacements retain
+                # region identity; pruning invalidates changed/removed regions.
+                by_id = {int(ob['id']): ob for ob in self._obligations}
+                pair = tuple(sorted(set(self._path_co_plan_ids)))
+                pairs = self._path_reciprocal_pairs
+                if len(pair) == 2 and all(oid in by_id for oid in pair):
+                    if pair not in pairs and len(pairs) >= 64:
+                        pairs.pop(next(iter(pairs)))
+                    pairs[pair] = tuple(observation_region_token(by_id[oid]) for oid in pair)
             candidates = [
                 oid for oid in new_ids
                 if oid != locked_owner and oid in active_ids]
@@ -2810,7 +2915,10 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             # is still allowed after one member is seen and pruned.
             with self._obligation_lock:
                 previous_pair = set(int(oid) for oid in self._path_co_plan_ids)
-            if previous_pair == {int(current), int(blocker)}:
+            remembered_pair = tuple(sorted((int(current), int(blocker))))
+            if (not urgent_gcdf_recovery and
+                    (previous_pair == {int(current), int(blocker)} or
+                     remembered_pair in self._path_reciprocal_pairs)):
                 self._stack_cycle_block_count += 1
                 with self._obligation_lock:
                     self._path_co_plan_ids = [int(current), int(blocker)]
@@ -3150,6 +3258,53 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._final_recovery_pending = (seq, token)
             self._final_recovery_active_request = (seq, token)
 
+    @staticmethod
+    def _local_head_step(view, target):
+        proposal = view.get('per_sensor_hybrid') or {}
+        sensor = view.get('per_sensor_selected_sensor_id')
+        if proposal.get('proposal_kind') != 'local_r1_direction' or sensor != proposal.get('selected_sensor_id'):
+            return None
+        return next((row for row in proposal.get('candidates', ())
+                     if row['sensor_id'] == sensor and np.array_equal(row['q'],target)),None)
+
+    def _record_seen_query(self, ob, published, seen, fraction, diag):
+        super()._record_seen_query(ob,published,seen,fraction,diag)
+        if (seen or not self.local_observation_directions or not published or diag.get('status') != 'ok'
+                or diag.get('progress_observation_token') != published['observation_token']):
+            return
+        step = self._local_head_step(ob,published['q_vis'])
+        if step is None or not step['start_margin_m'] < step['target_margin_m'] < 0.:
+            return
+        measured = diag.get('measured_q')
+        if measured is None or abs(diag['measured_ros_s'] - diag['query_ros_s']) > .15:
+            return
+        gap = np.max(abs((measured-published['q_vis'])*published['q_vis_joint_mask']))
+        if not np.isfinite(gap) or gap > .01:
+            return
+        token = published['observation_token']
+        with self._final_recovery_lock:
+            if self._final_recovery_pending or getattr(self,'_last_reached_local_token',None)==token:
+                return
+            self._last_reached_local_token = token
+            self._reached_local_request = (self._final_recovery_latest_seq, token, 'reached_local')
+        self._trace_observation('local_r1_reached_unseen',observation_token=token,sensor=step['sensor_id'],
+            masked_error_rad=float(gap),target_margin_m=step['target_margin_m'])
+
+    def _stalled_view_cb(self, msg):
+        token = msg.data
+        with self._schedule_publish_lock:
+            target = getattr(self, '_trace_published_target', None)
+            if target is None or target.get('observation_token') != token:
+                return
+            with self._final_recovery_lock:
+                if self._final_recovery_pending is not None:
+                    return
+                request = (self._final_recovery_latest_seq, token, 'stalled_view')
+                if self._final_recovery_active_request == request:
+                    return
+                self._final_recovery_pending = request
+                self._final_recovery_active_request = request
+
     def _traced_waypoint(self, ob, q):
         """Record a bounded publication identity for target-aware recovery."""
         msg = super()._traced_waypoint(ob, q)
@@ -3200,8 +3355,21 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         with self._final_recovery_lock:
             request = self._final_recovery_pending
             self._final_recovery_pending = None
+            reached_request = getattr(self,'_reached_local_request',None)
+            self._reached_local_request = None
+            if request is None and reached_request is not None and reached_request[0] == self._final_recovery_latest_seq:
+                request = reached_request
+                self._final_recovery_active_request = request
         if request is None:
             return
+        continuing = len(request) == 3 and request[2] == 'reached_local'
+        stalled_view = len(request) == 3 and request[2] == 'stalled_view' 
+        if stalled_view:
+            # This same request can be retried if the live geometry or
+            # measured seed expires. The region still has the original budget.
+            with self._final_recovery_lock:
+                if self._final_recovery_active_request == request:
+                    self._final_recovery_active_request = None
         self._final_recovery_process_count += 1
         with self._schedule_publish_lock:
             published = getattr(self, '_trace_published_target', None)
@@ -3231,6 +3399,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._final_recovery_last_reason = 'stale_target'
                 return
             old = dict(live)
+        if continuing and (not published_matches or observation_token(old) != request[1]):
+            return
         if not published_matches:
             self._final_recovery_live_obligation_fallback_count += 1
             self._final_recovery_last_reason = 'live_obligation_target_fallback'
@@ -3245,28 +3415,90 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         if measured is None:
             return
         measured = np.asarray(measured, dtype=np.float64).copy()
+        recovery_seed_stamp = getattr(self, '_trace_measured', (None, math.nan))[1]
         with self._lock:
             trajectory, received, _ = self._preferred_trajectory_locked()
         if trajectory is None or received is None:
             return
-        if not self._final_recovery_budget.reserve(old['points'], measured):
+        excluded = set()
+        if stalled_view:
+            key = region_key(old['points'])
+            if key not in self._view_tried_heads and len(self._view_tried_heads) >= self.max_obligations:
+                self._view_tried_heads.pop(next(iter(self._view_tried_heads)))
+            excluded = self._view_tried_heads.setdefault(key, set())
+            current_sensor = int(old.get('per_sensor_selected_sensor_id', -1))
+            if len(excluded) >= 7:
+                excluded.clear()
+            if 0 <= current_sensor < 8:
+                excluded.add(current_sensor)
+        paired_mode = os.environ.get('CARE_PAIRED_VIEW') == 'true'
+        paired_replacement = None
+        if paired_mode and stalled_view:
+            try:
+                paired_replacement = self._task_route.choose(old['points'], self._trajectory,
+                    dict(observation_token=request[1]), previous_view=previous_q_vis, excluded=excluded)
+            except Exception as exc:
+                self._trace_observation('task_route_preview_error', error=repr(exc))
+            if self._task_route.pending:
+                with self._final_recovery_lock:
+                    if self._final_recovery_pending is None:
+                        self._final_recovery_pending = request
+                return
+        if paired_replacement is not None and paired_replacement.get('ready'):
+            self._task_route.publish_ready(paired_replacement)
+            return
+        recovery_sensor = current_sensor if stalled_view and self.local_observation_directions else None
+        if continuing:
+            step = self._local_head_step(old, previous_q_vis)
+            if step is None or not (step['start_margin_m'] < step['target_margin_m'] < 0.):
+                return
+            if np.max(abs((measured-previous_q_vis)*published['q_vis_joint_mask'])) > .01:
+                return
+            excluded = set(range(8)) - {step['sensor_id']}
+        if not self._final_recovery_budget.reserve(old['points'], measured, recovery_sensor):
             self._final_recovery_last_reason = 'attempt_budget_hold'
             return
         start = time.perf_counter()
         alternative_seed_attempted = False
+        attempted_heads = []
         try:
             with self._progressive_shared_lock:
                 def generate(seed):
                     self._seed_override = np.asarray(seed, dtype=np.float64).copy()
+                    old_override = getattr(self, '_candidate_replacement_override', None)
+                    if excluded:
+                        self._candidate_replacement_override = dict(
+                            excluded=sorted(excluded), previous_q=previous_q_vis.tolist(),
+                            compute_deadline_monotonic_s=time.monotonic(),
+                            preference_reason='continue_reached_r1' if continuing else 'stalled_view_new_r1_branch')
                     try:
                         return self._generate_active_set_waypoint(
                             old['points'], trajectory,
                             float(old['discovered_sweep_time_s']), received)
                     finally:
                         self._seed_override = None
+                        self._candidate_replacement_override = old_override
 
-                result = generate(measured)
-            if not certified_distinct_q(result, previous_q_vis):
+                replacement = paired_replacement
+                if stalled_view and not paired_mode and os.environ.get('CARE_INDEPENDENT_VIEW') == 'true':
+                    replacement = self._task_route.choose(old['points'], self._trajectory,
+                        dict(observation_token=request[1]), previous_view=previous_q_vis, excluded=excluded)
+                if replacement is None:
+                    result = generate(measured)
+                else:
+                    result = self._task_route.waypoint(replacement, trajectory,
+                        float(old['discovered_sweep_time_s']), received)
+            if stalled_view:
+                attempted_heads = [int(a['sensor_id']) for a in
+                                   result.get('per_sensor_hybrid', {}).get('attempts', [])]
+            if continuing:
+                forward = self._local_head_step(result, result['q_vis'])
+                if (forward is None or forward['sensor_id'] != step['sensor_id']
+                        or forward['target_margin_m'] <= forward['start_margin_m']
+                        or not certified_distinct_q(result,previous_q_vis)):
+                    self._final_recovery_last_reason = 'reached_r1_no_further_gain'
+                    return
+            if not certified_distinct_q(result, previous_q_vis) and not stalled_view:
                 alternative = self._final_recovery_alternative_seed(measured)
                 if float(np.max(np.abs(alternative - measured))) > 1e-9:
                     alternative_seed_attempted = True
@@ -3278,6 +3510,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 if not certified_distinct_q(result, previous_q_vis):
                     self._final_recovery_last_reason = 'no_certified_distinct_target_hold'
                     return
+            if stalled_view and not certified_distinct_q(result, previous_q_vis):
+                self._final_recovery_last_reason = 'no_distinct_alternative_r1_branch'
+                return
+            if excluded and (not result.get('per_sensor_hybrid_used') or
+                    int(result.get('per_sensor_selected_sensor_id', -1)) in excluded):
+                self._final_recovery_last_reason = 'no_valid_alternative_r1_branch'
+                return
             # Validate the entire update before touching a live obligation.
             updates = {}
             for key in ['final_f_min', 'shared_solution_mode']:
@@ -3318,16 +3557,64 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                       observation_region_token(live) == published['region_token']) or
                      (historical is not None and
                       observation_region_token(live) == historical['region_token'])))
-                if (live is None or not live_matches or
-                        (published_matches and not current_matches) or
-                        self._final_recovery_latest_seq != request[0] or
-                        self._final_recovery_active_request != request or
-                        self._latest_measured_q is None or
-                        not np.all(np.isfinite(self._latest_measured_q)) or
-                        np.max(np.abs(np.asarray(self._latest_measured_q)-measured)) > .01):
+                measured_now = self._latest_measured_q
+                valid_state = measured_now is not None and np.all(np.isfinite(measured_now))
+                if stalled_view:
+                    # The blocker stack can serve a different region during
+                    # generation. Preserve an alternative for the exact live
+                    # obligation; its eventual motion starts at fresh state.
+                    current_region = live is not None and (
+                        observation_token(live) == observation_token(old) and
+                        observation_region_token(live) == observation_region_token(old))
+                    accept = current_region and valid_state
+                    if accept and current_matches and old.get('shared_solution_mode') == 'independent_task_view_r1':
+                        mask = np.asarray(old.get('q_vis_joint_mask', [1.]*7), dtype=float)
+                        previous_error = np.max(abs(mask * (measured - previous_q_vis)))
+                        recent = tuple(getattr(self._task_route, 'recent_measured', ()))
+                        evidence = [q for q, _, stamp in recent if stamp >= recovery_seed_stamp]
+                        evidence.append(np.asarray(measured_now))
+                        best_error = min(np.max(abs(mask * (q - previous_q_vis))) for q in evidence)
+                        if previous_error - best_error >= .012:
+                            self._final_recovery_last_reason = 'stale_generation_discarded'
+                            self._trace_observation('task_route_view_progress_kept',
+                                observation_token=request[1], seed_error_rad=float(previous_error),
+                                best_error_rad=float(best_error))
+                            return
+                else:
+                    accept = (live_matches and (not published_matches or current_matches) and
+                              self._final_recovery_latest_seq == request[0] and
+                              self._final_recovery_active_request == request and valid_state and
+                              np.max(np.abs(np.asarray(measured_now)-measured)) <= .01)
+                if not accept:
                     self._final_recovery_last_reason = 'stale_generation_discarded'
                     return
+                if paired_replacement is not None:
+                    points = paired_replacement['points'].copy()
+                    keys = tuple(sorted(self._cell_key(p) for p in points))
+                    centroid = points.mean(axis=0)
+                    updates.update(points=points, keys=keys, centroid=centroid,
+                        q_vis_source_points=points.copy(), q_vis_source_keys=keys,
+                        q_vis_source_centroid=centroid.copy(), q_vis_source_xyz_min=points.min(axis=0),
+                        q_vis_source_xyz_max=points.max(axis=0), geometry_changed_since_qvis=False,
+                        paired_task_route=paired_replacement['target'] is not None)
+                elif paired_mode:
+                    updates['paired_task_route'] = False
                 live.update(updates)
+                if continuing:
+                    self._trace_observation('local_r1_continuation_applied',previous_token=request[1],
+                        observation_token=observation_token(live),sensor=forward['sensor_id'],
+                        start_margin_m=forward['start_margin_m'],target_margin_m=forward['target_margin_m'])
+                if paired_replacement is not None and paired_replacement['target'] is not None:
+                    self._task_route.publish(observation_token(live), paired_replacement)
+                    self._trace_observation('task_route_scheduled',
+                        observation_token=observation_token(live), points=live['points'].tolist(),
+                        view=updates['q_vis'].tolist(), task_target=paired_replacement['target'].tolist(),
+                        vbc_identity=dict(observation_token=request[1]))
+                if replacement is not None:
+                    self._trace_observation('task_route_refresh_applied',
+                        observation_token=observation_token(live), previous_token=request[1],
+                        points=live['points'].tolist(), view=updates['q_vis'].tolist(),
+                        sensor=int(updates['per_sensor_selected_sensor_id']))
             self._final_recovery_last_reason = 'certified_steering_refresh_pending_hard_audit'
             with self._final_recovery_lock:
                 if self._final_recovery_active_request == request:
@@ -3338,9 +3625,13 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             self._final_recovery_last_reason = 'generation_error_hold'
             rospy.logwarn('bounded final VBC recovery failed; hold retained: %s', exc)
         finally:
+            if stalled_view and self._final_recovery_last_reason != 'stale_generation_discarded':
+                excluded.update(s for s in attempted_heads if 0 <= s < 8)
             self._trace_observation('final_vbc_recovery', observation_token=request[1],
                 reason=self._final_recovery_last_reason, measured_seed=measured.tolist(),
                 alternative_seed_attempted=bool(alternative_seed_attempted),
+                stall_driven=stalled_view, excluded_sensors=sorted(excluded),
+                attempted_sensors=attempted_heads,
                 compute_ms=1000.*(time.perf_counter()-start))
 
     def _process_new_active_set(self) -> None:
@@ -3439,11 +3730,56 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                 self._trace_observation('near_prefix_partition', vbc_identity=trace_identity,
                     decisions=decisions, all_points_retained=True,
                     observation_completed=False, motion_authorized=False)
+        route = None
+        if self._task_route is not None and bundle_source == 'candidate' and trace_identity is not None:
+            with self._obligation_lock:
+                no_active_view = not self._obligations
+            measured_routes = os.environ.get('CARE_MEASURED_TASK_ROUTE') == 'true'
+            if no_active_view or (measured_routes and not getattr(self._task_route, 'choose_observation_only', False)):
+                try:
+                    timing = {self._cell_key(v['point']): float(v['sweep_s'])
+                              for v in (evidence or {}).get('violations', [])}
+                    raw_order = [timing.get(self._cell_key(p), float(sweep)) for p in raw]
+                    first = raw[np.asarray(raw_order) <= min(raw_order) + 1e-6]
+                    route = self._task_route.choose(first, self._trajectory, trace_identity)
+                    if route is not None and route.get('ready'):
+                        self._task_route.publish_ready(route)
+                        return
+                    local_view = route is not None and route.get('local_surface_ready', False)
+                    if local_view and not no_active_view:
+                        # The local view has a measured-map-supported approach.
+                        # Preserve an in-flight tracked move or authenticated QP retry.
+                        with self._coherent_bundle_lock:
+                            tracker = self._pending_relevance.tracker or {}
+                            now = rospy.Time.now().to_sec()
+                            tracking_view = (tracker.get('execution_state') == 'EXECUTING'
+                                and 0. <= now-tracker.get('received', -1.) <= .15)
+                        replacement = getattr(self, '_candidate_replacement', None)
+                        locked = replacement is not None and replacement.locked_qp_owner_id() is not None
+                        local_view = not tracking_view and not locked
+                    if not no_active_view and not local_view:
+                        route = None
+                    elif getattr(self._task_route, 'pending', False):
+                        return
+                    if route is not None:
+                        if 'points' in route:
+                            points = route['points']
+                            nominated = dict(points=points, centroid=points.mean(axis=0),
+                                keys=tuple(sorted(self._cell_key(p) for p in points)),
+                                local_surface_view=local_view,
+                                independent_view_waypoint=self._task_route.waypoint(
+                                    route, trajectory, float(sweep), trajectory_received))
+                            regions = [nominated, *regions] if local_view else [nominated]
+                        else:
+                            regions = self._cluster_regions(np.asarray([route['point']]))
+                except Exception as exc:
+                    self._trace_observation('task_route_preview_error', error=repr(exc))
         trace_routes = []
         trace_stack_before = list(self._repair_stack)
         active_ids: List[int] = []
         new_ids: List[int] = []
         all_regions_handled = True
+        local_view_id = None
         for region in regions:
             # A partially materialized inbox can outlive its first obligation.
             # That obligation may already have been observed and removed. A
@@ -3503,7 +3839,8 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
             generation_revision=broker.goal_revision if broker is not None else None
             try:
                 new_ob=(broker.restore_result(region,bundle_source,trace_identity,
-                    float(sweep),trajectory_source) if broker is not None else None)
+                    float(sweep),trajectory_source) if broker is not None and
+                    'independent_view_waypoint' not in region else None)
                 restored=new_ob is not None
                 if new_ob is None:
                     new_ob = self._generate_new_obligation(
@@ -3547,6 +3884,20 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
                                 points=np.asarray(new_ob['points']).tolist(),
                                 group_reason=region.get('near_prefix_group_reason'),
                                 observation_completed=False, motion_authorized=False)
+                        if region.get('local_surface_view'):
+                            local_view_id = oid
+                        if route is not None and 'independent_view_waypoint' in region:
+                            token = observation_token(new_ob)
+                            target = route['target']
+                            if target is not None:
+                                if os.environ.get('CARE_PAIRED_VIEW') == 'true':
+                                    new_ob['paired_task_route'] = True
+                                self._task_route.publish(token, route)
+                            self._trace_observation('task_route_scheduled',
+                                observation_token=token, points=new_ob['points'].tolist(),
+                                view=new_ob['q_vis'].tolist(),
+                                task_target=None if target is None else target.tolist(),
+                                vbc_identity=trace_identity)
                         trace_routes.append(dict(points=region['points'].tolist(), obligation_id=oid, route='reused_result' if restored else 'generated'))
                         active_ids.append(oid)
                         new_ids.append(oid)
@@ -3586,7 +3937,18 @@ class BlockerAwareVisibilityAcquisitionWaypointNode(VisibilityAcquisitionWaypoin
         self._prune_or_initialize_stack()
         self._consider_active_layer(
             active_ids, new_ids, float(sweep),
-            urgent_gcdf_recovery=urgent_recovery)
+            urgent_gcdf_recovery=urgent_recovery,
+            candidate_identity=trace_identity if bundle_source == 'candidate' else None)
+        if local_view_id is not None:
+            with self._obligation_lock:
+                live = {int(ob['id']) for ob in self._obligations}
+                if local_view_id in live:
+                    self._repair_stack = [oid for oid in self._repair_stack if oid != local_view_id]
+                    self._repair_stack.append(local_view_id)
+                    self._path_co_plan_ids = [local_view_id]
+                    self._last_switch_reason = 'measured_map_local_r1_view'
+                    self._trace_observation('task_route_local_priority', observation_id=local_view_id,
+                        prior_obligations_live=len(live)-1, candidate_identity=trace_identity)
         self._process_pending_refinement(
             trajectory, trajectory_received,
             trajectory_source, float(sweep))

@@ -84,6 +84,8 @@ private:
     int recovery_attempt = 0;
     Eigen::VectorXd recovery_target;
     Eigen::VectorXd visibility_gradient;
+    int stopped_view_sensor = -1;
+    std::vector<Eigen::Vector3d> stopped_view_points;
     std::vector<Eigen::VectorXd> failed_directions;
   };
 
@@ -524,10 +526,18 @@ private:
   unsigned long long latest_vbc_obligation_points_seq_ = 0;
   long long latest_vbc_obligation_id_ = -1;
   FrontierObjective latest_frontier_;
+  ros::Subscriber observed_task_route_sub_;
+  Eigen::VectorXd observed_task_route_target_, observed_task_route_goal_, observed_task_terminal_;
+  unsigned long long observed_task_route_goal_revision_ = 0;
+  bool observed_task_route_precision_view_ = false;
   ros::Subscriber visibility_guidance_sub_;
   bool rolling_visibility_guidance_enabled_=false;
   VisibilityGuidanceState latest_visibility_guidance_;
   std::string latest_observation_region_;
+  int latest_local_r1_direction_ = -1;
+  ros::Publisher local_r1_handoff_pub_;
+  std::string last_refused_local_r1_token_;
+  void publishLocalR1HandoffLocked(bool refused);
   int latest_observation_sensor_=-1;
   bool safe_frontier_recovery_enabled_ = false;
   SafeFrontierRecovery safe_frontier_recovery_;
@@ -621,6 +631,8 @@ private:
   Eigen::VectorXd plan_q_current_;
   Eigen::VectorXd plan_previous_command_;
   Eigen::MatrixXd plan_q_ref_;
+  Eigen::VectorXd plan_observed_task_target_;
+  bool reference_route_joint_objective_ = false;
   Eigen::MatrixXd plan_u_ref_;
   Eigen::MatrixXd plan_q_bar_;
   // One-use shape only. Fresh q/v, query, executable and audit are required.

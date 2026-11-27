@@ -1,28 +1,40 @@
 robot_description_param: /robot_description
-urdf_path: ""
-
+urdf_path: ''
 base_frame: base_link
 ee_frame: EE_link
-
 joint_names:
-  - joint1
-  - joint2
-  - joint3
-  - joint4
-  - wrist_joint1
-  - wrist_joint2
-  - wrist_joint3
-
+- joint1
+- joint2
+- joint3
+- joint4
+- wrist_joint1
+- wrist_joint2
+- wrist_joint3
 sensors:
-  - {id: 0, name: link2_sensor1, frame: link2_sensor1_tof_link}
-  - {id: 1, name: link2_sensor2, frame: link2_sensor2_tof_link}
-  - {id: 2, name: link3_sensor1, frame: link3_sensor1_tof_link}
-  - {id: 3, name: link3_sensor2, frame: link3_sensor2_tof_link}
-  - {id: 4, name: link4_sensor1, frame: link4_sensor1_tof_link}
-  - {id: 5, name: link4_sensor2, frame: link4_sensor2_tof_link}
-  - {id: 6, name: ee_sensor1, frame: EE_sensor1_tof_link}
-  - {id: 7, name: ee_sensor2, frame: EE_sensor2_tof_link}
-
+- id: 0
+  name: link2_sensor1
+  frame: link2_sensor1_tof_link
+- id: 1
+  name: link2_sensor2
+  frame: link2_sensor2_tof_link
+- id: 2
+  name: link3_sensor1
+  frame: link3_sensor1_tof_link
+- id: 3
+  name: link3_sensor2
+  frame: link3_sensor2_tof_link
+- id: 4
+  name: link4_sensor1
+  frame: link4_sensor1_tof_link
+- id: 5
+  name: link4_sensor2
+  frame: link4_sensor2_tof_link
+- id: 6
+  name: ee_sensor1
+  frame: EE_sensor1_tof_link
+- id: 7
+  name: ee_sensor2
+  frame: EE_sensor2_tof_link
 ik:
   position_weight: 1.0
   orientation_weight: 0.5
@@ -31,7 +43,6 @@ ik:
   position_tolerance: 0.01
   orientation_tolerance: 0.2
   max_iterations: 100
-
 task_generator:
   T_plan: 2.0
   trajectory_dt: 0.02
@@ -62,49 +73,36 @@ task_generator:
   duration_limit_check_margin: 1.02
   reject_large_joint_jump: true
   max_joint_jump_inf_norm: 3.0
-
 intervention:
   T_cmd: 2.0
   hold_duration: 0.5
   command_dt: 0.02
-
 receding_horizon:
   planning_rate: 20.0
   mpc_command_topic: /care_arm/arm_group_velocity_controller/command
-  mpc_command_timeout: 0.20
-
-
-# C5.4 event-triggered local trajectory optimizer.
-# This replaces 20 Hz planning-MPC in the new architecture while legacy C4.x
-# keeps using the mpc section below unchanged.
+  mpc_command_timeout: 0.2
 local_planner:
   num_intervals: 20
   horizon_duration: 1.0
   poll_rate: 50.0
-  min_replan_interval: 0.10
-  cdf_wait_timeout: 0.50
-  cdf_stamp_tolerance: 0.000001
-
+  min_replan_interval: 0.1
+  cdf_wait_timeout: 0.5
+  cdf_stamp_tolerance: 1.0e-06
   q_tracking_weight: 50.0
   terminal_q_tracking_weight: 100.0
   u_tracking_weight: 2.0
   u_smooth_weight: 1.0
-
-  # In REPAIR the local planner follows the active visibility obligations
-  # rather than fighting the original task reference.
   repair_task_tracking_scale: 0.0
   visibility_waypoint_weight: 3000.0
-
   scp:
     max_iterations: 3
     step_tolerance_inf: 0.01
-    trust_region_initial: 0.20
+    trust_region_initial: 0.2
     trust_region_min: 0.05
-    trust_region_max: 0.50
-    trust_region_grow: 1.50
-    trust_region_shrink: 0.50
+    trust_region_max: 0.5
+    trust_region_grow: 1.5
+    trust_region_shrink: 0.5
     improvement_tolerance: 0.002
-
   cdf:
     safety_margin: 0.0
     slack_linear_weight: 500.0
@@ -112,13 +110,11 @@ local_planner:
     slack_upper_bound: 2.0
     safe_row_screening: true
     linearization_tolerance_inf: 0.0001
-
   piqp:
     max_iterations: 100
-    eps_abs: 0.00001
-    eps_rel: 0.00001
+    eps_abs: 1.0e-05
+    eps_rel: 1.0e-05
     verbose: false
-
   joint_states: /care_arm/joint_states
   reference_trajectory: /care_planner/task_trajectory
   waypoint_schedule_topic: /care_planner/active_sensing/visibility_waypoint_schedule
@@ -129,7 +125,6 @@ local_planner:
   query_trajectory_topic: /care_planner/local_planner/scp_query_trajectory
   candidate_trajectory_topic: /care_planner/local_planner/candidate_trajectory
   summary_topic: /care_planner/local_planner/summary
-
 mpc:
   rate: 20.0
   horizon_duration: 1.0
@@ -138,7 +133,6 @@ mpc:
   terminal_q_tracking_weight: 100.0
   u_tracking_weight: 2.0
   u_smooth_weight: 1.0
-
   visibility:
     enabled: false
     weight: 0.0
@@ -146,15 +140,10 @@ mpc:
     gradient_norm_clip: 0.0
     active_topic: /care_planner/active_sensing/acquisition_active
     gradient_topic: /care_planner/active_sensing/normalized_gradient_q
-
-  # C4.3 planner mode keeps the existing visibility/recovery optimization
-  # semantics, but the MPC no longer owns the actuator command topic.  Its
-  # complete receding-horizon solution on predicted_trajectory is the planner
-  # output and is tracked by TrajectoryExecutionManager below.
   visibility_waypoint:
     enabled: false
     weight: 3000.0
-    timeout: 0.20
+    timeout: 0.2
     horizon_slack: 0.025
     active_topic: /care_planner/active_sensing/visibility_waypoint_active
     q_topic: /care_planner/active_sensing/visibility_waypoint_q
@@ -164,73 +153,76 @@ mpc:
     recovery_active_topic: /care_planner/execution/visibility_recovery_active
     recovery_complete_topic: /care_planner/execution/visibility_recovery_complete
     replan_ready_topic: /care_planner/execution/visibility_replan_ready
-
-  # C5.3a constrained-QP shadow. Disabled by default so all frozen C4.x
-  # experiments remain unchanged unless the dedicated C5.3 runner enables it.
   cdf_shadow:
     enabled: false
     safety_margin: 0.0
-    trust_region_q_inf: 0.20
+    trust_region_q_inf: 0.2
     constraint_horizon_steps: 20
     snapshot_timeout: 0.75
     snapshot_history_size: 12
-    stamp_tolerance: 0.000001
+    stamp_tolerance: 1.0e-06
     constraint_batch_topic: /care_planner/collision_cdf/constraint_batch
     predicted_trajectory_topic: /care_planner/mpc/cdf_shadow_predicted_trajectory
     summary_topic: /care_planner/mpc/cdf_shadow_summary
-
   joint_position_margin: 0.01
   joint_position_limits:
-    joint1: {lower: -3.14, upper: 3.14}
-    joint2: {lower: -2.30, upper: 2.30}
-    joint3: {lower: -3.14, upper: 3.14}
-    joint4: {lower: -2.65, upper: 2.65}
-    wrist_joint1: {lower: -3.14, upper: 3.14}
-    wrist_joint2: {lower: -3.14, upper: 3.14}
-    wrist_joint3: {lower: -1.20, upper: 1.20}
+    joint1:
+      lower: -3.14
+      upper: 3.14
+    joint2:
+      lower: -2.3
+      upper: 2.3
+    joint3:
+      lower: -3.14
+      upper: 3.14
+    joint4:
+      lower: -2.65
+      upper: 2.65
+    wrist_joint1:
+      lower: -3.14
+      upper: 3.14
+    wrist_joint2:
+      lower: -3.14
+      upper: 3.14
+    wrist_joint3:
+      lower: -1.2
+      upper: 1.2
   joint_velocity_limits:
     joint1: 2.0
     joint2: 2.0
     joint3: 2.0
     joint4: 2.0
-    wrist_joint1: 2.5
-    wrist_joint2: 2.5
-    wrist_joint3: 2.5
+    wrist_joint1: 2.0
+    wrist_joint2: 2.0
+    wrist_joint3: 2.0
   joint_acceleration_limits:
-    joint1: 3.0
-    joint2: 3.0
-    joint3: 4.0
-    joint4: 4.0
-    wrist_joint1: 6.0
-    wrist_joint2: 6.0
-    wrist_joint3: 6.0
+    joint1: 0.5
+    joint2: 0.5
+    joint3: 0.5
+    joint4: 0.5
+    wrist_joint1: 0.5
+    wrist_joint2: 0.5
+    wrist_joint3: 0.5
   piqp:
     max_iterations: 100
-    eps_abs: 0.000001
-    eps_rel: 0.000001
+    eps_abs: 1.0e-06
+    eps_rel: 1.0e-06
     verbose: false
     compute_timings: true
   joint_states: /care_arm/joint_states
   reference_trajectory: /care_planner/command_trajectory_candidate
-  # Planner/controller split: this debug topic is intentionally NOT connected
-  # to the actuator. The actuator is owned by TrajectoryExecutionManager.
   output_velocity_command: /care_planner/mpc/internal_velocity_command_unused
-  # This full horizon is both the CAREPlanner optimized trajectory and the
-  # prediction audited by the global VBC supervisor.
   predicted_trajectory: /care_planner/mpc/predicted_trajectory
-  joint_state_timeout: 0.20
-  reference_timeout: 0.20
-
+  joint_state_timeout: 0.2
+  reference_timeout: 0.2
 topics:
   joint_states: /care_arm/joint_states
   target_pose: /care_planner/ee_target_pose
   task_trajectory: /care_planner/task_trajectory
   command_trajectory: /care_planner/command_trajectory_candidate
-
 debug:
   publish_task_trajectory: true
   overrun_warn_ratio: 1.0
-
 visualization:
   marker_topic: /care_planner/debug/markers
   path_line_width: 0.015
@@ -239,12 +231,9 @@ visualization:
   target_axis_width: 0.01
   target_sphere_radius: 0.035
   publish_rate: 10.0
-
 execution:
   rate: 100.0
   joint_states: /care_arm/joint_states
-  # Low-level controller tracks the first short segment of each fresh optimized
-  # receding-horizon trajectory. A new horizon arrives at 20 Hz.
   input_trajectory: /care_planner/mpc/predicted_trajectory
   output_velocity_command: /care_arm/arm_group_velocity_controller/command
   reference_state: /care_planner/execution/reference_state
@@ -257,10 +246,8 @@ execution:
   hold_initial_zero_pose: true
   hold_last_reference_when_no_trajectory: true
   reference_timeout: 0.15
-  # Full-trajectory tracker can ask the local planner for a new trajectory when
-  # measured tracking error becomes materially larger than nominal.
   replan_tracking_error_inf: 0.25
-  replan_request_min_interval: 0.50
+  replan_request_min_interval: 0.5
   summary_topic: /care_planner/execution/tracker_summary
   replan_request_topic: /care_planner/local_planner/replan_request
   position_feedback_gain: 2.5

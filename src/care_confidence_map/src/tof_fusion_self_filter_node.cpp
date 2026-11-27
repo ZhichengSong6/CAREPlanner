@@ -79,7 +79,7 @@ struct NearestPrimitive
 struct RaySample
 {
   pcl::PointXYZ endpoint_base;
-  bool hit = false;
+  uint8_t hit = 0;
 };
 
 struct SensorState
@@ -664,7 +664,10 @@ private:
           best.signed_distance = d;
         }
 
-        if (d <= 0.0)
+        // Finite returns within1mm of the rendered body surface are
+        // numerically ambiguous. Keep only the original25mm-truncated
+        // measured free prefix (hit2), never mark their endpoint FREE.
+        if (d <= .001)
         {
           if (!nearest)
           {
@@ -972,6 +975,13 @@ private:
             if (is_self)
             {
               ++ray_self_blocked;
+              // Retain the measured segment preceding a finite body return.
+              // Code2 is consumed only by the valid-interval adapter.
+              sample.endpoint_base.x = static_cast<float>(p_base.x());
+              sample.endpoint_base.y = static_cast<float>(p_base.y());
+              sample.endpoint_base.z = static_cast<float>(p_base.z());
+              sample.hit = 2;
+              ray_samples.push_back(sample);
               continue;
             }
 
@@ -1283,8 +1293,7 @@ private:
         *ray_origin_z =
             static_cast<float>(state.sensor_origin_base.z());
         *ray_hit =
-            ray.hit ? static_cast<uint8_t>(1)
-                    : static_cast<uint8_t>(0);
+            static_cast<uint8_t>(ray.hit);
         // Exact integer source time survives heterogeneous fused packets.
         // This is the time used for TF; it is not a registration-error bound.
         *source_sec=state.cloud_stamp.sec;*source_nsec=state.cloud_stamp.nsec;

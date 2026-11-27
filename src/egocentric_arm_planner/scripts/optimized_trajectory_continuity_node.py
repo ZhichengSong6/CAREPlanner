@@ -357,6 +357,10 @@ class OptimizedTrajectoryContinuityNode:
         self._preflight_measured_age_ns = self._preflight_actuator_age_ns = 0
         self._handoff_previous_measured = None
         self._handoff_tracker_fields = {}
+        self._occupied_veto = None
+        if os.environ.get('CARE_OCCUPIED_FEEDBACK') == 'true':
+            from occupied_approach_execution import OccupiedApproach
+            self._occupied_veto = OccupiedApproach(self)
         self._handoff_completed_token = 0
         self._handoff_certificate = None
         self._handoff_wait_count = self._handoff_resume_count = 0
@@ -379,8 +383,23 @@ class OptimizedTrajectoryContinuityNode:
         self.enforce_execution_motion_limits = bool(rospy.get_param('~execution/enforce_motion_limits', False))
         self.execution_velocity_cap = float(rospy.get_param('~execution/max_command_velocity', 2.))
         if self.enforce_execution_motion_limits:
-            effective_limits(list(rospy.get_param('~joint_names', [])),
-                             self.recovery_velocity_limits, self.execution_velocity_cap)
+            joint_names = list(rospy.get_param('~joint_names', []))
+            tracker = '/trajectory_execution_manager_node/mpc/'
+            tracker_velocity = rospy.get_param(tracker + 'joint_velocity_limits',
+                                               self.recovery_velocity_limits)
+            tracker_acceleration = rospy.get_param(tracker + 'joint_acceleration_limits',
+                                                   rospy.get_param('~mpc/joint_acceleration_limits', {}))
+            self.recovery_velocity_limits = {
+                name: min(self.recovery_velocity_limits[name], float(tracker_velocity[name]))
+                for name in joint_names}
+            if len(joint_names) != len(self.repair_acceleration_limits):
+                raise ValueError('brake limits do not match the tracker joint order')
+            self.repair_acceleration_limits = [
+                min(limit, float(tracker_acceleration[name]))
+                for name, limit in zip(joint_names, self.repair_acceleration_limits)]
+            effective_limits(joint_names, self.recovery_velocity_limits, self.execution_velocity_cap)
+            if any(not math.isfinite(a) or a <= 0 for a in self.repair_acceleration_limits):
+                raise ValueError('invalid tracker acceleration limits')
         self._latest_joint_state_received = None
 
         self._selector_cycle_count = 0
@@ -581,7 +600,7 @@ class OptimizedTrajectoryContinuityNode:
         self._execution_tracker_received = None
         self.execution_tracker_sub = rospy.Subscriber(
             '/care_planner/execution/tracker_summary', String,
-            self._execution_tracker_cb, queue_size=1)
+            self._execution_tracker_cb, queue_size=20)
         self.blocker_stack_sub = rospy.Subscriber(
             self.blocker_stack_summary_topic, String,
             self._blocker_stack_summary_cb, queue_size=1)
@@ -1082,6 +1101,8 @@ class OptimizedTrajectoryContinuityNode:
             self._execution_tracker_state = state
             self._execution_tracker_received = rospy.Time.now()
             self._handoff_tracker_fields = values
+            if self._occupied_veto is not None:
+                self._occupied_veto.observe_tracker(state, values, self._execution_tracker_received)
             master = self._committed_master
             if (master is not None and state[0] == master.header.stamp.to_nsec() and
                     state[1] >= self._duration(master)-1e-9 and
@@ -2840,10 +2861,8 @@ class OptimizedTrajectoryContinuityNode:
                 from rejection_evidence import capture
                 capture(candidate,msg,diag,geometry_unsafe,geometry_min,malformed,self.final_gcdf_safety_margin)
 
-            gcdf_safe = (
-                not malformed and not geometry_unsafe and
-                (int(msg.num_pairs) == 0 or
-                 hard_min_d >= self.final_gcdf_safety_margin))
+            native_gcdf_safe = (not malformed and not geometry_unsafe
+                                and (int(msg.num_pairs) == 0 or hard_min_d >= self.final_gcdf_safety_margin))
             restore=diag.get('geometric_restore')
             geometry_request=False
             if restore is not None and was_repair and not was_probe and not malformed and not geometry_unsafe:
@@ -2851,7 +2870,31 @@ class OptimizedTrajectoryContinuityNode:
                     geometry_request=permits_unknown_conflicts(restore,msg,distances,self.final_gcdf_safety_margin)
                 except (ValueError,TypeError,AttributeError):
                     geometry_request=False
-            if gcdf_safe or geometry_request:
+            wrist_points = []
+            moving_prefix = was_probe or (was_repair and view == 'repair_prefix_brake_hold')
+            if (native_gcdf_safe or geometry_request) and self._occupied_veto is not None and moving_prefix:
+                wrist_points = self._occupied_veto.approaching_measured_wrist(candidate)
+            missing_wrist_evidence = wrist_points is None
+            if wrist_points:
+                rospy.logwarn('[MEASURED_WRIST_CLEARANCE] rejected audit=%d raw=%s points=%s',
+                              candidate.header.stamp.to_nsec(), diag.get('raw_candidate_stamp_ns'), wrist_points)
+            gcdf_safe = native_gcdf_safe and not wrist_points and not missing_wrist_evidence
+            geometry_request = geometry_request and not wrist_points and not missing_wrist_evidence
+            if missing_wrist_evidence:
+                self._verification_outcome_count += 1
+                self._verification_timeout_count += 1
+                self._last_verification_seq = seq
+                self._last_verification_result = 'timeout'
+                self._last_verification_age_s = age
+                self._last_verification_view = view
+                self._last_source = 'measured_wrist_clearance_evidence_unavailable'
+                if raw_received is not None:
+                    self._last_candidate_total_safety_pipeline_ms = 1000. * max(0., (now-raw_received).to_sec())
+                diag['audited_trajectory_stamp_ns'] = candidate.header.stamp.to_nsec()
+                diag['failure_kind'] = self._last_source
+                event_to_publish = self._make_verification_event(
+                    seq, 'timeout', False, age, view, safety_gate='state_evidence', diag=diag)
+            elif gcdf_safe or geometry_request:
                 diag['final_gcdf_passed'] = bool(gcdf_safe)
                 diag['geometry_override_pending'] = bool(geometry_request)
                 self._final_gcdf_safe_count += 1
@@ -2895,6 +2938,9 @@ class OptimizedTrajectoryContinuityNode:
                     gcdf_unknown_count,
                     gcdf_occupied_count,
                 ) = self._classify_final_gcdf_unsafe(msg, distances, geometry_unsafe)
+                if wrist_points:
+                    gcdf_blocker_class = 'mixed' if gcdf_unknown_count else 'occupied'
+                    gcdf_occupied_count += len(wrist_points)//3
                 self._last_final_gcdf_blocker_class = gcdf_blocker_class
                 self._last_final_gcdf_unsafe_unknown_count = gcdf_unknown_count
                 self._last_final_gcdf_unsafe_occupied_count = gcdf_occupied_count
@@ -2922,6 +2968,19 @@ class OptimizedTrajectoryContinuityNode:
                     diag = {}
                 # This is the GCDF-audited executable, not the future VBC epoch.
                 diag['audited_trajectory_stamp_ns'] = candidate.header.stamp.to_nsec()
+                if wrist_points:
+                    raw_stamp = int(diag.get('raw_candidate_stamp_ns', 0))
+                    if raw_stamp > 0:
+                        self._occupied_veto.reject(candidate, raw_stamp, wrist_points, False, rospy.Time.now())
+                if self._occupied_veto is not None and not malformed and geometry_unsafe:
+                    try:
+                        points, overflow = rejection_points(
+                            msg, candidate, self.final_gcdf_safety_margin, geometry_unsafe)
+                        raw_stamp = int(diag.get('raw_candidate_stamp_ns', 0))
+                        if raw_stamp > 0 and points:
+                            self._occupied_veto.reject(candidate, raw_stamp, points, overflow, now)
+                    except (ValueError, OverflowError) as exc:
+                        rospy.logwarn('Occupied GCDF rejection feedback unavailable: %s', exc)
                 if was_repair and not was_probe:
                     try:
                         points, overflow = rejection_points(msg, candidate, self.final_gcdf_safety_margin)
@@ -2934,8 +2993,8 @@ class OptimizedTrajectoryContinuityNode:
                     except (ValueError, OverflowError) as exc:
                         rospy.logwarn('GCDF rejection feedback unavailable: %s', exc)
                 event_to_publish = self._make_verification_event(
-                    seq, "unsafe", False, age, view,
-                    safety_gate=gcdf_safety_gate, diag=diag)
+                    seq, 'unsafe', False, age, view, safety_gate=gcdf_safety_gate, diag=diag)
+            if not (gcdf_safe or geometry_request):
                 dispatched, route = self._dispatch_pending_locked(now)
                 if dispatched is not None:
                     self._post_cert_pending_dispatch_count += 1
@@ -3344,6 +3403,16 @@ class OptimizedTrajectoryContinuityNode:
                             seq, self._last_verification_result, False, verification_age, view,
                             diag=diag, safety_gate="certificate_protocol" if protocol_failure else "state_evidence" if state_failure else "vbc")
                         self._sync_repair_prefix_locked()
+                    elif self._occupied_veto is not None and not self._occupied_veto.permits_commit(candidate):
+                        self._verification_timeout_count += 1
+                        self._last_verification_result = 'state_changed'
+                        self._last_source = 'occupied_veto_stop_requires_fresh_candidate'
+                        if (not self._occupied_veto.hold_token
+                                and candidate.header.stamp.to_nsec() > self._occupied_veto.release_stamp):
+                            diag = dict(diag or {}, failure_kind='retained_occupied_approach')
+                        event_to_publish = self._make_verification_event(
+                            seq, 'timeout', False, verification_age, view,
+                            diag=diag, safety_gate='state_evidence')
                     else:
                         was_normal = (not was_probe and not was_repair)
                         # Execute the exact candidate that passed GCDF + VBC.

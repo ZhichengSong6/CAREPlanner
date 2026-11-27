@@ -73,34 +73,54 @@ inline bool probeStoppedView(const Eigen::MatrixXd& q,const Eigen::MatrixXd& u,
   *stopped=position;return position.allFinite();
 }
 
-// Phasewise numerical derivatives of the exact ramp/scale/brake map. FK is
-// differentiated only in the seven stopped-position coordinates. No solver
-// or geometry constraint is changed by this soft residual.
+// Differentiate the same executed prefix and brake model for either task residual.
+inline bool probeStoppedPositionJacobian(const Eigen::MatrixXd& q, const Eigen::MatrixXd& u,
+    double dt, const Eigen::VectorXd& measured_v, const ProbeTaskSettings& settings,
+    Eigen::VectorXd* stopped, Eigen::MatrixXd* jacobian) {
+  if (!jacobian || !probeStoppedView(q, u, dt, measured_v, settings, stopped)) return false;
+  const int n = q.rows(), steps = u.cols(), position_columns = n * steps;
+  constexpr double eps = 1e-5;
+  jacobian->resize(n, 2 * position_columns);
+  for (int col = 0; col < jacobian->cols(); ++col) {
+    auto qp = q, qm = q, up = u, um = u;
+    if (col < position_columns) {
+      qp(col % n, col / n + 1) += eps;
+      qm(col % n, col / n + 1) -= eps;
+    } else {
+      const int index = col - position_columns;
+      up(index % n, index / n) += eps;
+      um(index % n, index / n) -= eps;
+    }
+    Eigen::VectorXd plus, minus;
+    if (!probeStoppedView(qp, up, dt, measured_v, settings, &plus) ||
+        !probeStoppedView(qm, um, dt, measured_v, settings, &minus)) return false;
+    jacobian->col(col) = (plus - minus) / (2. * eps);
+  }
+  return jacobian->allFinite();
+}
+
 inline bool probeTaskResidualJacobian(const PrimitiveObservationGuard& geometry,
-    const Eigen::MatrixXd& q,const Eigen::MatrixXd& u,double dt,
-    const Eigen::VectorXd& measured_v,const ProbeTaskSettings& s,
-    const std::string& frame,const Eigen::Isometry3d& goal,
-    Eigen::Matrix<double,6,1>* error,Eigen::MatrixXd* jacobian) {
+    const Eigen::MatrixXd& q, const Eigen::MatrixXd& u, double dt,
+    const Eigen::VectorXd& measured_v, const ProbeTaskSettings& settings,
+    const std::string& frame, const Eigen::Isometry3d& goal,
+    Eigen::Matrix<double, 6, 1>* error, Eigen::MatrixXd* jacobian) {
   Eigen::VectorXd stop;
-  if(!error || !jacobian || !probeStoppedView(q,u,dt,measured_v,s,&stop) ||
-      !taskPoseResidual(geometry,stop,frame,goal,error))return false;
-  const int n=q.rows(),K=u.cols();const double eps=1e-5;
-  Eigen::MatrixXd fk(6,n);
-  for(int j=0;j<n;++j) {
-    auto plus=stop,minus=stop;plus[j]+=eps;minus[j]-=eps;
-    Eigen::Matrix<double,6,1> ep,em;
-    if(!taskPoseResidual(geometry,plus,frame,goal,&ep) || !taskPoseResidual(geometry,minus,frame,goal,&em))return false;
-    fk.col(j)=(ep-em)/(2.*eps);
+  Eigen::MatrixXd stopped_jacobian;
+  if (!error || !jacobian ||
+      !probeStoppedPositionJacobian(q, u, dt, measured_v, settings, &stop, &stopped_jacobian) ||
+      !taskPoseResidual(geometry, stop, frame, goal, error)) return false;
+  constexpr double eps = 1e-5;
+  Eigen::MatrixXd fk(6, q.rows());
+  for (int j = 0; j < q.rows(); ++j) {
+    auto plus = stop, minus = stop;
+    plus[j] += eps;
+    minus[j] -= eps;
+    Eigen::Matrix<double, 6, 1> ep, em;
+    if (!taskPoseResidual(geometry, plus, frame, goal, &ep) ||
+        !taskPoseResidual(geometry, minus, frame, goal, &em)) return false;
+    fk.col(j) = (ep - em) / (2. * eps);
   }
-  jacobian->setZero(6,2*n*K);
-  for(int col=0;col<2*n*K;++col) {
-    auto qp=q,qm=q,up=u,um=u;
-    if(col<n*K){qp(col%n,col/n+1)+=eps;qm(col%n,col/n+1)-=eps;}
-    else {const int k=col-n*K;up(k%n,k/n)+=eps;um(k%n,k/n)-=eps;}
-    Eigen::VectorXd sp,sm;
-    if(!probeStoppedView(qp,up,dt,measured_v,s,&sp) || !probeStoppedView(qm,um,dt,measured_v,s,&sm))return false;
-    jacobian->col(col)=fk*((sp-sm)/(2.*eps));
-  }
+  *jacobian = fk * stopped_jacobian;
   return jacobian->allFinite();
 }
 } // namespace egocentric_arm_planner

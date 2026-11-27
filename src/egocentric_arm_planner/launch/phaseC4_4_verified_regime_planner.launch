@@ -151,7 +151,7 @@
   <arg name="vbc_continuous_motion_bound_enabled" default="true" />
   <!-- Stage-one A/B only; both candidate and execution VBC use this backend. -->
   <arg name="vbc_geometry_backend" default="$(arg geometry_backend)" />
-  <arg name="repair_prefix_binding_enabled" default="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('repair_prefix_verification_enabled')) and bool(arg('probe_single_flight_enabled')))" />
+  <arg name="repair_prefix_binding_enabled" default="$(eval arg('vbc_geometry_backend') == 'primitive' and bool(arg('repair_prefix_verification_enabled')) and bool(arg('probe_single_flight_enabled')) and float(arg('vbc_swept_volume_margin_m')) > float(arg('execution_vbc_swept_volume_margin_m')))" />
   <arg name="body_prior_geometry_backend" default="$(arg geometry_backend)" />
   <arg name="diagnostic_geometry_backend" default="$(arg geometry_backend)" />
   <arg name="body_prior_primitive_urdf_file" default="$(arg primitive_urdf_file)" />
@@ -359,7 +359,7 @@
     <param name="repair_hold_s"
            value="$(arg repair_hold_s)" />
     <param name="repair_brake_max_steps" value="20" />
-    <rosparam param="repair_acceleration_limits">[3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0]</rosparam>
+    <rosparam param="repair_acceleration_limits">[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]</rosparam>
     <param name="cycle_recovery_enabled"
            value="$(arg cycle_recovery_enabled)" />
     <param name="blocker_stack_summary_topic"
@@ -493,7 +493,7 @@
     <rosparam param="local_planner/repair_executable_view/cycle_prefixes_s">[0.15, 0.10, 0.05]</rosparam>
     <param name="local_planner/repair_executable_view/brake_dt_s" value="$(arg repair_brake_dt_s)" />
     <param name="local_planner/repair_executable_view/max_brake_steps" value="20" />
-    <rosparam param="local_planner/repair_executable_view/acceleration_limits">[3.0, 3.0, 4.0, 4.0, 6.0, 6.0, 6.0]</rosparam>
+    <rosparam param="local_planner/repair_executable_view/acceleration_limits">[0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]</rosparam>
     <param name="local_planner/rejection_snapshots_enabled"
            value="$(eval arg('rejection_snapshot_dir') != '')" />
     <param name="local_planner/verification_outcome_topic" value="$(arg candidate_outcome_topic)" />
@@ -669,6 +669,7 @@
         pkg="care_collision_cdf"
         type="cpp_forbidden_voxel_gpu_shadow_node"
         name="c5_4_local_scp_cdf_selector"
+        launch-prefix="/usr/bin/python3 -B /home/zhicheng/Project/CAREPlanner/outputs/r1_unknown_task_lookahead_20261117/baseline/fixed/runtime/scripts/deployment_launch.py --role client --"
         output="screen">
     <param name="anchor_topic" value="$(arg local_scp_body_anchor_topic)" />
     <param name="geometry_backend" value="$(arg gcdf_geometry_backend)" />
@@ -813,6 +814,7 @@
         pkg="care_collision_cdf"
         type="cpp_forbidden_voxel_gpu_shadow_node"
         name="c5_3a_cpp_forbidden_voxel_gpu_shadow"
+        launch-prefix="/usr/bin/python3 -B /home/zhicheng/Project/CAREPlanner/outputs/r1_unknown_task_lookahead_20261117/baseline/fixed/runtime/scripts/deployment_launch.py --role client --"
         output="screen">
     <param name="geometry_backend" value="$(arg diagnostic_geometry_backend)" />
     <param name="anchor_topic" value="$(arg forbidden_space_pair_topic)" />

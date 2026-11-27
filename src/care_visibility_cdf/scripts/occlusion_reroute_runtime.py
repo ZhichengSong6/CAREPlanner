@@ -200,6 +200,8 @@ class OcclusionReroute:
                     point_clearance_bound_m=relevance,reason='task_prefix_superseded' if task_superseded else
                     ('superseded_candidate' if obsolete else 'alternative_reference_avoids_region'))
                 continue
+            if self.node.local_observation_directions:
+                continue
             sid=int(view.get('per_sensor_selected_sensor_id',-1))
             if sid<0:
                 # Scalar fallback can only be deferred if every FOV-admissible

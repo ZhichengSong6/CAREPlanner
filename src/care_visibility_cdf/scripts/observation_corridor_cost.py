@@ -26,7 +26,7 @@ class BoundedCorridorQuery:
         return result[0] if done.wait(self.timeout_s) and result else None
 
 
-def body_path_probes(runtime, q_start, q_end, resolution=.05, limit=96):
+def body_path_probes(runtime, q_start, q_end, resolution=.05, limit=96, budget=None):
     """Four joint-path samples, active URDF solids, bounded voxel probes.
 
     These samples estimate new observation work; they do not certify a swept
@@ -34,8 +34,10 @@ def body_path_probes(runtime, q_start, q_end, resolution=.05, limit=96):
     """
     cells=set()
     for q in np.linspace(np.asarray(q_start),np.asarray(q_end),4):
+        if budget is not None:budget.check('corridor_body_sample')
         qmap=dict(zip(DEFAULT_JOINT_NAMES,q));frames={}
         for primitive,chain in zip(runtime.primitives,runtime.collision_chains):
+            if budget is not None:budget.check('corridor_body_primitive')
             link=primitive['link']
             if link in ('base_link','link1'):continue
             if link not in frames:frames[link]=fk_transform(chain,qmap)
@@ -48,6 +50,7 @@ def body_path_probes(runtime, q_start, q_end, resolution=.05, limit=96):
                 direction=np.zeros(3);direction[axis]=half[axis]
                 local.extend([direction,-direction])
             for point in local:
+                if budget is not None:budget.check('corridor_probe_point')
                 p=transform[:3,:3]@point+transform[:3,3]
                 if not np.all(np.isfinite(p)):raise ValueError('nonfinite path preview')
                 cells.add(tuple(np.rint(p/resolution).astype(int)))
@@ -57,7 +60,7 @@ def body_path_probes(runtime, q_start, q_end, resolution=.05, limit=96):
     return [tuple(float(x)*resolution for x in cell) for cell in ordered]
 
 
-def approach_visibility_order(runtime, points, q_start, q_end, sensor_id):
+def approach_visibility_order(runtime, points, q_start, q_end, sensor_id, budget=None):
     """Rank an available straight approach against one needing a detour.
 
     A sampled path is a proposal hint only. A missing clear straight path does
@@ -73,8 +76,10 @@ def approach_visibility_order(runtime, points, q_start, q_end, sensor_id):
     seen=np.zeros(len(points),dtype=bool);first_seen=[None]*len(points);first_entry=[None]*len(points)
     minimum=np.full(len(points),float('inf'))
     for k,q in enumerate(np.linspace(start,end,17)):
+        if budget is not None:budget.check('approach_sample_start')
         qmap=dict(zip(DEFAULT_JOINT_NAMES,q));frames={};distance=np.full(len(points),float('inf'))
         for primitive,chain in zip(runtime.primitives,runtime.collision_chains):
+            if budget is not None:budget.check('approach_body_primitive')
             link=primitive['link']
             if link in ('base_link','link1'):continue
             if link not in frames:frames[link]=fk_transform(chain,qmap)
@@ -90,7 +95,9 @@ def approach_visibility_order(runtime, points, q_start, q_end, sensor_id):
         for j in range(len(points)):
             if not seen[j] and distance[j]<.01 and first_entry[j] is None:first_entry[j]=k
         geometry=getattr(runtime,'_approach_order_geometry',runtime._candidate_geometry)
+        if budget is not None:budget.check('approach_geometry_start')
         view=geometry(points,q,sensor_id)
+        if budget is not None:budget.check('approach_geometry_end')
         for j,p in enumerate(view['per_point']):
             if p['nominal_margin']>=0. and not p['primitive_self_occluded']:
                 seen[j]=True
@@ -138,12 +145,15 @@ def paired_legacy_corridor_costs(runtime, candidates, context, query, now_ns, th
     """
     if len(candidates) != 2:
         return [dict(status='unavailable', reason='not_a_pair') for _ in candidates]
-    paths = [(body_path_probes(runtime, context['q_start'], q),
-              body_path_probes(runtime, q, context['q_task'])) for q in candidates]
+    budget=context.get('_search_budget')
+    paths = [(body_path_probes(runtime, context['q_start'], q, budget=budget),
+              body_path_probes(runtime, q, context['q_task'], budget=budget)) for q in candidates]
     points = sorted(set(p for pair in paths for leg in pair for p in leg))
     if not points:
         return [dict(status='unavailable', reason='no_body_probes') for _ in candidates]
+    if budget is not None:budget.check('paired_map_query_start')
     response = query(points)
+    if budget is not None:budget.check('paired_map_query_end')
     captured_now = now_ns()
     costs = [snapshot_cost(response, points, approach, rejoin, captured_now, threshold)
              for approach, rejoin in paths]

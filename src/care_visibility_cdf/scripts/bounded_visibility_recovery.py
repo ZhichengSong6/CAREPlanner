@@ -14,12 +14,14 @@ class VisibilityRecoveryBudget:
         self.anchor = None
         self.attempted = set()
 
-    def reserve(self, points, q):
+    def reserve(self, points, q, sensor=None):
         if len(q) != 7 or not all(math.isfinite(float(v)) for v in q):
             return False
         key = region_key(points)
         if not key:
             return False
+        if sensor in range(8):
+            key = (key, int(sensor))
         if self.anchor is None or max(abs(float(a)-float(b)) for a,b in zip(q,self.anchor)) > .01:
             self.anchor = tuple(float(v) for v in q)
             self.attempted.clear()
@@ -36,7 +38,14 @@ def certified_distinct_q(result, previous):
             not all(math.isfinite(float(v)) for v in q) or
             not all(math.isfinite(float(v)) for v in previous)):
         return False
-    if hybrid is not None:
+    if hybrid is not None and hybrid.get('proposal_kind') == 'local_r1_direction':
+        sensor = result.get('per_sensor_selected_sensor_id')
+        if sensor not in range(8) or sensor != hybrid.get('selected_sensor_id'):
+            return False
+        if not any(c.get('sensor_id') == sensor and list(q) == c.get('q')
+                   for c in hybrid.get('candidates', ())):
+            return False
+    elif hybrid is not None:
         # When the optional per-sensor proposer ran, only its explicitly
         # accepted branch is a valid bounded refresh. A rejected branch must
         # not silently fall back to the scalar pose in this path.

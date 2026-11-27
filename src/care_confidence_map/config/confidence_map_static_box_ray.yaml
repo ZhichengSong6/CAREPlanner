@@ -15,7 +15,7 @@ confidence_map:
   pointcloud_topic: /care_planner/confidence_map/points
   fov_marker_topic: /care_planner/confidence_map/fov_markers
   query_service: /care_planner/confidence_map/query
-  ray_observation_topic: /care_planner/perception/tof_ray_observations
+  ray_observation_topic: /care_planner/perception/valid_interval_tof_rays
   e3_summary_topic: /care_planner/confidence_map/e3_summary
   ray_observation_timeout: 0.25
   ray_free_start_range: 0.0
@@ -26,16 +26,8 @@ confidence_map:
   ray_persistent_occupied: true
 current_body_prior:
   enabled: true
-  inflation_radius: 0.1
-  link_inflation_radius:
-    base_link: 0.1
-    link1: 0.1
-    link2: 0.1
-    link3: 0.1
-    link4: 0.1421
-    wrist_link1: 0.1806
-    wrist_link2: 0.1812
-    wrist_link3: 0.21
+  inflation_radius: 0.0
+  link_inflation_radius: {}
   refresh_on_startup: false
   lock_after_complete_refresh: true
   risk_samples_only: false

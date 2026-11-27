@@ -1,0 +1,104 @@
+# Source in Bash to select the online planner policy used in run 611.
+# The ROS launcher supplies the scene, goal, ROS endpoints and per-run recording paths.
+care_611_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+export CONFIDENCE_MAP_CONFIG_FILE="$care_611_root/src/care_confidence_map/config/graduated_initial_prior_100mm_map.yaml"
+export CHECKPOINT="$care_611_root/src/care_collision_cdf/checkpoints/cdf_25mm_v2/model.pt"
+export PER_SENSOR_CHECKPOINT="$care_611_root/src/care_visibility_cdf/checkpoints/hierarchical9_r1_scratch50k/final.pt"
+export CDF_EXPECTED_SHA256=d153c5b08af0d2b8ce12da500fe13d5d0b04cfc0d9ce07a2e6ad4d2dfd93a4e6
+export CDF_ACTIVATION=relu
+export CDF_CHECKPOINT_KEY=5000
+unset care_611_root
+
+# ToF mapping and robot geometry
+export CARE_SENSOR_ONLY=true
+export CARE_SELF_VOLUME_ONLY=true
+export CARE_INITIAL_WRIST_CLEARANCE_M=0.0
+export CARE_INITIAL_LINK_CLEARANCE_M='{"base_link": 0.0, "link1": 0.0, "link2": 0.02, "link3": 0.03, "link4": 0.04, "wrist_link1": 0.06, "wrist_link2": 0.08, "wrist_link3": 0.1}'
+export CARE_KNOWN_GROUND_ENABLED=false
+export CARE_GROUND_BACKEND=native
+export CARE_ANALYTIC_GROUND_APPLY=false
+export CARE_VBC_WHOLE_VOXEL=false
+export CARE_POSE_TRANSFORM_REUSE_ENABLED=false
+
+# Visibility and task observation
+export CARE_VISIBILITY_BACKEND=r1
+export CARE_ACTIVE_OBSERVATION=true
+export CARE_OBSERVATION_SELECTOR=observation
+export CARE_RESEARCH_PROFILE=nominal_plane_point_v1
+export CARE_RESEARCH_OPPORTUNISTIC_PROBE=false
+export CARE_RESEARCH_SOFT_UNKNOWN=false
+export CARE_RESEARCH_VERIFY_TIMEOUT_S=0.75
+export CARE_RESEARCH_LEAD_MARGIN_S=0.30
+export CARE_PENDING_RELEVANCE_ENABLED=true
+export CARE_OBSERVATION_PROGRESS_ENABLED=true
+export CARE_ROLLING_TASK_OBSERVATION=true
+export CARE_OCCLUSION_REROUTE_ENABLED=true
+export CARE_OBSERVATION_ACTION_PROGRESS=true
+export CARE_NATIVE_VIEW_SELECTION=false
+export CARE_NATIVE_VIEW_MODE=legacy
+export CARE_ACTIVATION_REFRESH=off
+export CARE_TASK_CORRIDOR=legacy
+export CARE_MATCHED_OBSERVATION_RELEASE=true
+export CARE_VIEW_EVIDENCE_HANDOFF=true
+export CARE_STOPPED_VIEW_OBJECTIVE=true
+export CARE_TASK_POSE_RANKING=true
+export CARE_OBSERVATION_REUSE=true
+export ROLLING_VISIBILITY_GUIDANCE_MODE=drive
+
+# Measured routes and task proposals
+export CARE_TASK_ROUTE_COMPARISON=true
+export CARE_OCCUPIED_FEEDBACK=true
+export CARE_CHAINED_MEASURED_ENTRY=true
+export CARE_TARGETED_MEASURED_ENTRY=true
+export CARE_ONLINE_MEASURED_ENTRY=true
+export CARE_MEASURED_BODY_ENTRY=true
+export CARE_RETAINED_FRONTIER_ENDPOINT=true
+export CARE_RETAINED_FRONTIER_ROUTE=true
+export CARE_FRONTIER_TOF_ROUTE=true
+export CARE_ROLLING_TOF_ROUTE=true
+export CARE_LIVE_TOF_ROUTE=true
+export CARE_MEASURED_TASK_ROUTE=true
+export CARE_PAIRED_VIEW=true
+export CARE_OPTICAL_VIEW=true
+export CARE_INDEPENDENT_VIEW=true
+export CARE_ALTERNATE_APPROACH=true
+export CARE_ROLLING_EXECUTABLE_TASK=true
+export CARE_PROBE_EXECUTABLE_TASK=true
+export CARE_TASK_FIRST_RESEARCH=true
+export CARE_EXECUTABLE_TASK_RESEARCH=true
+export CARE_CONTINUATION_RESEARCH=true
+export CARE_PREFIX_TASK_OBJECTIVE=true
+export CARE_TERMINAL_CANDIDATE_DISCOVERY=true
+export CARE_COMPLETION_RANKING_ENABLED=false
+export CARE_COMPLETION_PRUNE_ENABLED=true
+
+# Trajectory refinement, handoff and braking
+export CARE_REPAIR_UNKNOWN_SOFT=true
+export CARE_REPLACEMENT_EXECUTION_V2=true
+export CARE_RECEIVER_HANDOFF_RETRY=false
+export CARE_CERTIFICATE_REFINEMENT_POLICY=aligned
+export CARE_REPAIR_GOAL_STOPPING=true
+export CARE_NORMAL_NEAR_GOAL_OBJECTIVE=false
+export CARE_NEAR_GOAL_CAPTURE=false
+export CARE_NEAR_GOAL_PHASE_CAPTURE=false
+export CARE_NORMAL_GOAL_PREFIX=false
+export CARE_NORMAL_GOAL_RETENTION=false
+export CARE_NORMAL_PREFIX_REFINEMENT=false
+export CARE_NORMAL_PREFIX_GUARDS=false
+export CARE_NORMAL_PREFIX_SELECTED=false
+export CARE_OBSERVATION_TASK_RETREAT=false
+export CARE_VBC_UNKNOWN_POLICY=enforce
+export CARE_BRAKE_PREDICTION=off
+export CARE_BRAKE_DYNAMICS=ideal50
+export CARE_BRAKE_RESPONSE_VBC=true
+export CARE_OCCUPIED_VOLUME_QP_ENABLED=false
+export CARE_POSITION_LIMIT_ENVELOPE=true
+export VBC_SWEPT_VOLUME_MARGIN_M=0.00075
+export FIXED_START_RECOVERY_ENABLED=true
+export FIXED_START_REBASE_REAUDIT_ENABLED=true
+export SAFETY_MARGIN=0.30
+export REPAIR_PREFIX_S=0.25
+
+# The local R1 observer owns directions in this profile.
+unset CARE_PRIMITIVE_OCCUPIED_AUTHORITY CARE_MEASURED_PATH_REQUIRED CARE_PATH_SEED_TRACE
+unset CARE_LOCAL_VISCDF CARE_VISCDF_FINAL_BLOCKER PROGRESSIVE_SHARED_REPAIR_ENABLED

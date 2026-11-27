@@ -163,6 +163,7 @@ private:
   ros::Publisher velocity_command_pub_;
   ros::Publisher reference_state_pub_;
   ros::Publisher summary_pub_;
+  ros::Publisher rejection_pub_;
   ros::Publisher replan_request_pub_;
   ros::Publisher smooth_replan_request_pub_;
 

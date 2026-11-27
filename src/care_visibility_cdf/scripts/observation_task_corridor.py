@@ -26,7 +26,7 @@ def bounded_task_reference(q_rows, times, q_start, source, horizon_s=1., limit=8
         times=sample_t.tolist(), q=sample_q.tolist())
 
 
-def ordered_body_probes(runtime, q_rows, times, resolution=.05, limit=96):
+def ordered_body_probes(runtime, q_rows, times, resolution=.05, limit=96, budget=None):
     """Keep first-touch path order while deduplicating bounded RPC points."""
     q_rows = np.asarray(q_rows, dtype=float).reshape(-1, 7)
     times = np.asarray(times, dtype=float).reshape(-1)
@@ -36,6 +36,7 @@ def ordered_body_probes(runtime, q_rows, times, resolution=.05, limit=96):
         raise ValueError('invalid ordered body probe path')
     first = {}
     for sample, (q, stamp) in enumerate(zip(q_rows, times)):
+        if budget is not None:budget.check('ordered_corridor_body_sample')
         qmap = dict(zip(DEFAULT_JOINT_NAMES, q))
         frames = {}
         for primitive, chain in zip(runtime.primitives, runtime.collision_chains):
@@ -84,12 +85,12 @@ def candidate_corridors(runtime, q_candidate, context):
     approach_s = _rest_time(context['q_start'], q, context)
     return_s = _rest_time(q, task_q[0], context)
     approach = ordered_body_probes(runtime, np.linspace(context['q_start'], q, 4),
-        np.linspace(0., approach_s, 4))
+        np.linspace(0., approach_s, 4), budget=context.get('_search_budget'))
     # Four points on the return-to-reference leg, then the captured ordered
     # task segment. Omit the duplicate anchor shared by the two pieces.
     return_q = np.vstack([np.linspace(q, task_q[0], 4), task_q[1:]])
     return_t = np.r_[np.linspace(0., return_s, 4), return_s+task_t[1:]-task_t[0]]
-    rejoin = ordered_body_probes(runtime, return_q, return_t)
+    rejoin = ordered_body_probes(runtime, return_q, return_t, budget=context.get('_search_budget'))
     return dict(approach=approach, rejoin=rejoin, reference=reference)
 
 
@@ -102,7 +103,10 @@ def paired_corridor_costs(runtime, candidates, context, query, now_ns, threshold
         for p in path[leg]['points']))
     if not points:
         return [dict(status='unavailable', reason='no_body_probes') for _ in candidates]
+    budget=context.get('_search_budget')
+    if budget is not None:budget.check('paired_ordered_map_query_start')
     response = query(points)
+    if budget is not None:budget.check('paired_ordered_map_query_end')
     captured_now = now_ns()
     costs = [snapshot_cost(response, points, path['approach']['points'], path['rejoin']['points'],
         captured_now, threshold) for path in paths]

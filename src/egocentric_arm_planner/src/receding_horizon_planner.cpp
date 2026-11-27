@@ -296,6 +296,8 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   Eigen::VectorXd latest_mpc_command;
   Eigen::VectorXd previous_mpc_command;
   Eigen::VectorXd ik_seed;
+  int wrist_restart_side = 0;
+  bool elbow_wrist_first_seed = false;
   std::string ik_seed_source="measured";
   ros::Time latest_mpc_time;
   ros::Time previous_mpc_time;
@@ -324,6 +326,11 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
       if (reference_has_cached_ik_seed_ && reference_retry_.attempts == 2) {
         ik_seed.resize(0);
         ik_seed_source="measured";
+      }
+      if (!reference_has_cached_ik_seed_) {
+        elbow_wrist_first_seed = reference_retry_.attempts == 1;
+        if (reference_retry_.attempts == 2) wrist_restart_side = 1;
+        if (reference_retry_.attempts == 3) wrist_restart_side = -1;
       }
       joint_state = latest_joint_state_;
       target_pose = latest_target_pose_;
@@ -358,6 +365,29 @@ bool RecedingHorizonPlanner::runOnePlanningStep() {
   const Eigen::VectorXd q_current = robot_model_->getCurrentQ();
   const int nv = robot_model_->nv();
   const auto& task_cfg = task_generator_.config();
+
+  // Try both wrist branches for a fresh request within the existing retry
+  // budget. Keep successful cached-goal handling on its original path.
+  int wrist_index = 0;
+  if (wrist_restart_side != 0 && robot_model_->getJointQIndex("wrist_joint2", wrist_index)) {
+    ik_seed = q_current;
+    ik_seed[wrist_index] = 2.0 * wrist_restart_side;
+    ik_seed_source = wrist_restart_side > 0 ? "wrist_restart_positive" : "wrist_restart_negative";
+  }
+
+  // This changes only the first numerical IK initialization. The actual
+  // motion starts from q_current and uses the same safety pipeline.
+  int elbow_index = 0;
+  int wrist_roll_index = 0;
+  if (elbow_wrist_first_seed && robot_model_->getJointQIndex("joint4", elbow_index) &&
+      robot_model_->getJointQIndex("wrist_joint1", wrist_roll_index) &&
+      robot_model_->getJointQIndex("wrist_joint2", wrist_index)) {
+    ik_seed = q_current;
+    ik_seed[elbow_index] += 0.48;
+    ik_seed[wrist_roll_index] += 0.42;
+    ik_seed[wrist_index] -= 2.0;
+    ik_seed_source = "elbow_wrist_branch_first";
+  }
 
   // q comes from measured joint position. For dq/ddq, use the command state
   // that the MPC itself is enforcing. This keeps retarget boundary conditions
